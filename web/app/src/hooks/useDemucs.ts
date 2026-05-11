@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import type { DemucsState, LogEntry } from '../types';
-import { SAMPLE_RATE, Separator, type ModelType } from 'demucs-web';
+import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'demucs-web';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
 import { ORT_WASM_PATHS } from '../onnx-config';
@@ -55,7 +55,11 @@ export function useDemucs() {
         return audioContextRef.current;
     }, []);
 
-    const loadModel = useCallback(async (model: ModelType, backend: 'webgpu' | 'wasm' = 'webgpu') => {
+    const loadModel = useCallback(async (
+        model: ModelType,
+        backend: 'webgpu' | 'wasm' = 'webgpu',
+        precision: ModelPrecision = 'fp16',
+    ) => {
         // If a model is already loaded, tear it down before loading another.
         if (separatorRef.current) {
             await separatorRef.current.unload();
@@ -63,12 +67,13 @@ export function useDemucs() {
         }
 
         setState(prev => ({ ...prev, modelLoading: true }));
-        addLog(`Loading ${model}...`, 'info');
+        addLog(`Loading ${model} (${precision})...`, 'info');
         const start = performance.now();
 
         try {
             const separator = await Separator.load(model, {
                 backend,
+                precision,
                 wasmPaths: ORT_WASM_PATHS,
             });
             separatorRef.current = separator;
@@ -78,7 +83,7 @@ export function useDemucs() {
                 addLog('WebGPU unavailable, fell back to WASM', 'info');
             }
             addLog(
-                `Loaded ${separator.backend} in ${elapsed}s (${separator.sources.join(', ')})`,
+                `Loaded ${separator.backend}/${separator.precision} in ${elapsed}s (${separator.sources.join(', ')})`,
                 'success'
             );
 

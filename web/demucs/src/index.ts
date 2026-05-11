@@ -9,7 +9,7 @@ export {
 export type { ModelType } from './constants';
 
 export { Separator } from './separator';
-export type { LoadModelOptions } from './separator';
+export type { LoadModelOptions, ModelPrecision } from './separator';
 
 export type {
     SeparationProgress,

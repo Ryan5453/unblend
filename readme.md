@@ -78,7 +78,8 @@ demucs separate /path/to/music/folder
 | RTX A4000 | CUDA FP32 | 4.42 | 8.297 |
 | M2 Max | MPS FP16 | 8.65 | 8.318 |
 | M2 Max | MPS FP32 | 12.74 | 8.318 |
-| M2 Max | Browser ONNX (WebGPU) | 17.53 | 8.400 |
+| M2 Max | Browser ONNX FP16* (WebGPU) | 18.64 | 8.399 |
+| M2 Max | Browser ONNX FP32 (WebGPU) | 18.82 | 8.399 |
 | Intel i9-10900X | CPU FP32 | 49.94 | 8.318 |
 | M2 Max | CPU FP32 | 86.48 | 8.318 |
 
@@ -92,6 +93,8 @@ demucs separate /path/to/music/folder
 | M2 Max | CPU FP32 | 110.99 | 8.306 |
 
 `demucs-next` is faster than upstream on every config except M2 Max MPS FP32 (a torch 2.7 -> 2.8 `aten::copy_` regression we can't avoid; the recommended MPS FP16 path beats it). SDR equals or exceeds upstream everywhere.
+
+\* Browser ONNX FP16 is weight-only FP16 — Conv/MatMul weights are stored as FP16 on disk (cutting the download from 161 MB to 87 MB), but a Cast node restores FP32 at session-create so compute runs in full FP32. ORT-WASM does not accumulate FP16 GEMMs in FP32 the way CUDA/MPS do, so a real FP16 graph produced audible quantization noise; this approach gets the size win without the precision cost. SDR is bit-equivalent to FP32.
 
 ## Cog Usage
 

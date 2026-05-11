@@ -29,6 +29,7 @@ dev = [
 ]
 onnx = [
   "onnx>=1.14.0",
+  "onnxconverter-common>=1.14.0",
 ]
 
 [build-system]

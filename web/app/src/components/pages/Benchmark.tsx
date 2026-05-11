@@ -16,6 +16,7 @@ import {
     Separator,
     SAMPLE_RATE,
     type ModelType,
+    type ModelPrecision,
 } from 'demucs-web';
 import { computeSDRAsync, meanFiniteSDR, type StemSDR } from '../../utils/sdr';
 import { ORT_WASM_PATHS } from '../../onnx-config';
@@ -106,6 +107,7 @@ export function Benchmark() {
     const [phase, setPhase] = useState<Phase>('idle');
     const [model, setModel] = useState<ModelType>('htdemucs');
     const [backend, setBackend] = useState<'webgpu' | 'wasm'>('webgpu');
+    const [precision, setPrecision] = useState<ModelPrecision>('fp16');
     const [tracks, setTracks] = useState<MusdbTrack[]>([]);
     const [results, setResults] = useState<TrackResult[]>([]);
     const [currentIndex, setCurrentIndex] = useState<number>(-1);
@@ -185,7 +187,7 @@ export function Benchmark() {
         setResults([]);
         setLogs([]);
         setPhase('loading_model');
-        log(`Loading model ${model} (${backend})…`);
+        log(`Loading model ${model} (${backend}, ${precision})…`);
 
         if (backend === 'webgpu') {
             const ok = 'gpu' in navigator && (await navigator.gpu.requestAdapter()) !== null;
@@ -198,6 +200,7 @@ export function Benchmark() {
         try {
             separator = await Separator.load(model, {
                 backend,
+                precision,
                 wasmPaths: ORT_WASM_PATHS,
             });
         } catch (err) {
@@ -283,7 +286,7 @@ export function Benchmark() {
         setCurrentIndex(-1);
         setPhase('done');
         log('Benchmark complete');
-    }, [tracks, model, backend, getAudioContext, log]);
+    }, [tracks, model, backend, precision, getAudioContext, log]);
 
     const cancel = useCallback(() => {
         cancelRef.current = true;
@@ -309,7 +312,7 @@ export function Benchmark() {
                         recording per-track wall time, ONNX inference time, realtime factor, and SDR per stem.
                     </p>
 
-                    <div className="my-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="my-6 grid grid-cols-1 md:grid-cols-3 gap-4">
                         <label className="flex flex-col gap-2">
                             <span className="bench-field-label">Model</span>
                             <select
@@ -333,6 +336,19 @@ export function Benchmark() {
                             >
                                 <option value="webgpu">WebGPU</option>
                                 <option value="wasm">WebAssembly (CPU)</option>
+                            </select>
+                        </label>
+
+                        <label className="flex flex-col gap-2">
+                            <span className="bench-field-label">Precision</span>
+                            <select
+                                className="bench-select"
+                                value={precision}
+                                onChange={e => setPrecision(e.target.value as ModelPrecision)}
+                                disabled={phase === 'running' || phase === 'loading_model'}
+                            >
+                                <option value="fp16">fp16 (half)</option>
+                                <option value="fp32">fp32 (full)</option>
                             </select>
                         </label>
                     </div>

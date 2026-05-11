@@ -34,19 +34,31 @@ def export_onnx_command(
             help="ONNX opset version",
         ),
     ] = 17,
+    fp16: Annotated[
+        bool,
+        typer.Option(
+            "--fp16",
+            help="Convert weights and IO to float16 after export.",
+        ),
+    ] = False,
 ) -> None:
     """
     Export a HTDemucs model to the ONNX format.
 
     This is an internal developer tool for creating ONNX models for deployment.
     """
-    output_path = output if output is not None else f"{model}.onnx"
+    if output is not None:
+        output_path = output
+    else:
+        suffix = "_fp16" if fp16 else "_fp32"
+        output_path = f"{model}{suffix}.onnx"
 
     try:
         export_to_onnx(
             model_name=model,
             output_path=output_path,
             opset_version=opset,
+            fp16=fp16,
         )
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")

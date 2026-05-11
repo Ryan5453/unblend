@@ -1,6 +1,9 @@
 /**
  * ONNX Runtime worker. Handles both WebGPU and WASM backends — same code, the
- * caller picks via the ``backend`` field on the load message.
+ * caller picks via the ``backend`` field on the load message. Inputs and
+ * outputs are always float32; for fp16 models the weights and activations are
+ * fp16 internally but the converter inserts Cast nodes at the IO boundary so
+ * the JS pipeline stays fp32 end-to-end.
  */
 
 import * as onnx from 'onnxruntime-web';
@@ -79,6 +82,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             };
             self.postMessage(response);
         } catch (error) {
+            console.error('[onnx-worker] load failed:', error);
             const response: LoadResponse = {
                 type: 'load',
                 success: false,
@@ -131,6 +135,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
 
             self.postMessage(response);
         } catch (error) {
+            console.error('[onnx-worker] run failed:', error);
             const response: RunResponse = {
                 type: 'run',
                 success: false,

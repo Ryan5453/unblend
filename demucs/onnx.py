@@ -117,6 +117,7 @@ def export_to_onnx(
     model_name: str = "htdemucs",
     output_path: str | None = None,
     opset_version: int = 17,
+    fp16: bool = False,
 ) -> str:
     """
     Export a Demucs model to ONNX. Traced at the model's training length
@@ -125,6 +126,9 @@ def export_to_onnx(
     :param model_name: Name of the model to export.
     :param output_path: Path to save the ONNX model (defaults to ``{model_name}.onnx``).
     :param opset_version: ONNX opset version.
+    :param fp16: If True, convert all weights, activations, and IO to float16
+        after export. Halves model file size and enables faster inference on
+        FP16-capable backends (WebGPU, CUDA, etc.).
     :return: Path to the exported ONNX model.
     :raises ImportError: If the ``onnx`` package is not installed.
     :raises ValueError: If the resolved model is not an ``HTDemucs`` instance.
@@ -136,6 +140,10 @@ def export_to_onnx(
             "The 'onnx' package is required for ONNX export. "
             "Install it with: uv pip install demucs-next[onnx]"
         )
+
+    if fp16:
+        import numpy as np
+        from onnx import numpy_helper, TensorProto, helper
 
     if output_path is None:
         output_path = f"{model_name}.onnx"
@@ -187,6 +195,64 @@ def export_to_onnx(
 
     onnx_model = onnx.load(output_path)
 
+    if fp16:
+        # Weight-only fp16: store every Conv/MatMul/Gemm/ConvTranspose
+        # weight as float16, then insert a Cast(fp16->float32) node right
+        # after the initializer so compute runs in full fp32. This halves
+        # the on-disk model size without any fp16 compute precision loss —
+        # ORT-WASM's pure-fp16 accumulation in Conv/MatMul kernels produces
+        # audible 8-bit-style quantization noise that CUDA/MPS hide via
+        # fp32 accumulation; we sidestep the issue entirely by computing in
+        # fp32 regardless of EP. ORT's graph optimizer typically folds the
+        # constant Cast at load time so there's no runtime overhead.
+        weight_op_inputs = {
+            "Conv": (1, 2),
+            "ConvTranspose": (1, 2),
+            "MatMul": (0, 1),
+            "Gemm": (0, 1, 2),
+        }
+        weight_init_names: set[str] = set()
+        for node in onnx_model.graph.node:
+            for idx in weight_op_inputs.get(node.op_type, ()):
+                if idx < len(node.input) and node.input[idx]:
+                    weight_init_names.add(node.input[idx])
+
+        existing_outputs = {n.output[0] for n in onnx_model.graph.node if n.output}
+        existing_inputs = {i.name for i in onnx_model.graph.input}
+
+        new_inits = []
+        new_cast_nodes = []
+        for init in onnx_model.graph.initializer:
+            if (
+                init.name in weight_init_names
+                and init.data_type == TensorProto.FLOAT
+                # Only rewrite tensors that are bona-fide weight initializers,
+                # not ones already produced by some upstream node.
+                and init.name not in existing_outputs
+                and init.name not in existing_inputs
+            ):
+                arr = numpy_helper.to_array(init).astype(np.float16)
+                fp16_name = init.name + "_fp16"
+                new_inits.append(numpy_helper.from_array(arr, name=fp16_name))
+                new_cast_nodes.append(
+                    helper.make_node(
+                        "Cast",
+                        inputs=[fp16_name],
+                        outputs=[init.name],
+                        to=TensorProto.FLOAT,
+                        name=init.name + "_cast_to_fp32",
+                    )
+                )
+            else:
+                new_inits.append(init)
+
+        onnx_model.graph.ClearField("initializer")
+        onnx_model.graph.initializer.extend(new_inits)
+        # Prepend the weight-Cast nodes so ORT sees them before any consumer.
+        original_nodes = list(onnx_model.graph.node)
+        onnx_model.graph.ClearField("node")
+        onnx_model.graph.node.extend(new_cast_nodes + original_nodes)
+
     sources_meta = onnx_model.metadata_props.add()
     sources_meta.key = "sources"
     sources_meta.value = json.dumps(model.sources)
@@ -198,6 +264,10 @@ def export_to_onnx(
     channels_meta = onnx_model.metadata_props.add()
     channels_meta.key = "audio_channels"
     channels_meta.value = str(model.audio_channels)
+
+    precision_meta = onnx_model.metadata_props.add()
+    precision_meta.key = "precision"
+    precision_meta.value = "fp16" if fp16 else "fp32"
 
     onnx.save(onnx_model, output_path)
 
