@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect, type DragEvent } from 'react';
 import { useDemucs } from '../../hooks/useDemucs';
 import { Vinyl, ChannelStrip } from '../ui/Vinyl';
-import { Settings, type ExecutionBackend } from '../ui/Settings';
-import type { ModelType } from 'demucs-web';
+import { Waveform } from '../ui/Waveform';
 
 interface StemStyle {
     name: string;
@@ -41,17 +40,13 @@ export function Home() {
         trackArtist,
         audioError,
         loadModel,
-        unloadModel,
         loadAudio,
         clearAudioError,
         separateAudio,
-        resetForNewTrack,
     } = useDemucs();
 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dropZoneRef = useRef<HTMLDivElement>(null);
-    const [selectedModel, setSelectedModel] = useState<ModelType>('htdemucs');
-    const [selectedBackend, setSelectedBackend] = useState<ExecutionBackend>('webgpu');
     const [volumes, setVolumes] = useState<Record<string, number>>({});
     const [mutedStems, setMutedStems] = useState<Record<string, boolean>>({});
     const [isTransportPlaying, setIsTransportPlaying] = useState(false);
@@ -147,21 +142,11 @@ export function Home() {
         }
     }, [mergedStemUrl]);
 
-    const handleModelChange = async (model: ModelType) => {
-        if (modelLoaded && selectedModel === model) return;
-        if (modelLoaded) await unloadModel();
-        setSelectedModel(model);
-    };
-
-    const handleBackendChange = (backend: ExecutionBackend) => {
-        setSelectedBackend(backend);
-    };
-
     const handleSeparate = async () => {
         if (!audioLoaded) return;
 
         if (!modelLoaded) {
-            const success = await loadModel(selectedModel, selectedBackend);
+            const success = await loadModel('htdemucs');
             if (success) {
                 separateAudio();
             }
@@ -240,6 +225,15 @@ export function Home() {
         });
         setIsTransportPlaying(false);
         setCurrentTime(0);
+    };
+
+    const seekTo = (time: number) => {
+        const clamped = Math.max(0, Math.min(duration, time));
+        setCurrentTime(clamped);
+        getTransportStemKeys().forEach(stem => {
+            const audio = audioRefs.current[stem];
+            if (audio) audio.currentTime = clamped;
+        });
     };
 
     const handleDownload = (stemName: string) => {
@@ -350,13 +344,6 @@ export function Home() {
 
     return (
         <>
-            <Settings
-                selectedModel={selectedModel}
-                selectedBackend={selectedBackend}
-                onModelChange={handleModelChange}
-                onBackendChange={handleBackendChange}
-            />
-
             <main className="flex-1 relative">
                 <input
                     ref={fileInputRef}
@@ -444,11 +431,27 @@ export function Home() {
                 {hasStemsReady && (
                     <div className="absolute inset-0 flex items-center justify-center animate-fade-in">
                         <div className="flex flex-col items-center gap-6">
-                            {/* Transport + Time */}
-                            <div className="flex items-center justify-center gap-4">
+                            {/* Track info + Time + Transport on one row */}
+                            <div className="flex items-center justify-center gap-6">
+                                <div className="track-info">
+                                    {artworkUrl ? (
+                                        <img src={artworkUrl} alt="" className="track-info-art" />
+                                    ) : (
+                                        <div className="track-info-art track-info-art-empty" />
+                                    )}
+                                    <div className="track-info-text">
+                                        <div className="track-info-title">{getTrackName()}</div>
+                                        {getArtistName() && (
+                                            <div className="track-info-artist">{getArtistName()}</div>
+                                        )}
+                                    </div>
+                                </div>
+
                                 <div className="lcd-display text-center">
-                                    <div className="lcd-label">Time</div>
-                                    <div className="lcd-time">{formatTime(currentTime)}</div>
+                                    <div className="lcd-time">
+                                        {formatTime(currentTime)}
+                                        <span className="lcd-time-total"> / {formatTime(duration)}</span>
+                                    </div>
                                 </div>
 
                                 <div className="transport">
@@ -457,8 +460,8 @@ export function Home() {
                                             <rect x="6" y="6" width="12" height="12" />
                                         </svg>
                                     </button>
-                                    <button 
-                                        className="transport-btn primary" 
+                                    <button
+                                        className="transport-btn primary"
                                         onClick={isTransportPlaying ? pauseAll : () => { void playAll(); }}
                                     >
                                         {isTransportPlaying ? (
@@ -472,12 +475,14 @@ export function Home() {
                                         )}
                                     </button>
                                 </div>
-
-                                <div className="lcd-display text-center">
-                                    <div className="lcd-label">Duration</div>
-                                    <div className="lcd-time" style={{ color: '#444' }}>{formatTime(duration)}</div>
-                                </div>
                             </div>
+
+                            <Waveform
+                                audioBuffer={audioBuffer}
+                                duration={duration}
+                                currentTime={currentTime}
+                                onSeek={seekTo}
+                            />
 
                             {/* Mixer */}
                             <div className="mixer-console">
@@ -537,9 +542,6 @@ export function Home() {
                                         </button>
                                         <button onClick={() => setMergeMode(true)} className="btn btn-ghost">
                                             Merge
-                                        </button>
-                                        <button onClick={resetForNewTrack} className="btn btn-ghost">
-                                            New Track
                                         </button>
                                     </>
                                 ) : (

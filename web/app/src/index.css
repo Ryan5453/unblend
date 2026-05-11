@@ -1381,3 +1381,83 @@ html, body {
     max-height: 24rem;
     overflow-y: auto;
 }
+
+/* ========================================
+   Waveform Scrubber
+   ======================================== */
+.waveform {
+  display: flex;
+  align-items: center;
+  height: 60px;
+  width: 600px;
+  gap: 1px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.waveform-bar {
+  flex: 1;
+  min-width: 1px;
+  background: #333;
+  border-radius: 1px;
+  transition: background 0.05s ease;
+}
+
+.waveform-bar.past {
+  background: #c9a227;
+}
+
+.waveform-bar.hover {
+  background: #fff;
+}
+
+/* ========================================
+   Track Info (now playing)
+   ======================================== */
+.track-info {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.track-info-art {
+  width: 56px;
+  height: 56px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.track-info-art-empty {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+}
+
+.track-info-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.track-info-title {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #ddd;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track-info-artist {
+  font-size: 0.8rem;
+  color: #888;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lcd-time-total {
+  color: #555;
+  font-weight: 400;
+}

@@ -7,26 +7,23 @@ export function About() {
 
                 <div className="content-body">
                     <p>
-                        <strong>demucs.app</strong> is a free, open-source audio stem separation tool powered by Meta AI's Demucs model.
-                        Everything runs entirely in your browser, so your audio files never leave your device.
-                    </p>
-
-                    <h2>The Technology</h2>
-
-                    <p>
-                        Demucs is a machine learning model that separates mixed audio into individual stems.
-                        The standard 4-source model separates audio into drums, bass, vocals, and other instruments.
-                        There's also an experimental 6-source model that adds guitar and piano stems, though piano separation is less reliable.
+                        <strong>demucs.app</strong> is a free, open-source audio stem separation tool powered by
+                        Meta AI's Demucs model. Everything runs entirely in your browser, so your audio files
+                        never leave your device.
                     </p>
 
                     <p>
-                        This app uses Demucs models converted to ONNX format for in-browser inference.
-                        When you select a model, either the WebGPU runtime (~24MB) or WebAssembly runtime (~12MB) is downloaded based on your device's capabilities, along with the model weights.
+                        Demucs separates a mixed track into four stems: drums, bass, vocals, and other
+                        instruments. The model is converted to ONNX format and runs in-browser via
+                        onnxruntime-web. On first use, the runtime binary (~26MB) and model weights (~80MB) are
+                        downloaded. Inference uses WebGPU when your browser supports it, falling back to
+                        WebAssembly otherwise.
                     </p>
 
                     <p>
-                        Audio files are decoded using <a href="https://mediabunny.dev/">MediaBunny</a>, which leverages your browser's native capabilities.
-                        For files that can't be decoded natively, the app falls back to <a href="https://ffmpegwasm.netlify.app/">ffmpeg.wasm</a> (~32MB).
+                        Audio files are decoded with <a href="https://mediabunny.dev/">MediaBunny</a>, which
+                        uses your browser's native decoders where possible. For formats that can't be decoded
+                        natively, the app falls back to <a href="https://ffmpegwasm.netlify.app/">ffmpeg.wasm</a> (~32MB).
                     </p>
                 </div>
             </div>
