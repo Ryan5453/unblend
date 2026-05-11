@@ -3,7 +3,7 @@
  * Runs STFT in parallel with GPU inference on the main thread.
  */
 
-import { computeSTFT, createSTFTBuffers, type STFTBuffers } from '../utils/audio-processor';
+import { computeSTFT, createSTFTBuffers, type STFTBuffers } from '../audio-processor';
 
 let stftBuffers: STFTBuffers | null = null;
 

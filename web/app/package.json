@@ -1,5 +1,5 @@
 {
-  "name": "web",
+  "name": "demucs-app",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -13,10 +13,9 @@
     "@ffmpeg/core": "^0.12.10",
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
-    "fft.js": "^4.0.4",
+    "demucs-web": "*",
     "lucide-react": "^0.556.0",
     "mediabunny": "^1.26.0",
-    "onnxruntime-web": "^1.24.0-dev.20251116-b39e144322",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.12.0"
@@ -35,7 +34,6 @@
     "tailwindcss": "^4.1.17",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",
-    "vite": "^7.3.2",
-    "vite-plugin-static-copy": "^3.1.4"
+    "vite": "^7.3.2"
   }
 }

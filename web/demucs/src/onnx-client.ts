@@ -1,14 +1,9 @@
-/**
- * Client for communicating with the ONNX Worker
- * 
- * This module provides a Promise-based API for the main thread to
- * interact with the ONNX worker for WASM inference.
- */
-
-// Message types (must match worker)
 interface LoadModelMessage {
     type: 'load';
     modelUrl: string;
+    backend: 'webgpu' | 'wasm';
+    wasmPaths?: string;
+    numThreads?: number;
 }
 
 interface RunInferenceMessage {
@@ -24,10 +19,10 @@ interface UnloadMessage {
     type: 'unload';
 }
 
-// Response types
 interface LoadResponse {
     type: 'load';
     success: boolean;
+    backend?: 'webgpu' | 'wasm';
     error?: string;
 }
 
@@ -47,12 +42,8 @@ interface UnloadResponse {
     success: boolean;
 }
 
-interface ProgressResponse {
-    type: 'progress';
-    message: string;
-}
-
-type WorkerResponse = LoadResponse | RunResponse | UnloadResponse | ProgressResponse;
+type WorkerResponse = LoadResponse | RunResponse | UnloadResponse;
+type Message = LoadModelMessage | RunInferenceMessage | UnloadMessage;
 
 export interface InferenceResult {
     outSpecReal: Float32Array;
@@ -62,157 +53,99 @@ export interface InferenceResult {
     outWaveShape: number[];
 }
 
-let worker: Worker | null = null;
-let pendingResolve: ((value: WorkerResponse) => void) | null = null;
-let pendingReject: ((reason?: unknown) => void) | null = null;
-let onProgress: ((message: string) => void) | null = null;
+export class OnnxClient {
+    private worker: Worker;
+    private pendingResolve: ((value: WorkerResponse) => void) | null = null;
+    private pendingReject: ((reason?: unknown) => void) | null = null;
 
-function clearPending(): void {
-    pendingResolve = null;
-    pendingReject = null;
-}
+    constructor() {
+        this.worker = new Worker(
+            new URL('./workers/onnx-worker.ts', import.meta.url),
+            { type: 'module' }
+        );
 
-function failPending(message: string): void {
-    const reject = pendingReject;
-    clearPending();
-    if (reject) {
-        reject(new Error(message));
+        this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+            const resolve = this.pendingResolve;
+            this.pendingResolve = null;
+            this.pendingReject = null;
+            resolve?.(event.data);
+        };
+
+        this.worker.onerror = (error) => {
+            console.error('[onnx-worker] error:', error);
+            this.failPending(error.message || 'ONNX worker failed');
+        };
     }
-}
 
-/**
- * Initialize the ONNX worker
- */
-export function initWorker(): void {
-    if (worker) return;
+    async load(
+        modelUrl: string,
+        backend: 'webgpu' | 'wasm',
+        options: { wasmPaths?: string; numThreads?: number } = {}
+    ): Promise<void> {
+        const response = (await this.send({
+            type: 'load',
+            modelUrl,
+            backend,
+            wasmPaths: options.wasmPaths,
+            numThreads: options.numThreads,
+        })) as LoadResponse;
 
-    // Use classic worker (not module) because importScripts doesn't work in module workers
-    worker = new Worker(
-        new URL('../workers/onnx-worker.ts', import.meta.url)
-    );
+        if (!response.success) {
+            throw new Error(response.error || 'Model load failed');
+        }
+    }
 
+    async runInference(
+        specReal: Float32Array,
+        specImag: Float32Array,
+        audio: Float32Array,
+        specShape: number[],
+        audioShape: number[]
+    ): Promise<InferenceResult> {
+        const response = (await this.send({
+            type: 'run',
+            specReal,
+            specImag,
+            audio,
+            specShape,
+            audioShape,
+        })) as RunResponse;
 
-    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-        const response = event.data;
-
-        if (response.type === 'progress') {
-            if (onProgress) {
-                onProgress(response.message);
-            }
-            return;
+        if (!response.success) {
+            throw new Error(response.error || 'Inference failed');
         }
 
-        if (pendingResolve) {
-            pendingResolve(response);
-            clearPending();
-        }
-    };
-
-    worker.onerror = (error) => {
-        console.error('[WorkerClient] Worker error:', error);
-        failPending(error.message || 'ONNX worker failed');
-    };
-}
-
-/**
- * Terminate the worker
- */
-export function terminateWorker(): void {
-    failPending('ONNX worker terminated');
-    if (worker) {
-        worker.terminate();
-        worker = null;
-    }
-}
-
-/**
- * Set a callback for progress messages
- */
-export function setProgressCallback(callback: ((message: string) => void) | null): void {
-    onProgress = callback;
-}
-
-/**
- * Load a model in the worker
- */
-export async function workerLoadModel(modelUrl: string): Promise<boolean> {
-    initWorker();
-
-    const message: LoadModelMessage = { type: 'load', modelUrl };
-
-    const response = await sendMessage(message) as LoadResponse;
-
-    if (!response.success && response.error) {
-        throw new Error(response.error);
+        return {
+            outSpecReal: response.outSpecReal!,
+            outSpecImag: response.outSpecImag!,
+            outWave: response.outWave!,
+            outSpecShape: response.outSpecShape!,
+            outWaveShape: response.outWaveShape!,
+        };
     }
 
-    return response.success;
-}
-
-/**
- * Run inference in the worker
- */
-export async function workerRunInference(
-    specReal: Float32Array,
-    specImag: Float32Array,
-    audio: Float32Array,
-    specShape: number[],
-    audioShape: number[]
-): Promise<InferenceResult> {
-    if (!worker) {
-        throw new Error('Worker not initialized');
+    async unload(): Promise<void> {
+        await this.send({ type: 'unload' });
     }
 
-    const message: RunInferenceMessage = {
-        type: 'run',
-        specReal,
-        specImag,
-        audio,
-        specShape,
-        audioShape,
-    };
-
-    const response = await sendMessage(message) as RunResponse;
-
-    if (!response.success) {
-        throw new Error(response.error || 'Inference failed');
+    terminate(): void {
+        this.failPending('ONNX worker terminated');
+        this.worker.terminate();
     }
 
-    return {
-        outSpecReal: response.outSpecReal!,
-        outSpecImag: response.outSpecImag!,
-        outWave: response.outWave!,
-        outSpecShape: response.outSpecShape!,
-        outWaveShape: response.outWaveShape!,
-    };
-}
+    private failPending(message: string): void {
+        const reject = this.pendingReject;
+        this.pendingResolve = null;
+        this.pendingReject = null;
+        reject?.(new Error(message));
+    }
 
-/**
- * Unload the model in the worker
- */
-export async function workerUnloadModel(): Promise<void> {
-    if (!worker) return;
-
-    const message: UnloadMessage = { type: 'unload' };
-    await sendMessage(message);
-}
-
-/**
- * Check if worker is active
- */
-export function isWorkerActive(): boolean {
-    return worker !== null;
-}
-
-/**
- * Send a message to the worker and wait for response
- */
-function sendMessage(message: LoadModelMessage | RunInferenceMessage | UnloadMessage): Promise<WorkerResponse> {
-    failPending('Superseded by a new ONNX request');
-
-    return new Promise((resolve, reject) => {
-        pendingResolve = resolve;
-        pendingReject = reject;
-        worker!.postMessage(message);
-    });
+    private send(message: Message): Promise<WorkerResponse> {
+        this.failPending('Superseded by a new ONNX request');
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = resolve;
+            this.pendingReject = reject;
+            this.worker.postMessage(message);
+        });
+    }
 }

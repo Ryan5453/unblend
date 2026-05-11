@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, type DragEvent } from 'react';
 import { useDemucs } from '../../hooks/useDemucs';
 import { Vinyl, ChannelStrip } from '../ui/Vinyl';
 import { Settings, type ExecutionBackend } from '../ui/Settings';
-import type { ModelType } from '../../types';
+import type { ModelType } from 'demucs-web';
 
 interface StemStyle {
     name: string;
@@ -159,11 +159,11 @@ export function Home() {
 
     const handleSeparate = async () => {
         if (!audioLoaded) return;
-        
+
         if (!modelLoaded) {
             const success = await loadModel(selectedModel, selectedBackend);
             if (success) {
-                separateAudio(true); // Skip model check since we just loaded it
+                separateAudio();
             }
         } else {
             separateAudio();

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import type { ModelType } from '../../types';
+import type { ModelType } from 'demucs-web';
 
 export interface ModelInfo {
     id: ModelType;

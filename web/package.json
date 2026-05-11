@@ -1,0 +1,8 @@
+{
+  "name": "demucs-web-workspace",
+  "private": true,
+  "workspaces": [
+    "demucs",
+    "app"
+  ]
+}

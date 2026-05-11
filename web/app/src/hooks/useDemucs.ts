@@ -1,12 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
-import type { DemucsState, LogEntry, ModelType } from '../types';
-import { SAMPLE_RATE } from '../types';
-import { loadModel as loadOnnxModel, unloadModel as unloadOnnxModel } from '../utils/onnx-runtime';
-import { terminateISTFTWorker } from '../utils/istft-worker-client';
-import { terminateSTFTWorker } from '../utils/stft-worker-client';
+import type { DemucsState, LogEntry } from '../types';
+import { SAMPLE_RATE, Separator, type ModelType } from 'demucs-web';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
-import { separateAudioBuffer } from '../utils/separator';
+import { ORT_WASM_PATHS } from '../onnx-config';
 
 const initialState: DemucsState = {
     modelLoaded: false,
@@ -24,6 +21,7 @@ export function useDemucs() {
     const [state, setState] = useState<DemucsState>(initialState);
     const [audioError, setAudioError] = useState<string | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
+    const separatorRef = useRef<Separator | null>(null);
 
     // Store pre-created blob URLs
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
@@ -50,11 +48,6 @@ export function useDemucs() {
         setState(prev => ({ ...prev, progress }));
     }, []);
 
-    const resetProcessingWorkers = useCallback(() => {
-        terminateSTFTWorker();
-        terminateISTFTWorker();
-    }, []);
-
     const getAudioContext = useCallback(() => {
         if (!audioContextRef.current) {
             audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -63,22 +56,49 @@ export function useDemucs() {
     }, []);
 
     const loadModel = useCallback(async (model: ModelType, backend: 'webgpu' | 'wasm' = 'webgpu') => {
+        // If a model is already loaded, tear it down before loading another.
+        if (separatorRef.current) {
+            await separatorRef.current.unload();
+            separatorRef.current = null;
+        }
+
         setState(prev => ({ ...prev, modelLoading: true }));
-        const result = await loadOnnxModel(model, addLog, backend);
-        setState(prev => ({
-            ...prev,
-            modelLoading: false,
-            modelLoaded: result.success,
-        }));
-        return result.success;
+        addLog(`Loading ${model}...`, 'info');
+        const start = performance.now();
+
+        try {
+            const separator = await Separator.load(model, {
+                backend,
+                wasmPaths: ORT_WASM_PATHS,
+            });
+            separatorRef.current = separator;
+
+            const elapsed = ((performance.now() - start) / 1000).toFixed(2);
+            if (backend === 'webgpu' && separator.backend === 'wasm') {
+                addLog('WebGPU unavailable, fell back to WASM', 'info');
+            }
+            addLog(
+                `Loaded ${separator.backend} in ${elapsed}s (${separator.sources.join(', ')})`,
+                'success'
+            );
+
+            setState(prev => ({ ...prev, modelLoading: false, modelLoaded: true }));
+            return true;
+        } catch (err) {
+            addLog(`Failed to load ${model}: ${(err as Error).message}`, 'error');
+            setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
+            return false;
+        }
     }, [addLog]);
 
     const unloadModel = useCallback(async () => {
-        resetProcessingWorkers();
-        await unloadOnnxModel();
+        if (separatorRef.current) {
+            await separatorRef.current.unload();
+            separatorRef.current = null;
+        }
         setState(prev => ({ ...prev, modelLoaded: false }));
         addLog('Model unloaded', 'info');
-    }, [addLog, resetProcessingWorkers]);
+    }, [addLog]);
 
     const clearAudioError = useCallback(() => {
         setAudioError(null);
@@ -129,8 +149,9 @@ export function useDemucs() {
         }
     }, [addLog, getAudioContext]);
 
-    const separateAudio = useCallback(async (skipModelCheck = false) => {
-        if (!skipModelCheck && !state.modelLoaded) {
+    const separateAudio = useCallback(async () => {
+        const separator = separatorRef.current;
+        if (!separator) {
             addLog('Model not loaded', 'error');
             return;
         }
@@ -140,8 +161,6 @@ export function useDemucs() {
         }
 
         try {
-            // Reset workers so a previous failed run can't leak stale state.
-            resetProcessingWorkers();
             setState(prev => ({ ...prev, separating: true }));
             setStemUrls({});
             setStemWaveforms({});
@@ -153,8 +172,7 @@ export function useDemucs() {
             await new Promise(resolve => setTimeout(resolve, 0));
             addLog('Starting separation...', 'info');
 
-            const audioBuffer = state.audioBuffer;
-            const result = await separateAudioBuffer(audioBuffer, {
+            const result = await separator.separate(state.audioBuffer, {
                 onProgress: ({ segIdx, totalSegs, fraction }) => {
                     setStatus(`Separating segment ${segIdx} of ${totalSegs}...`);
                     setProgress(fraction * 95);
@@ -194,18 +212,15 @@ export function useDemucs() {
             setStatus('Complete!');
             setProgress(100);
             addLog(`Finished separation in ${(result.wallMs / 1000).toFixed(2)}s.`, 'success');
-            resetProcessingWorkers();
             setState(prev => ({ ...prev, separating: false }));
         } catch (error) {
-            resetProcessingWorkers();
             addLog(`Separation failed: ${(error as Error).message}`, 'error');
             setStatus('Error during separation');
             setState(prev => ({ ...prev, separating: false }));
         }
-    }, [state.modelLoaded, state.audioBuffer, addLog, setStatus, setProgress, resetProcessingWorkers]);
+    }, [state.audioBuffer, addLog, setStatus, setProgress]);
 
     const resetForNewTrack = useCallback(() => {
-        resetProcessingWorkers();
         // Revoke old blob URLs to prevent memory leaks
         Object.values(stemUrls).forEach(url => URL.revokeObjectURL(url));
         if (artworkUrl) {
@@ -227,7 +242,7 @@ export function useDemucs() {
         setTrackTitle(null);
         setTrackArtist(null);
         setAudioError(null);
-    }, [stemUrls, artworkUrl, resetProcessingWorkers]);
+    }, [stemUrls, artworkUrl]);
 
     return {
         ...state,

@@ -1,6 +1,6 @@
 import FFT from 'fft.js';
-import type { STFTResult } from '../types';
-import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES } from '../types';
+import type { STFTResult } from './constants';
+import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES } from './constants';
 
 const fftInstance = new FFT(NFFT);
 

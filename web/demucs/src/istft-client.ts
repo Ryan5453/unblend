@@ -1,8 +1,3 @@
-/**
- * Client for communicating with the ISTFT Worker.
- * Sends inference results to the worker for parallel ISTFT computation.
- */
-
 interface ISTFTRequest {
     specReal: Float32Array;
     specImag: Float32Array;
@@ -27,67 +22,48 @@ export interface ISTFTResult {
     segLength: number;
 }
 
-let worker: Worker | null = null;
-let pendingResolve: ((result: ISTFTResult) => void) | null = null;
-let pendingReject: ((error: Error) => void) | null = null;
+export class ISTFTClient {
+    private worker: Worker;
+    private pendingResolve: ((result: ISTFTResult) => void) | null = null;
+    private pendingReject: ((error: Error) => void) | null = null;
 
-function clearPending(): void {
-    pendingResolve = null;
-    pendingReject = null;
-}
+    constructor() {
+        this.worker = new Worker(
+            new URL('./workers/istft-worker.ts', import.meta.url),
+            { type: 'module' }
+        );
 
-function failPending(message: string): void {
-    const reject = pendingReject;
-    clearPending();
-    if (reject) {
-        reject(new Error(message));
-    }
-}
+        this.worker.onmessage = (event: MessageEvent<ISTFTResult & { type: string }>) => {
+            const resolve = this.pendingResolve;
+            this.pendingResolve = null;
+            this.pendingReject = null;
+            resolve?.(event.data);
+        };
 
-export function initISTFTWorker(): void {
-    if (worker) return;
-
-    worker = new Worker(
-        new URL('../workers/istft-worker.ts', import.meta.url),
-        { type: 'module' }
-    );
-
-    worker.onmessage = (event: MessageEvent<ISTFTResult & { type: string }>) => {
-        if (pendingResolve) {
-            pendingResolve(event.data);
-            clearPending();
-        }
-    };
-
-    worker.onerror = (error) => {
-        console.error('[ISTFTWorker] Error:', error);
-        failPending(error.message || 'ISTFT worker failed');
-        worker?.terminate();
-        worker = null;
-    };
-}
-
-export function terminateISTFTWorker(): void {
-    failPending('ISTFT worker terminated');
-    if (worker) {
-        worker.terminate();
-        worker = null;
-    }
-}
-
-export function processISTFT(request: ISTFTRequest): Promise<ISTFTResult> {
-    if (!worker) {
-        initISTFTWorker();
+        this.worker.onerror = (error) => {
+            console.error('[istft-worker] error:', error);
+            this.failPending(error.message || 'iSTFT worker failed');
+        };
     }
 
-    failPending('Superseded by a new ISTFT request');
-
-    return new Promise((resolve, reject) => {
-        pendingResolve = resolve;
-        pendingReject = reject;
-        worker!.postMessage({
-            type: 'process',
-            ...request,
+    process(request: ISTFTRequest): Promise<ISTFTResult> {
+        this.failPending('Superseded by a new iSTFT request');
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = resolve;
+            this.pendingReject = reject;
+            this.worker.postMessage({ type: 'process', ...request });
         });
-    });
+    }
+
+    terminate(): void {
+        this.failPending('iSTFT worker terminated');
+        this.worker.terminate();
+    }
+
+    private failPending(message: string): void {
+        const reject = this.pendingReject;
+        this.pendingResolve = null;
+        this.pendingReject = null;
+        reject?.(new Error(message));
+    }
 }

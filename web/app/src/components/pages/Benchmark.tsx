@@ -12,11 +12,13 @@ import {
     type MusdbTrack,
 } from '../../utils/musdb-loader';
 import { decodeAudioFile } from '../../utils/audio-decoder';
-import { loadModel as loadOnnxModel, isWebGPUAvailable } from '../../utils/onnx-runtime';
-import { separateAudioBuffer } from '../../utils/separator';
+import {
+    Separator,
+    SAMPLE_RATE,
+    type ModelType,
+} from 'demucs-web';
 import { computeSDRAsync, meanFiniteSDR, type StemSDR } from '../../utils/sdr';
-import { SAMPLE_RATE } from '../../types';
-import type { ModelType } from '../../types';
+import { ORT_WASM_PATHS } from '../../onnx-config';
 
 type Phase = 'idle' | 'loading_model' | 'running' | 'done' | 'error';
 
@@ -186,18 +188,24 @@ export function Benchmark() {
         log(`Loading model ${model} (${backend})…`);
 
         if (backend === 'webgpu') {
-            const ok = await isWebGPUAvailable();
+            const ok = 'gpu' in navigator && (await navigator.gpu.requestAdapter()) !== null;
             if (!ok) {
                 log('WebGPU unavailable — falling back to wasm');
             }
         }
 
-        const loaded = await loadOnnxModel(model, (msg) => log(msg), backend);
-        if (!loaded.success) {
-            setError('Model failed to load');
+        let separator: Separator;
+        try {
+            separator = await Separator.load(model, {
+                backend,
+                wasmPaths: ORT_WASM_PATHS,
+            });
+        } catch (err) {
+            setError(`Model failed to load: ${(err as Error).message}`);
             setPhase('error');
             return;
         }
+        log(`Loaded ${separator.backend} (${separator.sources.join(', ')})`);
 
         setPhase('running');
         const ctx = getAudioContext();
@@ -216,7 +224,7 @@ export function Benchmark() {
             try {
                 const mixBuffer = await decodeWavFast(track.mixture, ctx);
                 const durationSec = mixBuffer.length / mixBuffer.sampleRate;
-                const sep = await separateAudioBuffer(mixBuffer);
+                const sep = await separator.separate(mixBuffer);
 
                 const stemSDR: StemSDR = {};
                 for (const stem of MUSDB_STEMS) {
@@ -271,6 +279,7 @@ export function Benchmark() {
             }
         }
 
+        await separator.unload();
         setCurrentIndex(-1);
         setPhase('done');
         log('Benchmark complete');

@@ -4,8 +4,8 @@
  * in parallel with GPU inference on the main thread.
  */
 
-import { computeISTFT, createISTFTBuffers, type ISTFTBuffers } from '../utils/audio-processor';
-import { SEGMENT_SAMPLES } from '../types';
+import { computeISTFT, createISTFTBuffers, type ISTFTBuffers } from '../audio-processor';
+import { SEGMENT_SAMPLES } from '../constants';
 
 let istftBuffers: ISTFTBuffers | null = null;
 const sourceReal = new Float32Array(2 * (4096 / 2) * Math.ceil(SEGMENT_SAMPLES / (4096 / 4)));

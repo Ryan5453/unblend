@@ -1,20 +1,28 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { viteStaticCopy } from 'vite-plugin-static-copy'
+
+// onnxruntime-web statically references its .wasm/.mjs assets, so Vite
+// bundles them. We don't want them: the worker sets wasmPaths to a CDN at
+// runtime (see demucs/src/workers/onnx-worker.ts), and the .wasm file alone
+// is 26MB — over Cloudflare Pages' 25MB per-file limit.
+const stripOrtAssets: Plugin = {
+  name: 'strip-ort-assets',
+  apply: 'build',
+  generateBundle(_, bundle) {
+    for (const key of Object.keys(bundle)) {
+      if (/ort-.*\.(wasm|mjs)$/.test(key)) {
+        delete bundle[key];
+      }
+    }
+  },
+};
 
 export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
-    viteStaticCopy({
-      targets: [
-        {
-          src: 'node_modules/onnxruntime-web/dist/*.mjs',
-          dest: '.'
-        }
-      ]
-    })
+    stripOrtAssets,
   ],
   server: {
     headers: {
@@ -23,22 +31,13 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['onnxruntime-web', '@ffmpeg/ffmpeg', '@ffmpeg/util'],
+    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
   },
   worker: {
     format: 'es',
   },
   build: {
     target: 'esnext',
-    rollupOptions: {
-      external: ['onnxruntime-web', 'onnxruntime-web/webgpu'],
-      output: {
-        globals: {
-          'onnxruntime-web': 'ort',
-          'onnxruntime-web/webgpu': 'ort',
-        },
-      },
-    },
   },
   preview: {
     headers: {

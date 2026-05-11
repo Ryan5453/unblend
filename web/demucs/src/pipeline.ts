@@ -1,25 +1,12 @@
 /**
- * Shared STFT → ONNX → iSTFT pipeline used by both the interactive player
- * and the benchmark page. Caller must ``loadModel`` first.
+ * Shared STFT → ONNX → iSTFT pipeline. Pure: takes the worker clients and
+ * source list it needs, no module-level state.
  */
 
-import {
-    SAMPLE_RATE,
-    SEGMENT_SAMPLES,
-    SEGMENT_OVERLAP,
-} from '../types';
-import { runInference, getSources } from './onnx-runtime';
-import {
-    initSTFTWorker,
-    terminateSTFTWorker,
-    processSTFT,
-} from './stft-worker-client';
-import {
-    initISTFTWorker,
-    terminateISTFTWorker,
-    processISTFT,
-    type ISTFTResult,
-} from './istft-worker-client';
+import { SEGMENT_SAMPLES, SEGMENT_OVERLAP } from './constants';
+import type { OnnxClient } from './onnx-client';
+import type { STFTClient } from './stft-client';
+import { type ISTFTClient, type ISTFTResult } from './istft-client';
 
 export interface SeparationProgress {
     /** 1-based segment index that just finished. */
@@ -46,11 +33,20 @@ export interface SeparationResult {
     numSegments: number;
 }
 
-export async function separateAudioBuffer(
+export interface Pipeline {
+    onnx: OnnxClient;
+    stft: STFTClient;
+    istft: ISTFTClient;
+}
+
+export async function runPipeline(
+    pipeline: Pipeline,
     audioBuffer: AudioBuffer,
+    sources: string[],
     options: SeparationOptions = {}
 ): Promise<SeparationResult> {
     const { onProgress } = options;
+    const { onnx, stft, istft } = pipeline;
     const numChannels = 2;
     const numSamples = audioBuffer.length;
 
@@ -68,7 +64,6 @@ export async function separateAudioBuffer(
     const STEP = SEGMENT_SAMPLES - OVERLAP;
     const numSegments = Math.ceil((numSamples - OVERLAP) / STEP);
 
-    const sources = getSources();
     const outputs: Record<string, Float32Array> = {};
     for (const source of sources) {
         outputs[source] = new Float32Array(numSamples * numChannels);
@@ -87,9 +82,6 @@ export async function separateAudioBuffer(
         new Float32Array(SEGMENT_SAMPLES * numChannels),
     ];
     let pendingPlanarIndex = 0;
-
-    initSTFTWorker();
-    initISTFTWorker();
 
     function accumulate(result: ISTFTResult) {
         const { chunks, segStart, segLength } = result;
@@ -128,83 +120,78 @@ export async function separateAudioBuffer(
     const startTime = performance.now();
     let totalInferenceMs = 0;
 
-    // ``.catch(() => {})`` silences unhandled-rejection warnings when the
-    // ``finally`` block rejects in-flight worker requests after a throw.
+    // ``.catch(() => {})`` silences unhandled-rejection warnings when an
+    // exception aborts the loop before we await these promises.
     const seg0End = Math.min(SEGMENT_SAMPLES, numSamples);
-    let pendingStft = processSTFT(prepareInterleaved(0, seg0End));
+    let pendingStft = stft.process(prepareInterleaved(0, seg0End));
     pendingStft.catch(() => {});
     let pendingPlanar = preparePlanar(planarBuffers[pendingPlanarIndex], 0, seg0End);
     let prevIstftPromise: Promise<ISTFTResult> | null = null;
 
-    try {
-        for (let seg = 0; seg < numSegments; seg++) {
-            const segStart = seg * STEP;
-            const segEnd = Math.min(segStart + SEGMENT_SAMPLES, numSamples);
-            const segLength = segEnd - segStart;
+    for (let seg = 0; seg < numSegments; seg++) {
+        const segStart = seg * STEP;
+        const segEnd = Math.min(segStart + SEGMENT_SAMPLES, numSamples);
+        const segLength = segEnd - segStart;
 
-            // Yield to the event loop occasionally so the UI can repaint.
-            if (seg % 5 === 0) {
-                await new Promise(resolve => requestAnimationFrame(resolve));
-            }
-
-            const stft = await pendingStft;
-            const currentPlanar = pendingPlanar;
-
-            const specShape = [1, numChannels, stft.numBins, stft.numFrames];
-            const audioShape = [1, numChannels, SEGMENT_SAMPLES];
-
-            const inferenceStart = performance.now();
-            const inferencePromise = runInference(
-                stft.real, stft.imag, currentPlanar, specShape, audioShape
-            );
-
-            if (seg + 1 < numSegments) {
-                const nextSegStart = (seg + 1) * STEP;
-                const nextSegEnd = Math.min(nextSegStart + SEGMENT_SAMPLES, numSamples);
-                const nextSegLength = nextSegEnd - nextSegStart;
-                pendingStft = processSTFT(prepareInterleaved(nextSegStart, nextSegLength));
-                pendingStft.catch(() => {});
-                pendingPlanarIndex = 1 - pendingPlanarIndex;
-                pendingPlanar = preparePlanar(
-                    planarBuffers[pendingPlanarIndex], nextSegStart, nextSegLength
-                );
-            }
-
-            const results = await inferencePromise;
-            totalInferenceMs += performance.now() - inferenceStart;
-
-            if (prevIstftPromise) {
-                accumulate(await prevIstftPromise);
-            }
-
-            prevIstftPromise = processISTFT({
-                specReal: new Float32Array(results.outSpecReal),
-                specImag: new Float32Array(results.outSpecImag),
-                wave: new Float32Array(results.outWave),
-                numSources: sources.length,
-                numChannels,
-                numBins: stft.numBins,
-                numFrames: stft.numFrames,
-                segStart, segLength, seg,
-                numSegments, numSamples,
-                fadeIn, fadeOut,
-                overlap: OVERLAP,
-            });
-            prevIstftPromise.catch(() => {});
-
-            onProgress?.({
-                segIdx: seg + 1,
-                totalSegs: numSegments,
-                fraction: (seg + 1) / numSegments,
-            });
+        // Yield to the event loop occasionally so the UI can repaint.
+        if (seg % 5 === 0) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
         }
+
+        const stftResult = await pendingStft;
+        const currentPlanar = pendingPlanar;
+
+        const specShape = [1, numChannels, stftResult.numBins, stftResult.numFrames];
+        const audioShape = [1, numChannels, SEGMENT_SAMPLES];
+
+        const inferenceStart = performance.now();
+        const inferencePromise = onnx.runInference(
+            stftResult.real, stftResult.imag, currentPlanar, specShape, audioShape
+        );
+
+        if (seg + 1 < numSegments) {
+            const nextSegStart = (seg + 1) * STEP;
+            const nextSegEnd = Math.min(nextSegStart + SEGMENT_SAMPLES, numSamples);
+            const nextSegLength = nextSegEnd - nextSegStart;
+            pendingStft = stft.process(prepareInterleaved(nextSegStart, nextSegLength));
+            pendingStft.catch(() => {});
+            pendingPlanarIndex = 1 - pendingPlanarIndex;
+            pendingPlanar = preparePlanar(
+                planarBuffers[pendingPlanarIndex], nextSegStart, nextSegLength
+            );
+        }
+
+        const results = await inferencePromise;
+        totalInferenceMs += performance.now() - inferenceStart;
 
         if (prevIstftPromise) {
             accumulate(await prevIstftPromise);
         }
-    } finally {
-        terminateSTFTWorker();
-        terminateISTFTWorker();
+
+        prevIstftPromise = istft.process({
+            specReal: new Float32Array(results.outSpecReal),
+            specImag: new Float32Array(results.outSpecImag),
+            wave: new Float32Array(results.outWave),
+            numSources: sources.length,
+            numChannels,
+            numBins: stftResult.numBins,
+            numFrames: stftResult.numFrames,
+            segStart, segLength, seg,
+            numSegments, numSamples,
+            fadeIn, fadeOut,
+            overlap: OVERLAP,
+        });
+        prevIstftPromise.catch(() => {});
+
+        onProgress?.({
+            segIdx: seg + 1,
+            totalSegs: numSegments,
+            fraction: (seg + 1) / numSegments,
+        });
+    }
+
+    if (prevIstftPromise) {
+        accumulate(await prevIstftPromise);
     }
 
     return {
@@ -214,5 +201,3 @@ export async function separateAudioBuffer(
         numSegments,
     };
 }
-
-export const SEPARATOR_SAMPLE_RATE = SAMPLE_RATE;

@@ -1,0 +1,19 @@
+{
+  "name": "demucs-web",
+  "version": "0.1.0",
+  "description": "Browser-side audio source separation using ONNX Demucs models. Designed to be embedded in a web app.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "fft.js": "^4.0.4",
+    "onnxruntime-web": "^1.24.0-dev.20251116-b39e144322"
+  }
+}
