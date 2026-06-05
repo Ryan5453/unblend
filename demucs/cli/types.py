@@ -33,3 +33,10 @@ class ClipMode(str, Enum):
     clamp = "clamp"
     tanh = "tanh"
     none = "none"
+
+
+class Precision(str, Enum):
+    auto = "auto"
+    fp32 = "fp32"
+    fp16 = "fp16"
+    bf16 = "bf16"

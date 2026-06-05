@@ -1,12 +1,45 @@
 # demucs-next
 
 > [!WARNING]
-> `demucs-next` is still in alpha not recommended for production use.
+> This is an unstable pre-release. 
 
-Demucs is a SOTA music source separation model capable of separating drums, bass, and vocals from the rest of the accompaniment.
-This is a fork of the [author's fork](https://github.com/adefossez/demucs) of the original Demucs repository.
+`demucs-next` is a fork of the [Demucs](https://github.com/adefossez/demucs) reference implementation, updated for modern Python, PyTorch, and TorchCodec. It runs up to 4.6x faster than upstream (15x for single-stem extraction) at equal quality, and is easier to install and run.
 
-`demucs-next` has been updated to use modern versions of Python, PyTorch, and TorchCodec. It is significantly faster and easier to use than upstream Demucs.
+## Performance
+
+<details>
+<summary>Benchmarks and SDR comparisons</summary>
+
+50 tracks of [MUSDB18-HQ](https://zenodo.org/records/3338373), `htdemucs`, `shifts=1`, `split_overlap=0.25`. Steady-state mean seconds per track. Reproduce with `python benchmark.py --include-upstream`.
+
+### `demucs-next`
+
+| Hardware | Backend | s/track | Mean SDR |
+|---|---|---:|---:|
+| RTX A4000 | CUDA FP16 + compile | 1.77 | 8.359 |
+| RTX A4000 | CUDA BF16 + compile | 1.77 | 8.355 |
+| RTX A4000 | CUDA FP16 | 2.51 | 8.358 |
+| RTX A4000 | CUDA BF16 | 2.52 | 8.350 |
+| RTX A4000 | CUDA FP32 + compile | 3.08 | 8.359 |
+| RTX A4000 | CUDA FP32 | 4.14 | 8.359 |
+| M2 Max | MPS FP16 | 5.78 | 8.380 |
+| M2 Max | MPS BF16 | 7.39 | 8.373 |
+| M2 Max | MPS FP32 | 11.97 | 8.381 |
+| M2 Max | Browser ONNX FP16* (WebGPU) | 18.64 | 8.399 |
+| M2 Max | Browser ONNX FP32 (WebGPU) | 18.82 | 8.399 |
+| Intel i9-10900X | CPU FP32 | 45.70 | 8.381 |
+| M2 Max | CPU FP32 | 84.50 | 8.381 |
+
+### [demucs reference](https://github.com/adefossez/demucs)
+
+| Hardware | Backend | s/track | Mean SDR |
+|---|---|---:|---:|
+| RTX A4000 | CUDA FP32 | 6.93 | 8.357 |
+| M2 Max | MPS FP32 | 8.77 | 8.387 |
+| Intel i9-10900X | CPU FP32 | 48.51 | 8.350 |
+| M2 Max | CPU FP32 | 102.38 | 8.294 |
+
+</details>
 
 ## Installation
 
@@ -48,7 +81,7 @@ uv pip install demucs-next --torch-backend=auto
 
 The `--torch-backend=auto` flag automatically detects your GPU and installs the appropriate version of PyTorch compatible with your system.
 
-## Usage
+## CLI Usage
 
 After installing Demucs, you can use it like the following:
 
@@ -66,35 +99,9 @@ demucs separate audio_file_1.mp3 audio_file_2.mp3
 demucs separate /path/to/music/folder
 ```
 
-## Performance
+## Python API Usage
 
-50 tracks of [MUSDB18-HQ](https://zenodo.org/records/3338373), `htdemucs`, `shifts=1`, `split_overlap=0.25`. Steady-state mean seconds per track. Reproduce with `python benchmark.py --include-upstream`.
-
-### `demucs-next`
-
-| Hardware | Backend | s/track | Mean SDR |
-|---|---|---:|---:|
-| RTX A4000 | CUDA FP16 | 2.85 | 8.297 |
-| RTX A4000 | CUDA FP32 | 4.42 | 8.297 |
-| M2 Max | MPS FP16 | 8.65 | 8.318 |
-| M2 Max | MPS FP32 | 12.74 | 8.318 |
-| M2 Max | Browser ONNX FP16* (WebGPU) | 18.64 | 8.399 |
-| M2 Max | Browser ONNX FP32 (WebGPU) | 18.82 | 8.399 |
-| Intel i9-10900X | CPU FP32 | 49.94 | 8.318 |
-| M2 Max | CPU FP32 | 86.48 | 8.318 |
-
-### Upstream demucs (`main`, `4.1.0a3`)
-
-| Hardware | Backend | s/track | Mean SDR |
-|---|---|---:|---:|
-| RTX A4000 | CUDA FP32 | 7.63 | 8.246 |
-| M2 Max | MPS FP32 | 10.05 | 8.288 |
-| Intel i9-10900X | CPU FP32 | 54.26 | 8.299 |
-| M2 Max | CPU FP32 | 110.99 | 8.306 |
-
-`demucs-next` is faster than upstream on every config except M2 Max MPS FP32 (a torch 2.7 -> 2.8 `aten::copy_` regression we can't avoid; the recommended MPS FP16 path beats it). SDR equals or exceeds upstream everywhere.
-
-\* Browser ONNX FP16 is weight-only FP16 — Conv/MatMul weights are stored as FP16 on disk (cutting the download from 161 MB to 87 MB), but a Cast node restores FP32 at session-create so compute runs in full FP32. ORT-WASM does not accumulate FP16 GEMMs in FP32 the way CUDA/MPS do, so a real FP16 graph produced audible quantization noise; this approach gets the size win without the precision cost. SDR is bit-equivalent to FP32.
+Demucs provides a Python API for separating audio files. Please refer to the [API docs](docs/api.md) for more information.
 
 ## Cog Usage
 

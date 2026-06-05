@@ -7,7 +7,7 @@
 // tanh form is what most ML kernels ship, and the difference from PyTorch's
 // default exact-erf form is ~1e-7 in FP32, well below FP16 precision.
 //
-// ``apply_norm_gelu_fp16`` is the third stage of the multi-stage path; its
+// ``apply_norm_gelu`` is the third stage of the multi-stage path; its
 // mean/scale come from ``finalize_meanvar`` over in ``group_norm.metal``.
 // Same source compiles for FP16 (half) and BF16 (bfloat) — the Python side
 // prepends ``#define SCALAR_T bfloat`` to switch.
@@ -26,7 +26,7 @@ inline float gelu_tanh(float y) {
     return 0.5f * y * (1.0f + tanh(inner));
 }
 
-kernel void group_norm_g1_gelu_fp16(
+kernel void group_norm_g1_gelu(
     device SCALAR_T*       out      [[buffer(0)]],
     device const SCALAR_T* in_      [[buffer(1)]],
     device const SCALAR_T* weight   [[buffer(2)]],
@@ -85,7 +85,7 @@ kernel void group_norm_g1_gelu_fp16(
     }
 }
 
-kernel void apply_norm_gelu_fp16(
+kernel void apply_norm_gelu(
     device SCALAR_T*        out          [[buffer(0)]],
     device const SCALAR_T*  in_          [[buffer(1)]],
     device const float* meanvar      [[buffer(2)]],

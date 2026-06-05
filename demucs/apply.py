@@ -248,37 +248,90 @@ def apply_model(
     :return: Separated sources tensor.
     :raises ValueError: If ``overlap`` produces a non-positive segment stride.
     """
+    # Single-mix separation is just the one-element case of the multi-mix
+    # path, so we delegate rather than keep a second copy of the chunking /
+    # bounded-GPU staging / tail-padding / shift-averaging / ensemble-
+    # weighting machinery. For a single mix the cross-mix tail pool degenerates
+    # to that mix's own tail batch, the random-shift offsets are drawn in the
+    # same order (one ``randint`` per shift round), and the result is moved
+    # back to ``mix.device`` identically — so output is unchanged.
+    return apply_model_multi(
+        model,
+        [mix],
+        device=device,
+        shifts=shifts,
+        overlap=overlap,
+        transition_power=transition_power,
+        progress_callback=progress_callback,
+        use_only_stem=use_only_stem,
+        chunk_batch_size=chunk_batch_size,
+    )[0]
+
+
+def apply_model_multi(
+    model: ModelEnsemble | Model,
+    mixes: list[Tensor],
+    device: torch.device | str | None = None,
+    shifts: int = 0,
+    overlap: float = 0.25,
+    transition_power: float = 1.0,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    use_only_stem: str | None = None,
+    chunk_batch_size: int = 1,
+) -> list[Tensor]:
+    """
+    Apply model to multiple mixes simultaneously, pooling tail chunks across
+    mixes so every forward pass is exactly ``chunk_batch_size`` items.
+
+    Each mix is chunked independently into segments of the model's training
+    length. Per-mix "full" batches (those that already fill ``chunk_batch_size``)
+    run as today. The leftover chunks across *all* mixes — which would each be
+    a sub-full tail batch under the single-mix path — are collected into a
+    global pool and drained in full-size batches. Outputs are routed back to
+    their source mix's accumulator. Compared with calling ``apply_model`` per
+    mix, this eliminates the per-mix tail-pad overhead which can be
+    significant on short audio with large ``chunk_batch_size``.
+
+    Same semantics as ``apply_model`` otherwise: shifts averaging applies
+    per-mix (each mix gets its own random offsets per shift round), and
+    ``ModelEnsemble`` is handled by running every sub-model with the same
+    pooling.
+
+    :param model: Model or ensemble to apply.
+    :param mixes: List of input mixtures, each of shape ``[batch, channels, samples]``.
+    :param device: Device for local computation; if ``None``, ``mixes[0].device``.
+    :param shifts: If > 0, average over ``shifts`` random sub-second shifts per mix.
+    :param overlap: Overlap ratio between consecutive segments.
+    :param transition_power: Exponent on the triangular crossfade weight.
+    :param progress_callback: Optional ``callback(event_type, data)``; events:
+        ``processing_start``, ``chunk_complete``, ``processing_complete``.
+        Chunk counts are summed across all mixes.
+    :param use_only_stem: For ``ModelEnsemble``, only run the sub-model
+        specialised for this stem.
+    :param chunk_batch_size: Chunks processed in parallel per forward pass.
+    :return: One separated-sources tensor per input mix, same shape as
+        ``apply_model`` would have produced.
+    :raises ValueError: If ``overlap`` produces a non-positive segment stride.
+    """
+    if not mixes:
+        return []
+
     if device is None:
-        device = mix.device
+        device = mixes[0].device
     else:
         device = torch.device(device)
-    kwargs = {
-        "shifts": shifts,
-        "overlap": overlap,
-        "transition_power": transition_power,
-        "progress_callback": progress_callback,
-        "device": device,
-        "use_only_stem": use_only_stem,
-        "chunk_batch_size": chunk_batch_size,
-    }
-    out: float | Tensor
-    res: float | Tensor
-    if isinstance(model, ModelEnsemble):
-        # Special treatment for model ensemble.
-        # We explicitely apply multiple times `apply_model` so that the random shifts
-        # are different for each model.
 
-        # Optimization: If use_only_stem is specified, only run the specialized model
+    if isinstance(model, ModelEnsemble):
+        # Same specialisation shortcut as apply_model: when use_only_stem points
+        # at a model that has a 1.0 weight for that stem (and zeros elsewhere),
+        # we can run that sub-model alone.
         if use_only_stem:
-            # Find which model specializes in this stem
             try:
                 stem_index = model.sources.index(use_only_stem)
             except ValueError:
-                # Stem doesn't exist, fall through to run all models
-                pass
-            else:
-                # Find the model that specializes in this stem
-                model_index = None
+                stem_index = None
+            if stem_index is not None:
+                model_index: int | None = None
                 for i, weights in enumerate(model.weights):
                     if (
                         len(weights) > stem_index
@@ -291,74 +344,118 @@ def apply_model(
                     ):
                         model_index = i
                         break
-
                 if model_index is not None:
-                    sub_kwargs = dict(kwargs)
-                    sub_kwargs.pop("use_only_stem")
-                    return apply_model(model.models[model_index], mix, **sub_kwargs)
+                    return apply_model_multi(
+                        model.models[model_index],
+                        mixes,
+                        device=device,
+                        shifts=shifts,
+                        overlap=overlap,
+                        transition_power=transition_power,
+                        progress_callback=progress_callback,
+                        chunk_batch_size=chunk_batch_size,
+                    )
 
-        # Run all models in the ensemble — all sub-models are already on device
-        estimates: float | Tensor = 0.0
+        # Run every sub-model with the same pooling, then weighted-average.
+        results: list[Tensor] | None = None
         totals = [0.0] * len(model.sources)
         for sub_model, model_weights in zip(model.models, model.weights):
-            sub_kwargs = dict(kwargs)
-            sub_kwargs.pop("use_only_stem")
-            out = apply_model(sub_model, mix, **sub_kwargs)
-
+            sub_outs = apply_model_multi(
+                sub_model,
+                mixes,
+                device=device,
+                shifts=shifts,
+                overlap=overlap,
+                transition_power=transition_power,
+                progress_callback=progress_callback,
+                chunk_batch_size=chunk_batch_size,
+            )
             for k, inst_weight in enumerate(model_weights):
-                out[:, k, :, :] *= inst_weight
                 totals[k] += inst_weight
-            estimates += out
-            del out
+                for sub_out in sub_outs:
+                    sub_out[:, k, :, :] *= inst_weight
+            if results is None:
+                results = sub_outs
+            else:
+                for acc, sub_out in zip(results, sub_outs):
+                    acc += sub_out
+        assert results is not None
+        for acc in results:
+            for k in range(acc.shape[1]):
+                acc[:, k, :, :] /= totals[k]
+        return results
 
-        assert isinstance(estimates, Tensor)
-        for k in range(estimates.shape[1]):
-            estimates[:, k, :, :] /= totals[k]
-        return estimates
-
-    # Move/eval the model only when needed. ``Module.to`` and ``Module.eval``
-    # iterate every submodule even when the result is a no-op, so we cheaply
-    # check first and skip the recursion when the model is already where we
-    # want it. ``Separator.__init__`` always sets eval mode and places the
-    # model on its device, so the typical call hits the fast path.
+    # Move/eval the model only when needed.
     first_param = next(model.parameters(), None)
     if first_param is not None and first_param.device != device:
         model.to(device)
     if model.training:
         model.eval()
     assert transition_power >= 1, "transition_power < 1 leads to weird behavior."
-    batch, channels, length = mix.shape
-    if shifts:
-        kwargs["shifts"] = 0
-        max_shift = int(0.5 * model.samplerate)
-        mix = tensor_chunk(mix)
-        assert isinstance(mix, TensorChunk)
-        padded_mix = mix.padded(length + 2 * max_shift)
-        out = 0.0
-        for shift_idx in range(shifts):
-            offset = random.randint(0, max_shift)
-            shifted = TensorChunk(padded_mix, offset, length + max_shift - offset)
-            res = apply_model(model, shifted, **kwargs)
-            shifted_out = res
-            out += shifted_out[..., max_shift - offset :]
-        out /= shifts
-        assert isinstance(out, Tensor)
-        return out
 
-    # Allocate accumulators on the inference *device* rather than mix.device.
-    # Previously each chunk's output was transferred from device->host (e.g.
-    # MPS/CUDA -> CPU) before being added to the accumulator, forcing a
-    # synchronization for every chunk. Accumulating on-device lets the
-    # backend keep work in flight and we transfer once at the end.
-    out_device = device
-    out = torch.zeros(
-        batch,
-        len(model.sources),
-        channels,
-        length,
-        device=out_device,
+    if shifts:
+        max_shift = int(0.5 * model.samplerate)
+        accumulators: list[Tensor | None] = [None] * len(mixes)
+        for _shift_idx in range(shifts):
+            # Per-mix random offset, mirroring apply_model.
+            offsets_per_mix = [random.randint(0, max_shift) for _ in mixes]
+            shifted_inputs: list[Tensor | TensorChunk] = []
+            for mix, offset in zip(mixes, offsets_per_mix):
+                length = mix.shape[-1]
+                tc = tensor_chunk(mix)
+                padded = tc.padded(length + 2 * max_shift)
+                shifted_inputs.append(
+                    TensorChunk(padded, offset, length + max_shift - offset)
+                )
+            partials = _apply_model_multi_unshifted(
+                model,
+                shifted_inputs,
+                device=device,
+                overlap=overlap,
+                transition_power=transition_power,
+                progress_callback=progress_callback,
+                chunk_batch_size=chunk_batch_size,
+            )
+            for i, (partial, offset) in enumerate(zip(partials, offsets_per_mix)):
+                trimmed = partial[..., max_shift - offset :]
+                trimmed = trimmed[..., : mixes[i].shape[-1]]
+                if accumulators[i] is None:
+                    accumulators[i] = trimmed
+                else:
+                    accumulators[i] = accumulators[i] + trimmed
+        assert all(a is not None for a in accumulators)
+        return [a / shifts for a in accumulators]  # type: ignore[operator]
+
+    return _apply_model_multi_unshifted(
+        model,
+        mixes,
+        device=device,
+        overlap=overlap,
+        transition_power=transition_power,
+        progress_callback=progress_callback,
+        chunk_batch_size=chunk_batch_size,
     )
-    sum_weight = torch.zeros(length, device=out_device)
+
+
+def _apply_model_multi_unshifted(
+    model: Model,
+    mixes: list[Tensor | TensorChunk],
+    *,
+    device: torch.device,
+    overlap: float,
+    transition_power: float,
+    chunk_batch_size: int,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[Tensor]:
+    """
+    Multi-mix forward without shift averaging — pools tail chunks across
+    mixes so every forward pass has exactly ``chunk_batch_size`` items.
+
+    Internal helper for ``apply_model_multi``. Each mix's full-size batches
+    are processed first; whatever's left across all mixes is collected into
+    a single pool and drained as full-size batches (with a final tail-pad
+    on the last drain batch if needed).
+    """
     segment = model.max_allowed_segment
     assert segment > 0.0
     segment_length: int = int(model.samplerate * segment)
@@ -367,54 +464,110 @@ def apply_model(
         raise ValueError(
             f"split overlap {overlap} produces an invalid stride for segment length {segment_length}"
         )
-    offsets = range(0, length, stride)
-    weight = _split_weight(segment_length, transition_power, out_device, torch.float32)
+    # See ``apply_model`` for the bounded-GPU / unified-memory split.
+    bounded_gpu = str(device).startswith("cuda")
+    accum_device = torch.device("cpu") if bounded_gpu else device
+    weight = _split_weight(segment_length, transition_power, accum_device, torch.float32)
 
     if isinstance(model, HTDemucs):
         chunk_valid_length: int = segment_length
     elif hasattr(model, "valid_length"):
-        chunk_valid_length = model.valid_length(segment_length)  # type: ignore
+        chunk_valid_length = model.valid_length(segment_length)  # type: ignore[attr-defined]
     else:
         chunk_valid_length = segment_length
 
-    # Move mix to the inference device once instead of per chunk in the loop.
-    mix_dev: Tensor | TensorChunk
-    if isinstance(mix, TensorChunk):
-        inner = mix.tensor
-        if inner.device != device:
-            inner = inner.to(device)
-        mix_dev = TensorChunk(inner, mix.offset, mix.length)
-    else:
-        mix_dev = mix if mix.device == device else mix.to(device)
+    mix_states: list[dict[str, Any]] = []
+    full_pool: list[tuple[int, int, TensorChunk]] = []  # (mix_idx, offset, chunk)
+    tail_pool: list[tuple[int, int, TensorChunk]] = []
 
-    # Collect all chunks
-    all_chunks = [
-        (offset, TensorChunk(mix_dev, offset, segment_length)) for offset in offsets
-    ]
-    total_chunks = len(all_chunks)
+    for mix_idx, mix in enumerate(mixes):
+        # CUDA bounded path keeps mix on CPU; MPS/CPU move to inference
+        # device once (unified memory on MPS = essentially free).
+        if isinstance(mix, TensorChunk):
+            length = mix.length
+            channels = mix.tensor.shape[-2]
+            batch_dim = mix.tensor.shape[0] if mix.tensor.dim() > 2 else 1
+            original_device = mix.tensor.device
+            if bounded_gpu:
+                mix_dev: Tensor | TensorChunk = mix
+            else:
+                inner = mix.tensor
+                if inner.device != device:
+                    inner = inner.to(device)
+                mix_dev = TensorChunk(inner, mix.offset, mix.length)
+        else:
+            length = mix.shape[-1]
+            channels = mix.shape[-2]
+            batch_dim = mix.shape[0] if mix.dim() > 2 else 1
+            original_device = mix.device
+            if bounded_gpu:
+                mix_dev = mix
+            else:
+                mix_dev = mix if mix.device == device else mix.to(device)
 
+        out_acc = torch.zeros(
+            batch_dim,
+            len(model.sources),
+            channels,
+            length,
+            device=accum_device,
+        )
+        sum_weight_mix = torch.zeros(length, device=accum_device)
+        mix_states.append(
+            {
+                "out": out_acc,
+                "sum_weight": sum_weight_mix,
+                "original_device": original_device,
+            }
+        )
+
+        offsets = range(0, length, stride)
+        chunks_for_mix = [
+            (offset, TensorChunk(mix_dev, offset, segment_length)) for offset in offsets
+        ]
+        n = len(chunks_for_mix)
+        n_full = (n // chunk_batch_size) * chunk_batch_size
+        for offset, chunk in chunks_for_mix[:n_full]:
+            full_pool.append((mix_idx, offset, chunk))
+        for offset, chunk in chunks_for_mix[n_full:]:
+            tail_pool.append((mix_idx, offset, chunk))
+
+    # Progress is reported across every mix's chunks (for a single mix this is
+    # just that mix's chunk count, matching the old single-mix ``apply_model``).
+    total_chunks = len(full_pool) + len(tail_pool)
+    completed_chunks = 0
     if progress_callback:
         progress_callback("processing_start", {"total_chunks": total_chunks})
 
-    completed_chunks = 0
-    for batch_start in range(0, total_chunks, chunk_batch_size):
-        batch_items = all_chunks[batch_start : batch_start + chunk_batch_size]
-
-        # Chunks already live on `device`; just pad and stack.
+    def run_batch(batch_items: list[tuple[int, int, TensorChunk]]) -> None:
+        """Run one forward pass for ``batch_items`` and accumulate into per-mix state."""
+        nonlocal completed_chunks
         padded = torch.cat(
-            [chunk.padded(chunk_valid_length) for _, chunk in batch_items],
+            [chunk.padded(chunk_valid_length) for _, _, chunk in batch_items],
             dim=0,
-        )  # [N, channels, chunk_valid_length]
+        )
+        n_actual = padded.shape[0]
+        if n_actual < chunk_batch_size:
+            pad_count = chunk_batch_size - n_actual
+            zero_pad = padded.new_zeros((pad_count, *padded.shape[1:]))
+            padded = torch.cat([padded, zero_pad], dim=0)
+
+        if bounded_gpu:
+            padded = padded.to(device)
 
         with torch.inference_mode():
-            batch_out = model(padded)  # [N, sources, channels, ...]
+            batch_out = model(padded)
 
-        for i, (offset, chunk) in enumerate(batch_items):
+        if bounded_gpu:
+            batch_out = batch_out.cpu()
+
+        for i, (mix_idx, offset, chunk) in enumerate(batch_items):
+            state = mix_states[mix_idx]
             chunk_out = center_trim(batch_out[i : i + 1], chunk.length)
             chunk_length = chunk_out.shape[-1]
             w = weight[:chunk_length]
-            out[..., offset : offset + segment_length] += w * chunk_out
-            sum_weight[offset : offset + segment_length] += w
+            state["out"][..., offset : offset + segment_length] += w * chunk_out
+            state["sum_weight"][offset : offset + segment_length] += w
 
             completed_chunks += 1
             if progress_callback:
@@ -426,12 +579,23 @@ def apply_model(
                     },
                 )
 
+    # Full-size batches first — by construction each block has exactly
+    # ``chunk_batch_size`` items, so no padding is needed.
+    for batch_start in range(0, len(full_pool), chunk_batch_size):
+        run_batch(full_pool[batch_start : batch_start + chunk_batch_size])
+
+    # Drain the cross-mix tail pool. The final batch tail-pads if the pool's
+    # length isn't a clean multiple of ``chunk_batch_size``.
+    for batch_start in range(0, len(tail_pool), chunk_batch_size):
+        run_batch(tail_pool[batch_start : batch_start + chunk_batch_size])
+
     if progress_callback:
         progress_callback("processing_complete", {"total_chunks": total_chunks})
-    # No `assert sum_weight.min() > 0`: `.min()` forces a host sync, and the
-    # triangular weight + validated stride guarantee full coverage.
-    out /= sum_weight
-    if out.device != mix.device:
-        out = out.to(mix.device)
-    assert isinstance(out, Tensor)
-    return out
+
+    results: list[Tensor] = []
+    for state in mix_states:
+        out_acc = state["out"] / state["sum_weight"]
+        if out_acc.device != state["original_device"]:
+            out_acc = out_acc.to(state["original_device"])
+        results.append(out_acc)
+    return results

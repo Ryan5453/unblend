@@ -10,7 +10,7 @@ import statistics
 import subprocess
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -24,10 +24,17 @@ from demucs.cli.models import ensure_model_available
 
 REFERENCE_STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
 DEFAULT_MODELS = ["htdemucs", "htdemucs_ft"]
-DEFAULT_PRECISIONS = ["fp32", "fp16"]
+DEFAULT_PRECISIONS = ["fp32", "fp16", "bf16"]
 DEFAULT_COMPILE_MODES = [False, True]
 DEFAULT_SHIFTS = [1, 2, 4]
 DEFAULT_SPLIT_OVERLAPS = [0.1, 0.25, 0.5]
+# Tracks per batched ``separate([...])`` call in --dataset-throughput mode.
+# Feeding the whole 50-track set at once holds every decoded waveform plus
+# every output stem in CPU RAM simultaneously (~60+ GB for full-length MUSDB
+# tracks → OOM). Processing in small groups bounds RAM to ~group_size tracks
+# while still exercising apply_model_multi's cross-input pooling; per-track
+# throughput is unchanged (the batched win is intra-call tail pooling).
+DATASET_THROUGHPUT_GROUP = 8
 DEFAULT_UPSTREAM_VERSION = "main"
 DEFAULT_UPSTREAM_PYTHON = "3.11"
 UPSTREAM_VENV_ROOT = Path(".upstream-venv")
@@ -234,6 +241,28 @@ def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
     return 10.0 * math.log10(reference_energy / noise_energy)
 
 
+def _score_stems(
+    separator: Separator, track: BenchmarkTrack, separated: Any
+) -> dict[str, float]:
+    """
+    Compute per-stem SDR for one separated track against its references.
+
+    :param separator: The separator (used for its ``_to_tensor`` loader).
+    :param track: The track whose reference stems to score against.
+    :param separated: The ``SeparatedSources`` returned for this track.
+    :return: Mapping of stem name to SDR in dB.
+    """
+    stem_scores: dict[str, float] = {}
+    for stem_name in track.reference_stems:
+        if stem_name not in separated.sources:
+            continue
+        reference = separator._to_tensor(track.directory / f"{stem_name}.wav")
+        stem_scores[stem_name] = _compute_sdr(
+            separated.sources[stem_name], reference
+        )
+    return stem_scores
+
+
 def _discover_tracks(musdb_root: Path) -> list[BenchmarkTrack]:
     """
     Walk a MUSDB18-HQ split directory and return the per-track records.
@@ -365,6 +394,17 @@ def _ensure_upstream_venv(version: str, python_version: str) -> Path:
     # legacy deps (dora-search, lameenc) still import it, so we pull it in.
     install_targets = [
         f"demucs @ git+{UPSTREAM_REPO}@{version}",
+        # Pin torch/torchaudio explicitly. Upstream caps torchaudio<2.2, but
+        # an unconstrained resolve now grabs the latest torch (2.12+) first and
+        # then fails to find a matching old torchaudio ("No matching
+        # distribution for torchaudio<2.2"). 2.1.2 is the newest pair that
+        # satisfies upstream's cap and ships cp311 CUDA wheels. This is
+        # upstream's own dependency reality — the comparison is "upstream as it
+        # ships" vs "demucs-next as it ships".
+        "torch==2.1.2",
+        "torchaudio==2.1.2",
+        # torch 2.1.x was built against numpy 1 — pin to avoid "Numpy is not
+        # available" at runtime.
         "numpy<2",
         # setuptools >=80 removed `pkg_resources`; legacy upstream deps still
         # import it, so pin below the cutoff.
@@ -374,16 +414,23 @@ def _ensure_upstream_venv(version: str, python_version: str) -> Path:
         "soundfile",
     ]
     if uv_bin is not None:
-        typer.echo(f"Creating upstream venv via uv at {venv_dir} (python {python_version})")
+        typer.echo(
+            f"Creating upstream venv via uv at {venv_dir} (python {python_version})"
+        )
         subprocess.run(
             [uv_bin, "venv", "--python", python_version, str(venv_dir)],
             check=True,
         )
-        typer.echo(f"Installing demucs=={version} into upstream venv (this can take a few minutes)")
+        typer.echo(
+            f"Installing demucs=={version} into upstream venv (this can take a few minutes)"
+        )
         subprocess.run(
             [
-                uv_bin, "pip", "install",
-                "--python", str(python_bin),
+                uv_bin,
+                "pip",
+                "install",
+                "--python",
+                str(python_bin),
                 *install_targets,
             ],
             check=True,
@@ -394,10 +441,15 @@ def _ensure_upstream_venv(version: str, python_version: str) -> Path:
             [sys.executable, "-m", "venv", str(venv_dir)],
             check=True,
         )
-        typer.echo(f"Installing demucs=={version} into upstream venv (this can take a few minutes)")
+        typer.echo(
+            f"Installing demucs=={version} into upstream venv (this can take a few minutes)"
+        )
         subprocess.run(
             [
-                str(python_bin), "-m", "pip", "install",
+                str(python_bin),
+                "-m",
+                "pip",
+                "install",
                 *install_targets,
             ],
             check=True,
@@ -444,13 +496,21 @@ def _run_upstream_config(
         # ``-P`` keeps cwd (the demucs-next repo) off ``sys.path`` so the
         # subprocess imports the upstream ``demucs`` from the venv rather than
         # our local checkout. ``-`` reads the worker source from stdin.
-        str(venv_python), "-P", "-",
-        "--model", config.model,
-        "--device", device,
-        "--precision", config.precision,
-        "--shifts", str(config.shifts),
-        "--overlap", str(config.split_overlap),
-        "--tracks-json", str(tracks_json_path),
+        str(venv_python),
+        "-P",
+        "-",
+        "--model",
+        config.model,
+        "--device",
+        device,
+        "--precision",
+        config.precision,
+        "--shifts",
+        str(config.shifts),
+        "--overlap",
+        str(config.split_overlap),
+        "--tracks-json",
+        str(tracks_json_path),
     ]
 
     detail_rows: list[dict[str, Any]] = []
@@ -550,25 +610,27 @@ def _run_upstream_config(
     for track in tracks:
         if track.name in seen_track_names:
             continue
-        detail_rows.append({
-            **_detail_row_base(config, chunk_batch_size, seed, device),
-            "track_index": track_index_by_name[track.name],
-            "track_name": track.name,
-            "track_seed": None,
-            "elapsed_sec": None,
-            "status": "error",
-            "error_type": init_error_type or "WorkerCrashed",
-            "error_message": init_error_message or stderr_tail[-300:],
-            "num_scored_stems": 0,
-            "mean_sdr": float("nan"),
-            **{f"{stem}_sdr": None for stem in REFERENCE_STEMS},
-        })
+        detail_rows.append(
+            {
+                **_detail_row_base(config, chunk_batch_size, seed, device),
+                "track_index": track_index_by_name[track.name],
+                "track_name": track.name,
+                "track_seed": None,
+                "elapsed_sec": None,
+                "status": "error",
+                "error_type": init_error_type or "WorkerCrashed",
+                "error_message": init_error_message or stderr_tail[-300:],
+                "num_scored_stems": 0,
+                "mean_sdr": float("nan"),
+                **{f"{stem}_sdr": None for stem in REFERENCE_STEMS},
+            }
+        )
 
     summary_extras = {
         "model_init_sec": init_sec,
         "error_type": init_error_type,
         "error_message": init_error_message
-            or (stderr_tail[-300:] if proc.returncode != 0 else ""),
+        or (stderr_tail[-300:] if proc.returncode != 0 else ""),
     }
     return detail_rows, summary_extras
 
@@ -577,14 +639,17 @@ def _precision_to_dtype(precision: str) -> torch.dtype | None:
     """
     Map a CLI precision label to the corresponding ``torch.dtype``.
 
-    :param precision: ``"fp32"`` or ``"fp16"``.
-    :return: ``torch.float16`` for fp16, ``None`` (default float32) for fp32.
+    :param precision: ``"fp32"``, ``"fp16"``, or ``"bf16"``.
+    :return: ``torch.float16`` for fp16, ``torch.bfloat16`` for bf16,
+        ``None`` (default float32) for fp32.
     :raises ValueError: If ``precision`` is anything else.
     """
     if precision == "fp32":
         return None
     if precision == "fp16":
         return torch.float16
+    if precision == "bf16":
+        return torch.bfloat16
     raise ValueError(f"Unsupported precision: {precision}")
 
 
@@ -743,6 +808,14 @@ def main(
         min=1,
         help="Override how many split chunks are processed per batch",
     ),
+    dataset_throughput: bool = typer.Option(
+        False,
+        "--dataset-throughput",
+        help="Measure whole-dataset wall time via the batched separate([...]) "
+        "path (apply_model_multi) instead of per-track latency. Local configs "
+        "only; upstream stays file-per-file (its total wall is still recorded "
+        "for the comparison). Reports tracks/sec + dataset_wall_sec.",
+    ),
     models: list[str] = typer.Option(
         DEFAULT_MODELS,
         "--model",
@@ -773,7 +846,7 @@ def main(
         None,
         "--device",
         help="Device: 'cuda', 'mps', or 'auto' (default: auto). On MPS,"
-             " --compile-mode True is silently dropped (no MPS support yet).",
+        " --compile-mode True is silently dropped (no MPS support yet).",
     ),
     include_upstream: bool = typer.Option(
         False,
@@ -808,15 +881,16 @@ def main(
         compile_modes = [c for c in compile_modes if not c]
         if not compile_modes:
             compile_modes = [False]
-    # FP16 is rejected on CPU by ``api.py`` (no faster path in PyTorch).
-    if device == "cpu" and "fp16" in precisions:
-        dropped = [p for p in precisions if p == "fp16"]
+
+    reduced_for_cpu = {"fp16", "bf16"}
+    if device == "cpu":
+        dropped = [p for p in precisions if p in reduced_for_cpu]
         if dropped:
             typer.echo(
                 f"Note: device=cpu; dropping {dropped} from the matrix "
-                f"(FP16 is not supported on CPU)."
+                f"(reduced precision is not supported on CPU)."
             )
-        precisions = [p for p in precisions if p != "fp16"]
+        precisions = [p for p in precisions if p not in reduced_for_cpu]
         if not precisions:
             precisions = ["fp32"]
 
@@ -858,7 +932,9 @@ def main(
 
     for config_index, config in enumerate(configs, start=1):
         variant_label = (
-            f"upstream-{config.upstream_version}" if config.variant == "upstream" else "local"
+            f"upstream-{config.upstream_version}"
+            if config.variant == "upstream"
+            else "local"
         )
         label = (
             f"[{config_index}/{len(configs)}] {config.config_id} variant={variant_label} "
@@ -886,7 +962,9 @@ def main(
                 if row.get("elapsed_sec") is not None
             ]
             remaining_elapsed = ok_elapsed[1:]
-            error_count = sum(1 for row in upstream_details if row.get("status") == "error")
+            error_count = sum(
+                1 for row in upstream_details if row.get("status") == "error"
+            )
             oom_count = sum(1 for row in upstream_details if row.get("status") == "oom")
             attempted_elapsed = [
                 float(row["elapsed_sec"])
@@ -923,31 +1001,55 @@ def main(
                     "model_init_sec": upstream_extras.get("model_init_sec"),
                     "first_attempt_sec": (
                         float(upstream_details[0]["elapsed_sec"])
-                        if upstream_details and upstream_details[0].get("elapsed_sec") is not None
+                        if upstream_details
+                        and upstream_details[0].get("elapsed_sec") is not None
                         else None
                     ),
                     "first_attempt_status": (
                         str(upstream_details[0].get("status", ""))
-                        if upstream_details else ""
+                        if upstream_details
+                        else ""
                     ),
                     "first_track_sec": ok_elapsed[0] if ok_elapsed else None,
-                    "remaining_total_sec": sum(remaining_elapsed) if remaining_elapsed else 0.0,
+                    "remaining_total_sec": sum(remaining_elapsed)
+                    if remaining_elapsed
+                    else 0.0,
                     "steady_state_mean_sec": (
-                        statistics.fmean(remaining_elapsed) if remaining_elapsed else None
+                        statistics.fmean(remaining_elapsed)
+                        if remaining_elapsed
+                        else None
                     ),
                     "steady_state_median_sec": (
-                        statistics.median(remaining_elapsed) if remaining_elapsed else None
+                        statistics.median(remaining_elapsed)
+                        if remaining_elapsed
+                        else None
                     ),
                     "attempted_track_sec": sum(attempted_elapsed),
                     "track_total_sec": sum(ok_elapsed),
+                    # Upstream is always file-per-file; its whole-dataset wall
+                    # is the summed per-track time, directly comparable to a
+                    # local --dataset-throughput run's measured batched wall.
+                    "dataset_wall_sec": sum(attempted_elapsed),
+                    "tracks_per_sec": (
+                        len(ok_rows) / sum(attempted_elapsed)
+                        if ok_rows and sum(attempted_elapsed) > 0
+                        else None
+                    ),
                     "mean_sdr": (
-                        statistics.fmean(mean_sdr_values) if mean_sdr_values else float("nan")
+                        statistics.fmean(mean_sdr_values)
+                        if mean_sdr_values
+                        else float("nan")
                     ),
                     "median_sdr": (
-                        statistics.median(mean_sdr_values) if mean_sdr_values else float("nan")
+                        statistics.median(mean_sdr_values)
+                        if mean_sdr_values
+                        else float("nan")
                     ),
                     "peak_vram_mb": None,
-                    **{f"{stem}_mean_sdr": value for stem, value in per_stem_summary.items()},
+                    **{
+                        f"{stem}_mean_sdr": value
+                        for stem, value in per_stem_summary.items()
+                    },
                 }
             )
             continue
@@ -986,6 +1088,12 @@ def main(
             typer.echo(f"Failed to initialize {config.config_id}: {error}")
             continue
 
+        effective_chunk_batch_size = (
+            chunk_batch_size
+            if chunk_batch_size is not None
+            else separator.chunk_batch_size
+        )
+
         model_init_sec = perf_counter() - init_started_at
         _empty_cache(device)
         _reset_peak_memory(device)
@@ -997,12 +1105,119 @@ def main(
         config_error_type = ""
         config_error_message = ""
 
-        for track_index, track in enumerate(tracks, start=1):
+        # Dataset-throughput mode: run the track list through the batched
+        # ``separate([...])`` path (apply_model_multi) in bounded groups and
+        # sum the separation wall, instead of timing each track separately.
+        # Groups bound CPU RAM (all-at-once holds every decoded input + output
+        # stem in memory → OOM on full-length tracks). Only the separate calls
+        # are timed; SDR scoring happens between groups, untimed, and each
+        # group's audio is dropped before the next. Local configs only —
+        # upstream has no batched path. ``dataset_wall_override`` carries the
+        # summed separation wall into the summary; the per-track loop below is
+        # skipped (it iterates an empty list when ``use_batched``).
+        dataset_wall_override: float | None = None
+        use_batched = (
+            dataset_throughput
+            and config.variant == "local"
+            and device in ("cuda", "mps")
+        )
+        if use_batched:
+            sep_wall = 0.0
+            bi = 0
+            batched_failed = False
+            for grp_start in range(0, len(tracks), DATASET_THROUGHPUT_GROUP):
+                group = tracks[grp_start : grp_start + DATASET_THROUGHPUT_GROUP]
+                try:
+                    grp_t0 = perf_counter()
+                    group_results = separator.separate(
+                        [t.mixture_path for t in group],
+                        shifts=config.shifts,
+                        split_overlap=config.split_overlap,
+                        seed=seed,
+                        chunk_batch_size=chunk_batch_size,
+                    )
+                    sep_wall += perf_counter() - grp_t0  # times separation only
+                except Exception as error:
+                    error_type = type(error).__name__
+                    is_oom = isinstance(error, torch.OutOfMemoryError) or (
+                        "out of memory" in str(error).lower()
+                    )
+                    config_error_type = error_type
+                    config_error_message = str(error)
+                    if is_oom:
+                        oom_count += 1
+                    else:
+                        error_count += 1
+                    typer.echo(
+                        f"{config.config_id} batched group "
+                        f"[{grp_start}:{grp_start + len(group)}] failed with "
+                        f"{'oom' if is_oom else 'error'}: {error_type}: {error}"
+                    )
+                    traceback.print_exc()
+                    _empty_cache(device)
+                    batched_failed = True
+                    break
+
+                # Score + record each track in the group, then drop the audio.
+                for track, separated in zip(group, group_results):
+                    bi += 1
+                    stem_scores = _score_stems(separator, track, separated)
+                    detail_row = {
+                        **_detail_row_base(
+                            config, effective_chunk_batch_size, seed, device
+                        ),
+                        "track_index": bi,
+                        "track_name": track.name,
+                        "track_seed": None
+                        if seed is None
+                        else _build_track_seed(seed, track.name),
+                        # Per-track wall isn't individually observable inside a
+                        # batched call; attributed evenly below once the total
+                        # is known. ``dataset_wall_sec`` is the authoritative
+                        # number.
+                        "elapsed_sec": None,
+                        "status": "ok",
+                        "error_type": "",
+                        "error_message": "",
+                        "num_scored_stems": len(stem_scores),
+                        "mean_sdr": statistics.fmean(stem_scores.values())
+                        if stem_scores
+                        else float("nan"),
+                    }
+                    for stem_name in REFERENCE_STEMS:
+                        detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
+                    successful_track_rows.append(detail_row)
+                    details_rows.append(detail_row)
+                del group_results
+
+            # Per-track wall time isn't individually observable inside a
+            # batched ``separate([...])`` call, so batched rows keep
+            # ``elapsed_sec=None``. We deliberately do NOT back-fill it with
+            # ``sep_wall / n``: that would make every track report the same
+            # fabricated number, which the summary would then present as a
+            # real first-track / steady-state latency curve. ``dataset_wall_sec``
+            # and ``tracks_per_sec`` (from the measured ``sep_wall`` override)
+            # are the authoritative timing numbers in this mode.
+            #
+            # Only treat the summed wall as the authoritative dataset time when
+            # the whole set completed; a partial run falls back downstream.
+            if not batched_failed:
+                dataset_wall_override = sep_wall
+
+            measured_peak = _peak_memory_bytes(device)
+            if measured_peak is not None:
+                peak_vram_bytes = max(peak_vram_bytes, measured_peak)
+
+        for track_index, track in enumerate(
+            [] if use_batched else tracks, start=1
+        ):
             detail_row = {
-                **_detail_row_base(config, chunk_batch_size, seed, device),
+                **_detail_row_base(config, effective_chunk_batch_size, seed, device),
                 "track_index": track_index,
                 "track_name": track.name,
-                "track_seed": None if seed is None else _build_track_seed(seed, track.name),
+                "track_seed": None
+                if seed is None
+                else _build_track_seed(seed, track.name),
             }
 
             started_at = perf_counter()
@@ -1021,7 +1236,9 @@ def main(
                 for stem_name in track.reference_stems:
                     if stem_name not in separated.sources:
                         continue
-                    reference = separator._to_tensor(track.directory / f"{stem_name}.wav")
+                    reference = separator._to_tensor(
+                        track.directory / f"{stem_name}.wav"
+                    )
                     stem_scores[stem_name] = _compute_sdr(
                         separated.sources[stem_name],
                         reference,
@@ -1032,7 +1249,9 @@ def main(
                 detail_row["error_message"] = ""
                 detail_row["num_scored_stems"] = len(stem_scores)
                 detail_row["mean_sdr"] = (
-                    statistics.fmean(stem_scores.values()) if stem_scores else float("nan")
+                    statistics.fmean(stem_scores.values())
+                    if stem_scores
+                    else float("nan")
                 )
                 for stem_name in REFERENCE_STEMS:
                     detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
@@ -1076,7 +1295,16 @@ def main(
             row for row in details_rows if row["config_id"] == config.config_id
         ]
         ok_rows = [row for row in successful_track_rows if row["status"] == "ok"]
-        ok_elapsed = [float(row["elapsed_sec"]) for row in ok_rows]
+        # Batched (dataset-throughput) rows have ``elapsed_sec=None`` — per-track
+        # time isn't observable there — so filter them out. This leaves
+        # ok_elapsed empty in batched mode, which correctly nulls the
+        # first-track / steady-state per-track stats below; dataset_wall_sec /
+        # tracks_per_sec carry the real timing.
+        ok_elapsed = [
+            float(row["elapsed_sec"])
+            for row in ok_rows
+            if row.get("elapsed_sec") is not None
+        ]
         remaining_elapsed = ok_elapsed[1:]
         attempted_elapsed = [
             float(row["elapsed_sec"])
@@ -1103,7 +1331,7 @@ def main(
 
         summary_rows.append(
             {
-                **_summary_row_base(config, chunk_batch_size, seed, device),
+                **_summary_row_base(config, effective_chunk_batch_size, seed, device),
                 "status": "ok" if len(ok_rows) == len(tracks) else "partial",
                 "error_type": config_error_type,
                 "error_message": config_error_message,
@@ -1113,13 +1341,18 @@ def main(
                 "oom_tracks": oom_count,
                 "model_init_sec": model_init_sec,
                 "first_attempt_sec": (
-                    float(config_detail_rows[0]["elapsed_sec"]) if config_detail_rows else None
+                    float(config_detail_rows[0]["elapsed_sec"])
+                    if config_detail_rows
+                    and config_detail_rows[0].get("elapsed_sec") is not None
+                    else None
                 ),
                 "first_attempt_status": (
                     str(config_detail_rows[0]["status"]) if config_detail_rows else ""
                 ),
                 "first_track_sec": ok_elapsed[0] if ok_elapsed else None,
-                "remaining_total_sec": sum(remaining_elapsed) if remaining_elapsed else 0.0,
+                "remaining_total_sec": sum(remaining_elapsed)
+                if remaining_elapsed
+                else 0.0,
                 "steady_state_mean_sec": (
                     statistics.fmean(remaining_elapsed) if remaining_elapsed else None
                 ),
@@ -1128,14 +1361,49 @@ def main(
                 ),
                 "attempted_track_sec": sum(attempted_elapsed),
                 "track_total_sec": sum(ok_elapsed),
+                # Whole-dataset wall: the measured batched total in
+                # dataset-throughput mode, else the summed per-track time.
+                # ``tracks_per_sec`` is the headline throughput number.
+                "dataset_wall_sec": (
+                    dataset_wall_override
+                    if dataset_wall_override is not None
+                    else sum(attempted_elapsed)
+                ),
+                "tracks_per_sec": (
+                    len(ok_rows)
+                    / (
+                        dataset_wall_override
+                        if dataset_wall_override is not None
+                        else sum(attempted_elapsed)
+                    )
+                    if (
+                        ok_rows
+                        and (
+                            dataset_wall_override
+                            if dataset_wall_override is not None
+                            else sum(attempted_elapsed)
+                        )
+                        > 0
+                    )
+                    else None
+                ),
                 "mean_sdr": (
-                    statistics.fmean(mean_sdr_values) if mean_sdr_values else float("nan")
+                    statistics.fmean(mean_sdr_values)
+                    if mean_sdr_values
+                    else float("nan")
                 ),
                 "median_sdr": (
-                    statistics.median(mean_sdr_values) if mean_sdr_values else float("nan")
+                    statistics.median(mean_sdr_values)
+                    if mean_sdr_values
+                    else float("nan")
                 ),
-                "peak_vram_mb": peak_vram_bytes / (1024 * 1024) if peak_vram_bytes else None,
-                **{f"{stem}_mean_sdr": value for stem, value in per_stem_summary.items()},
+                "peak_vram_mb": peak_vram_bytes / (1024 * 1024)
+                if peak_vram_bytes
+                else None,
+                **{
+                    f"{stem}_mean_sdr": value
+                    for stem, value in per_stem_summary.items()
+                },
             }
         )
 
@@ -1209,6 +1477,8 @@ def main(
         "steady_state_median_sec",
         "attempted_track_sec",
         "track_total_sec",
+        "dataset_wall_sec",
+        "tracks_per_sec",
         "peak_vram_mb",
         "mean_sdr",
         "median_sdr",
@@ -1236,6 +1506,7 @@ def main(
         "split_overlaps": split_overlaps,
         "seed": seed,
         "limit": limit,
+        "dataset_throughput": dataset_throughput,
         "num_tracks": len(tracks),
         "num_configs": len(configs),
         "include_upstream": include_upstream,

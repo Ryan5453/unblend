@@ -26,12 +26,13 @@ def main() -> None:
     app = typer.Typer(
         add_completion=False,
         no_args_is_help=True,
-        rich_markup_mode="legacy",
+        rich_markup_mode="rich",
         pretty_exceptions_show_locals=False,
     )
 
     models_app = typer.Typer(
-        help="Download, list and manage models", no_args_is_help=True
+        help="Download, list and manage models", no_args_is_help=True,
+        rich_markup_mode="rich",
     )
     models_app.command(name="list")(list_models_command)
     models_app.command(name="download")(download_models_command)

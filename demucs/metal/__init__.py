@@ -1,4 +1,4 @@
-"""Custom Metal kernels for FP16 inference on Apple Silicon (MPS).
+"""Custom Metal kernels for low-precision (FP16/BF16) inference on Apple Silicon (MPS).
 
 PyTorch's MPS backend in 2.11 has slow paths for several FP16 ops that are
 hot in HTDemucs — most notably ``aten::native_group_norm`` (3.5x slower in
@@ -8,15 +8,18 @@ replacements that close those gaps:
 
 - :class:`MetalGroupNorm` and :class:`MetalMyGroupNorm` — wrap PyTorch's
   ``nn.GroupNorm`` and the transformer's ``MyGroupNorm`` with a single
-  fused Metal kernel for FP16 inputs (with an FP32-cast fallback for the
-  small-batch / large-per-batch shapes where the GPU stays under-utilised).
+  fused Metal kernel for FP16/BF16 inputs (with an FP32-cast fallback for
+  the small-batch / large-per-batch shapes where the GPU stays
+  under-utilised).
 - :class:`MetalMultiheadAttention` — keeps Q/K/V/output linear projections
-  in FP16 (PyTorch's MPS matmul has a fast FP16 path) and casts only for
-  the SDPA call itself, where MPS's FP32 path is faster than its FP16 path.
+  in the input dtype (MPS matmul has a fast FP16/BF16 path) and runs the
+  attention itself as a manual matmul → softmax → matmul in that same dtype,
+  avoiding both the fused-SDPA per-call dispatch overhead and the FP32
+  upcast. Only the rare masked/causal case falls back to PyTorch's FP32 SDPA.
 
 These are activated automatically by :func:`apply_metal_optimizations`,
-which :class:`demucs.api.Separator` calls when the user opts into FP16
-on MPS. They are no-ops on CPU/CUDA — those paths use PyTorch's native
+which :class:`demucs.api.Separator` calls when the user opts into FP16 or
+BF16 on MPS. They are no-ops on CPU/CUDA — those paths use PyTorch's native
 ops.
 """
 
@@ -38,7 +41,7 @@ import torch.nn.functional as F
 # split by purpose:
 #
 #   group_norm.metal       — basic GroupNorm + reduction primitives
-#                            (``partial_reduce_fp16`` + ``finalize_meanvar``,
+#                            (``partial_reduce`` + ``finalize_meanvar``,
 #                            shared by every multi-stage path below)
 #   group_norm_gelu.metal  — GroupNorm fused with GELU
 #   group_norm_glu.metal   — GroupNorm fused with GLU (channel halving)
@@ -66,20 +69,20 @@ def _load_metal_source(name: str) -> str:
 
 _KERNEL_SOURCES: dict[str, str] = {
     # group_norm.metal — basic GroupNorm + reduction primitives
-    "group_norm_g1_fp16":         "group_norm.metal",
-    "partial_reduce_fp16":        "group_norm.metal",
+    "group_norm_g1":         "group_norm.metal",
+    "partial_reduce":        "group_norm.metal",
     "finalize_meanvar":           "group_norm.metal",
-    "apply_norm_fp16":            "group_norm.metal",
+    "apply_norm":            "group_norm.metal",
     # group_norm_gelu.metal — GN fused with GELU
-    "group_norm_g1_gelu_fp16":    "group_norm_gelu.metal",
-    "apply_norm_gelu_fp16":       "group_norm_gelu.metal",
+    "group_norm_g1_gelu":    "group_norm_gelu.metal",
+    "apply_norm_gelu":       "group_norm_gelu.metal",
     # group_norm_glu.metal — GN fused with GLU (channel halving)
-    "group_norm_g1_glu_fp16":     "group_norm_glu.metal",
-    "apply_norm_glu_fp16":        "group_norm_glu.metal",
+    "group_norm_g1_glu":     "group_norm_glu.metal",
+    "apply_norm_glu":        "group_norm_glu.metal",
     # dconv_envelope.metal — DConv post-conv2 fusion paths
-    "glu_layerscale_resid_fp16":      "dconv_envelope.metal",
-    "norm_glu_ls_resid_fp16":         "dconv_envelope.metal",
-    "apply_norm_glu_ls_resid_fp16":   "dconv_envelope.metal",
+    "glu_layerscale_resid":      "dconv_envelope.metal",
+    "norm_glu_ls_resid":         "dconv_envelope.metal",
+    "apply_norm_glu_ls_resid":   "dconv_envelope.metal",
 }
 
 
@@ -96,6 +99,18 @@ _DTYPE_TO_METAL: dict[torch.dtype, str] = {
 }
 
 _LP_DTYPES = frozenset(_DTYPE_TO_METAL.keys())
+
+
+def _is_metal_lp(t: torch.Tensor) -> bool:
+    """
+    True only for a low-precision (FP16/BF16) tensor on MPS — the sole case
+    the custom Metal kernels handle. Every other (device, dtype) combination
+    falls back to PyTorch. Names the dispatch condition that every fused
+    module's ``forward`` shares, so the fallback gate reads the same way in
+    one place instead of being open-coded as ``device != "mps" or dtype not
+    in _LP_DTYPES`` at each call site.
+    """
+    return t.device.type == "mps" and t.dtype in _LP_DTYPES
 
 
 def _get_kernel(name: str, dtype: torch.dtype) -> Any:
@@ -147,9 +162,9 @@ def _get_kernel(name: str, dtype: torch.dtype) -> Any:
 
 
 class MetalGroupNorm(nn.Module):
-    """Replacement for ``nn.GroupNorm(num_groups=1)`` on MPS+FP16.
+    """Replacement for ``nn.GroupNorm(num_groups=1)`` on MPS in FP16/BF16.
 
-    Two FP16 fast paths and one FP32 fallback:
+    Two low-precision fast paths and one FP32 fallback:
 
     - **Single-stage** (``per_batch <= 1.5M``): one threadgroup per batch
       element. Fully fused; lowest launch overhead. Best for the high-B,
@@ -191,7 +206,7 @@ class MetalGroupNorm(nn.Module):
     def from_groupnorm(cls, gn: nn.GroupNorm) -> "MetalGroupNorm":
         return cls(gn)
 
-    def _fp16_affine(
+    def _lp_affine(
         self, dtype: torch.dtype, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cache = getattr(self, "_aff_cache", None)
@@ -209,7 +224,7 @@ class MetalGroupNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # FP32 / non-MPS / unsupported low-precision dtype: defer to PyTorch.
-        if x.device.type != "mps" or x.dtype not in _LP_DTYPES:
+        if not _is_metal_lp(x):
             if x.dtype == torch.float32 or x.device.type != "mps":
                 return F.group_norm(x, 1, self.weight, self.bias, self.eps)
             return F.group_norm(
@@ -224,10 +239,10 @@ class MetalGroupNorm(nn.Module):
             N *= d
         per_batch = C * N
 
-        weight, bias = self._fp16_affine(x.dtype, x.device)
+        weight, bias = self._lp_affine(x.dtype, x.device)
 
         if per_batch <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("group_norm_g1_fp16", x.dtype)
+            kernel = _get_kernel("group_norm_g1", x.dtype)
             max_tgs = min(kernel.max_threads_per_threadgroup, 1024)
             tgs = 256
             while tgs > max_tgs:
@@ -270,9 +285,9 @@ class MetalGroupNorm(nn.Module):
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
         out = torch.empty_like(x_contig)
 
-        k1 = _get_kernel("partial_reduce_fp16", x.dtype)
+        k1 = _get_kernel("partial_reduce", x.dtype)
         k2 = _get_kernel("finalize_meanvar", x.dtype)
-        k3 = _get_kernel("apply_norm_fp16", x.dtype)
+        k3 = _get_kernel("apply_norm", x.dtype)
 
         tgs1 = 256
         while tgs1 > k1.max_threads_per_threadgroup:
@@ -335,7 +350,7 @@ class FusedGroupNormGelu(MetalGroupNorm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # FP32 / non-MPS / unsupported low-precision dtype: hand to PyTorch.
-        if x.device.type != "mps" or x.dtype not in _LP_DTYPES:
+        if not _is_metal_lp(x):
             if x.dtype == torch.float32 or x.device.type != "mps":
                 return F.gelu(
                     F.group_norm(x, 1, self.weight, self.bias, self.eps),
@@ -355,10 +370,10 @@ class FusedGroupNormGelu(MetalGroupNorm):
         for d in x_contig.shape[2:]:
             N *= d
         per_batch = C * N
-        weight, bias = self._fp16_affine(x.dtype, x.device)
+        weight, bias = self._lp_affine(x.dtype, x.device)
 
         if per_batch <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("group_norm_g1_gelu_fp16", x.dtype)
+            kernel = _get_kernel("group_norm_g1_gelu", x.dtype)
             tgs = min(256, kernel.max_threads_per_threadgroup)
             while tgs > 1 and tgs > per_batch:
                 tgs //= 2
@@ -384,9 +399,9 @@ class FusedGroupNormGelu(MetalGroupNorm):
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
         out = torch.empty_like(x_contig)
 
-        k1 = _get_kernel("partial_reduce_fp16", x.dtype)
+        k1 = _get_kernel("partial_reduce", x.dtype)
         k2 = _get_kernel("finalize_meanvar", x.dtype)
-        k3 = _get_kernel("apply_norm_gelu_fp16", x.dtype)
+        k3 = _get_kernel("apply_norm_gelu", x.dtype)
 
         tgs1 = min(256, k1.max_threads_per_threadgroup)
         tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
@@ -418,7 +433,7 @@ class FusedGroupNormGlu(MetalGroupNorm):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type != "mps" or x.dtype not in _LP_DTYPES:
+        if not _is_metal_lp(x):
             if x.dtype == torch.float32 or x.device.type != "mps":
                 return F.glu(
                     F.group_norm(x, 1, self.weight, self.bias, self.eps), dim=1,
@@ -443,10 +458,10 @@ class FusedGroupNormGlu(MetalGroupNorm):
             N *= d
         per_batch_in = C_in * N
         per_batch_out = C_half * N
-        weight, bias = self._fp16_affine(x.dtype, x.device)
+        weight, bias = self._lp_affine(x.dtype, x.device)
 
         if per_batch_in <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("group_norm_g1_glu_fp16", x.dtype)
+            kernel = _get_kernel("group_norm_g1_glu", x.dtype)
             tgs = min(256, kernel.max_threads_per_threadgroup)
             while tgs > 1 and tgs > per_batch_out:
                 tgs //= 2
@@ -476,9 +491,9 @@ class FusedGroupNormGlu(MetalGroupNorm):
         out_shape = (B, C_half) + tuple(x_contig.shape[2:])
         out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
-        k1 = _get_kernel("partial_reduce_fp16", x.dtype)
+        k1 = _get_kernel("partial_reduce", x.dtype)
         k2 = _get_kernel("finalize_meanvar", x.dtype)
-        k3 = _get_kernel("apply_norm_glu_fp16", x.dtype)
+        k3 = _get_kernel("apply_norm_glu", x.dtype)
 
         tgs1 = min(256, k1.max_threads_per_threadgroup)
         tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
@@ -514,7 +529,7 @@ class FusedGluLayerScaleResidual(nn.Module):
         # Stored in FP32; cast to FP16 lazily and cache.
         self.layer_scale = nn.Parameter(layer_scale.detach().to(torch.float32).clone())
 
-    def _fp16_scale(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    def _lp_scale(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         cache = getattr(self, "_ls_cache", None)
         if cache is None:
             cache = {}
@@ -528,7 +543,7 @@ class FusedGluLayerScaleResidual(nn.Module):
         return cached
 
     def forward(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if z.device.type != "mps" or z.dtype not in _LP_DTYPES:
+        if not _is_metal_lp(z):
             # Fallback: explicit eltwise ops.
             return residual + self.layer_scale[:, None] * F.glu(z, dim=1)
 
@@ -542,10 +557,10 @@ class FusedGluLayerScaleResidual(nn.Module):
         N = 1
         for d in z_c.shape[2:]:
             N *= d
-        ls = self._fp16_scale(z.dtype, z.device)
+        ls = self._lp_scale(z.dtype, z.device)
         out_shape = (B, C) + tuple(z_c.shape[2:])
         out = torch.empty(out_shape, dtype=z.dtype, device=z.device)
-        kernel = _get_kernel("glu_layerscale_resid_fp16", z.dtype)
+        kernel = _get_kernel("glu_layerscale_resid", z.dtype)
         tgs = min(256, kernel.max_threads_per_threadgroup)
         kernel(out, z_c, r_c, ls, C, N, threads=B * tgs, group_size=tgs)
         return out
@@ -578,7 +593,7 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
     ) -> "FusedNormGluLayerScaleResid":
         return cls(gn, layer_scale_param)
 
-    def _fp16_layer_scale(
+    def _lp_layer_scale(
         self, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
         cache = getattr(self, "_ls_cache", None)
@@ -597,7 +612,7 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         self, z: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor:
         # FP32 / non-MPS / unsupported low-precision dtype: explicit eltwise.
-        if z.device.type != "mps" or z.dtype not in _LP_DTYPES:
+        if not _is_metal_lp(z):
             zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
             return residual + self.layer_scale[:, None] * F.glu(zn, dim=1)
 
@@ -613,13 +628,13 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
             N *= d
         per_batch_in = C2 * N
         per_batch_out = C * N
-        weight, bias = self._fp16_affine(z.dtype, z.device)
-        ls = self._fp16_layer_scale(z.dtype, z.device)
+        weight, bias = self._lp_affine(z.dtype, z.device)
+        ls = self._lp_layer_scale(z.dtype, z.device)
         out_shape = (B, C) + tuple(z_c.shape[2:])
         out = torch.empty(out_shape, dtype=z.dtype, device=z.device)
 
         if per_batch_in <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("norm_glu_ls_resid_fp16", z.dtype)
+            kernel = _get_kernel("norm_glu_ls_resid", z.dtype)
             tgs = min(256, kernel.max_threads_per_threadgroup)
             kernel(
                 out, z_c, r_c, weight, bias, ls,
@@ -641,9 +656,9 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         scratch = torch.empty((B, num_tiles, 2), dtype=torch.float32, device=z.device)
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=z.device)
 
-        k1 = _get_kernel("partial_reduce_fp16", z.dtype)
+        k1 = _get_kernel("partial_reduce", z.dtype)
         k2 = _get_kernel("finalize_meanvar", z.dtype)
-        k3 = _get_kernel("apply_norm_glu_ls_resid_fp16", z.dtype)
+        k3 = _get_kernel("apply_norm_glu_ls_resid", z.dtype)
 
         tgs1 = min(256, k1.max_threads_per_threadgroup)
         tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
@@ -666,7 +681,7 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
 
 
 class MetalMyGroupNorm(nn.Module):
-    """Replacement for ``demucs.transformer.MyGroupNorm`` on MPS+FP16.
+    """Replacement for ``demucs.transformer.MyGroupNorm`` on MPS in FP16/BF16.
 
     The original transposes ``(B, T, C) -> (B, C, T)``, runs ``GroupNorm``
     with ``num_groups=1``, transposes back. Since ``num_groups=1`` is just
@@ -688,7 +703,7 @@ class MetalMyGroupNorm(nn.Module):
         self.weight = nn.Parameter(my_gn.weight.detach().to(torch.float32).clone())
         self.bias = nn.Parameter(my_gn.bias.detach().to(torch.float32).clone())
 
-    def _fp16_affine(
+    def _lp_affine(
         self, dtype: torch.dtype, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cache = getattr(self, "_aff_cache", None)
@@ -739,7 +754,7 @@ class MetalMyGroupNorm(nn.Module):
         var = x_flat.var(dim=1, unbiased=False, keepdim=True)
         x_norm = (x_flat - mean) * torch.rsqrt(var + self.eps)
         x_norm = x_norm.view(B, T, C).to(x.dtype)
-        w, b = self._fp16_affine(x.dtype, x.device)
+        w, b = self._lp_affine(x.dtype, x.device)
         return x_norm * w + b
 
 
@@ -834,7 +849,7 @@ class FusedDConv(nn.Module):
 
 class FusedHEncLayer(nn.Module):
     """Replacement for ``demucs.blocks.HEncLayer`` that uses fused Metal
-    kernels for FP16 inference on MPS. Same forward contract.
+    kernels for low-precision (FP16/BF16) inference on MPS. Same forward contract.
 
     We keep ``self.conv``, ``self.rewrite``, and the layer's ``empty`` /
     ``stride`` / ``freq`` / ``pad`` flags as on the original. The
@@ -1013,7 +1028,7 @@ class FusedHDecLayer(nn.Module):
 
 
 class MetalMultiheadAttention(nn.Module):
-    """Replacement for ``nn.MultiheadAttention`` on MPS+FP16.
+    """Replacement for ``nn.MultiheadAttention`` on MPS in FP16/BF16.
 
     Q/K/V/output linear projections stay in the parameter dtype — matmul
     has a fast FP16 path on MPS, and PyTorch's MPSGraph backend already
@@ -1154,7 +1169,7 @@ class MetalMultiheadAttention(nn.Module):
 
 
 def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
-    """Replace FP16-slow ops with Metal-backed equivalents in-place.
+    """Replace low-precision-slow ops with Metal-backed equivalents in-place.
 
     Idempotent (safe to call multiple times) and only swaps modules whose
     forward semantics we know how to preserve. Returns counts per kind for
@@ -1177,7 +1192,7 @@ def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
     GroupNorms it fuses and *leaves behind* a few that the second pass
     still needs to replace (e.g. ``HDecLayer.norm2``, transformer norms).
     """
-    from ..blocks import HEncLayer, HDecLayer
+    from ..blocks import HDecLayer, HEncLayer
     from ..transformer import MyGroupNorm
 
     counts = {

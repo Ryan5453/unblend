@@ -6,7 +6,7 @@
 // ``b = norm(in[c + C])`` and combine via ``a * sigmoid(b)`` without ever
 // writing the post-norm full-size tensor to memory.
 //
-// ``apply_norm_glu_fp16`` is the third stage of the multi-stage path,
+// ``apply_norm_glu`` is the third stage of the multi-stage path,
 // reading ``meanvar`` produced by ``finalize_meanvar`` in
 // ``group_norm.metal``. Crucially it tiles the OUTPUT space (size C*N),
 // not the input — each output element pulls its two input channels by
@@ -22,7 +22,7 @@ using namespace metal;
 #define SCALAR_T half
 #endif
 
-kernel void group_norm_g1_glu_fp16(
+kernel void group_norm_g1_glu(
     device SCALAR_T*       out      [[buffer(0)]],   // (B, C/2, N)
     device const SCALAR_T* in_      [[buffer(1)]],   // (B, C,   N)
     device const SCALAR_T* weight   [[buffer(2)]],   // (C,)
@@ -89,7 +89,7 @@ kernel void group_norm_g1_glu_fp16(
     }
 }
 
-kernel void apply_norm_glu_fp16(
+kernel void apply_norm_glu(
     device SCALAR_T*        out          [[buffer(0)]],   // (B, C/2 * N)
     device const SCALAR_T*  in_          [[buffer(1)]],   // (B, C * N)
     device const float* meanvar      [[buffer(2)]],

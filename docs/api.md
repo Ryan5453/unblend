@@ -21,60 +21,70 @@ A `Separator` takes the following parameters:
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
-- `dtype` - Optional, set to `torch.float16` for half-precision inference. Supported only on CUDA and MPS. If `None`, uses default float32.
-- `compile` - Optional, if `True`, compiles the core of the HTDemucs neural network on CUDA. This will significantly improve the performance of the model at the cost of a significant warmup cost. 
+- `dtype` - Optional, set to `torch.float16` or `torch.bfloat16` for reduced-precision inference. Supported on CUDA and MPS (CPU is rejected). On CUDA, BF16 runs natively on tensor cores at the same throughput as FP16 with FP32 exponent range — generally the fastest option. On MPS, FP16 is the recommended path (custom Metal kernels in `demucs.metal`); BF16 is supported but ~28 % slower than FP16 on PyTorch 2.11. If `None`, uses default float32.
+- `compile` - Optional, if `True`, applies `torch.compile` (CUDAGraphs / Inductor) to the HTDemucs neural network core. Significantly improves steady-state throughput on CUDA at the cost of a heavy first-call compile (~7–55 s depending on dtype). Silently ignored on MPS and CPU (`torch.compile` on MPS hits dynamo recompile limits on the Metal kernels' varying channel counts).
 
 ### Attributes
 
 After construction, the following attributes are available on a `Separator` instance:
 
 - `device` - The device being used for processing (`str`).
+- `dtype` - The dtype being used for inference (`torch.dtype | None`).
 - `model` - The loaded model instance (`Model | ModelEnsemble`).
 - `audio_channels` - Number of audio channels the model expects (`int`).
 - `sample_rate` - Sample rate the model operates at (`int`).
+- `chunk_batch_size` - Number of segments processed per forward call. On CUDA this is auto-detected at init time from a single eager forward measurement + `mem_get_info` + a capture-verify step that halves on `CUDAOutOfMemoryError` (max 4 attempts). Read this attribute after construction to see the value picked for your GPU. On MPS/CPU it falls back to a small default.
 
-If you enable compilation, you can optionally pre-warm the compiled path for the batch sizes you expect to run:
+If you enable `compile=True`, warmup happens automatically at the end of `__init__` (via a zero-tensor pass through `Separator.separate`, so the CUDAGraph captured is the same one real requests reuse). You can call `separator.warmup()` again later to re-prime if needed; the method takes no arguments because tail-padding inside `apply_model` guarantees a single batch shape per session.
 
 ```python
-separator.warmup(batch_sizes=[4, 1])
+separator.warmup()  # no args — there's exactly one batch shape after tail-padding
 ```
 
-Once you have a `Separator` instance, you can use the `separate` method to separate an audio file into its constituent stems.
+Once you have a `Separator` instance, you can use the `separate` method to separate one audio input — or a list of inputs — into its constituent stems.
 
 ```python
 def separate(
     self,
-    audio: tuple[Tensor, int] | Path | str | bytes,
+    audio: tuple[Tensor, int] | Path | str | bytes | list[...],
     shifts: int = 1,
     split_overlap: float = 0.25,
     seed: int | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     use_only_stem: str | None = None,
     chunk_batch_size: int | None = None,
-) -> SeparatedSources:
+) -> SeparatedSources | list[SeparatedSources]:
 ```
 
 When separating audio, you have the ability to specify the following parameters:
 
-- `audio` - The audio to separate. Can be a tuple of (Tensor, sample_rate), a file path, or raw audio bytes.
+- `audio` - The audio to separate. **Polymorphic input**: a single `(Tensor, sample_rate)` tuple / file path / raw bytes returns a single `SeparatedSources`. Passing a `list` of those returns `list[SeparatedSources]` and pools tail chunks across inputs (so every forward pass runs at full `chunk_batch_size`, no wasted slots). Useful when serving many short clips concurrently — see `apply_model_multi` in `demucs/apply.py`.
 - `shifts` - The number of random shifts for equivariant stabilization. In simple terms, this is a technique to make the model more robust to small changes in the audio, such as small shifts in time or pitch. More shifts mean generally higher quality separation but also longer processing time.
 - `split_overlap` - The overlap between consecutive segments. Must be in the range `[0.0, 1.0)`. Higher values smooth segment boundaries at the cost of more compute per track.
-- `seed` - Optional random seed for reproducible shift-based inference. This is especially useful when benchmarking configurations that use `shifts > 1`.
-- `progress_callback` - A callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
+- `seed` - Optional random seed for reproducible shift-based inference. With list input, per-input shift offsets advance from this seed in sequence — outputs are reproducible across runs at the same seed, but a list call with `seed=N` does NOT produce bit-identical outputs to N separate single-file calls with `seed=N`.
+- `progress_callback` - A callback function to receive progress updates. Only supported on single-input calls; passing it alongside a `list` input raises `ValidationError`. View the [Progress Callbacks](#progress-callbacks) section for more information.
 - `use_only_stem` - If specified, perform the separation using only the specialized model for this stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
-- `chunk_batch_size` - Number of segments to process in parallel. Defaults to `4` on CUDA, `2` on MPS (kernel-launch amortization on Apple Silicon's unified memory; degrades past 2), and `1` on CPU.
+- `chunk_batch_size` - Override the auto-detected `chunk_batch_size` for this call without persisting it. Pass `None` (default) to use `self.chunk_batch_size`.
 
 The model's training segment length (`max_allowed_segment * samplerate`, e.g. 7.8s for HTDemucs) is used internally for every chunk; it isn't a knob because there's no useful range — shorter chunks get padded back up to that length before inference (so they're strictly slower without quality benefit) and longer chunks would extrapolate the cross-transformer's positional embeddings past their training range (degrading quality).
+
+**Bounded GPU memory.** Output accumulators live on CPU on CUDA, with per-batch GPU→CPU transfers after each forward. This means GPU VRAM usage is bounded by `model + cudagraph_pool + active_batch` regardless of audio length — a 10-hour file uses the same VRAM as a 6-minute one. The per-batch transfer adds ~10 % wall time vs the old all-on-GPU path, traded for predictable VRAM and no length-dependent OOMs. On MPS (unified memory) the accumulator stays on-device.
 
 Example:
 
 ```python
+# Single input
 sources = separator.separate(
     "mixture.wav",
     shifts=4,
     split_overlap=0.25,
     seed=1234,
 )
+
+# Batched list input — pools tail chunks across inputs
+results = separator.separate(["a.wav", "b.wav", "c.wav"])
+for sources in results:
+    ...
 ```
 
 ## SeparatedSources

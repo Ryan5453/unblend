@@ -1,17 +1,17 @@
 // GroupNorm with num_groups=1: single-stage and the reduction primitives
 // shared with every other ``apply_*`` kernel in this folder.
 //
-// ``group_norm_g1_fp16`` runs one threadgroup per batch element — best for
+// ``group_norm_g1`` runs one threadgroup per batch element — best for
 // shapes with many batch elements and small per-batch work (DConv internals).
 //
-// ``partial_reduce_fp16`` + ``finalize_meanvar`` are the first two stages of
+// ``partial_reduce`` + ``finalize_meanvar`` are the first two stages of
 // the multi-stage path used for the outermost encoder/decoder GroupNorms,
 // where ``B`` is small but per-batch work is huge. Apply kernels in the
 // other ``.metal`` files (``group_norm_gelu``, ``group_norm_glu``,
 // ``dconv_envelope``) read the (B, 2) ``meanvar`` buffer this finalize
 // stage writes.
 //
-// ``apply_norm_fp16`` is the plain (no activation) third stage. Its mirror
+// ``apply_norm`` is the plain (no activation) third stage. Its mirror
 // kernels with fused activations live alongside their respective single-
 // stage variants in the other files.
 //
@@ -29,7 +29,7 @@ using namespace metal;
 #define SCALAR_T half
 #endif
 
-kernel void group_norm_g1_fp16(
+kernel void group_norm_g1(
     device SCALAR_T*       out      [[buffer(0)]],
     device const SCALAR_T* in_      [[buffer(1)]],
     device const SCALAR_T* weight   [[buffer(2)]],
@@ -92,7 +92,7 @@ kernel void group_norm_g1_fp16(
     }
 }
 
-kernel void partial_reduce_fp16(
+kernel void partial_reduce(
     device const SCALAR_T*  in_           [[buffer(0)]],
     device float*       scratch       [[buffer(1)]],   // (B, num_tiles, 2)
     constant uint&      total_per_b   [[buffer(2)]],
@@ -179,7 +179,7 @@ kernel void finalize_meanvar(
     }
 }
 
-kernel void apply_norm_fp16(
+kernel void apply_norm(
     device SCALAR_T*        out          [[buffer(0)]],
     device const SCALAR_T*  in_          [[buffer(1)]],
     device const float* meanvar      [[buffer(2)]],    // (B, 2)

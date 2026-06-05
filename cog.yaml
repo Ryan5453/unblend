@@ -16,3 +16,5 @@ build:
     - python -c "import site; open(site.getsitepackages()[0] + '/sitecustomize.py', 'w').write('import os\nos.environ.pop(\"LD_LIBRARY_PATH\", None)\n')"
 
 predict: "predictor.py:Predictor"
+concurrency:
+  max: 32

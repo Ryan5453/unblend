@@ -2,10 +2,10 @@
 // down to a single launch (or, for the multi-stage variant, two launches
 // over the input followed by one over the output).
 //
-// ``glu_layerscale_resid_fp16``: combines GLU + per-channel LayerScale +
+// ``glu_layerscale_resid``: combines GLU + per-channel LayerScale +
 // residual add for an already-normalised input.
 //
-// ``norm_glu_ls_resid_fp16`` (single-stage) and ``apply_norm_glu_ls_resid_fp16``
+// ``norm_glu_ls_resid`` (single-stage) and ``apply_norm_glu_ls_resid``
 // (multi-stage third stage) absorb GroupNorm into the same fused op:
 //   output = residual + layer_scale * glu(group_norm(z))
 // which replaces FOUR previously separate kernel launches (group_norm,
@@ -21,7 +21,7 @@ using namespace metal;
 #define SCALAR_T half
 #endif
 
-kernel void glu_layerscale_resid_fp16(
+kernel void glu_layerscale_resid(
     device SCALAR_T*       out         [[buffer(0)]],   // (B, C, N)
     device const SCALAR_T* z           [[buffer(1)]],   // (B, 2C, N)
     device const SCALAR_T* residual    [[buffer(2)]],   // (B, C, N)
@@ -50,7 +50,7 @@ kernel void glu_layerscale_resid_fp16(
     }
 }
 
-kernel void norm_glu_ls_resid_fp16(
+kernel void norm_glu_ls_resid(
     device SCALAR_T*       out          [[buffer(0)]],   // (B, C, N)
     device const SCALAR_T* z            [[buffer(1)]],   // (B, 2C, N)
     device const SCALAR_T* residual     [[buffer(2)]],   // (B, C, N)
@@ -121,7 +121,7 @@ kernel void norm_glu_ls_resid_fp16(
     }
 }
 
-kernel void apply_norm_glu_ls_resid_fp16(
+kernel void apply_norm_glu_ls_resid(
     device SCALAR_T*        out             [[buffer(0)]],
     device const SCALAR_T*  z               [[buffer(1)]],
     device const SCALAR_T*  residual        [[buffer(2)]],

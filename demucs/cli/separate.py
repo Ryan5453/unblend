@@ -14,7 +14,7 @@ from typing_extensions import Annotated
 from ..api import Separator, select_model
 from .models import ensure_model_available
 from .progress import FileProgressTracker
-from .types import ClipMode, DeviceType, ModelName, StemName
+from .types import ClipMode, DeviceType, ModelName, Precision, StemName
 from .utils import console, expand_paths_to_audio_files, format_output_path
 
 
@@ -87,6 +87,14 @@ def separate_command(
             rich_help_panel="Processing",
         ),
     ] = False,
+    precision: Annotated[
+        Precision,
+        typer.Option(
+            "--precision",
+            help="Inference precision; auto picks bf16 on CUDA, fp16 on MPS, fp32 on CPU",
+            rich_help_panel="Processing",
+        ),
+    ] = Precision.auto,
     # Output
     output: Annotated[
         str,
@@ -150,14 +158,30 @@ def separate_command(
     if not ensure_model_available(selected_model_name):
         return
 
-    # FP16 is on by default for CUDA (tensor cores) and MPS (custom Metal
-    # kernels — see ``demucs.metal``). CPU stays in FP32.
-    fp16_devices = {DeviceType.cuda.value, DeviceType.mps.value}
+    # Resolve --precision auto → the best-known dtype for the device:
+    # CUDA picks bf16 (native tensor cores at the same throughput as fp16,
+    # with FP32 exponent range); MPS picks fp16 (custom Metal kernels in
+    # ``demucs.metal``; BF16 on MPS works but is slower on PyTorch 2.11);
+    # CPU stays at fp32 (no faster path).
+    if precision is Precision.auto:
+        if device.value == DeviceType.cuda.value:
+            dtype: torch.dtype | None = torch.bfloat16
+        elif device.value == DeviceType.mps.value:
+            dtype = torch.float16
+        else:
+            dtype = None
+    elif precision is Precision.fp32:
+        dtype = None
+    elif precision is Precision.fp16:
+        dtype = torch.float16
+    else:  # Precision.bf16
+        dtype = torch.bfloat16
+
     separator = Separator(
         model=selected_model_name,
         device=device.value,
         only_load=only_load_stem,
-        dtype=torch.float16 if device.value in fp16_devices else None,
+        dtype=dtype,
         compile=compile,
     )
 
