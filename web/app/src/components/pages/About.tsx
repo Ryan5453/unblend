@@ -13,8 +13,8 @@ export function About() {
                     </p>
 
                     <p>
-                        Demucs separates a mixed track into four stems: drums, bass, vocals, and other
-                        instruments. The model is converted to ONNX format and runs in-browser via
+                        Demucs separates a mixed track into individual stems such as drums, bass, vocals,
+                        and other instruments. The model is converted to ONNX format and runs in-browser via
                         onnxruntime-web. On first use, the runtime binary (~26MB) and model weights (~80MB) are
                         downloaded. Inference uses WebGPU when your browser supports it, falling back to
                         WebAssembly otherwise.
@@ -23,7 +23,7 @@ export function About() {
                     <p>
                         Audio files are decoded with <a href="https://mediabunny.dev/">MediaBunny</a>, which
                         uses your browser's native decoders where possible. For formats that can't be decoded
-                        natively, the app falls back to <a href="https://ffmpegwasm.netlify.app/">ffmpeg.wasm</a> (~32MB).
+                        natively, the app falls back to <a href="https://ffmpegwasm.netlify.app/">ffmpeg.wasm</a>.
                     </p>
                 </div>
             </div>

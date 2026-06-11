@@ -5,13 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 import click
 import torch
 import typer
-from typing_extensions import Annotated
 
-from ..api import Separator, select_model
+from ..api import Separator, default_device, select_model
+from ..exceptions import ValidationError
 from .models import ensure_model_available
 from .progress import FileProgressTracker
 from .types import ClipMode, DeviceType, ModelName, Precision, StemName
@@ -39,20 +40,15 @@ def separate_command(
     ] = ModelName.auto,
     # Processing Options
     device: Annotated[
-        DeviceType,
+        DeviceType | None,
         typer.Option(
             "-d",
             "--device",
-            help="Device to process separation on",
+            help="Device to process separation on (defaults to the best available: cuda > mps > cpu)",
+            show_default=False,
             rich_help_panel="Processing",
         ),
-    ] = (
-        DeviceType.cuda
-        if torch.cuda.is_available()
-        else DeviceType.mps
-        if torch.backends.mps.is_available()
-        else DeviceType.cpu
-    ),
+    ] = None,
     shifts: Annotated[
         int,
         typer.Option(
@@ -79,11 +75,11 @@ def separate_command(
             rich_help_panel="Processing",
         ),
     ] = None,
-    compile: Annotated[
+    compile_model: Annotated[
         bool,
         typer.Option(
             "--compile/--no-compile",
-            help="Compile the HTDemucs neural network core on CUDA. Improves steady-state throughput for long-running jobs, but adds a heavy warmup cost.",
+            help="Compile the HTDemucs neural network core on CUDA. Improves steady-state throughput for long-running jobs, but adds a heavy warmup cost. Ignored on non-CUDA devices.",
             rich_help_panel="Processing",
         ),
     ] = False,
@@ -131,18 +127,40 @@ def separate_command(
 ) -> None:
     """
     Separates the given tracks.
+
+    :param tracks: Paths to audio files or directories containing audio files
+    :param model: Model to use for separation
+    :param device: Device to process separation on
+    :param shifts: Number of random shifts for equivariant stabilization;
+        increases separation time but improves quality
+    :param split_overlap: Overlap between split chunks; higher values improve
+        quality at chunk boundaries
+    :param seed: Random seed for reproducible shift-based inference
+    :param compile_model: Compile the HTDemucs neural network core on CUDA; improves
+        steady-state throughput for long-running jobs, but adds a heavy warmup cost
+    :param precision: Inference precision; auto picks bf16 on CUDA, fp16 on MPS,
+        fp32 on CPU
+    :param output: Output path template; variables are {model}, {track}, {stem},
+        {ext}, {date}, {time}, {timestamp}
+    :param isolate_stem: Only creates a {stem} and no_{stem} stem/file
+    :param clip_mode: Strategy for avoiding clipping
+    :param format: Output audio format, anything supported by FFmpeg
     """
     if tracks is None or not tracks:
         ctx = click.get_current_context()
         click.echo(ctx.get_help())
         ctx.exit()
-        return
+
+    # Resolved at invocation rather than as the parameter default: a default-
+    # argument ternary would probe CUDA/MPS at import time (even for --help).
+    if device is None:
+        device = DeviceType(default_device())
 
     audio_files = expand_paths_to_audio_files(tracks)
 
     if not audio_files:
         console.print("[red]No audio files found to process.[/red]")
-        return
+        raise typer.Exit(1)
 
     if model.value == ModelName.auto.value:
         selected_model_name, only_load_stem = select_model(
@@ -156,7 +174,7 @@ def separate_command(
         only_load_stem = isolate_stem.value if isolate_stem else None
 
     if not ensure_model_available(selected_model_name):
-        return
+        raise typer.Exit(1)
 
     # Resolve --precision auto → the best-known dtype for the device:
     # CUDA picks bf16 (native tensor cores at the same throughput as fp16,
@@ -177,55 +195,100 @@ def separate_command(
     else:  # Precision.bf16
         dtype = torch.bfloat16
 
-    separator = Separator(
-        model=selected_model_name,
-        device=device.value,
-        only_load=only_load_stem,
-        dtype=dtype,
-        compile=compile,
-    )
+    # only_load (set from --isolate-stem for an explicit model, or by
+    # select_model on the auto path) is validated against the model's sources
+    # inside Separator.__init__. Catch that here so an invalid stem prints a
+    # clean message instead of surfacing an uncaught ValidationError traceback.
+    try:
+        separator = Separator(
+            model=selected_model_name,
+            device=device.value,
+            only_load=only_load_stem,
+            dtype=dtype,
+            compile=compile_model,
+        )
+    except ValidationError as error:
+        console.print(
+            f"[red]✗[/red] [bold]{selected_model_name}[/bold]: error: {error}"
+        )
+        raise typer.Exit(1)
 
+    # Also covers the case where --isolate-stem is set but only_load is not (the
+    # auto path can pick a single model where only_load is a no-op): the stem
+    # must still exist in the loaded model's sources.
     if isolate_stem is not None and isolate_stem.value not in separator.model.sources:
         console.print(
             f'[red]✗[/red] [bold]{selected_model_name}[/bold]: error: stem "{isolate_stem.value}" is not in selected model. STEM must be one of {", ".join(separator.model.sources)}.'
         )
-        return
+        raise typer.Exit(1)
 
-    if audio_files:
-        resolved_template = output
-        resolved_template = resolved_template.replace("{model}", selected_model_name)
-        resolved_template = resolved_template.replace("{ext}", format)
+    # Detect output-path collisions up front, before doing any expensive
+    # separation. Compute the actual resolved path for every (track, stem) pair
+    # the run will write; if any two pairs map to the same path, the second
+    # would silently overwrite the first. This catches every cause — same
+    # basename in different directories, a missing {track} across multiple
+    # files, or a missing {stem} collapsing all stems onto one file.
+    if isolate_stem is not None:
+        planned_stems = [isolate_stem.value, f"no_{isolate_stem.value}"]
+    else:
+        planned_stems = list(separator.model.sources)
 
-        now = datetime.now()
-        resolved_template = resolved_template.replace(
-            "{date}", now.strftime("%Y-%m-%d")
-        )
-        resolved_template = resolved_template.replace(
-            "{time}", now.strftime("%H-%M-%S")
-        )
-        resolved_template = resolved_template.replace(
-            "{timestamp}", str(int(now.timestamp()))
-        )
+    # Capture a single timestamp for the whole run. The collision pre-check, the
+    # displayed template, and the actual writes below all reuse this so that
+    # {date}/{time}/{timestamp} resolve identically — otherwise the check could
+    # evaluate a different second than the writes and either miss a real
+    # collision or report a path that isn't the one written.
+    now = datetime.now()
 
-        if len(audio_files) == 1:
-            track_name = audio_files[0].name.rsplit(".", 1)[0]
-            resolved_template = resolved_template.replace("{track}", track_name)
-            console.print(
-                f"Separated track will be stored using template '{resolved_template}'"
+    planned_paths: dict[str, list[str]] = {}
+    for track in audio_files:
+        for stem_name in planned_stems:
+            path = str(
+                format_output_path(
+                    output, selected_model_name, track, stem_name, format, now=now
+                )
             )
-        else:
-            console.print(
-                f"Separated tracks will be stored using template '{resolved_template}'"
-            )
+            planned_paths.setdefault(path, []).append(f"{track.name} → {stem_name}")
 
+    collisions = {p: srcs for p, srcs in planned_paths.items() if len(srcs) > 1}
+    if collisions:
+        console.print(
+            "[red]✗[/red] Output template produces colliding paths; outputs would "
+            "overwrite each other. Add [bold]{track}[/bold] and/or "
+            "[bold]{stem}[/bold] to the template to make each path unique:"
+        )
+        for path, srcs in collisions.items():
+            console.print(f"  [bold]{path}[/bold] ← {', '.join(srcs)}")
+        raise typer.Exit(1)
+
+    # Reuse format_output_path so the displayed template can never drift from the
+    # paths actually written. Keep {stem} as a literal placeholder (and {track}
+    # too when there are multiple tracks) by passing them through as the values:
+    # format_output_path applies {track} as track.name minus its extension, so a
+    # Path of "{track}" resolves back to "{track}".
+    if len(audio_files) == 1:
+        track = audio_files[0]
+        message = "Separated track will be stored using template"
+    else:
+        track = Path("{track}")
+        message = "Separated tracks will be stored using template"
+    resolved_template = format_output_path(
+        output, selected_model_name, track, "{stem}", format, now=now
+    )
+    console.print(f"{message} '{resolved_template}'")
+
+    had_error = False
     with FileProgressTracker(len(audio_files)) as progress_tracker:
         for track in audio_files:
-            filename = track.name
+            # Key tracker entries on the full path so two same-named files in
+            # different directories don't collide; the tracker shows just the
+            # basename for display.
+            file_key = str(track)
 
-            progress_tracker.start_file(filename)
+            progress_tracker.start_file(file_key)
 
             try:
-                audio_callback = progress_tracker.create_audio_callback(filename)
+                audio_callback = progress_tracker.create_audio_callback(file_key)
 
                 separated = separator.separate(
                     audio=track,
@@ -241,7 +304,7 @@ def separate_command(
 
                 for stem_name in separated.sources:
                     stem_path = format_output_path(
-                        output, selected_model_name, track, stem_name, format
+                        output, selected_model_name, track, stem_name, format, now=now
                     )
                     separated.export_stem(
                         stem_name,
@@ -251,6 +314,11 @@ def separate_command(
                     )
 
             except Exception as e:
-                error_msg = str(e)
-                progress_tracker.error_file(filename, error_msg)
-                console.print(f"[red]✗[/red] Error processing {filename}: {error_msg}")
+                had_error = True
+                progress_tracker.error_file(file_key)
+                console.print(f"[red]✗[/red] Error processing {track.name}: {e}")
+
+    # If any track failed, exit nonzero so scripts/pipelines can detect it,
+    # while still having processed every other track.
+    if had_error:
+        raise typer.Exit(1)

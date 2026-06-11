@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gc
 import hashlib
+import inspect
 import json
 import math
 import shutil
@@ -19,13 +20,13 @@ from typing import Any
 import torch
 import typer
 
-from demucs.api import Separator
+from demucs.api import Separator, default_device
 from demucs.cli.models import ensure_model_available
 
 REFERENCE_STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
 DEFAULT_MODELS = ["htdemucs", "htdemucs_ft"]
 DEFAULT_PRECISIONS = ["fp32", "fp16", "bf16"]
-DEFAULT_COMPILE_MODES = [False, True]
+DEFAULT_COMPILE_MODES = ["false", "true"]
 DEFAULT_SHIFTS = [1, 2, 4]
 DEFAULT_SPLIT_OVERLAPS = [0.1, 0.25, 0.5]
 # Tracks per batched ``separate([...])`` call in --dataset-throughput mode.
@@ -46,7 +47,7 @@ UPSTREAM_REPO = "https://github.com/adefossez/demucs.git"
 # Anything non-JSON on stdout is treated as upstream's own logging and surfaced
 # verbatim. The worker only depends on torch/torchaudio + upstream demucs and
 # must NOT import anything from the demucs-next repo (different interpreter).
-UPSTREAM_WORKER_SOURCE = r'''
+_UPSTREAM_WORKER_TEMPLATE = r'''
 from __future__ import annotations
 import argparse, json, math, sys, time, traceback
 from pathlib import Path
@@ -62,28 +63,7 @@ def _emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
 
-def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
-    """
-    Compute SDR (in dB) using the same formula as the parent benchmark.
-
-    :param estimate: Separator output for the stem.
-    :param reference: Ground-truth stem.
-    :return: SDR in dB, ``nan`` if the reference is silent, ``inf`` if the
-        residual is below the numeric floor.
-    """
-    estimate = estimate.to(dtype=torch.float64, device="cpu")
-    reference = reference.to(dtype=torch.float64, device="cpu")
-    length = min(estimate.shape[-1], reference.shape[-1])
-    estimate = estimate[..., :length]
-    reference = reference[..., :length]
-    noise = estimate - reference
-    reference_energy = torch.sum(reference * reference).item()
-    noise_energy = torch.sum(noise * noise).item()
-    if reference_energy <= 0.0:
-        return float("nan")
-    if noise_energy <= 1e-12:
-        return float("inf")
-    return 10.0 * math.log10(reference_energy / noise_energy)
+# __SHARED_SDR__
 
 def main() -> int:
     """
@@ -159,6 +139,22 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
+
+def _build_upstream_worker_source() -> str:
+    """
+    Build the runnable upstream worker program.
+
+    ``_compute_sdr`` is a real function in this module; its source is injected
+    into the worker template so the parent process and the isolated upstream
+    subprocess share one SDR implementation rather than two copies that can drift.
+
+    :return: Complete worker source to feed to ``python -P -`` over stdin.
+    """
+    return _UPSTREAM_WORKER_TEMPLATE.replace(
+        "# __SHARED_SDR__", inspect.getsource(_compute_sdr)
+    )
+
+
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 
@@ -216,24 +212,25 @@ def _build_track_seed(seed: int, track_name: str) -> int:
 
 def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
     """
-    Compute SDR (in dB) between an estimated stem and its reference.
+    Compute SDR (in dB) for one estimated stem against its reference.
+
+    This is the single SDR implementation for the whole benchmark: it scores
+    demucs-next in-process, and ``_build_upstream_worker_source`` injects its
+    source into the isolated upstream subprocess so both sides score identically.
 
     :param estimate: Separator output for the stem.
     :param reference: Ground-truth stem.
-    :return: SDR in dB, ``nan`` if the reference has no energy, ``inf`` if
-        the residual is below the numeric floor.
+    :return: SDR in dB, ``nan`` if the reference is silent, ``inf`` if the
+        residual is below the numeric floor.
     """
     estimate = estimate.to(dtype=torch.float64, device="cpu")
     reference = reference.to(dtype=torch.float64, device="cpu")
-
     length = min(estimate.shape[-1], reference.shape[-1])
     estimate = estimate[..., :length]
     reference = reference[..., :length]
-
     noise = estimate - reference
     reference_energy = torch.sum(reference * reference).item()
     noise_energy = torch.sum(noise * noise).item()
-
     if reference_energy <= 0.0:
         return float("nan")
     if noise_energy <= 1e-12:
@@ -529,7 +526,7 @@ def _run_upstream_config(
         bufsize=1,
     )
     assert proc.stdin is not None
-    proc.stdin.write(UPSTREAM_WORKER_SOURCE)
+    proc.stdin.write(_build_upstream_worker_source())
     proc.stdin.close()
     try:
         assert proc.stdout is not None
@@ -576,10 +573,10 @@ def _run_upstream_config(
                         detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
                 else:
                     error_type = str(event.get("error_type", ""))
+                    error_message = str(event.get("error_message", "")).lower()
                     is_oom = (
-                        "out of memory" in event.get("error_message", "").lower()
-                        or error_type in ("OutOfMemoryError", "RuntimeError")
-                        and "out of memory" in event.get("error_message", "").lower()
+                        error_type == "OutOfMemoryError"
+                        or "out of memory" in error_message
                     )
                     detail_row["status"] = "oom" if is_oom else "error"
                     detail_row["error_type"] = error_type
@@ -720,11 +717,7 @@ def _resolve_device(device_flag: str | None) -> str:
     accelerator, falling back to CPU. CPU is also explicitly selectable for
     portability checks; only FP32 runs there."""
     if device_flag in (None, "auto"):
-        if torch.cuda.is_available():
-            return "cuda"
-        if torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+        return default_device()
     if device_flag == "cuda":
         if not torch.cuda.is_available():
             raise typer.BadParameter("CUDA requested but not available.")
@@ -826,10 +819,11 @@ def main(
         "--precision",
         help="Precision mode(s) to benchmark. Repeat to benchmark multiple values.",
     ),
-    compile_modes: list[bool] = typer.Option(
+    compile_modes: list[str] = typer.Option(
         DEFAULT_COMPILE_MODES,
         "--compile-mode",
-        help="Compilation mode(s) to benchmark. Repeat for false/true.",
+        help="Compilation mode(s) to benchmark: 'true' and/or 'false'. "
+        "Repeat to benchmark multiple values (e.g. --compile-mode false).",
     ),
     shifts_values: list[int] = typer.Option(
         DEFAULT_SHIFTS,
@@ -845,8 +839,8 @@ def main(
     device: str | None = typer.Option(
         None,
         "--device",
-        help="Device: 'cuda', 'mps', or 'auto' (default: auto). On MPS,"
-        " --compile-mode True is silently dropped (no MPS support yet).",
+        help="Device: 'cuda', 'mps', 'cpu', or 'auto' (default: auto). On MPS/CPU,"
+        " --compile-mode true is silently dropped (compile is CUDA-only here).",
     ),
     include_upstream: bool = typer.Option(
         False,
@@ -870,6 +864,21 @@ def main(
     """
     Benchmark the MUSDB matrix on the chosen device and record SDR + timing.
     """
+    # --compile-mode takes string values ("true"/"false"); a list[bool] Typer
+    # option degenerates into a value-less flag (can't express "false only"),
+    # so parse the strings to bools here before any truthiness checks below.
+    def _parse_compile_mode(value: str) -> bool:
+        v = value.strip().lower()
+        if v in ("true", "1", "yes"):
+            return True
+        if v in ("false", "0", "no"):
+            return False
+        raise typer.BadParameter(
+            f"--compile-mode must be 'true' or 'false', got '{value}'"
+        )
+
+    compile_modes = [_parse_compile_mode(c) for c in compile_modes]
+
     device = _resolve_device(device)
     # ``compile`` is CUDA-only (Inductor codegen errors on MPS for HTDemucs;
     # CPU compile path is not exercised here).

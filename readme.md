@@ -5,12 +5,11 @@
 
 `demucs-next` is a fork of the [Demucs](https://github.com/adefossez/demucs) reference implementation, updated for modern Python, PyTorch, and TorchCodec. It runs up to 4.6x faster than upstream (15x for single-stem extraction) at equal quality, and is easier to install and run.
 
-## Performance
 
 <details>
 <summary>Benchmarks and SDR comparisons</summary>
 
-50 tracks of [MUSDB18-HQ](https://zenodo.org/records/3338373), `htdemucs`, `shifts=1`, `split_overlap=0.25`. Steady-state mean seconds per track. Reproduce with `python benchmark.py --include-upstream`.
+50 tracks of [MUSDB18-HQ](https://zenodo.org/records/3338373), `htdemucs`, `shifts=1`, `split_overlap=0.25`. Steady-state mean seconds per track. Reproduce with `python benchmark.py --musdb-root /path/to/musdb18hq/test --include-upstream`.
 
 ### `demucs-next`
 
@@ -53,13 +52,15 @@ Before installing Demucs, make sure your system has:
 
 ### Temporary Installation using UV
 
-With UV, you can use the `uvx` command to run Demucs without installing it permanently on your system. This sets up a temporary virtual enviornment for the duration of the command. 
+With UV, you can use the `uvx` command to run Demucs without installing it permanently on your system. This sets up a temporary virtual environment for the duration of the command. 
 
 ```bash
-uvx demucs-next separate audio_file.mp3
+uvx --from demucs-next demucs separate audio_file.mp3
 ```
 
-**Note**: Demucs does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version (currently 12.8) on Linux when using uvx. Demucs will fall back to CPU if one of the above conditions are not met.
+The PyPI package is named `demucs-next`, but the installed CLI command is `demucs`, so `uvx` needs `--from demucs-next` to map the two.
+
+**Note**: Demucs does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version (currently 12.8) on Linux when using uvx. Demucs will fall back to CPU if one of the above conditions are not met. (This uvx default is independent of the Cog/Replicate build, which pins CUDA 12.4 in `cog.yaml`.)
 
 ### Install using UV
 
@@ -101,16 +102,16 @@ demucs separate /path/to/music/folder
 
 ## Python API Usage
 
-Demucs provides a Python API for separating audio files. Please refer to the [API docs](docs/api.md) for more information.
+Demucs provides a Python API for separating audio files. Please refer to the [API docs](api.md) for more information.
+
+## ONNX & Browser Usage
+
+Demucs can also run in the browser via ONNX. See the [ONNX export notes](onnx.md) and the [`demucs-next` npm package docs](web/demucs/README.md) for details.
 
 ## Cog Usage
 
 Demucs provides a [Cog](https://github.com/replicate/cog), which allows you to easily deploy a Demucs model as a REST API. You can alternatively use the hosted version at [Replicate](https://replicate.com/ryan5453/demucs).
 
-## API Usage
-
-Demucs provides a Python API for separating audio files. Please refer to the [API docs](docs/api.md) for more information.
-
 ## Changelog
 
-The [changelog](docs/changelog.md) contains information about the changes between versions of demucs-next.
+The [changelog](changelog.md) contains information about the changes between versions of demucs-next.

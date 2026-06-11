@@ -6,6 +6,7 @@
 
 
 import json
+import pickle
 import shutil
 import tempfile
 from hashlib import sha256
@@ -213,6 +214,7 @@ class ModelRepository:
                 buffer.seek(0)
 
                 # Try to load as a PyTorch model directly from memory
+                tmp_path: Path | None = None
                 try:
                     # Notify callback about loading phase
                     if progress_callback:
@@ -236,12 +238,15 @@ class ModelRepository:
                         tmp_path = Path(tmp_file.name)
                         tmp_file.write(buffer.getvalue())
 
-                    # Load the model to verify it's valid
-                    model_data = torch.load(
-                        tmp_path, map_location="cpu", weights_only=False
-                    )
-
-                    # Notify callback about verification phase
+                    # Verify integrity BEFORE unpickling. ``load_model`` /
+                    # ``torch.load`` use ``weights_only=False`` because the
+                    # checkpoint format pickles the model class and its init
+                    # args (``weights_only=True`` refuses to reconstruct those),
+                    # which means loading can execute arbitrary code. The
+                    # SHA-256 from the shipped metadata is the only integrity
+                    # gate we have, so it must pass before the bytes reach the
+                    # unpickler — not after, as it used to. The cache-load paths
+                    # in ``get_model`` already check_checksum before torch.load.
                     if progress_callback:
                         progress_callback(
                             "layer_progress",
@@ -255,17 +260,14 @@ class ModelRepository:
                                 "phase": "verifying",
                             },
                         )
+                    check_checksum(tmp_path, expected_checksum)
 
-                    # If successful, save to cache
+                    # Bytes are verified — now load and move into the cache.
+                    model_data = torch.load(
+                        tmp_path, map_location="cpu", weights_only=False
+                    )
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(tmp_path), str(cache_path))
-
-                    # Verify checksum
-                    try:
-                        check_checksum(cache_path, expected_checksum)
-                    except ModelLoadingError:
-                        cache_path.unlink()
-                        raise
 
                     # Notify callback about layer completion
                     if progress_callback:
@@ -281,8 +283,10 @@ class ModelRepository:
                     return load_model(model_data)
 
                 except Exception as e:
-                    # Clean up temp file
-                    if tmp_path.exists():
+                    # Clean up temp file. ``tmp_path`` may still be None if the
+                    # failure happened in the loading-phase callback above,
+                    # before the temp file was created.
+                    if tmp_path is not None and tmp_path.exists():
                         tmp_path.unlink()
                     raise ModelLoadingError(f"Failed to load model: {str(e)}")
 
@@ -349,7 +353,13 @@ class ModelRepository:
                             first_cache_path, map_location="cpu", weights_only=False
                         )
                     )
-                except (ModelLoadingError, Exception):
+                except (
+                    ModelLoadingError,
+                    RuntimeError,
+                    EOFError,
+                    pickle.UnpicklingError,
+                ):
+                    # The cached file is corrupt/unreadable: discard and redownload.
                     if first_cache_path.exists():
                         first_cache_path.unlink()
                     url = self._layer_urls[first_checksum]
@@ -444,8 +454,13 @@ class ModelRepository:
                             },
                         )
                     continue
-                except (ModelLoadingError, Exception):
-                    # If validation or loading fails, delete and redownload
+                except (
+                    ModelLoadingError,
+                    RuntimeError,
+                    EOFError,
+                    pickle.UnpicklingError,
+                ):
+                    # The cached file is corrupt/unreadable: discard and redownload.
                     if cache_path.exists():
                         cache_path.unlink()
 

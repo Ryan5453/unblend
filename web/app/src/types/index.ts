@@ -7,12 +7,4 @@ export interface DemucsState {
     separating: boolean;
     progress: number;
     status: string;
-
-    logs: LogEntry[];
-}
-
-export interface LogEntry {
-    timestamp: Date;
-    message: string;
-    type: 'info' | 'success' | 'error';
 }

@@ -1,8 +1,15 @@
 {
-  "name": "demucs-web-workspace",
+  "name": "demucs-next-workspace",
   "private": true,
+  "license": "MIT",
   "workspaces": [
     "demucs",
     "app"
-  ]
+  ],
+  "scripts": {
+    "build:lib": "npm run build -w demucs-next",
+    "build:app": "npm run build -w demucs-app",
+    "build": "npm run build:lib && npm run build:app",
+    "dev": "npm run build:lib && npm run dev -w demucs-app"
+  }
 }

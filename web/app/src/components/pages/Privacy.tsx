@@ -7,7 +7,7 @@ export function Privacy() {
 
                 <div className="content-body">
                     <p>
-                        <strong>Effective Date:</strong> December 2024
+                        <strong>Effective Date:</strong> June 2026
                     </p>
 
                     <h2>Data Collection</h2>

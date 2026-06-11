@@ -17,7 +17,7 @@ import {
     SAMPLE_RATE,
     type ModelType,
     type ModelPrecision,
-} from 'demucs-web';
+} from 'demucs-next';
 import { computeSDRAsync, meanFiniteSDR, type StemSDR } from '../../utils/sdr';
 import { ORT_WASM_PATHS } from '../../onnx-config';
 
@@ -189,13 +189,6 @@ export function Benchmark() {
         setPhase('loading_model');
         log(`Loading model ${model} (${backend}, ${precision})…`);
 
-        if (backend === 'webgpu') {
-            const ok = 'gpu' in navigator && (await navigator.gpu.requestAdapter()) !== null;
-            if (!ok) {
-                log('WebGPU unavailable — falling back to wasm');
-            }
-        }
-
         let separator: Separator;
         try {
             separator = await Separator.load(model, {
@@ -207,6 +200,9 @@ export function Benchmark() {
             setError(`Model failed to load: ${(err as Error).message}`);
             setPhase('error');
             return;
+        }
+        if (backend === 'webgpu' && separator.backend === 'wasm') {
+            log('WebGPU unavailable — fell back to wasm');
         }
         log(`Loaded ${separator.backend} (${separator.sources.join(', ')})`);
 

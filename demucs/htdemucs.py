@@ -11,7 +11,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .blocks import HDecLayer, HEncLayer, MultiWrap, ScaledEmbedding, ispectro, pad1d, rescale_module, spectro
+from .blocks import (
+    HDecLayer,
+    HEncLayer,
+    MultiWrap,
+    ScaledEmbedding,
+    ispectro,
+    pad1d,
+    rescale_module,
+    spectro,
+)
 from .states import capture_init
 from .transformer import CrossTransformerEncoder
 
@@ -359,7 +368,6 @@ class HTDemucs(nn.Module):
         """
         hl = self.hop_length
         nfft = self.nfft
-        x0 = x  # noqa
 
         # We re-pad the signal in order to keep the property
         # that the size of the output is exactly the size of the input
@@ -378,16 +386,15 @@ class HTDemucs(nn.Module):
         z = z[..., 2 : 2 + le]
         return z
 
-    def _ispec(self, z: torch.Tensor, length: int | None = None, scale: int = 0) -> torch.Tensor:
+    def _ispec(self, z: torch.Tensor, length: int) -> torch.Tensor:
         """
         Inverse STFT to reconstruct waveform from spectrogram.
 
         :param z: Complex spectrogram tensor
         :param length: Desired output length in samples
-        :param scale: Scale factor for hop length adjustment
         :return: Reconstructed waveform tensor
         """
-        hl = self.hop_length // (4**scale)
+        hl = self.hop_length
         z = F.pad(z, (0, 0, 0, 1))
         z = F.pad(z, (2, 2))
         pad = hl // 2 * 3

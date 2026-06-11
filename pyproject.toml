@@ -1,16 +1,16 @@
 [project]
 name = "demucs-next"
-version = "1.0.0.dev0"
+version = "1.0.0"
 description = "Audio source separation for music."
 readme = "readme.md"
 authors = [
     {name = "Alexandre Défossez", email = "defossez@fb.com"},
     {name = "Ryan Fahey", email = "git@ryan.science"}
 ]
-license = {text = "MIT License"}
-requires-python = ">=3.10, <=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10,<3.14"
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -26,10 +26,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "ruff",
+  "pytest",
 ]
 onnx = [
   "onnx>=1.14.0",
-  "onnxconverter-common>=1.14.0",
 ]
 
 [build-system]
@@ -42,6 +42,12 @@ module-root = ""
 
 source-include = ["demucs/metal/*.metal"]
 wheel-include = ["demucs/metal/*.metal"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: downloads models / runs real inference (deselect with '-m \"not slow\"')",
+]
 
 [tool.ruff.lint]
 extend-select = ["I"]

@@ -17,6 +17,10 @@ import {
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { toBlobURL } from '@ffmpeg/util';
 
+// Set to true to enable verbose decode logging during development.
+const DEBUG = false;
+const debug = (...args: unknown[]) => { if (DEBUG) console.log(...args); };
+
 // Lazy-loaded ffmpeg instance
 let ffmpegInstance: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
@@ -41,30 +45,30 @@ export interface DecodeResult {
  */
 async function loadFFmpeg(): Promise<FFmpeg> {
     if (ffmpegInstance?.loaded) {
-        console.log('ffmpeg.wasm already loaded');
+        debug('ffmpeg.wasm already loaded');
         return ffmpegInstance;
     }
 
     if (ffmpegLoadPromise) {
-        console.log('ffmpeg.wasm load already in progress...');
+        debug('ffmpeg.wasm load already in progress...');
         return ffmpegLoadPromise;
     }
 
     ffmpegLoadPromise = (async () => {
         try {
-            console.log('Initializing ffmpeg.wasm...');
+            debug('Initializing ffmpeg.wasm...');
             const ffmpeg = new FFmpeg();
 
             // Add logging for progress
             ffmpeg.on('log', ({ message }) => {
-                console.log('[ffmpeg]', message);
+                debug('[ffmpeg]', message);
             });
 
             ffmpeg.on('progress', ({ progress, time }) => {
-                console.log(`[ffmpeg] Progress: ${Math.round(progress * 100)}%, Time: ${time}`);
+                debug(`[ffmpeg] Progress: ${Math.round(progress * 100)}%, Time: ${time}`);
             });
 
-            console.log('Downloading ffmpeg-core (~25MB)... This may take a moment.');
+            debug('Downloading ffmpeg-core... This may take a moment.');
 
             // Use toBlobURL to fetch and convert to blob URLs
             // This works around Vite/ESM module loading issues with CDN resources
@@ -82,11 +86,11 @@ async function loadFFmpeg(): Promise<FFmpeg> {
                 'text/javascript'
             );
 
-            console.log('Core files downloaded, initializing...');
+            debug('Core files downloaded, initializing...');
 
             await ffmpeg.load({ coreURL, wasmURL, workerURL });
 
-            console.log('ffmpeg.wasm loaded successfully!');
+            debug('ffmpeg.wasm loaded successfully!');
             ffmpegInstance = ffmpeg;
             return ffmpeg;
         } catch (error) {
@@ -178,11 +182,11 @@ async function extractMetadataWithFFmpeg(
                 
                 if (key?.toLowerCase() === 'title' && value) {
                     title = value;
-                    console.log('Extracted title from ffmpeg:', title);
+                    debug('Extracted title from ffmpeg:', title);
                 }
                 if (key?.toLowerCase() === 'artist' && value) {
                     artist = value;
-                    console.log('Extracted artist from ffmpeg:', artist);
+                    debug('Extracted artist from ffmpeg:', artist);
                 }
             }
 
@@ -205,7 +209,7 @@ async function decodeWithFFmpeg(
     fileName: string,
     targetSampleRate: number
 ): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
-    console.log('Loading ffmpeg.wasm for decoding...');
+    debug('Loading ffmpeg.wasm for decoding...');
     const ffmpeg = await loadFFmpeg();
 
     // Write input file to virtual filesystem
@@ -250,7 +254,8 @@ async function decodeWithFFmpeg(
  */
 async function decodeWithMediabunny(
     arrayBuffer: ArrayBuffer,
-    targetSampleRate: number
+    targetSampleRate: number,
+    audioContext: AudioContext
 ): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
     // Create input from array buffer
     const input = new Input({
@@ -268,19 +273,19 @@ async function decodeWithMediabunny(
             const image = tags.images[0];
             const blob = new Blob([new Uint8Array(image.data)], { type: image.mimeType || 'image/jpeg' });
             artwork = URL.createObjectURL(blob);
-            console.log('Extracted artwork from audio file');
+            debug('Extracted artwork from audio file');
         }
         // Extract title and artist
         if (tags.title) {
             title = tags.title;
-            console.log('Extracted title:', title);
+            debug('Extracted title:', title);
         }
         if (tags.artist) {
             artist = tags.artist;
-            console.log('Extracted artist:', artist);
+            debug('Extracted artist:', artist);
         }
     } catch (e) {
-        console.log('Could not extract metadata tags:', e);
+        debug('Could not extract metadata tags:', e);
     }
 
     // Get audio track
@@ -305,8 +310,9 @@ async function decodeWithMediabunny(
     // Calculate total samples
     const totalSamples = Math.ceil(duration * sampleRate);
 
-    // Create output AudioBuffer
-    const buffer = new AudioContext().createBuffer(
+    // Create output AudioBuffer (reuse the caller's AudioContext to avoid
+    // leaking contexts; browsers cap the number of live AudioContexts).
+    const buffer = audioContext.createBuffer(
         numberOfChannels,
         totalSamples,
         sampleRate
@@ -367,19 +373,19 @@ export async function decodeAudioFile(
 
     // Tier 1: Try Mediabunny first (handles most formats via WebCodecs)
     try {
-        console.log('Attempting to decode with Mediabunny...');
-        const { buffer, artwork, title, artist } = await decodeWithMediabunny(arrayBuffer, audioContext.sampleRate);
-        console.log('Successfully decoded with Mediabunny');
+        debug('Attempting to decode with Mediabunny...');
+        const { buffer, artwork, title, artist } = await decodeWithMediabunny(arrayBuffer, audioContext.sampleRate, audioContext);
+        debug('Successfully decoded with Mediabunny');
         return { buffer, artwork, title, artist, usedFallback: 'mediabunny' };
     } catch (mediabunnyError) {
-        console.log('Mediabunny decode failed, trying ffmpeg.wasm:', mediabunnyError);
+        debug('Mediabunny decode failed, trying ffmpeg.wasm:', mediabunnyError);
     }
 
     // Tier 2: Try ffmpeg.wasm (handles exotic codecs like ALAC, WMA, etc)
     try {
-        console.log('Attempting to decode with ffmpeg.wasm...');
+        debug('Attempting to decode with ffmpeg.wasm...');
         const { buffer, artwork, title, artist } = await decodeWithFFmpeg(arrayBuffer, file.name, audioContext.sampleRate);
-        console.log('Successfully decoded with ffmpeg.wasm');
+        debug('Successfully decoded with ffmpeg.wasm');
         return { buffer, artwork, title, artist, usedFallback: 'ffmpeg' };
     } catch (ffmpegError) {
         console.error('All decode methods failed:', ffmpegError);

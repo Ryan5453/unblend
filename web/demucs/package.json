@@ -1,19 +1,53 @@
 {
-  "name": "demucs-web",
-  "version": "0.1.0",
+  "name": "demucs-next",
+  "version": "1.0.0",
   "description": "Browser-side audio source separation using ONNX Demucs models. Designed to be embedded in a web app.",
   "license": "MIT",
-  "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
-  "exports": {
-    ".": "./src/index.ts"
+  "author": "Ryan Fahey <git@ryan.science>",
+  "homepage": "https://github.com/Ryan5453/demucs-next#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ryan5453/demucs-next.git",
+    "directory": "web/demucs"
   },
-  "files": [
-    "src"
+  "bugs": {
+    "url": "https://github.com/Ryan5453/demucs-next/issues"
+  },
+  "keywords": [
+    "demucs",
+    "audio",
+    "source-separation",
+    "stem-separation",
+    "onnx",
+    "onnxruntime-web",
+    "webgpu",
+    "music",
+    "browser"
   ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build"
+  },
   "dependencies": {
     "fft.js": "^4.0.4",
-    "onnxruntime-web": "^1.24.0-dev.20251116-b39e144322"
+    "onnxruntime-web": "^1.26.0"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.40",
+    "typescript": "~5.9.3"
   }
 }

@@ -15,3 +15,20 @@ __pycache__
 
 # Exclude Python virtual environment
 /venv
+.venv
+
+# Exclude JS / web sources (not part of the Cog build)
+node_modules
+web/
+
+# Exclude tests
+tests/
+
+# Exclude macOS metadata
+.DS_Store
+
+# Exclude benchmark output directories
+benchmarks/
+/musdb_*/
+/upstream_*/
+/dt_*/

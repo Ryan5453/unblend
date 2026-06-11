@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Guard against tagging without bumping versions: the publish jobs skip
+      # already-published versions, so a stale version would otherwise
+      # silently release nothing.
+      - name: Check tag matches package versions
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          py=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          js=$(node -p "require('./web/demucs/package.json').version")
+          test "$py" = "$version" || { echo "pyproject.toml has $py, tag is $version"; exit 1; }
+          test "$js" = "$version" || { echo "web/demucs/package.json has $js, tag is $version"; exit 1; }
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --extra dev
+      - name: Run fast tests
+        run: uv run pytest -m "not slow" -q
+
+  pypi:
+    needs: test
+    runs-on: ubuntu-latest
+    # Trusted publishing (OIDC): register this repo + workflow + environment as
+    # a trusted publisher for demucs-next on pypi.org; no token needed.
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Build distributions
+        run: uv build
+      - name: Verify wheel contents
+        run: |
+          listing=$(unzip -l dist/*.whl)
+          echo "$listing" | grep -q "demucs/metadata.json"
+          echo "$listing" | grep -qi "licenses/LICENSE"
+          for kernel in demucs/metal/*.metal; do
+            echo "$listing" | grep -q "$kernel"
+          done
+      - name: Publish to PyPI
+        # --check-url makes reruns idempotent: files already on PyPI are
+        # skipped instead of erroring.
+        run: uv publish --check-url https://pypi.org/simple/
+
+  npm:
+    needs: test
+    runs-on: ubuntu-latest
+    # Trusted publishing with provenance: configure this repo + workflow +
+    # environment as a trusted publisher for demucs-next on npmjs.com. The
+    # package must already exist there, so the very first publish is manual.
+    environment: release
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # npm >= 11.5 is required for OIDC trusted publishing.
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Publish to npm
+        # Skip if this version is already on the registry (the manual first
+        # publish, or a rerun after a partial failure). npm refuses to publish
+        # over an existing version, so this keeps the job green.
+        run: |
+          version=$(node -p "require('./demucs/package.json').version")
+          if npm view "demucs-next@$version" version >/dev/null 2>&1; then
+            echo "demucs-next@$version already published; skipping."
+          else
+            npm publish -w demucs-next --provenance --access public
+          fi
+
+  github-release:
+    needs: [pypi, npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract changelog section for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            /^## / { found = ($2 == ver); next }
+            found { print }
+          ' changelog.md > release-notes.md
+          test -s release-notes.md || echo "See changelog.md." > release-notes.md
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; skipping."
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+          fi

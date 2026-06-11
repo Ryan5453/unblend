@@ -1,4 +1,4 @@
-import type { ModelType } from './constants';
+import { SAMPLE_RATE, type ModelType } from './constants';
 import { OnnxClient } from './onnx-client';
 import { STFTClient } from './stft-client';
 import { ISTFTClient } from './istft-client';
@@ -36,8 +36,10 @@ export interface LoadModelOptions {
      * fp16 on disk, with a Cast(fp16->fp32) node inserted right after each
      * weight so compute still runs in full fp32 (ORT folds the constant Cast
      * at session-create, no runtime cost). The download is roughly half the
-     * size of the fp32 model with bit-equivalent output. Defaults to
-     * ``'fp32'``.
+     * size of the fp32 model. Output is near-identical to fp32 (the weights
+     * themselves are rounded to fp16, so it is not bit-exact, but compute still
+     * runs in fp32 so the difference is well below the audible floor). Defaults
+     * to ``'fp32'``.
      *
      * Note: this is NOT real fp16 compute. ORT-WASM doesn't accumulate fp16
      * GEMMs in fp32 the way CUDA/MPS do, so a true fp16 graph produced
@@ -104,13 +106,16 @@ export class Separator {
         options: LoadModelOptions = {}
     ): Promise<Separator> {
         const preferredBackend = options.backend ?? 'webgpu';
-        const hasWebGPU = await isWebGPUAvailable();
+        // Only probe WebGPU when it could actually be used; skip the adapter
+        // request entirely if the caller explicitly asked for 'wasm'.
         let backend: 'webgpu' | 'wasm' =
-            preferredBackend === 'webgpu' && hasWebGPU ? 'webgpu' : 'wasm';
+            preferredBackend === 'webgpu' && (await isWebGPUAvailable())
+                ? 'webgpu'
+                : 'wasm';
         const precision: ModelPrecision = options.precision ?? 'fp32';
         const modelUrl = MODEL_URLS[model][precision];
 
-        const onnx = new OnnxClient();
+        let onnx = new OnnxClient();
         const workerOptions = {
             wasmPaths: options.wasmPaths,
             numThreads: options.numThreads,
@@ -120,20 +125,43 @@ export class Separator {
             await onnx.load(modelUrl, backend, workerOptions);
         } catch (err) {
             // WebGPU can be available but fail at session create (driver bugs,
-            // unsupported ops); transparently fall back to WASM.
+            // unsupported ops); transparently fall back to WASM. The WebGPU
+            // worker may be left in an indeterminate state, so tear it down and
+            // retry on a fresh worker rather than reusing it.
             if (backend === 'webgpu') {
+                onnx.terminate();
                 backend = 'wasm';
-                await onnx.load(modelUrl, backend, workerOptions);
+                onnx = new OnnxClient();
+                try {
+                    await onnx.load(modelUrl, backend, workerOptions);
+                } catch (wasmErr) {
+                    onnx.terminate();
+                    throw wasmErr;
+                }
             } else {
                 onnx.terminate();
                 throw err;
             }
         }
 
-        const stft = new STFTClient();
-        const istft = new ISTFTClient();
+        // The STFT/iSTFT clients spin up their own workers in their
+        // constructors, and ``new Worker(...)`` can throw synchronously (e.g.
+        // CSP blocks worker creation). If that happens, the onnx worker is
+        // already loaded — tear it down (and any stft client we did manage to
+        // create) before rethrowing so we don't leak a live worker.
+        let stft: STFTClient | null = null;
+        let istft: ISTFTClient | null = null;
+        try {
+            stft = new STFTClient();
+            istft = new ISTFTClient();
+        } catch (err) {
+            onnx.terminate();
+            stft?.terminate();
+            throw err;
+        }
+        // Both are non-null here: the try block either assigns both or rethrows.
         return new Separator(
-            model, MODEL_SOURCES[model], backend, precision, onnx, stft, istft
+            model, MODEL_SOURCES[model], backend, precision, onnx, stft!, istft!
         );
     }
 
@@ -147,6 +175,18 @@ export class Separator {
     ): Promise<SeparationResult> {
         if (this.disposed) {
             throw new Error('Separator has been unloaded');
+        }
+        // The ONNX graph is traced at 44.1kHz; feeding another rate would
+        // silently produce pitch/tempo-wrong stems rather than erroring.
+        if (audioBuffer.sampleRate !== SAMPLE_RATE) {
+            throw new Error(
+                `Separator expects ${SAMPLE_RATE} Hz audio, got ` +
+                `${audioBuffer.sampleRate} Hz. Resample the AudioBuffer to ` +
+                `${SAMPLE_RATE} Hz before calling separate().`
+            );
+        }
+        if (audioBuffer.length === 0) {
+            throw new Error('audioBuffer is empty (0 samples).');
         }
         return runPipeline(
             { onnx: this.onnx, stft: this.stft, istft: this.istft },
@@ -165,7 +205,12 @@ export class Separator {
         this.disposed = true;
 
         try {
-            await this.onnx.unload();
+            // Bound the graceful release so a wedged worker can't hang unload()
+            // forever; terminate() below frees it either way.
+            await Promise.race([
+                this.onnx.unload(),
+                new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+            ]);
         } catch {
             // Worker may already be in a bad state; terminate regardless.
         }

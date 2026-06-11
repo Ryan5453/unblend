@@ -4,14 +4,20 @@ export class STFTClient {
     private worker: Worker;
     private pendingResolve: ((result: STFTResult) => void) | null = null;
     private pendingReject: ((error: Error) => void) | null = null;
+    private requestCounter = 0;
+    private pendingId = -1;
 
     constructor() {
         this.worker = new Worker(
-            new URL('./workers/stft-worker.ts', import.meta.url),
+            new URL('./workers/stft-worker.js', import.meta.url),
             { type: 'module' }
         );
 
-        this.worker.onmessage = (event: MessageEvent<STFTResult & { type: string }>) => {
+        this.worker.onmessage = (
+            event: MessageEvent<STFTResult & { type: string; requestId: number }>
+        ) => {
+            // Discard late replies from a superseded request (see OnnxClient).
+            if (event.data.requestId !== this.pendingId) return;
             const resolve = this.pendingResolve;
             this.pendingResolve = null;
             this.pendingReject = null;
@@ -22,15 +28,25 @@ export class STFTClient {
             console.error('[stft-worker] error:', error);
             this.failPending(error.message || 'STFT worker failed');
         };
+
+        this.worker.onmessageerror = (event) => {
+            console.error('[stft-worker] message error:', event);
+            this.failPending('STFT worker message deserialization failed');
+        };
     }
 
     process(segmentInterleaved: Float32Array): Promise<STFTResult> {
+        // Single in-flight request by contract (see OnnxClient.send): the
+        // pipeline awaits each result before the next call, so this clears
+        // only a stale pending left by a prior run that aborted mid-pipeline.
         this.failPending('Superseded by a new STFT request');
+        const requestId = ++this.requestCounter;
+        this.pendingId = requestId;
         return new Promise((resolve, reject) => {
             this.pendingResolve = resolve;
             this.pendingReject = reject;
             this.worker.postMessage(
-                { type: 'process', segmentInterleaved },
+                { type: 'process', requestId, segmentInterleaved },
                 [segmentInterleaved.buffer] as unknown as Transferable[]
             );
         });

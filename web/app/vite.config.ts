@@ -31,7 +31,12 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
+    // demucs-next ships tsc-transpiled JS whose workers are referenced with
+    // `new Worker(new URL('./workers/*.js', import.meta.url))`. Excluding it
+    // from esbuild dep pre-bundling lets Vite process those workers on demand
+    // (resolving onnxruntime-web, emitting strippable ort-*.wasm), exactly as
+    // it did when consuming the lib's source.
+    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util', 'demucs-next'],
   },
   worker: {
     format: 'es',

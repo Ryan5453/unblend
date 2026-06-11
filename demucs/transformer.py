@@ -233,12 +233,6 @@ class LayerScale(nn.Module):
 
 
 class MyGroupNorm(nn.GroupNorm):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """
-        GroupNorm variant that handles (B, T, C) input by transposing internally.
-        """
-        super().__init__(*args, **kwargs)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply group normalization on (B, T, C) input.
@@ -308,7 +302,7 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
             )
 
         self.norm_out = None
-        if self.norm_first & norm_out:
+        if self.norm_first and norm_out:
             self.norm_out = MyGroupNorm(num_groups=int(norm_out), num_channels=d_model)
         self.gamma_1 = (
             LayerScale(d_model, init_values, True) if layer_scale else nn.Identity()
@@ -418,7 +412,7 @@ class CrossTransformerEncoderLayer(nn.Module):
             self.norm3 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
 
         self.norm_out = None
-        if self.norm_first & norm_out:
+        if self.norm_first and norm_out:
             self.norm_out = MyGroupNorm(num_groups=int(norm_out), num_channels=d_model)
 
         self.gamma_1 = (
@@ -747,5 +741,11 @@ class CrossTransformerEncoder(nn.Module):
         elif self.emb == "scaled":
             pos = torch.arange(T, device=device)
             pos_emb = self.position_embeddings(pos)[:, None]
+
+        else:
+            raise ValueError(
+                f"Unknown positional embedding type '{self.emb}'. "
+                "Expected one of: 'sin', 'cape', 'scaled'."
+            )
 
         return pos_emb

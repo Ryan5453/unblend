@@ -37,7 +37,7 @@ class SeparatedSources:
         sources: dict[str, Tensor],
         sample_rate: int,
         original: Tensor,
-    ):
+    ) -> None:
         """
         Initialize a SeparatedSources object.
 
@@ -129,6 +129,19 @@ class SeparatedSources:
             return encoded_tensor.numpy().tobytes()
 
 
+def default_device() -> str:
+    """
+    Pick the best available inference device: cuda > mps > cpu.
+
+    :return: Device string suitable for ``Separator(device=...)``.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class Separator:
     """
     Audio source separation using Demucs models.
@@ -177,6 +190,8 @@ class Separator:
         ``htdemucs.py:467`` and the transformer's ``_cached_pos_emb_*``). By
         running one eager pass first we anchor each cached embedding in the
         regular allocator so CUDAGraphs treats it as a stable external input.
+
+        :param model: HTDemucs model whose embedding caches to prefill.
         """
         training_length = int(model.max_allowed_segment * model.samplerate)
         model_dtype = next(model.parameters()).dtype
@@ -238,6 +253,9 @@ class Separator:
 
         Returns ``None`` for non-HTDemucs models / non-CUDA devices, in
         which case the caller should pick a conservative default.
+
+        :return: Peak per-chunk VRAM delta in bytes, or ``None`` for
+            non-HTDemucs models / non-CUDA devices.
         """
         if self.device != "cuda":
             return None
@@ -285,6 +303,8 @@ class Separator:
         Intentionally conservative — the capture-verification loop in
         ``_calibrate_chunk_batch_size`` halves on OOM, so an over-estimate
         only costs a few extra setup attempts; an under-estimate is silent.
+
+        :return: Initial number of chunks to process per batch.
         """
         if self.device == "cpu":
             return 1
@@ -364,6 +384,14 @@ class Separator:
         halve and retry up to ``_CHUNK_BATCH_MAX_ATTEMPTS`` times. Each retry
         tears down the prior attempt's compile state so the released cudagraph
         pool is reclaimable.
+
+        :param initial_guess: Starting chunk_batch_size to verify (the math
+            estimate from ``_initial_chunk_batch_size_estimate``).
+        :param compile_enabled: Whether ``torch.compile`` is active; when
+            ``False`` (or on non-CUDA) the guess is trusted without capture.
+        :return: The verified chunk_batch_size to use.
+        :raises ModelLoadingError: If calibration runs out of halving attempts
+            (or batch size 1 still OOMs) without fitting.
         """
         if self.device != "cuda":
             return initial_guess
@@ -390,7 +418,7 @@ class Separator:
         self._calibration_attempts = tried
         raise ModelLoadingError(
             f"chunk_batch_size calibration exhausted "
-            f"{self._CHUNK_BATCH_MAX_ATTEMPTS} attempts (tried {tried}). "
+            f"{len(tried)} attempts (tried {tried}). "
             f"Last error: {last_error}"
         )
 
@@ -471,27 +499,32 @@ class Separator:
     def __init__(
         self,
         model: str | Model | ModelEnsemble = "htdemucs",
-        device: str = "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu",
+        device: str | None = None,
         only_load: str | None = None,
         dtype: torch.dtype | None = None,
         compile: bool = False,
-    ):
+    ) -> None:
         """
         Initialize a Separator with the specified model and device.
 
         :param model: Model to use for separation (name or model instance)
-        :param device: Device to use for processing (must be "cpu", "cuda", or "mps")
-        :param only_load: If specified, load only the specialized model for this stem
-                         (only applicable to bag-of-models like htdemucs_ft)
+        :param device: Device to use for processing (must be "cpu", "cuda", or "mps").
+                       If ``None`` (the default), auto-selects cuda > mps > cpu based
+                       on availability at construction time.
+        :param only_load: Construction-time optimisation for bag-of-models like
+                         ``htdemucs_ft``: download and load *only* the sub-model
+                         specialised for this stem instead of the full ensemble,
+                         saving download time and memory. The loaded model still
+                         outputs all of its sources (only the named stem is
+                         high quality). This is the startup-time counterpart to
+                         ``separate(..., use_only_stem=...)``, which makes the
+                         same choice per-call on an already-loaded full ensemble.
+                         Ignored for single (non-ensemble) models.
         :param dtype: Set to torch.float16 or torch.bfloat16 for reduced-precision
                      inference on CUDA or MPS. Model weights are cast at init
                      time. CPU is rejected (no faster path in PyTorch). On MPS,
-                     BF16 is supported but ~22% slower than FP16 on PyTorch 2.11
-                     (BF16 native ops are not well-optimised yet); use it when
+                     BF16 is supported but, as of PyTorch 2.11, ~22% slower than
+                     FP16 (BF16 native ops are not well-optimised yet); use it when
                      you want BF16's FP32 exponent range — e.g. to skip the
                      FP16-overflow FP32-fallback cast in MyGroupNorm.
         :param compile: If True, apply ``torch.compile`` for faster inference after an
@@ -500,6 +533,11 @@ class Separator:
         :raises ValidationError: If device is not valid or only_load stem doesn't exist
         :raises ModelLoadingError: If model fails to load
         """
+        # Resolve the device at call time (not import time): auto-select the
+        # best available backend when the caller didn't specify one.
+        if device is None:
+            device = default_device()
+
         # Validate device
         valid_devices = {"cpu", "cuda", "mps"}
         if device not in valid_devices:
@@ -528,9 +566,9 @@ class Separator:
             # model is already a Model instance
             self.model = model
 
-        self.model.eval()
         if self.model is None:
             raise ModelLoadingError("Failed to load model")
+        self.model.eval()
 
         # Validate only_load stem exists in the loaded model
         if only_load and only_load not in self.model.sources:
@@ -579,6 +617,10 @@ class Separator:
         # halving on OOM (see ``_calibrate_chunk_batch_size``); this is what
         # makes the path work on arbitrary GPUs without hardcoded thresholds.
         self._compile_enabled = compile and self.device == "cuda"
+        # Records the chunk_batch_size values tried during calibration. Only the
+        # CUDA+compile path actually iterates; initialise it here so the
+        # attribute always exists (CPU/MPS/compile-disabled return early).
+        self._calibration_attempts: list[int] = []
         initial_cbs = self._initial_chunk_batch_size_estimate()
         self.chunk_batch_size = self._calibrate_chunk_batch_size(
             initial_guess=initial_cbs,
@@ -615,6 +657,13 @@ class Separator:
         Convert various input types (tuple of Tensor and sample rate, path, bytes)
         to a 2D float32 tensor on the configured device, matching the model's
         sample rate and channels when possible.
+
+        :param audio: Audio input as a ``(Tensor, sample_rate)`` tuple, a file
+            path (str/Path), or raw audio bytes.
+        :return: A 2D ``[channels, samples]`` float32 waveform tensor.
+        :raises LoadAudioError: If a path or bytes input cannot be decoded.
+        :raises ValueError: If the input is not a supported type.
+        :raises ValidationError: If the decoded audio is empty (zero samples).
         """
         wav: Tensor
         input_sr: int | None = None
@@ -669,6 +718,9 @@ class Separator:
                 wav, self.sample_rate, self.sample_rate, self.audio_channels
             )
 
+        if wav.shape[-1] == 0:
+            raise ValidationError("Audio input is empty (zero samples).")
+
         return wav
 
     def separate(
@@ -702,11 +754,20 @@ class Separator:
         :param shifts: Number of random shifts for equivariant stabilization (1-20).
         :param split_overlap: Overlap between segments (0.0 to 1.0).
         :param seed: Optional random seed for reproducible shift-based inference.
+            Note: this seeds the process-global ``random`` and ``torch`` RNGs as
+            a side effect, affecting other code in the host process.
         :param progress_callback: Optional callback for progress updates. Only
             applies to single-input mode; the batched path doesn't surface
             per-input progress yet.
-        :param use_only_stem: For ``ModelEnsemble``, only run the sub-model
-            specialised for this stem.
+        :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
+            fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
+            specialised for this stem, skipping the others. The result still
+            contains **all** of the model's sources (only the named stem is high
+            quality) — it does *not* filter the output to one stem; use
+            ``SeparatedSources.isolate_stem`` for that. Must name one of the
+            model's sources (raises ``ValidationError`` otherwise); a valid stem
+            on a model that can't specialise (single model, or no one-hot
+            sub-model) just runs the full model normally.
         :param chunk_batch_size: Chunks processed in parallel. Defaults to
             ``self.chunk_batch_size`` (auto-detected at init from VRAM on CUDA,
             2 on MPS, 1 on CPU).
@@ -742,6 +803,16 @@ class Separator:
         if not isinstance(chunk_batch_size, int) or chunk_batch_size < 1:
             raise ValidationError(
                 f"chunk_batch_size must be a positive integer, got {chunk_batch_size}"
+            )
+
+        # An unknown use_only_stem is a caller mistake (e.g. a typo) — fail
+        # loudly rather than silently running the full model. A *valid* stem on
+        # a model that can't specialise (plain htdemucs, or no one-hot sub-model)
+        # is fine and just runs normally; that's handled in apply_model.
+        if use_only_stem is not None and use_only_stem not in self.model.sources:
+            raise ValidationError(
+                f"use_only_stem '{use_only_stem}' is not a source of this model. "
+                f"Available stems: {', '.join(self.model.sources)}"
             )
 
         if isinstance(audio, list):
@@ -803,7 +874,11 @@ class Separator:
 
     @staticmethod
     def _seed_rngs(seed: int | None) -> None:
-        """Seed the RNGs that drive shift offsets, mirroring both paths."""
+        """
+        Seed the RNGs that drive shift offsets, mirroring both paths.
+
+        :param seed: Random seed to apply, or ``None`` to leave RNGs untouched.
+        """
         if seed is not None:
             random.seed(seed)
             torch.manual_seed(seed)
@@ -823,6 +898,18 @@ class Separator:
     ) -> SeparatedSources:
         """
         Single-input separation. See ``separate`` for parameter semantics.
+
+        :param audio: Single audio input ((Tensor, sample_rate) tuple, path,
+            or bytes).
+        :param shifts: Number of random shifts for equivariant stabilization.
+        :param split_overlap: Overlap between segments (0.0 to 1.0).
+        :param seed: Optional random seed for reproducible shift-based inference.
+        :param progress_callback: Optional callback for progress updates.
+        :param use_only_stem: Optional stem name to run only its specialised
+            sub-model in a ``ModelEnsemble``; the result still contains all
+            sources.
+        :param chunk_batch_size: Number of chunks processed in parallel.
+        :return: A ``SeparatedSources`` for the input.
         """
         wav = self._to_tensor(audio)
         original = wav.clone()
@@ -860,6 +947,19 @@ class Separator:
         """
         Batched separation: pools tail chunks across inputs to keep every
         forward pass full-batch. Returns one ``SeparatedSources`` per input.
+
+        See ``separate`` for parameter semantics.
+
+        :param audios: List of audio inputs ((Tensor, sample_rate) tuples,
+            paths, or bytes).
+        :param shifts: Number of random shifts for equivariant stabilization.
+        :param split_overlap: Overlap between segments (0.0 to 1.0).
+        :param seed: Optional random seed for reproducible shift-based inference.
+        :param use_only_stem: Optional stem name to run only its specialised
+            sub-model in a ``ModelEnsemble``; each result still contains all
+            sources.
+        :param chunk_batch_size: Number of chunks processed in parallel.
+        :return: A ``list[SeparatedSources]`` in the same order as ``audios``.
         """
         wavs = [self._to_tensor(a) for a in audios]
         originals = [w.clone() for w in wavs]

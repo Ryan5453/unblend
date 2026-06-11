@@ -44,9 +44,13 @@ kernel void group_norm_g1_glu(
     device const SCALAR_T* in_b = in_ + b * total_in;
     device SCALAR_T*       out_b = out + b * total_out;
 
+    // Shift by the batch's first element before summing so the one-pass
+    // variance doesn't lose precision to cancellation on large-DC inputs
+    // (see group_norm.metal:group_norm_g1 for the rationale).
+    float K = float(in_b[0]);
     float local_sum = 0.0f, local_sqsum = 0.0f;
     for (uint i = tid; i < total_in; i += tgs) {
-        float v = float(in_b[i]);
+        float v = float(in_b[i]) - K;
         local_sum += v;
         local_sqsum += v * v;
     }
@@ -64,10 +68,9 @@ kernel void group_norm_g1_glu(
     threadgroup float bcast_mean, bcast_scale;
     if (tid == 0) {
         float invN = 1.0f / float(total_in);
-        float mean = shared_sum[0] * invN;
-        float meanSq = shared_sqsum[0] * invN;
-        float var = max(meanSq - mean * mean, 0.0f);
-        bcast_mean = mean;
+        float mean_d = shared_sum[0] * invN;
+        float var = max(shared_sqsum[0] * invN - mean_d * mean_d, 0.0f);
+        bcast_mean = K + mean_d;
         bcast_scale = rsqrt(var + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

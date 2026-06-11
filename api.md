@@ -9,7 +9,7 @@ The `Separator` class is a high level representation of a Demucs audio source se
 ```python
 separator = Separator(
     model: str | Model | ModelEnsemble = "htdemucs",
-    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
+    device: str | None = None,
     only_load: str | None = None,
     dtype: torch.dtype | None = None,
     compile: bool = False,
@@ -19,9 +19,9 @@ separator = Separator(
 A `Separator` takes the following parameters:
 
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
-- `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
-- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
-- `dtype` - Optional, set to `torch.float16` or `torch.bfloat16` for reduced-precision inference. Supported on CUDA and MPS (CPU is rejected). On CUDA, BF16 runs natively on tensor cores at the same throughput as FP16 with FP32 exponent range — generally the fastest option. On MPS, FP16 is the recommended path (custom Metal kernels in `demucs.metal`); BF16 is supported but ~28 % slower than FP16 on PyTorch 2.11. If `None`, uses default float32.
+- `device` - The device/backend to use for loading and running the model. If left as `None` (the default), Demucs auto-selects the best available backend at construction time (cuda > mps > cpu). Pass `"cpu"`, `"cuda"`, or `"mps"` to force one.
+- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft). This is a **performance optimization** (smaller download and memory footprint) — it does **not** filter the output to one stem; the result still contains all of the model's sources, with only the named stem at full quality. Use `SeparatedSources.isolate_stem` to actually isolate a stem.
+- `dtype` - Optional, set to `torch.float16` or `torch.bfloat16` for reduced-precision inference. Supported on CUDA and MPS (CPU is rejected). On CUDA, BF16 runs natively on tensor cores at the same throughput as FP16 with FP32 exponent range — generally the fastest option. On MPS, FP16 is the recommended path (custom Metal kernels in `demucs.metal`); BF16 is supported but, as of PyTorch 2.11, ~22 % slower than FP16 (its native ops aren't well-optimized on MPS yet). If `None`, uses default float32.
 - `compile` - Optional, if `True`, applies `torch.compile` (CUDAGraphs / Inductor) to the HTDemucs neural network core. Significantly improves steady-state throughput on CUDA at the cost of a heavy first-call compile (~7–55 s depending on dtype). Silently ignored on MPS and CPU (`torch.compile` on MPS hits dynamo recompile limits on the Metal kernels' varying channel counts).
 
 ### Attributes
@@ -40,6 +40,8 @@ If you enable `compile=True`, warmup happens automatically at the end of `__init
 ```python
 separator.warmup()  # no args — there's exactly one batch shape after tail-padding
 ```
+
+`warmup()` is CUDA-only: it raises `ValidationError` on CPU/MPS, and on non-HTDemucs models.
 
 Once you have a `Separator` instance, you can use the `separate` method to separate one audio input — or a list of inputs — into its constituent stems.
 
@@ -63,7 +65,7 @@ When separating audio, you have the ability to specify the following parameters:
 - `split_overlap` - The overlap between consecutive segments. Must be in the range `[0.0, 1.0)`. Higher values smooth segment boundaries at the cost of more compute per track.
 - `seed` - Optional random seed for reproducible shift-based inference. With list input, per-input shift offsets advance from this seed in sequence — outputs are reproducible across runs at the same seed, but a list call with `seed=N` does NOT produce bit-identical outputs to N separate single-file calls with `seed=N`.
 - `progress_callback` - A callback function to receive progress updates. Only supported on single-input calls; passing it alongside a `list` input raises `ValidationError`. View the [Progress Callbacks](#progress-callbacks) section for more information.
-- `use_only_stem` - If specified, perform the separation using only the specialized model for this stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
+- `use_only_stem` - If specified, perform the separation using only the specialized model for this stem (a `ModelEnsemble` of fine-tuned specialists like `htdemucs_ft`). Like `only_load`, this is a **performance optimization** and does **not** filter the output to one stem — the result still contains all of the model's sources, with only the named stem at full quality. Use `SeparatedSources.isolate_stem` to actually isolate a stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
 - `chunk_batch_size` - Override the auto-detected `chunk_batch_size` for this call without persisting it. Pass `None` (default) to use `self.chunk_batch_size`.
 
 The model's training segment length (`max_allowed_segment * samplerate`, e.g. 7.8s for HTDemucs) is used internally for every chunk; it isn't a knob because there's no useful range — shorter chunks get padded back up to that length before inference (so they're strictly slower without quality benefit) and longer chunks would extrapolate the cross-transformer's positional embeddings past their training range (degrading quality).
@@ -136,6 +138,15 @@ If you are attempting to isolate a single stem, pass in the name of the stem to 
 
 This will return a tuple of the model name and the stem to exclusively load from the model. When creating a `Separator` instance, you pass these in as the `model` and `only_load` parameters respectively.
 
+The routing is:
+
+| `isolate_stem` | model | `only_load` |
+|---|---|---|
+| `vocals`, `bass`, `other` | `htdemucs_ft` | the requested stem |
+| `guitar`, `piano` | `htdemucs_6s` | `None` |
+| `drums` | `htdemucs` | `None` |
+| anything else / `None` | `htdemucs` | `None` |
+
 ## ModelRepository
 
 Demucs provides a `ModelRepository` class to more deeply control the model loading process. This is used internally by the `Separator` class but can be used directly to load models manually to then pass to Separator itself.
@@ -155,7 +166,7 @@ This will return a dictionary of information about the cached models.
     "model_name": {
         "layers": {       # A dictionary mapping layer checksums to their cache information
             "checksum": {
-                "path": Path,      # Path to the cached layer file
+                "path": str,       # Path to the cached layer file
                 "size_bytes": int, # Size of the layer in bytes
             }
         },
@@ -190,9 +201,8 @@ This will return a dictionary of all available models.
 ```python
 {
     "model_name": {
-        "description": str, # Description of the model
-        "layers": list,     # List of layer configurations
-        # ... other metadata fields
+        "models": list,  # Layer entries, each {"checksum": str, "remote": str}
+        "weights": list, # Bag-of-models only: per-source mixing weights
     }
 }
 ```
@@ -207,8 +217,12 @@ Pass in the name of the model you would like to remove and it will remove the we
 
 ### get_cache_dir
 
+A module-level function (not a `ModelRepository` method), imported directly:
+
 ```python
-def get_cache_dir(self) -> Path:
+from demucs.repo import get_cache_dir
+
+def get_cache_dir() -> Path:
 ```
 
 This will return the directory where the models are cached. This path is fully resolved.
@@ -273,4 +287,4 @@ You can get the version of the `demucs` package you have installed:
 def get_version() -> str:
 ```
 
-Returns the version string (e.g. `"5.0.0"`).
+Returns the version string (e.g. `"1.0.0"`).

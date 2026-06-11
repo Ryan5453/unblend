@@ -34,15 +34,32 @@ def main() -> None:
         help="Download, list and manage models", no_args_is_help=True,
         rich_markup_mode="rich",
     )
-    models_app.command(name="list")(list_models_command)
-    models_app.command(name="download")(download_models_command)
-    models_app.command(name="remove")(remove_models_command)
+    # Explicit ``help=`` strings keep the reST ``:param`` docstrings (required
+    # by the repo's code-standards test) out of the rendered ``--help`` output;
+    # each option already documents itself via its own ``help=``.
+    models_app.command(name="list", help="List available and downloaded models.")(
+        list_models_command
+    )
+    models_app.command(
+        name="download", help="Download and cache models for offline use."
+    )(download_models_command)
+    models_app.command(name="remove", help="Remove downloaded models from the cache.")(
+        remove_models_command
+    )
 
-    app.command(name="separate")(separate_command)
+    app.command(
+        name="separate", help="Separate audio tracks into their component stems."
+    )(separate_command)
     app.add_typer(models_app, name="models")
-    app.command(name="version")(version_command)
+    app.command(name="version", help="Show the installed version of Demucs.")(
+        version_command
+    )
 
-    app.command(name="export-onnx", hidden=True)(export_onnx_command)
+    app.command(
+        name="export-onnx",
+        hidden=True,
+        help="Export a HTDemucs model to ONNX (internal developer tool).",
+    )(export_onnx_command)
 
     app()
 

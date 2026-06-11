@@ -12,6 +12,7 @@ let session: onnx.InferenceSession | null = null;
 
 interface LoadMessage {
     type: 'load';
+    requestId: number;
     modelUrl: string;
     backend: 'webgpu' | 'wasm';
     wasmPaths?: string;
@@ -20,6 +21,7 @@ interface LoadMessage {
 
 interface RunMessage {
     type: 'run';
+    requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
     audio: Float32Array;
@@ -29,12 +31,14 @@ interface RunMessage {
 
 interface UnloadMessage {
     type: 'unload';
+    requestId: number;
 }
 
 type Message = LoadMessage | RunMessage | UnloadMessage;
 
 interface LoadResponse {
     type: 'load';
+    requestId: number;
     success: boolean;
     backend?: 'webgpu' | 'wasm';
     error?: string;
@@ -42,6 +46,7 @@ interface LoadResponse {
 
 interface RunResponse {
     type: 'run';
+    requestId: number;
     success: boolean;
     outSpecReal?: Float32Array;
     outSpecImag?: Float32Array;
@@ -53,6 +58,7 @@ interface RunResponse {
 
 interface UnloadResponse {
     type: 'unload';
+    requestId: number;
     success: boolean;
 }
 
@@ -67,7 +73,12 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             if (msg.wasmPaths !== undefined) {
                 onnx.env.wasm.wasmPaths = msg.wasmPaths;
             }
-            onnx.env.wasm.numThreads = msg.numThreads ?? 4;
+            // numThreads only affects the WASM backend. Setting >1 on a page
+            // that isn't cross-origin isolated can fail/warn at session create,
+            // so only apply it when WASM is actually the execution provider.
+            if (msg.backend === 'wasm') {
+                onnx.env.wasm.numThreads = msg.numThreads ?? 4;
+            }
             onnx.env.logLevel = 'warning';
 
             session = await onnx.InferenceSession.create(msg.modelUrl, {
@@ -77,6 +88,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
 
             const response: LoadResponse = {
                 type: 'load',
+                requestId: msg.requestId,
                 success: true,
                 backend: msg.backend,
             };
@@ -85,6 +97,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             console.error('[onnx-worker] load failed:', error);
             const response: LoadResponse = {
                 type: 'load',
+                requestId: msg.requestId,
                 success: false,
                 error: (error as Error).message,
             };
@@ -97,6 +110,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
         if (!session) {
             const response: RunResponse = {
                 type: 'run',
+                requestId: msg.requestId,
                 success: false,
                 error: 'No session loaded',
             };
@@ -119,25 +133,65 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             const outSpecImag = results.out_spec_imag;
             const outWave = results.out_wave;
 
-            const response: RunResponse = {
-                type: 'run',
-                success: true,
-                outSpecReal: outSpecReal.data as Float32Array,
-                outSpecImag: outSpecImag.data as Float32Array,
-                outWave: outWave.data as Float32Array,
-                outSpecShape: outSpecReal.dims as number[],
-                outWaveShape: outWave.dims as number[],
-            };
+            // The model's IO is float32 by design (Cast nodes bracket fp16
+            // graphs). The .data casts below are unchecked, so a model whose
+            // outputs are some other dtype would be silently mis-wrapped as
+            // Float32Array. Verify the dtype up front so a mismatched model
+            // fails loudly instead.
+            for (const [name, tensor] of [
+                ['out_spec_real', outSpecReal],
+                ['out_spec_imag', outSpecImag],
+                ['out_wave', outWave],
+            ] as const) {
+                if (tensor.type !== 'float32') {
+                    throw new Error(
+                        `Expected output '${name}' to be float32, got '${tensor.type}'`
+                    );
+                }
+            }
+
+            // Copy each output's bytes into fresh buffers so we no longer
+            // depend on dispose() running after postMessage. Dispose the
+            // tensors right away to free their backing buffers (WASM heap /
+            // GPU) — otherwise they'd only be reclaimed by GC finalizers and
+            // accumulate across every segment of every track.
+            const outSpecRealData = new Float32Array(outSpecReal.data as Float32Array);
+            const outSpecImagData = new Float32Array(outSpecImag.data as Float32Array);
+            const outWaveData = new Float32Array(outWave.data as Float32Array);
+            const outSpecShape = outSpecReal.dims as number[];
+            const outWaveShape = outWave.dims as number[];
 
             specReal.dispose();
             specImag.dispose();
             audio.dispose();
+            outSpecReal.dispose();
+            outSpecImag.dispose();
+            outWave.dispose();
 
-            self.postMessage(response);
+            const response: RunResponse = {
+                type: 'run',
+                requestId: msg.requestId,
+                success: true,
+                outSpecReal: outSpecRealData,
+                outSpecImag: outSpecImagData,
+                outWave: outWaveData,
+                outSpecShape,
+                outWaveShape,
+            };
+
+            // Transfer the fresh buffers — they're owned by this scope and no
+            // longer needed here, so handing ownership to the client avoids a
+            // structured-clone copy.
+            self.postMessage(response, [
+                outSpecRealData.buffer,
+                outSpecImagData.buffer,
+                outWaveData.buffer,
+            ]);
         } catch (error) {
             console.error('[onnx-worker] run failed:', error);
             const response: RunResponse = {
                 type: 'run',
+                requestId: msg.requestId,
                 success: false,
                 error: (error as Error).message,
             };
@@ -147,12 +201,23 @@ self.onmessage = async (event: MessageEvent<Message>) => {
     }
 
     if (msg.type === 'unload') {
-        if (session) {
-            await session.release();
+        // Always post the response, even if release() throws — otherwise the
+        // client's unload() promise never settles and the caller hangs.
+        try {
+            if (session) {
+                await session.release();
+            }
+        } catch (error) {
+            console.error('[onnx-worker] release failed:', error);
+        } finally {
             session = null;
+            const response: UnloadResponse = {
+                type: 'unload',
+                requestId: msg.requestId,
+                success: true,
+            };
+            self.postMessage(response);
         }
-        const response: UnloadResponse = { type: 'unload', success: true };
-        self.postMessage(response);
         return;
     }
 };

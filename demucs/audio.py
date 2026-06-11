@@ -32,7 +32,10 @@ def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
         # Case 2:
         # The caller asked for multiple channels, but the input file have
         # one single channel, replicate the audio over all channels.
-        wav = wav.expand(*shape, channels, length)
+        # ``.contiguous()`` materialises the broadcast: ``expand`` returns a
+        # stride-0 view, which breaks downstream ops that require a contiguous
+        # last dim (e.g. ``unfold``/``as_strided`` in the time-branch BLSTM).
+        wav = wav.expand(*shape, channels, length).contiguous()
     elif src_channels >= channels:
         # Case 3:
         # The caller asked for multiple channels, and the input file have
@@ -57,6 +60,8 @@ def convert_audio(wav: Tensor, from_samplerate: int, to_samplerate: int, channel
     :return: Converted audio tensor
     """
     wav = convert_audio_channels(wav, channels)
+    if from_samplerate == to_samplerate:
+        return wav
     return torchaudio.functional.resample(wav, from_samplerate, to_samplerate)
 
 
@@ -70,7 +75,7 @@ def prevent_clip(audio: Tensor, mode: str | None = "rescale") -> Tensor:
     :raises ValidationError: If the clipping mode is invalid
     """
     if mode == "rescale":
-        return audio / max(1.01 * audio.abs().max(), 1)
+        return audio / (1.01 * audio.abs().max()).clamp(min=1.0)
     elif mode == "clamp":
         return audio.clamp(-0.99, 0.99)
     elif mode == "tanh":

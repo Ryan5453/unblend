@@ -5,11 +5,18 @@ This is how [demucs.app](https://demucs.app) runs Demucs in-browser.
 
 ## Export
 
-You can use the CLI to export a Demucs model to the ONNX format:
+ONNX export is an internal developer tool, exposed as a hidden CLI command (it won't show in `demucs --help`):
 
 ```bash
-demucs onnx --model htdemucs --output htdemucs.onnx
+# FP32 (default). Output defaults to {model}_fp32.onnx
+demucs export-onnx --model htdemucs
+
+# Weight-only FP16 — roughly halves file size; weights are rounded to fp16
+# but compute and IO stay fp32, so output is near-identical (not bit-exact)
+demucs export-onnx --model htdemucs --fp16 --output htdemucs_fp16.onnx
 ```
+
+Flags: `-m/--model` (default `htdemucs`), `-o/--output`, `--opset` (default `17`), `--fp16`.
 
 ## Model Interface
 
@@ -29,24 +36,40 @@ Where `S` = number of sources (4 for htdemucs, 6 for htdemucs_6s).
 
 The ONNX model contains only the core neural network - STFT and iSTFT are not included. You'll need to implement these yourself or use an existing FFT library.
 
+The graph is traced at the model's training length, so feed exactly that many samples per call: `max_allowed_segment * sample_rate` = **343980 samples (~7.8s @ 44.1kHz)** for HTDemucs. (Only the batch axis is declared dynamic; the time/sample axes are fixed at the training length, since the cross-transformer's positional embeddings are only valid there — shorter or longer segments would degrade quality.)
+
+The STFT/iSTFT parameters are fixed and must match exactly:
+
+| Parameter | Value |
+|---|---|
+| `n_fft` | 4096 |
+| `hop_length` | 1024 |
+| `win_length` | 4096 |
+| `window` | Hann, length 4096 |
+| `normalized` | `True` |
+| `center` | `True` |
+| `pad_mode` | `"reflect"` |
+
+> **Normalization caveat:** Demucs scales the iSTFT output by an extra `n_fft ** 0.5`. PyTorch's `torch.istft(normalized=True)` already folds this in, but if you reimplement the iSTFT with a raw FFT library (common in JS/WASM), apply the `sqrt(n_fft)` factor yourself or the output level will be wrong.
+
 ### 1. Preprocessing (STFT)
 
 ```python
-# Constants
 NFFT = 4096
 HOP = 1024
-SEGMENT = 441000  # 10 seconds at 44.1kHz
+SEGMENT = 343980  # max_allowed_segment * sample_rate (~7.8s @ 44.1kHz)
 
 # Pad audio to segment length
 audio = pad(audio, SEGMENT)
 
 # Demucs padding
 le = ceil(samples / HOP)
-pad_amount = HOP // 2 * 3  # 384
+pad_amount = HOP // 2 * 3  # 1536
 audio_padded = reflect_pad(audio, (pad_amount, pad_amount + le * HOP - samples))
 
-# STFT
-z = stft(audio_padded, n_fft=4096, hop_length=1024, window=hann, normalized=True, center=True)
+# STFT (params per the table above)
+z = stft(audio_padded, n_fft=NFFT, hop_length=HOP, win_length=NFFT,
+         window=hann, normalized=True, center=True)
 
 # Trim
 z = z[..., :-1, :]      # Remove last freq bin: 2049 -> 2048
@@ -72,8 +95,9 @@ for each source:
     z = out_real[s] + 1j * out_imag[s]
     z = pad(z, freq=(0, 1), time=(2, 2))  # Reverse the trimming
     
-    # iSTFT
-    freq_audio = istft(z, hop_length=1024, window=hann, normalized=True, length=target_len)
+    # iSTFT (same params as the forward STFT; see the normalization caveat above)
+    freq_audio = istft(z, n_fft=NFFT, hop_length=HOP, win_length=NFFT,
+                       window=hann, normalized=True, center=True, length=target_len)
     
     # Trim Demucs padding
     freq_audio = freq_audio[..., pad_amount:pad_amount+samples]

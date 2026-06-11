@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import warnings
+from importlib.metadata import PackageNotFoundError, version
 
 # Suppress PyTorch internal resize warnings from STFT/iSTFT
 # These are benign and originate from PyTorch issue #134323
@@ -14,13 +15,24 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-__version__ = "1.0.0.dev0"
+try:
+    __version__ = version("demucs-next")
+except PackageNotFoundError:
+    # Running from a source tree without an installed distribution.
+    __version__ = "0.0.0+unknown"
 
 from .api import (
     SeparatedSources,
     Separator,
     get_version,
     select_model,
+)
+from .apply import Model, ModelEnsemble
+from .exceptions import (
+    DemucsError,
+    LoadAudioError,
+    ModelLoadingError,
+    ValidationError,
 )
 from .repo import ModelRepository
 
@@ -29,6 +41,12 @@ __all__ = [
     "Separator",
     "SeparatedSources",
     "ModelRepository",
+    "Model",
+    "ModelEnsemble",
     "get_version",
     "select_model",
+    "DemucsError",
+    "LoadAudioError",
+    "ModelLoadingError",
+    "ValidationError",
 ]

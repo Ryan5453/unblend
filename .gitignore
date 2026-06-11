@@ -1,10 +1,13 @@
 TODO.md
 .cog/
-node_modules
-DS_Store
 .upstream-venv/
 benchmarks/
 .claude
+
+# Benchmark output directories (also produced at repo root by --output-dir)
+/musdb_*/
+/upstream_*/
+/dt_*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

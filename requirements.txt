@@ -1,5 +1,6 @@
-# This is only used for the Cog build
-# It is identical to the pyproject.toml dependencies which is used for the PyPI package
+# This is only used for the Cog build.
+# It is a manually-maintained mirror of the [project].dependencies in pyproject.toml
+# (used for the PyPI package). Keep the two in sync by hand; they can drift.
 
 numpy>=2.0.0
 torch>=2.9.0

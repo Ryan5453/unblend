@@ -3,7 +3,7 @@
  * source list it needs, no module-level state.
  */
 
-import { SEGMENT_SAMPLES, SEGMENT_OVERLAP } from './constants';
+import { SEGMENT_SAMPLES, SEGMENT_OVERLAP, createSplitWeight } from './constants';
 import type { OnnxClient } from './onnx-client';
 import type { STFTClient } from './stft-client';
 import { type ISTFTClient, type ISTFTResult } from './istft-client';
@@ -23,7 +23,7 @@ export interface SeparationOptions {
 }
 
 export interface SeparationResult {
-    /** stem name → planar interleaved Float32Array of length ``numSamples * 2``. */
+    /** stem name → interleaved stereo Float32Array (L,R,L,R…) of length ``numSamples * 2``. */
     stems: Record<string, Float32Array>;
     /** Total wall time including STFT/iSTFT orchestration. */
     wallMs: number;
@@ -52,6 +52,9 @@ export async function runPipeline(
 
     const audio = new Float32Array(numSamples * numChannels);
     const left = audioBuffer.getChannelData(0);
+    // Mono is duplicated to both channels; for >2 channels we take the first
+    // two. This matches the Python pipeline's convert_audio_channels, which
+    // returns wav[:channels] when the source has more channels than the model.
     const right = audioBuffer.numberOfChannels > 1
         ? audioBuffer.getChannelData(1)
         : left;
@@ -60,20 +63,27 @@ export async function runPipeline(
         audio[i * 2 + 1] = right[i];
     }
 
-    const OVERLAP = Math.floor(SEGMENT_SAMPLES * SEGMENT_OVERLAP);
-    const STEP = SEGMENT_SAMPLES - OVERLAP;
-    const numSegments = Math.ceil((numSamples - OVERLAP) / STEP);
+    // Mirror the Python chunking exactly (demucs/apply.py): segments start at
+    // every multiple of the stride, the window for a short final chunk is
+    // centered on it (real left context, zeros past the end), and chunks are
+    // blended with the triangular weight normalized by the per-sample weight
+    // sum.
+    const STEP = Math.floor(SEGMENT_SAMPLES * (1 - SEGMENT_OVERLAP));
+    const numSegments = Math.ceil(numSamples / STEP);
 
     const outputs: Record<string, Float32Array> = {};
     for (const source of sources) {
         outputs[source] = new Float32Array(numSamples * numChannels);
     }
 
-    const fadeIn = new Float32Array(OVERLAP);
-    const fadeOut = new Float32Array(OVERLAP);
-    for (let i = 0; i < OVERLAP; i++) {
-        fadeIn[i] = i / OVERLAP;
-        fadeOut[i] = 1 - i / OVERLAP;
+    const weight = createSplitWeight();
+    const sumWeight = new Float32Array(numSamples);
+
+    function segmentWindow(seg: number) {
+        const segStart = seg * STEP;
+        const segLength = Math.min(SEGMENT_SAMPLES, numSamples - segStart);
+        const trimOffset = (SEGMENT_SAMPLES - segLength) >> 1;
+        return { segStart, segLength, trimOffset, windowStart: segStart - trimOffset };
     }
 
     // Double-buffer so we can prepare the next segment while inference reads the current one.
@@ -88,29 +98,38 @@ export async function runPipeline(
         for (let s = 0; s < sources.length; s++) {
             const chunk = chunks[s];
             for (let i = 0; i < segLength; i++) {
-                const globalIdx = segStart + i;
-                if (globalIdx >= numSamples) continue;
-                const outIdx = globalIdx * numChannels;
+                const outIdx = (segStart + i) * numChannels;
                 outputs[sources[s]][outIdx] += chunk[i * numChannels];
                 outputs[sources[s]][outIdx + 1] += chunk[i * numChannels + 1];
             }
         }
+        // Chunks arrive pre-weighted from the iSTFT worker; track the matching
+        // weight sum so the final normalization divides it back out.
+        for (let i = 0; i < segLength; i++) {
+            sumWeight[segStart + i] += weight[i];
+        }
     }
 
-    function prepareInterleaved(segStart: number, segLength: number): Float32Array {
+    // ``windowStart`` may be negative (track shorter than one segment) or run
+    // past the end of the audio; out-of-range samples stay zero.
+    function prepareInterleaved(windowStart: number): Float32Array {
         const interleaved = new Float32Array(SEGMENT_SAMPLES * numChannels);
-        for (let i = 0; i < segLength; i++) {
-            const srcIdx = (segStart + i) * numChannels;
+        const from = Math.max(0, -windowStart);
+        const to = Math.min(SEGMENT_SAMPLES, numSamples - windowStart);
+        for (let i = from; i < to; i++) {
+            const srcIdx = (windowStart + i) * numChannels;
             interleaved[i * 2] = audio[srcIdx];
             interleaved[i * 2 + 1] = audio[srcIdx + 1];
         }
         return interleaved;
     }
 
-    function preparePlanar(buffer: Float32Array, segStart: number, segLength: number): Float32Array {
+    function preparePlanar(buffer: Float32Array, windowStart: number): Float32Array {
         buffer.fill(0);
-        for (let i = 0; i < segLength; i++) {
-            const srcIdx = (segStart + i) * numChannels;
+        const from = Math.max(0, -windowStart);
+        const to = Math.min(SEGMENT_SAMPLES, numSamples - windowStart);
+        for (let i = from; i < to; i++) {
+            const srcIdx = (windowStart + i) * numChannels;
             buffer[i] = audio[srcIdx];
             buffer[SEGMENT_SAMPLES + i] = audio[srcIdx + 1];
         }
@@ -122,16 +141,14 @@ export async function runPipeline(
 
     // ``.catch(() => {})`` silences unhandled-rejection warnings when an
     // exception aborts the loop before we await these promises.
-    const seg0End = Math.min(SEGMENT_SAMPLES, numSamples);
-    let pendingStft = stft.process(prepareInterleaved(0, seg0End));
+    const seg0 = segmentWindow(0);
+    let pendingStft = stft.process(prepareInterleaved(seg0.windowStart));
     pendingStft.catch(() => {});
-    let pendingPlanar = preparePlanar(planarBuffers[pendingPlanarIndex], 0, seg0End);
+    let pendingPlanar = preparePlanar(planarBuffers[pendingPlanarIndex], seg0.windowStart);
     let prevIstftPromise: Promise<ISTFTResult> | null = null;
 
     for (let seg = 0; seg < numSegments; seg++) {
-        const segStart = seg * STEP;
-        const segEnd = Math.min(segStart + SEGMENT_SAMPLES, numSamples);
-        const segLength = segEnd - segStart;
+        const { segStart, segLength, trimOffset } = segmentWindow(seg);
 
         // Yield to the event loop occasionally so the UI can repaint.
         if (seg % 5 === 0) {
@@ -150,14 +167,12 @@ export async function runPipeline(
         );
 
         if (seg + 1 < numSegments) {
-            const nextSegStart = (seg + 1) * STEP;
-            const nextSegEnd = Math.min(nextSegStart + SEGMENT_SAMPLES, numSamples);
-            const nextSegLength = nextSegEnd - nextSegStart;
-            pendingStft = stft.process(prepareInterleaved(nextSegStart, nextSegLength));
+            const next = segmentWindow(seg + 1);
+            pendingStft = stft.process(prepareInterleaved(next.windowStart));
             pendingStft.catch(() => {});
             pendingPlanarIndex = 1 - pendingPlanarIndex;
             pendingPlanar = preparePlanar(
-                planarBuffers[pendingPlanarIndex], nextSegStart, nextSegLength
+                planarBuffers[pendingPlanarIndex], next.windowStart
             );
         }
 
@@ -176,10 +191,7 @@ export async function runPipeline(
             numChannels,
             numBins: stftResult.numBins,
             numFrames: stftResult.numFrames,
-            segStart, segLength, seg,
-            numSegments, numSamples,
-            fadeIn, fadeOut,
-            overlap: OVERLAP,
+            segStart, segLength, trimOffset,
         });
         prevIstftPromise.catch(() => {});
 
@@ -192,6 +204,17 @@ export async function runPipeline(
 
     if (prevIstftPromise) {
         accumulate(await prevIstftPromise);
+    }
+
+    // Normalize by the accumulated weight sum (Python: out / sum_weight).
+    // Every sample is covered by at least one chunk, so sumWeight > 0.
+    for (const source of sources) {
+        const out = outputs[source];
+        for (let i = 0; i < numSamples; i++) {
+            const w = sumWeight[i];
+            out[i * 2] /= w;
+            out[i * 2 + 1] /= w;
+        }
     }
 
     return {

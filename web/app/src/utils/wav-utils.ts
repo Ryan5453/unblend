@@ -3,7 +3,7 @@ export function createWavBlob(
     numChannels: number,
     sampleRate: number
 ): Blob {
-    const numSamples = audioData.length / numChannels;
+    const numSamples = Math.floor(audioData.length / numChannels);
     const bytesPerSample = 2;
     const blockAlign = numChannels * bytesPerSample;
     const byteRate = sampleRate * blockAlign;
@@ -37,8 +37,12 @@ export function createWavBlob(
         for (let c = 0; c < numChannels; c++) {
             let sample = audioData[i * numChannels + c];
             sample = Math.max(-1, Math.min(1, sample));
-            sample = sample * 32767;
-            view.setInt16(offset, sample, true);
+            // Round (setInt16 would otherwise truncate toward zero) and use
+            // the full negative range: -1 maps to -32768, +1 to +32767. The
+            // clamp keeps the +1 case from overflowing to -32768.
+            const scaled = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+            const q = Math.max(-32768, Math.min(32767, Math.round(scaled)));
+            view.setInt16(offset, q, true);
             offset += 2;
         }
     }

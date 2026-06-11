@@ -1,6 +1,6 @@
 /**
- * Web Worker for STFT computation.
- * Runs STFT in parallel with GPU inference on the main thread.
+ * Web Worker for STFT computation. Lives in its own worker so it overlaps with
+ * the ONNX and iSTFT workers rather than blocking the main thread.
  */
 
 import { computeSTFT, createSTFTBuffers, type STFTBuffers } from '../audio-processor';
@@ -9,11 +9,13 @@ let stftBuffers: STFTBuffers | null = null;
 
 interface STFTMessage {
     type: 'process';
+    requestId: number;
     segmentInterleaved: Float32Array;
 }
 
 interface STFTResponse {
     type: 'result';
+    requestId: number;
     real: Float32Array;
     imag: Float32Array;
     numBins: number;
@@ -25,7 +27,7 @@ self.onmessage = (event: MessageEvent<STFTMessage>) => {
         stftBuffers = createSTFTBuffers();
     }
 
-    const { segmentInterleaved } = event.data;
+    const { requestId, segmentInterleaved } = event.data;
     const stft = computeSTFT(segmentInterleaved, stftBuffers);
 
     // Copy results since computeSTFT returns references to shared buffers
@@ -34,6 +36,7 @@ self.onmessage = (event: MessageEvent<STFTMessage>) => {
 
     const response: STFTResponse = {
         type: 'result',
+        requestId,
         real,
         imag,
         numBins: stft.numBins,

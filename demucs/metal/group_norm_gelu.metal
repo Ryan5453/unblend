@@ -2,10 +2,13 @@
 //
 // Saves the round-trip that PyTorch would otherwise spend on the explicit
 // ``functional.gelu(...)`` op after every ``norm1`` call inside HEncLayer
-// / HDecLayer / DConv. We use the tanh approximation
-// (``F.gelu(approximate='tanh')``) — Metal lacks an ``erf`` builtin, the
-// tanh form is what most ML kernels ship, and the difference from PyTorch's
-// default exact-erf form is ~1e-7 in FP32, well below FP16 precision.
+// / HDecLayer / DConv. We use the tanh approximation (the same form as
+// ``F.gelu(approximate='tanh')``) because the MPS shader toolchain exposes no
+// ``erf`` builtin. The per-element gap from PyTorch's default exact-erf GELU
+// peaks at ~1e-3 (near |x|≈2), which is below FP16/BF16 output precision, so
+// this path is numerically equivalent to the reference at the dtypes it runs
+// in. (The FP32 fallback in ``demucs/metal/__init__.py`` uses exact erf, since
+// there erf is available and the difference is no longer sub-precision.)
 //
 // ``apply_norm_gelu`` is the third stage of the multi-stage path; its
 // mean/scale come from ``finalize_meanvar`` over in ``group_norm.metal``.
@@ -46,9 +49,13 @@ kernel void group_norm_g1_gelu(
     device const SCALAR_T* in_b = in_ + b * total;
     device SCALAR_T*       out_b = out + b * total;
 
+    // Shift by the batch's first element before summing so the one-pass
+    // variance doesn't lose precision to cancellation on large-DC inputs
+    // (see group_norm.metal:group_norm_g1 for the rationale).
+    float K = float(in_b[0]);
     float local_sum = 0.0f, local_sqsum = 0.0f;
     for (uint i = tid; i < total; i += tgs) {
-        float v = float(in_b[i]);
+        float v = float(in_b[i]) - K;
         local_sum += v;
         local_sqsum += v * v;
     }
@@ -66,10 +73,9 @@ kernel void group_norm_g1_gelu(
     threadgroup float bcast_mean, bcast_scale;
     if (tid == 0) {
         float invN = 1.0f / float(total);
-        float mean = shared_sum[0] * invN;
-        float meanSq = shared_sqsum[0] * invN;
-        float var = max(meanSq - mean * mean, 0.0f);
-        bcast_mean = mean;
+        float mean_d = shared_sum[0] * invN;
+        float var = max(shared_sqsum[0] * invN - mean_d * mean_d, 0.0f);
+        bcast_mean = K + mean_d;
         bcast_scale = rsqrt(var + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

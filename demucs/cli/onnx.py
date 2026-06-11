@@ -4,8 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Annotated
+
 import typer
-from typing_extensions import Annotated
 
 from ..onnx import export_to_onnx
 from .utils import console
@@ -25,7 +26,8 @@ def export_onnx_command(
         typer.Option(
             "-o",
             "--output",
-            help="Output ONNX file path (defaults to {model}.onnx)",
+            help="Output ONNX file path (defaults to {model}_fp16.onnx or "
+            "{model}_fp32.onnx depending on --fp16)",
         ),
     ] = None,
     opset: Annotated[
@@ -38,7 +40,8 @@ def export_onnx_command(
         bool,
         typer.Option(
             "--fp16",
-            help="Convert weights and IO to float16 after export.",
+            help="Store weights as float16 (weight-only; compute and IO stay fp32). "
+            "Roughly halves file size; output is near-identical to fp32.",
         ),
     ] = False,
 ) -> None:
@@ -46,6 +49,12 @@ def export_onnx_command(
     Export a HTDemucs model to the ONNX format.
 
     This is an internal developer tool for creating ONNX models for deployment.
+
+    :param model: Model name to export
+    :param output: Output ONNX file path (defaults to {model}_fp16.onnx or
+        {model}_fp32.onnx depending on --fp16)
+    :param opset: ONNX opset version
+    :param fp16: Store weights as float16 (weight-only; compute and IO stay fp32)
     """
     if output is not None:
         output_path = output

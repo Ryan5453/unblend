@@ -309,7 +309,6 @@ class DConv(nn.Module):
         lstm: bool = False,
         gelu: bool = True,
         kernel: int = 3,
-        dilate: bool = True,
     ) -> None:
         """Initialize DConv residual branch.
 
@@ -324,7 +323,6 @@ class DConv(nn.Module):
         :param lstm: Use LSTM
         :param gelu: Use GELU activation
         :param kernel: Kernel size for the (dilated) convolutions
-        :param dilate: If true, use dilation increasing with depth
         """
 
         super().__init__()
@@ -332,6 +330,10 @@ class DConv(nn.Module):
         self.channels = channels
         self.compress = compress
         self.depth = abs(depth)
+        # The sign of `depth` selects dilation: a positive depth dilates
+        # (2**d per layer), a negative depth uses |depth| layers with no
+        # dilation. (Vestigial upstream convention; the shipped configs all
+        # pass positive depths.)
         dilate = depth > 0
 
         norm_fn: Callable[[int], nn.Module]

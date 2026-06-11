@@ -7,12 +7,12 @@ build:
     - "ffmpeg"
   run:
     - mkdir -p /root/.demucs/models
-    - curl -L -o /root/.demucs/models/1941ce65.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/75fc33f5-1941ce65.th
+    # This Cog serves htdemucs only (see predictor.py), so bake just that
+    # model's single layer into the image to avoid downloading it on cold
+    # start. The checksum and remote path come from demucs/metadata.json; the
+    # cache filename is the second hash segment, matching demucs.repo's naming.
+    # predictor.setup() would otherwise download htdemucs by name on first boot.
     - curl -L -o /root/.demucs/models/8726e21a.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th
-    - curl -L -o /root/.demucs/models/ba3fe64a.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/f7e0c4bc-ba3fe64a.th
-    - curl -L -o /root/.demucs/models/e57c48e6.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/d12395a8-e57c48e6.th
-    - curl -L -o /root/.demucs/models/ef3bcb9c.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/92cfc3b6-ef3bcb9c.th
-    - curl -L -o /root/.demucs/models/34c22ccb.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th
     - python -c "import site; open(site.getsitepackages()[0] + '/sitecustomize.py', 'w').write('import os\nos.environ.pop(\"LD_LIBRARY_PATH\", None)\n')"
 
 predict: "predictor.py:Predictor"

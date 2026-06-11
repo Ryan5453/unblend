@@ -1,6 +1,6 @@
-import { useState, useCallback, useRef } from 'react';
-import type { DemucsState, LogEntry } from '../types';
-import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'demucs-web';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import type { DemucsState } from '../types';
+import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'demucs-next';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
 import { ORT_WASM_PATHS } from '../onnx-config';
@@ -14,7 +14,6 @@ const initialState: DemucsState = {
     separating: false,
     progress: 0,
     status: 'Ready',
-    logs: [],
 };
 
 export function useDemucs() {
@@ -27,17 +26,22 @@ export function useDemucs() {
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
     // Store artwork URL (album art from audio file)
     const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
+    // Mirror the latest object URLs into refs so the unmount cleanup can
+    // revoke them without reading stale state from its empty-deps closure.
+    const stemUrlsRef = useRef<Record<string, string>>({});
+    const artworkUrlRef = useRef<string | null>(null);
     // Store track metadata from audio file
     const [trackTitle, setTrackTitle] = useState<string | null>(null);
     const [trackArtist, setTrackArtist] = useState<string | null>(null);
-    // Store waveform data for visualization (array of 0-100 values)
-    const [stemWaveforms, setStemWaveforms] = useState<Record<string, number[]>>({});
 
-    const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
-        setState(prev => ({
-            ...prev,
-            logs: [...prev.logs, { timestamp: new Date(), message, type }]
-        }));
+    // Route diagnostics to the console. These were previously accumulated in an
+    // unbounded state array that no component ever rendered.
+    const addLog = useCallback((message: string, type: 'info' | 'success' | 'error' = 'info') => {
+        if (type === 'error') {
+            console.error(`[demucs] ${message}`);
+        } else {
+            console.log(`[demucs] ${message}`);
+        }
     }, []);
 
     const setStatus = useCallback((status: string) => {
@@ -96,21 +100,26 @@ export function useDemucs() {
         }
     }, [addLog]);
 
-    const unloadModel = useCallback(async () => {
-        if (separatorRef.current) {
-            await separatorRef.current.unload();
-            separatorRef.current = null;
-        }
-        setState(prev => ({ ...prev, modelLoaded: false }));
-        addLog('Model unloaded', 'info');
-    }, [addLog]);
-
     const clearAudioError = useCallback(() => {
         setAudioError(null);
     }, []);
 
     const loadAudio = useCallback(async (file: File) => {
         try {
+            // Revoke object URLs from the previous track before it is replaced.
+            setStemUrls(prev => {
+                Object.values(prev).forEach(url => URL.revokeObjectURL(url));
+                return {};
+            });
+            setArtworkUrl(prev => {
+                if (prev) URL.revokeObjectURL(prev);
+                return null;
+            });
+            // Clear previous track metadata up front so an untagged track
+            // does not keep showing the previous track's title/artist.
+            setTrackTitle(null);
+            setTrackArtist(null);
+
             setAudioError(null);
             addLog(`Loading audio: ${file.name}`, 'info');
             const ctx = getAudioContext();
@@ -168,7 +177,6 @@ export function useDemucs() {
         try {
             setState(prev => ({ ...prev, separating: true }));
             setStemUrls({});
-            setStemWaveforms({});
             setStatus('Preparing audio...');
             setProgress(0);
 
@@ -184,35 +192,18 @@ export function useDemucs() {
                 },
             });
 
-            // Build blob URLs and waveform RMS bars for the player UI.
+            // Build blob URLs for the player UI.
             setStatus('Finalizing...');
             setProgress(98);
 
             const urls: Record<string, string> = {};
-            const waveforms: Record<string, number[]> = {};
-            const numBars = 60;
 
             for (const [source, samples] of Object.entries(result.stems)) {
                 const blob = createWavBlob(samples, 2, SAMPLE_RATE);
                 urls[source] = URL.createObjectURL(blob);
-
-                const samplesPerBar = Math.floor(samples.length / numBars);
-                const bars: number[] = [];
-                for (let i = 0; i < numBars; i++) {
-                    const start = i * samplesPerBar;
-                    const end = Math.min(start + samplesPerBar, samples.length);
-                    let sumSquares = 0;
-                    for (let j = start; j < end; j++) {
-                        sumSquares += samples[j] * samples[j];
-                    }
-                    const rms = Math.sqrt(sumSquares / (end - start));
-                    bars.push(Math.min(100, Math.max(15, rms * 300)));
-                }
-                waveforms[source] = bars;
             }
 
             setStemUrls(urls);
-            setStemWaveforms(waveforms);
 
             setStatus('Complete!');
             setProgress(100);
@@ -221,47 +212,46 @@ export function useDemucs() {
         } catch (error) {
             addLog(`Separation failed: ${(error as Error).message}`, 'error');
             setStatus('Error during separation');
+            setProgress(0);
             setState(prev => ({ ...prev, separating: false }));
         }
     }, [state.audioBuffer, addLog, setStatus, setProgress]);
 
-    const resetForNewTrack = useCallback(() => {
-        // Revoke old blob URLs to prevent memory leaks
-        Object.values(stemUrls).forEach(url => URL.revokeObjectURL(url));
-        if (artworkUrl) {
-            URL.revokeObjectURL(artworkUrl);
-        }
+    // Keep refs in sync with the latest object URLs for the unmount cleanup.
+    useEffect(() => {
+        stemUrlsRef.current = stemUrls;
+    }, [stemUrls]);
+    useEffect(() => {
+        artworkUrlRef.current = artworkUrl;
+    }, [artworkUrl]);
 
-        setState(prev => ({
-            ...prev,
-            audioLoaded: false,
-            audioBuffer: null,
-            audioFile: null,
-            separating: false,
-            progress: 0,
-            status: 'Ready',
-        }));
-        setStemUrls({});
-        setStemWaveforms({});
-        setArtworkUrl(null);
-        setTrackTitle(null);
-        setTrackArtist(null);
-        setAudioError(null);
-    }, [stemUrls, artworkUrl]);
+    // Terminate the separator's workers, close the AudioContext, and revoke
+    // outstanding object URLs when the hook unmounts to free audio resources.
+    useEffect(() => {
+        return () => {
+            if (separatorRef.current) {
+                void separatorRef.current.unload();
+                separatorRef.current = null;
+            }
+            if (audioContextRef.current) {
+                void audioContextRef.current.close();
+                audioContextRef.current = null;
+            }
+            Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
+            if (artworkUrlRef.current) URL.revokeObjectURL(artworkUrlRef.current);
+        };
+    }, []);
 
     return {
         ...state,
         stemUrls,
-        stemWaveforms,
         artworkUrl,
         trackTitle,
         trackArtist,
         audioError,
         loadModel,
-        unloadModel,
         loadAudio,
         clearAudioError,
         separateAudio,
-        resetForNewTrack,
     };
 }

@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import time
+from typing import Annotated
 
 import typer
 from rich.progress import (
@@ -15,8 +16,8 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.table import Table
-from typing_extensions import Annotated
 
+from ..apply import Model, ModelEnsemble
 from ..exceptions import ModelLoadingError
 from ..repo import ModelRepository
 from .progress import create_model_progress_bar, create_progress_callback
@@ -65,7 +66,7 @@ def list_models_command() -> None:
 
 def download_models_command(
     names: Annotated[
-        list[str],
+        list[str] | None,
         typer.Argument(help="Model names to download."),
     ] = None,
     all_models: Annotated[
@@ -87,7 +88,7 @@ def download_models_command(
         console.print("  1. Specify one or more model names to download")
         console.print("  2. Use [bold]--all[/bold] to download all available models")
         console.print("\nTo see available models, run: [bold]demucs models list[/bold]")
-        return
+        raise typer.Exit(1)
 
     if all_models:
         models = get_models()
@@ -100,7 +101,7 @@ def download_models_command(
 
 def remove_models_command(
     names: Annotated[
-        list[str],
+        list[str] | None,
         typer.Argument(help="Model names to remove."),
     ] = None,
     all_models: Annotated[
@@ -124,11 +125,12 @@ def remove_models_command(
             console.print(
                 "[yellow]No models specified for removal. Please specify at least one model name.[/yellow]"
             )
-            return
+            raise typer.Exit(1)
         else:
             model_names = names
 
     if not model_names:
+        # Reached via --all with an empty cache: nothing to do, not an error.
         console.print("[yellow]No models found to remove.[/yellow]")
         return
 
@@ -159,6 +161,46 @@ def remove_models_command(
             progress_bar.update(task, advance=1)
 
     console.print("[bold green]Model removal complete![/bold green]")
+
+
+def _format_download_summary(
+    name: str,
+    model: Model | ModelEnsemble,
+    models: dict,
+    cache_info: dict,
+    download_time: float,
+) -> str:
+    """
+    Build the success summary line shown after a model finishes downloading.
+
+    :param name: Model name
+    :param model: Loaded model instance
+    :param models: Dictionary of available model metadata
+    :param cache_info: Cache info mapping from ``ModelRepository.get_cache_info``
+    :param download_time: Elapsed download time in seconds
+    :return: Rich-markup summary string
+    """
+    num_sources = len(model.sources)
+    if name in models:
+        layer_count = len(models[name]["models"])
+        layer_word = "layer" if layer_count == 1 else "layers"
+        model_type = f"{layer_count} {layer_word}"
+    else:
+        model_type = "Model"
+
+    size_str = ""
+    speed_str = ""
+    if name in cache_info:
+        size_bytes = cache_info[name]["size_bytes"]
+        size_str = f" ({format_file_size(size_bytes)})"
+
+        if download_time > 0.1:
+            speed = size_bytes / download_time
+            speed_str = f" at {format_file_size(speed)}/s"
+
+    return (
+        f"[green]✓[/green] [bold]{name}[/bold]: {model_type} with {num_sources} sources{size_str}{speed_str}"
+    )
 
 
 def _download_model_with_progress(name: str) -> bool:
@@ -205,29 +247,10 @@ def _download_model_with_progress(name: str) -> bool:
             progress_bar.remove_task(task)
 
             download_time = time.time() - start_time
-            model_repo = ModelRepository()
             cache_info = model_repo.get_cache_info()
 
-            num_sources = len(model.sources)
-            if name in models:
-                layer_count = len(models[name]["models"])
-                layer_word = "layer" if layer_count == 1 else "layers"
-                model_type = f"{layer_count} {layer_word}"
-            else:
-                model_type = "Model"
-
-            size_str = ""
-            speed_str = ""
-            if name in cache_info:
-                size_bytes = cache_info[name]["size_bytes"]
-                size_str = f" ({format_file_size(size_bytes)})"
-
-                if download_time > 0.1:
-                    speed = size_bytes / download_time
-                    speed_str = f" at {format_file_size(speed)}/s"
-
             console.print(
-                f"[green]✓[/green] [bold]{name}[/bold]: {model_type} with {num_sources} sources{size_str}{speed_str}"
+                _format_download_summary(name, model, models, cache_info, download_time)
             )
             return True
 
@@ -333,29 +356,10 @@ def _download_single_model_in_batch(name: str, models: dict, progress_bar: Progr
         progress_bar.remove_task(task)
 
         download_time = time.time() - start_time
-        model_repo = ModelRepository()
         cache_info = model_repo.get_cache_info()
 
-        num_sources = len(model.sources)
-        if name in models:
-            layer_count = len(models[name]["models"])
-            layer_word = "layer" if layer_count == 1 else "layers"
-            model_type = f"{layer_count} {layer_word}"
-        else:
-            model_type = "Model"
-
-        size_str = ""
-        speed_str = ""
-        if name in cache_info:
-            size_bytes = cache_info[name]["size_bytes"]
-            size_str = f" ({format_file_size(size_bytes)})"
-
-            if download_time > 0.1:
-                speed = size_bytes / download_time
-                speed_str = f" at {format_file_size(speed)}/s"
-
         console.print(
-            f"[green]✓[/green] [bold]{name}[/bold]: {model_type} with {num_sources} sources{size_str}{speed_str}"
+            _format_download_summary(name, model, models, cache_info, download_time)
         )
 
     except ModelLoadingError as error:

@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 from collections.abc import Callable
+from pathlib import Path
 
 from rich.progress import (
     BarColumn,
@@ -46,7 +47,13 @@ def create_progress_callback(progress_bar: Progress, task: TaskID) -> Callable[[
     :return: Callback function for model download progress
     """
 
-    def callback(event_type: str, data: dict):
+    def callback(event_type: str, data: dict) -> None:
+        """
+        Update the progress bar in response to a download event.
+
+        :param event_type: Type of progress event
+        :param data: Event data dictionary
+        """
         if event_type == "layer_start":
             progress_bar.update(
                 task,
@@ -120,7 +127,6 @@ class FileProgressTracker:
         :param total_files: Total number of files to process
         """
         self.total_files = total_files
-        self.completed_files = 0
         self.progress_bar = None
         self.current_task = None
         self.file_tasks = {}
@@ -150,10 +156,13 @@ class FileProgressTracker:
         """
         Start processing a new file.
 
-        :param filename: Name of the file being processed
+        :param filename: Unique key for the file (e.g. its full path); the
+            displayed label is the basename. Keying on the full path keeps two
+            same-named files in different directories from colliding.
         :return: Task ID for the progress bar entry
         """
-        task_id = self.progress_bar.add_task(filename.strip(), total=100, completed=0)
+        label = Path(filename).name.strip()
+        task_id = self.progress_bar.add_task(label, total=100, completed=0)
         self.file_tasks[filename] = task_id
         return task_id
 
@@ -161,7 +170,7 @@ class FileProgressTracker:
         """
         Update progress for a specific file.
 
-        :param filename: Name of the file to update
+        :param filename: Unique key for the file (matches ``start_file``).
         :param event_type: Type of progress event
         :param data: Event data dictionary
         """
@@ -169,11 +178,12 @@ class FileProgressTracker:
             return
 
         task_id = self.file_tasks[filename]
+        label = Path(filename).name.strip()
 
         if event_type == "processing_start":
             self.progress_bar.update(
                 task_id,
-                description=filename.strip(),
+                description=label,
                 total=data["total_chunks"],
                 completed=0,
             )
@@ -181,39 +191,49 @@ class FileProgressTracker:
             self.progress_bar.update(
                 task_id,
                 completed=data["completed_chunks"],
-                description=filename.strip(),
+                description=label,
             )
         elif event_type == "processing_complete":
             self.progress_bar.update(
-                task_id, completed=data["total_chunks"], description=filename.strip()
+                task_id, completed=data["total_chunks"], description=label
             )
-            self.completed_files += 1
 
-    def error_file(self, filename: str, error_msg: str) -> None:
+    def error_file(self, filename: str) -> None:
         """
-        Mark a file as having an error.
+        Mark a file as having an error. The error text itself is surfaced by
+        the caller (printed to the console), so it isn't shown in the bar.
 
-        :param filename: Name of the file that errored
-        :param error_msg: Error message to display
+        :param filename: Unique key for the file (matches ``start_file``).
         """
         if filename not in self.file_tasks:
             return
 
         task_id = self.file_tasks[filename]
+        label = Path(filename).name.strip()
+        # Fill the bar to its current total (which is 100 before processing
+        # starts, then the chunk count once it does) rather than a hardcoded
+        # 100 that overshoots a chunk-count total.
+        task = next((t for t in self.progress_bar.tasks if t.id == task_id), None)
+        total = task.total if task is not None and task.total is not None else 100
         self.progress_bar.update(
-            task_id, completed=100, description=f"[red]✗[/red] {filename.strip()}"
+            task_id, completed=total, description=f"[red]✗[/red] {label}"
         )
-        self.completed_files += 1
 
     def create_audio_callback(self, filename: str) -> Callable[[str, dict], None]:
         """
         Create a callback for audio processing progress.
 
-        :param filename: Name of the file being processed
+        :param filename: Unique key for the file (matches ``start_file``).
         :return: Callback function for audio processing events
         """
 
-        def callback(event_type: str, data: dict):
+        def callback(event_type: str, data: dict) -> None:
+            """
+            Forward an audio processing event to the file progress tracker.
+
+            :param event_type: Type of progress event
+            :param data: Event data dictionary
+            """
             self.update_file_progress(filename, event_type, data)
 
         return callback

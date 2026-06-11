@@ -107,15 +107,16 @@ export function createISTFTBuffers(): ISTFTBuffers {
 }
 
 function reflectIndex(i: number, len: number): number {
-    while (i < 0 || i >= len) {
-        if (i < 0) {
-            i = -i;
-        }
-        if (i >= len) {
-            i = 2 * (len - 1) - i;
-        }
+    if (len === 1) {
+        return 0;
     }
-    return i;
+    // Reflect into [0, len) in O(1). The reflection has period 2*(len-1)
+    // (edge samples are not repeated), matching the iterative mirror below:
+    //   i < 0      -> -i
+    //   i >= len   -> 2*(len-1) - i
+    const period = 2 * (len - 1);
+    i = ((i % period) + period) % period;
+    return i >= len ? period - i : i;
 }
 
 /**

@@ -97,11 +97,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 animationRef.current = requestAnimationFrame(animate);
             };
             animationRef.current = requestAnimationFrame(animate);
-        } else {
-            setVuLevel(0);
-            if (animationRef.current) {
-                cancelAnimationFrame(animationRef.current);
-            }
+        } else if (animationRef.current) {
+            cancelAnimationFrame(animationRef.current);
         }
         return () => {
             if (animationRef.current) {
@@ -111,7 +108,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
     }, [isPlaying, volume]);
 
     const segments = 10;
-    const litSegments = Math.floor((vuLevel / 100) * segments);
+    // Derive lit segments from playback state: when paused the VU meter reads 0
+    // without needing to write state from the effect (the rAF loop only updates
+    // vuLevel while playing).
+    const litSegments = isPlaying ? Math.floor((vuLevel / 100) * segments) : 0;
 
     const handleFaderMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
         const track = e.currentTarget;

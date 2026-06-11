@@ -19,6 +19,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from .blocks import center_trim
+from .exceptions import ValidationError
 from .htdemucs import HTDemucs
 
 Model: TypeAlias = HTDemucs
@@ -30,7 +31,7 @@ class ModelEnsemble(nn.Module):
         models: list[Model],
         weights: list[list[float]] | None = None,
         segment: float | None = None,
-    ):
+    ) -> None:
         """
         Represents a model ensemble with specific weights.
         You should call ``apply_model`` rather than calling the forward directly
@@ -108,8 +109,13 @@ class TensorChunk:
         :param length: Number of frames to include. If ``None``, extends to the end.
         """
         total_length = tensor.shape[-1]
-        assert offset >= 0
-        assert offset < total_length
+        if offset < 0:
+            raise ValidationError(f"offset must be >= 0, got {offset}")
+        if offset >= total_length:
+            raise ValidationError(
+                f"offset ({offset}) must be < total length ({total_length}); "
+                "cannot wrap an empty tensor"
+            )
 
         if length is None:
             length = total_length - offset
@@ -241,9 +247,18 @@ def apply_model(
     :param overlap: Overlap ratio between consecutive segments.
     :param transition_power: Exponent on the triangular crossfade weight.
     :param progress_callback: Optional ``callback(event_type, data)``; events:
-        ``processing_start``, ``chunk_complete``, ``processing_complete``.
-    :param use_only_stem: For ``ModelEnsemble``, only run the sub-model
-        specialised for this stem.
+        ``processing_start``, ``chunk_complete``, ``processing_complete``. For a
+        ``ModelEnsemble`` that runs all sub-models, the reported totals span the
+        whole ensemble (``total_chunks = per_model_chunks * num_sub_models``), so
+        progress advances monotonically instead of restarting per sub-model.
+    :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
+        fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
+        whose weights select this stem with a clean one-hot (1.0/0.0) row,
+        skipping the others. The returned tensor still contains **all** of the
+        model's sources (the lone specialist produces them all — only the named
+        stem is high quality); it does *not* filter the output to one stem (use
+        ``SeparatedSources.isolate_stem`` for that). Silently has no effect when
+        the model is not such an ensemble or no sub-model matches one-hot.
     :param chunk_batch_size: Chunks processed in parallel.
     :return: Separated sources tensor.
     :raises ValueError: If ``overlap`` produces a non-positive segment stride.
@@ -305,9 +320,18 @@ def apply_model_multi(
     :param transition_power: Exponent on the triangular crossfade weight.
     :param progress_callback: Optional ``callback(event_type, data)``; events:
         ``processing_start``, ``chunk_complete``, ``processing_complete``.
-        Chunk counts are summed across all mixes.
-    :param use_only_stem: For ``ModelEnsemble``, only run the sub-model
-        specialised for this stem.
+        Chunk counts are summed across all mixes. For a ``ModelEnsemble`` that
+        runs all sub-models, the totals also span every sub-model
+        (``total_chunks = per_model_chunks * num_sub_models``), so the progress
+        bar advances continuously rather than restarting once per sub-model.
+    :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
+        fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
+        whose weights select this stem with a clean one-hot (1.0/0.0) row,
+        skipping the others. The returned tensor still contains **all** of the
+        model's sources (the lone specialist produces them all — only the named
+        stem is high quality); it does *not* filter the output to one stem (use
+        ``SeparatedSources.isolate_stem`` for that). Silently has no effect when
+        the model is not such an ensemble or no sub-model matches one-hot.
     :param chunk_batch_size: Chunks processed in parallel per forward pass.
     :return: One separated-sources tensor per input mix, same shape as
         ``apply_model`` would have produced.
@@ -357,6 +381,53 @@ def apply_model_multi(
                     )
 
         # Run every sub-model with the same pooling, then weighted-average.
+        # Progress is reported as one continuous span across the whole
+        # ensemble: each sub-model processes the same chunks, so the aggregate
+        # total is ``per_model_chunks * num_sub_models``. Without this wrapper
+        # each sub-model would emit its own start/complete cycle and the bar
+        # would restart N times.
+        num_sub_models = len(model.models)
+        sub_models_done = 0
+        sub_total_chunks: int | None = None
+
+        def ensemble_progress(event_type: str, data: dict[str, Any]) -> None:
+            """
+            Re-scale per-sub-model progress events into one continuous span
+            across the whole ensemble before forwarding to ``progress_callback``.
+
+            :param event_type: Progress event name (``"processing_start"`` or
+                ``"chunk_complete"``); per-sub-model ``"processing_complete"``
+                events are swallowed.
+            :param data: Event payload with ``total_chunks`` and, for
+                ``"chunk_complete"``, ``completed_chunks``.
+            :return: None.
+            """
+            nonlocal sub_total_chunks
+            assert progress_callback is not None
+            if event_type == "processing_start":
+                if sub_total_chunks is None:
+                    sub_total_chunks = int(data.get("total_chunks", 0))
+                    progress_callback(
+                        "processing_start",
+                        {"total_chunks": sub_total_chunks * num_sub_models},
+                    )
+            elif event_type == "chunk_complete":
+                per_model = int(data.get("total_chunks", sub_total_chunks or 0))
+                completed = sub_models_done * per_model + int(
+                    data.get("completed_chunks", 0)
+                )
+                progress_callback(
+                    "chunk_complete",
+                    {
+                        "completed_chunks": completed,
+                        "total_chunks": per_model * num_sub_models,
+                    },
+                )
+            # Swallow per-sub-model "processing_complete"; one is emitted for
+            # the whole ensemble after the loop.
+
+        sub_callback = ensemble_progress if progress_callback else None
+
         results: list[Tensor] | None = None
         totals = [0.0] * len(model.sources)
         for sub_model, model_weights in zip(model.models, model.weights):
@@ -367,9 +438,10 @@ def apply_model_multi(
                 shifts=shifts,
                 overlap=overlap,
                 transition_power=transition_power,
-                progress_callback=progress_callback,
+                progress_callback=sub_callback,
                 chunk_batch_size=chunk_batch_size,
             )
+            sub_models_done += 1
             for k, inst_weight in enumerate(model_weights):
                 totals[k] += inst_weight
                 for sub_out in sub_outs:
@@ -383,6 +455,11 @@ def apply_model_multi(
         for acc in results:
             for k in range(acc.shape[1]):
                 acc[:, k, :, :] /= totals[k]
+        if progress_callback and sub_total_chunks is not None:
+            progress_callback(
+                "processing_complete",
+                {"total_chunks": sub_total_chunks * num_sub_models},
+            )
         return results
 
     # Move/eval the model only when needed.
@@ -455,6 +532,16 @@ def _apply_model_multi_unshifted(
     are processed first; whatever's left across all mixes is collected into
     a single pool and drained as full-size batches (with a final tail-pad
     on the last drain batch if needed).
+
+    :param model: Model to run on each chunk.
+    :param mixes: Input mixes as tensors or ``TensorChunk`` views.
+    :param device: Inference device.
+    :param overlap: Overlap between segments, used to derive the chunk stride.
+    :param transition_power: Exponent for the triangular overlap-add weighting.
+    :param chunk_batch_size: Number of chunks per forward pass.
+    :param progress_callback: Optional callback for progress updates.
+    :return: One separated-sources tensor per input mix, in input order.
+    :raises ValueError: If ``overlap`` produces a non-positive segment stride.
     """
     segment = model.max_allowed_segment
     assert segment > 0.0
@@ -540,7 +627,13 @@ def _apply_model_multi_unshifted(
         progress_callback("processing_start", {"total_chunks": total_chunks})
 
     def run_batch(batch_items: list[tuple[int, int, TensorChunk]]) -> None:
-        """Run one forward pass for ``batch_items`` and accumulate into per-mix state."""
+        """
+        Run one forward pass for ``batch_items`` and accumulate into per-mix state.
+
+        :param batch_items: List of ``(mix_idx, offset, chunk)`` tuples to run
+            together as a single batch.
+        :return: None.
+        """
         nonlocal completed_chunks
         padded = torch.cat(
             [chunk.padded(chunk_valid_length) for _, _, chunk in batch_items],

@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, type DragEvent } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback, type DragEvent } from 'react';
+import { SAMPLE_RATE } from 'demucs-next';
 import { useDemucs } from '../../hooks/useDemucs';
 import { Vinyl, ChannelStrip } from '../ui/Vinyl';
 import { Waveform } from '../ui/Waveform';
@@ -58,27 +59,57 @@ export function Home() {
     const [mergeMode, setMergeMode] = useState(false);
     const [selectedStems, setSelectedStems] = useState<Set<string>>(new Set());
     const [mergedStemUrl, setMergedStemUrl] = useState<string | null>(null);
+    // Mirror of mergedStemUrl so the unmount cleanup below can revoke the
+    // live blob without re-running on every URL change (and without a stale
+    // closure over the state value).
+    const mergedStemUrlRef = useRef<string | null>(null);
     const [mergedStemMembers, setMergedStemMembers] = useState<string[]>([]);
     const [isMerging, setIsMerging] = useState(false);
+    // Tracks the stemUrls we last reset for, so a fresh separation resets
+    // transport/mute/merge state during render (React's recommended
+    // reset-on-input-change pattern) rather than in a post-commit effect.
+    const [prevStemUrls, setPrevStemUrls] = useState(stemUrls);
 
     const duration = audioBuffer?.duration ?? 0;
-    const stems = Object.keys(stemUrls);
+    const stems = useMemo(() => Object.keys(stemUrls), [stemUrls]);
     const hasStemsReady = stems.length > 0;
-    const mergedMemberSet = new Set(mergedStemMembers);
-    const visibleStemKeys = stems.filter(stem => !mergedMemberSet.has(stem));
+    // Memoized so its array identity is stable across renders: the time-sync
+    // interval effect depends on it, and a fresh array every render would tear
+    // down and recreate the interval on every render while playing.
+    const visibleStemKeys = useMemo(() => {
+        const mergedMemberSet = new Set(mergedStemMembers);
+        return stems.filter(stem => !mergedMemberSet.has(stem));
+    }, [stems, mergedStemMembers]);
 
-    const getPlaybackVolume = (stemName: string) => {
+    // Reset transport/mute/merge state when a new set of stems arrives.
+    if (prevStemUrls !== stemUrls) {
+        setPrevStemUrls(stemUrls);
+        setMutedStems({});
+        setIsTransportPlaying(false);
+        setCurrentTime(0);
+        setMergedStemMembers([]);
+        // Revoke the previous merged blob so it isn't leaked when the merge
+        // isn't replaced by another merge before the next separation/track.
+        setMergedStemUrl(prev => {
+            if (prev) URL.revokeObjectURL(prev);
+            return null;
+        });
+    }
+
+    // useCallback so these are stable references the effects below can list
+    // as honest dependencies (rather than omitting them).
+    const getPlaybackVolume = useCallback((stemName: string) => {
         if (mutedStems[stemName]) return 0;
         return (volumes[stemName] ?? 80) / 100;
-    };
+    }, [mutedStems, volumes]);
 
-    const getTransportStemKeys = () => {
+    const getTransportStemKeys = useCallback(() => {
         const stemKeys = [...visibleStemKeys];
         if (mergedStemUrl) {
             stemKeys.push('merged');
         }
         return stemKeys;
-    };
+    }, [visibleStemKeys, mergedStemUrl]);
 
     // Sync volumes
     useEffect(() => {
@@ -88,7 +119,7 @@ export function Home() {
                 audio.volume = getPlaybackVolume(key);
             }
         });
-    }, [mutedStems, volumes]);
+    }, [getPlaybackVolume]);
 
     // Time sync
     useEffect(() => {
@@ -104,14 +135,7 @@ export function Home() {
             }
         }, 100);
         return () => clearInterval(interval);
-    }, [isTransportPlaying, mergedStemUrl, visibleStemKeys]);
-
-    useEffect(() => {
-        setMutedStems({});
-        setIsTransportPlaying(false);
-        setCurrentTime(0);
-        setMergedStemMembers([]);
-    }, [stemUrls]);
+    }, [isTransportPlaying, getTransportStemKeys]);
 
     useEffect(() => {
         const mergedAudio = audioRefs.current.merged;
@@ -120,6 +144,22 @@ export function Home() {
             mergedAudio.currentTime = 0;
         }
     }, [mergedStemUrl]);
+
+    // Keep the ref in sync with the latest URL (read only in the unmount
+    // cleanup below, never during render).
+    useEffect(() => {
+        mergedStemUrlRef.current = mergedStemUrl;
+    }, [mergedStemUrl]);
+
+    // Revoke any live merged blob when leaving the page (the track/separation
+    // reset path handles it while mounted; this covers unmount).
+    useEffect(() => {
+        return () => {
+            if (mergedStemUrlRef.current) {
+                URL.revokeObjectURL(mergedStemUrlRef.current);
+            }
+        };
+    }, []);
 
     useEffect(() => {
         mergedStemMembers.forEach(stemName => {
@@ -130,6 +170,11 @@ export function Home() {
         });
     }, [mergedStemMembers]);
 
+    // Sync the freshly-merged audio to the transport ONLY when a merge
+    // completes (mergedStemUrl changes). currentTime / isTransportPlaying are
+    // intentionally omitted from the deps: including them would re-seek the
+    // merged element on every 100ms time tick. We want the current values at
+    // merge time, which is exactly what this captures.
     useEffect(() => {
         const mergedAudio = audioRefs.current.merged;
         if (!mergedAudio || !mergedStemUrl) return;
@@ -140,6 +185,7 @@ export function Home() {
         if (isTransportPlaying) {
             void mergedAudio.play();
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [mergedStemUrl]);
 
     const handleSeparate = async () => {
@@ -236,13 +282,18 @@ export function Home() {
         });
     };
 
+    const downloadUrl = (url: string, filename: string) => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        a.remove();
+    };
+
     const handleDownload = (stemName: string) => {
         const url = stemUrls[stemName];
         if (!url) return;
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${stemName}.wav`;
-        a.click();
+        downloadUrl(url, `${stemName}.wav`);
     };
 
     const handleDownloadAll = () => {
@@ -251,10 +302,7 @@ export function Home() {
             const url = source === 'merged' ? mergedStemUrl : stemUrls[source];
             if (url) {
                 setTimeout(() => {
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = source === 'merged' ? 'merged.wav' : `${source}.wav`;
-                    a.click();
+                    downloadUrl(url, source === 'merged' ? 'merged.wav' : `${source}.wav`);
                 }, index * 200);
             }
         });
@@ -272,7 +320,7 @@ export function Home() {
     const handleMergeStems = async () => {
         if (selectedStems.size === 0) return;
         setIsMerging(true);
-        const audioContext = new AudioContext({ sampleRate: 44100 });
+        const audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
         const mergeMembers = Array.from(selectedStems);
 
         try {
@@ -293,9 +341,10 @@ export function Home() {
                 return;
             }
 
-            const numSamples = decodedBuffers[0].length;
+            // Guard against off-by-one length mismatches between decoded buffers.
+            const numSamples = Math.min(...decodedBuffers.map(b => b.length));
             const mergedData = new Float32Array(numSamples * 2);
-            
+
             for (const buffer of decodedBuffers) {
                 const left = buffer.getChannelData(0);
                 const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
@@ -306,7 +355,7 @@ export function Home() {
             }
 
             const { createWavBlob } = await import('../../utils/wav-utils');
-            const blob = createWavBlob(mergedData, 2, 44100);
+            const blob = createWavBlob(mergedData, 2, SAMPLE_RATE);
             const url = URL.createObjectURL(blob);
 
             const mergedAudio = audioRefs.current.merged;
@@ -357,14 +406,14 @@ export function Home() {
                 {stems.map(stemKey => (
                     <audio
                         key={stemKey}
-                        ref={el => { if (el) audioRefs.current[stemKey] = el; }}
+                        ref={el => { if (el) audioRefs.current[stemKey] = el; else delete audioRefs.current[stemKey]; }}
                         src={stemUrls[stemKey]}
                         onEnded={() => setIsTransportPlaying(false)}
                     />
                 ))}
                 {mergedStemUrl && (
                     <audio
-                        ref={el => { if (el) audioRefs.current['merged'] = el; }}
+                        ref={el => { if (el) audioRefs.current['merged'] = el; else delete audioRefs.current['merged']; }}
                         src={mergedStemUrl}
                         onEnded={() => setIsTransportPlaying(false)}
                     />
@@ -518,12 +567,7 @@ export function Home() {
                                             isSelected={false}
                                             onVolumeChange={(v) => setVolumes(prev => ({ ...prev, merged: v }))}
                                             onTogglePlay={() => togglePlay('merged')}
-                                            onDownload={() => {
-                                                const a = document.createElement('a');
-                                                a.href = mergedStemUrl;
-                                                a.download = 'merged.wav';
-                                                a.click();
-                                            }}
+                                            onDownload={() => downloadUrl(mergedStemUrl, 'merged.wav')}
                                             onToggleSelect={() => {}}
                                         />
                                     )}

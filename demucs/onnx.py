@@ -10,7 +10,7 @@ import math
 import torch
 import torch.nn as nn
 
-from .blocks import spectro
+from .blocks import pad1d, spectro
 from .htdemucs import HTDemucs
 from .repo import ModelRepository
 
@@ -94,8 +94,10 @@ def compute_stft_for_export(
     le = int(math.ceil(audio.shape[-1] / hop_length))
     pad = hop_length // 2 * 3
 
-    # Pad the audio
-    padded = torch.nn.functional.pad(
+    # Pad the audio. Use pad1d (same as HTDemucs._spec) so the reflect-pad
+    # handling stays identical even if this helper is ever reused on a clip
+    # shorter than the pad amount.
+    padded = pad1d(
         audio, (pad, pad + le * hop_length - audio.shape[-1]), mode="reflect"
     )
 
@@ -104,6 +106,9 @@ def compute_stft_for_export(
 
     # Trim to expected size
     z = z[..., :-1, :]  # Remove last frequency bin
+    # Same alignment sanity check HTDemucs._spec makes — guards against the
+    # padding math here silently drifting out of sync with the model's STFT.
+    assert z.shape[-1] == le + 4, (z.shape, le)
     z = z[..., 2 : 2 + le]  # Trim time dimension
 
     # Split into real and imaginary
@@ -126,9 +131,12 @@ def export_to_onnx(
     :param model_name: Name of the model to export.
     :param output_path: Path to save the ONNX model (defaults to ``{model_name}.onnx``).
     :param opset_version: ONNX opset version.
-    :param fp16: If True, convert all weights, activations, and IO to float16
-        after export. Halves model file size and enables faster inference on
-        FP16-capable backends (WebGPU, CUDA, etc.).
+    :param fp16: If True, store weights as float16 (with a Cast(fp16->fp32)
+        node inserted before each consumer) after export. This is weight-only:
+        it roughly halves the on-disk file size while compute and IO stay in
+        float32, so output is near-identical to the fp32 model (not bit-exact,
+        since weights are rounded to fp16). Avoids the audible quantization
+        noise that pure-fp16 accumulation produces on ORT-WASM.
     :return: Path to the exported ONNX model.
     :raises ImportError: If the ``onnx`` package is not installed.
     :raises ValueError: If the resolved model is not an ``HTDemucs`` instance.
@@ -143,7 +151,7 @@ def export_to_onnx(
 
     if fp16:
         import numpy as np
-        from onnx import numpy_helper, TensorProto, helper
+        from onnx import TensorProto, helper, numpy_helper
 
     if output_path is None:
         output_path = f"{model_name}.onnx"
@@ -180,13 +188,17 @@ def export_to_onnx(
         output_path,
         input_names=["spec_real", "spec_imag", "audio"],
         output_names=["out_spec_real", "out_spec_imag", "out_wave"],
+        # Only ``batch`` is dynamic. The model always runs at exactly the
+        # trained segment length (HTDemucs.forward pads shorter inputs up and
+        # valid_length() rejects longer ones), so the time/sample axes are
+        # fixed -- advertising them as dynamic would be a false promise.
         dynamic_axes={
-            "spec_real": {0: "batch", 3: "time"},
-            "spec_imag": {0: "batch", 3: "time"},
-            "audio": {0: "batch", 2: "samples"},
-            "out_spec_real": {0: "batch", 4: "time"},
-            "out_spec_imag": {0: "batch", 4: "time"},
-            "out_wave": {0: "batch", 3: "samples"},
+            "spec_real": {0: "batch"},
+            "spec_imag": {0: "batch"},
+            "audio": {0: "batch"},
+            "out_spec_real": {0: "batch"},
+            "out_spec_imag": {0: "batch"},
+            "out_wave": {0: "batch"},
         },
         opset_version=opset_version,
         do_constant_folding=True,
@@ -246,6 +258,17 @@ def export_to_onnx(
             else:
                 new_inits.append(init)
 
+        # If nothing matched, the exporter's op/initializer layout has changed
+        # (e.g. a torch/onnx upgrade fused ops or renamed inputs) and we'd
+        # otherwise write a byte-for-byte fp32 model stamped ``precision=fp16``.
+        # Fail loudly instead of shipping a mislabeled, full-size artifact.
+        if not new_cast_nodes:
+            raise RuntimeError(
+                "fp16 export requested but no fp32 weight initializers were "
+                "converted — the exporter's op/initializer layout likely "
+                "changed. Refusing to write a model mislabeled as fp16."
+            )
+
         onnx_model.graph.ClearField("initializer")
         onnx_model.graph.initializer.extend(new_inits)
         # Prepend the weight-Cast nodes so ORT sees them before any consumer.
@@ -268,6 +291,10 @@ def export_to_onnx(
     precision_meta = onnx_model.metadata_props.add()
     precision_meta.key = "precision"
     precision_meta.value = "fp16" if fp16 else "fp32"
+
+    # Validate the graph before saving — catches any malformed nodes,
+    # especially after the fp16 weight/Cast surgery above.
+    onnx.checker.check_model(onnx_model)
 
     onnx.save(onnx_model, output_path)
 

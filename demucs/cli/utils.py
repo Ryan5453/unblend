@@ -32,7 +32,12 @@ def format_file_size(size_bytes: int) -> str:
 
 
 def format_output_path(
-    template: str, model: str, track: Path, stem: str, ext: str = "wav"
+    template: str,
+    model: str,
+    track: Path,
+    stem: str,
+    ext: str = "wav",
+    now: datetime | None = None,
 ) -> Path:
     """
     Format output path template with variables.
@@ -42,9 +47,13 @@ def format_output_path(
     :param track: Path to the source track
     :param stem: Stem name
     :param ext: Output file extension
+    :param now: Timestamp used for {date}/{time}/{timestamp} substitutions. Pass
+        a single value shared across an entire run so the collision pre-check and
+        the actual writes resolve to identical paths; defaults to ``datetime.now()``.
     :return: Resolved output path
     """
-    now = datetime.now()
+    if now is None:
+        now = datetime.now()
     variables = {
         "model": model,
         "track": track.name.rsplit(".", 1)[0],
