@@ -123,6 +123,14 @@ function reflectIndex(i: number, len: number): number {
  * Compute STFT using pre-allocated buffers to avoid memory allocations
  */
 export function computeSTFT(audio: Float32Array, buffers: STFTBuffers): STFTResult {
+    // The padding/frame constants above are compile-time functions of
+    // SEGMENT_SAMPLES; any other input length would silently produce garbage.
+    if (audio.length !== NUM_CHANNELS * SEGMENT_SAMPLES) {
+        throw new Error(
+            `computeSTFT expects ${NUM_CHANNELS * SEGMENT_SAMPLES} interleaved ` +
+            `samples (${NUM_CHANNELS} ch × SEGMENT_SAMPLES), got ${audio.length}`
+        );
+    }
     const numSamples = audio.length / NUM_CHANNELS;
     const { demucs_padded, paddedChannels, real, imag, outReal, outImag, fftInput, fftOutput } = buffers;
 
@@ -209,6 +217,21 @@ export function computeISTFT(
     targetLength: number,
     buffers: ISTFTBuffers
 ): Float32Array {
+    // The buffers (and the precomputed window sum) are sized from the
+    // compile-time segment constants; reject anything else loudly.
+    if (
+        numChannels !== NUM_CHANNELS ||
+        numBins !== OUT_BINS ||
+        numFrames !== OUT_FRAMES ||
+        targetLength !== SEGMENT_SAMPLES
+    ) {
+        throw new Error(
+            `computeISTFT expects ${NUM_CHANNELS} ch × ${OUT_BINS} bins × ` +
+            `${OUT_FRAMES} frames → ${SEGMENT_SAMPLES} samples, got ` +
+            `${numChannels} ch × ${numBins} bins × ${numFrames} frames → ` +
+            `${targetLength} samples`
+        );
+    }
     const paddedFrames = numFrames + 4;
     const { output, windowSumReciprocal, finalOutput, ifftInput, ifftOutput } = buffers;
 

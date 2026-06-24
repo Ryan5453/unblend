@@ -191,9 +191,62 @@ def tensor_chunk(tensor_or_chunk: Tensor | TensorChunk) -> TensorChunk:
         return TensorChunk(tensor_or_chunk)
 
 
-_SPLIT_WEIGHT_CACHE: dict[
-    tuple[int, float, torch.device, torch.dtype], Tensor
-] = {}
+_SPLIT_WEIGHT_CACHE: dict[tuple[int, float, torch.device, torch.dtype], Tensor] = {}
+
+# Sizing for the GPU-resident accumulation fast path. The CUDA pipeline keeps
+# each mix and its overlap-add accumulators on the GPU when they fit within
+# this fraction of the currently-free VRAM (after a fixed reserve for the
+# active chunk batch + STFT scratch, which scale with chunk_batch_size, not
+# input length). Inputs too long for the budget fall back to the bounded
+# CPU-accumulation path, preserving the "GPU usage bounded by model +
+# active batch" property for arbitrarily long audio.
+_GPU_ACCUM_VRAM_FRACTION = 0.3
+_GPU_ACCUM_VRAM_RESERVE_BYTES = 2 * 1024**3
+
+
+def _gpu_accum_budget_bytes(device: torch.device | str) -> int:
+    """
+    VRAM budget (bytes) available for keeping mixes and overlap-add
+    accumulators resident on the GPU.
+
+    :param device: CUDA device to query.
+    :return: Usable byte budget; 0 if free memory cannot be determined.
+    """
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info(
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
+    except Exception:
+        return 0
+    # Allocator-reserved-but-unallocated blocks are reusable by us on top of
+    # the driver-reported free memory.
+    reserved_slack = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
+        device
+    )
+    usable = free_bytes + max(0, reserved_slack)
+    return max(
+        0, int(_GPU_ACCUM_VRAM_FRACTION * (usable - _GPU_ACCUM_VRAM_RESERVE_BYTES))
+    )
+
+
+def _gpu_accum_bytes_needed(
+    batch_dim: int, n_sources: int, channels: int, length: int
+) -> int:
+    """
+    Bytes needed to keep one mix's GPU-resident state for the fast path:
+    the staged fp32 mix, the fp32 output accumulator, and the weight sum.
+
+    Shared by ``_apply_model_multi_unshifted`` (per-mix gate) and
+    ``Separator`` (deciding whether to stage the waveform on the GPU up
+    front) so the two can't disagree about what fits.
+
+    :param batch_dim: Leading batch dimension of the mix.
+    :param n_sources: Number of output sources.
+    :param channels: Audio channels.
+    :param length: Mix length in samples.
+    :return: Estimated bytes of GPU memory required.
+    """
+    return (batch_dim * channels * (n_sources + 1) * length + length) * 4
 
 
 def _split_weight(
@@ -261,7 +314,7 @@ def apply_model(
         the model is not such an ensemble or no sub-model matches one-hot.
     :param chunk_batch_size: Chunks processed in parallel.
     :return: Separated sources tensor.
-    :raises ValueError: If ``overlap`` produces a non-positive segment stride.
+    :raises ValidationError: If ``overlap`` produces a non-positive segment stride.
     """
     # Single-mix separation is just the one-element case of the multi-mix
     # path, so we delegate rather than keep a second copy of the chunking /
@@ -285,7 +338,7 @@ def apply_model(
 
 def apply_model_multi(
     model: ModelEnsemble | Model,
-    mixes: list[Tensor],
+    mixes: list[Tensor | TensorChunk],
     device: torch.device | str | None = None,
     shifts: int = 0,
     overlap: float = 0.25,
@@ -313,7 +366,8 @@ def apply_model_multi(
     pooling.
 
     :param model: Model or ensemble to apply.
-    :param mixes: List of input mixtures, each of shape ``[batch, channels, samples]``.
+    :param mixes: List of input mixtures (tensors or ``TensorChunk`` views),
+        each ``[batch, channels, samples]`` or ``[channels, samples]``.
     :param device: Device for local computation; if ``None``, ``mixes[0].device``.
     :param shifts: If > 0, average over ``shifts`` random sub-second shifts per mix.
     :param overlap: Overlap ratio between consecutive segments.
@@ -335,7 +389,7 @@ def apply_model_multi(
     :param chunk_batch_size: Chunks processed in parallel per forward pass.
     :return: One separated-sources tensor per input mix, same shape as
         ``apply_model`` would have produced.
-    :raises ValueError: If ``overlap`` produces a non-positive segment stride.
+    :raises ValidationError: If ``overlap`` produces a non-positive segment stride.
     """
     if not mixes:
         return []
@@ -344,6 +398,53 @@ def apply_model_multi(
         device = mixes[0].device
     else:
         device = torch.device(device)
+
+    # The pooled chunk batching below assumes one accumulator row per chunk,
+    # so a mix with batch dim > 1 is split into per-row mixes here and the
+    # outputs re-stacked afterwards (2-D mixes are lifted to batch 1). For
+    # the common batch-1 case this is a no-op passthrough.
+    flat_mixes: list[Tensor | TensorChunk] = []
+    spans: list[int] = []
+    needs_restack = False
+    for mix in mixes:
+        inner = mix.tensor if isinstance(mix, TensorChunk) else mix
+        if inner.dim() == 2:
+            if isinstance(mix, TensorChunk):
+                flat_mixes.append(TensorChunk(inner[None], mix.offset, mix.length))
+            else:
+                flat_mixes.append(mix[None])
+            spans.append(1)
+            needs_restack = True
+        elif inner.dim() == 3 and inner.shape[0] > 1:
+            for b in range(inner.shape[0]):
+                row_mix = inner[b : b + 1]
+                if isinstance(mix, TensorChunk):
+                    flat_mixes.append(TensorChunk(row_mix, mix.offset, mix.length))
+                else:
+                    flat_mixes.append(row_mix)
+            spans.append(inner.shape[0])
+            needs_restack = True
+        else:
+            flat_mixes.append(mix)
+            spans.append(1)
+    if needs_restack:
+        flat_results = apply_model_multi(
+            model,
+            flat_mixes,
+            device=device,
+            shifts=shifts,
+            overlap=overlap,
+            transition_power=transition_power,
+            progress_callback=progress_callback,
+            use_only_stem=use_only_stem,
+            chunk_batch_size=chunk_batch_size,
+        )
+        results: list[Tensor] = []
+        row = 0
+        for span in spans:
+            results.append(torch.cat(flat_results[row : row + span], dim=0))
+            row += span
+        return results
 
     if isinstance(model, ModelEnsemble):
         # Same specialisation shortcut as apply_model: when use_only_stem points
@@ -412,9 +513,14 @@ def apply_model_multi(
                         {"total_chunks": sub_total_chunks * num_sub_models},
                     )
             elif event_type == "chunk_complete":
-                per_model = int(data.get("total_chunks", sub_total_chunks or 0))
-                completed = sub_models_done * per_model + int(
-                    data.get("completed_chunks", 0)
+                # Use the latched first sub-model total for the span math and
+                # clamp the per-sub-model progress to it: with shifts > 1 each
+                # sub-model run draws its own random offsets, so totals can
+                # differ by a few chunks between sub-models. Clamping keeps
+                # the bar monotonic and bounded by the declared total.
+                per_model = sub_total_chunks or int(data.get("total_chunks", 0))
+                completed = sub_models_done * per_model + min(
+                    int(data.get("completed_chunks", 0)), per_model
                 )
                 progress_callback(
                     "chunk_complete",
@@ -431,6 +537,8 @@ def apply_model_multi(
         results: list[Tensor] | None = None
         totals = [0.0] * len(model.sources)
         for sub_model, model_weights in zip(model.models, model.weights):
+            sub_param = next(sub_model.parameters(), None)
+            sub_device = sub_param.device if sub_param is not None else None
             sub_outs = apply_model_multi(
                 sub_model,
                 mixes,
@@ -442,6 +550,11 @@ def apply_model_multi(
                 chunk_batch_size=chunk_batch_size,
             )
             sub_models_done += 1
+            # Restore the sub-model to where the caller had it (mirrors
+            # upstream BagOfModels): at most one sub-model stays resident on
+            # the inference device at a time. No-op when they already match.
+            if sub_device is not None and sub_device != device:
+                sub_model.to(sub_device)
             for k, inst_weight in enumerate(model_weights):
                 totals[k] += inst_weight
                 for sub_out in sub_outs:
@@ -472,10 +585,62 @@ def apply_model_multi(
 
     if shifts:
         max_shift = int(0.5 * model.samplerate)
+        # Pre-draw every round's offsets — same RNG draw order as drawing them
+        # round by round (round-major, one randint per mix) — so the exact
+        # chunk total across all rounds is known up front. Without this each
+        # round would emit its own processing_start/complete cycle and the
+        # progress bar would restart per shift.
+        all_offsets = [
+            [random.randint(0, max_shift) for _ in mixes] for _ in range(shifts)
+        ]
+
+        # Same validation as the unshifted helper, but raised before any
+        # progress events fire — otherwise a doomed run emits a
+        # ``processing_start`` with ``total_chunks: 0`` first.
+        segment_length = int(model.samplerate * model.max_allowed_segment)
+        stride = int((1 - overlap) * segment_length)
+        if stride < 1:
+            raise ValidationError(
+                f"split overlap {overlap} produces an invalid stride for segment length {segment_length}"
+            )
+
+        inner_callback = progress_callback
+        if progress_callback is not None:
+            total_chunks = 0
+            # Mirrors ``range(0, length, stride)`` in the unshifted helper.
+            for offsets_per_mix in all_offsets:
+                for mix, offset in zip(mixes, offsets_per_mix):
+                    shifted_length = mix.shape[-1] + max_shift - offset
+                    total_chunks += -(-shifted_length // stride)
+            completed_total = 0
+
+            def shift_progress(event_type: str, data: dict[str, Any]) -> None:
+                """
+                Aggregate per-round progress into one continuous span across
+                all shift rounds; per-round start/complete events are
+                swallowed (one spanning pair is emitted around the loop).
+
+                :param event_type: Progress event name.
+                :param data: Event payload.
+                :return: None.
+                """
+                nonlocal completed_total
+                assert progress_callback is not None
+                if event_type == "chunk_complete":
+                    completed_total += 1
+                    progress_callback(
+                        "chunk_complete",
+                        {
+                            "completed_chunks": completed_total,
+                            "total_chunks": total_chunks,
+                        },
+                    )
+
+            inner_callback = shift_progress
+            progress_callback("processing_start", {"total_chunks": total_chunks})
+
         accumulators: list[Tensor | None] = [None] * len(mixes)
-        for _shift_idx in range(shifts):
-            # Per-mix random offset, mirroring apply_model.
-            offsets_per_mix = [random.randint(0, max_shift) for _ in mixes]
+        for offsets_per_mix in all_offsets:
             shifted_inputs: list[Tensor | TensorChunk] = []
             for mix, offset in zip(mixes, offsets_per_mix):
                 length = mix.shape[-1]
@@ -490,7 +655,7 @@ def apply_model_multi(
                 device=device,
                 overlap=overlap,
                 transition_power=transition_power,
-                progress_callback=progress_callback,
+                progress_callback=inner_callback,
                 chunk_batch_size=chunk_batch_size,
             )
             for i, (partial, offset) in enumerate(zip(partials, offsets_per_mix)):
@@ -500,6 +665,8 @@ def apply_model_multi(
                     accumulators[i] = trimmed
                 else:
                     accumulators[i] = accumulators[i] + trimmed
+        if progress_callback is not None:
+            progress_callback("processing_complete", {"total_chunks": total_chunks})
         assert all(a is not None for a in accumulators)
         return [a / shifts for a in accumulators]  # type: ignore[operator]
 
@@ -541,41 +708,63 @@ def _apply_model_multi_unshifted(
     :param chunk_batch_size: Number of chunks per forward pass.
     :param progress_callback: Optional callback for progress updates.
     :return: One separated-sources tensor per input mix, in input order.
-    :raises ValueError: If ``overlap`` produces a non-positive segment stride.
+    :raises ValidationError: If ``overlap`` produces a non-positive segment stride.
     """
     segment = model.max_allowed_segment
     assert segment > 0.0
     segment_length: int = int(model.samplerate * segment)
     stride = int((1 - overlap) * segment_length)
     if stride < 1:
-        raise ValueError(
+        raise ValidationError(
             f"split overlap {overlap} produces an invalid stride for segment length {segment_length}"
         )
-    # See ``apply_model`` for the bounded-GPU / unified-memory split.
-    bounded_gpu = str(device).startswith("cuda")
-    accum_device = torch.device("cpu") if bounded_gpu else device
-    weight = _split_weight(segment_length, transition_power, accum_device, torch.float32)
-
-    if isinstance(model, HTDemucs):
-        chunk_valid_length: int = segment_length
-    elif hasattr(model, "valid_length"):
-        chunk_valid_length = model.valid_length(segment_length)  # type: ignore[attr-defined]
+    # CUDA path: accumulate on the GPU when every mix's accumulators fit the
+    # VRAM budget (single D2H at the end, no per-batch CPU round-trip);
+    # otherwise fall back to CPU accumulation with per-batch staging, which
+    # bounds GPU usage by ``model + active_batch`` for arbitrarily long audio.
+    # MPS/CPU accumulate on ``device`` as before (unified memory on MPS).
+    is_cuda = str(device).startswith("cuda")
+    if is_cuda:
+        bytes_needed = 0
+        for mix in mixes:
+            inner = mix.tensor if isinstance(mix, TensorChunk) else mix
+            mix_length = mix.length if isinstance(mix, TensorChunk) else mix.shape[-1]
+            bytes_needed += _gpu_accum_bytes_needed(
+                inner.shape[0] if inner.dim() > 2 else 1,
+                len(model.sources),
+                inner.shape[-2],
+                mix_length,
+            )
+        gpu_resident = bytes_needed <= _gpu_accum_budget_bytes(device)
     else:
-        chunk_valid_length = segment_length
+        gpu_resident = True
+    accum_device = device if gpu_resident else torch.device("cpu")
+    weight = _split_weight(
+        segment_length, transition_power, accum_device, torch.float32
+    )
+    # CUDAGraphs capture (Separator's compile path) requires every forward to
+    # have the captured batch shape, so sub-full tail batches are zero-padded
+    # up to ``chunk_batch_size``. Eager execution has no such constraint, and
+    # padding would just burn forward compute on zero chunks.
+    fixed_batch_shape = bool(getattr(model, "_fixed_batch_shape", False))
+
+    chunk_valid_length: int = segment_length
 
     mix_states: list[dict[str, Any]] = []
     full_pool: list[tuple[int, int, TensorChunk]] = []  # (mix_idx, offset, chunk)
     tail_pool: list[tuple[int, int, TensorChunk]] = []
 
     for mix_idx, mix in enumerate(mixes):
-        # CUDA bounded path keeps mix on CPU; MPS/CPU move to inference
-        # device once (unified memory on MPS = essentially free).
+        # GPU-resident path moves each mix to the inference device once and
+        # slices chunks there; the bounded CPU path keeps the mix on CPU and
+        # stages each batch instead. MPS/CPU always move once (unified memory
+        # on MPS = essentially free).
         if isinstance(mix, TensorChunk):
             length = mix.length
             channels = mix.tensor.shape[-2]
             batch_dim = mix.tensor.shape[0] if mix.tensor.dim() > 2 else 1
             original_device = mix.tensor.device
-            if bounded_gpu:
+            if not gpu_resident:
                 mix_dev: Tensor | TensorChunk = mix
             else:
                 inner = mix.tensor
@@ -587,7 +776,7 @@ def _apply_model_multi_unshifted(
             channels = mix.shape[-2]
             batch_dim = mix.shape[0] if mix.dim() > 2 else 1
             original_device = mix.device
-            if bounded_gpu:
+            if not gpu_resident:
                 mix_dev = mix
             else:
                 mix_dev = mix if mix.device == device else mix.to(device)
@@ -640,19 +829,33 @@ def _apply_model_multi_unshifted(
             dim=0,
         )
         n_actual = padded.shape[0]
-        if n_actual < chunk_batch_size:
+        if n_actual < chunk_batch_size and fixed_batch_shape:
+            # CUDAGraphs replay (Separator's compile path) requires the
+            # captured batch shape, so tails pad all the way up. Eager models
+            # run tails at their natural size — padding would burn forward
+            # compute on zero chunks. (Natural tail shapes are only viable
+            # because eager mode leaves ``cudnn.benchmark`` off; with it on,
+            # every distinct shape costs a multi-second exhaustive algorithm
+            # search, which measured far worse than any padding waste.)
             pad_count = chunk_batch_size - n_actual
             zero_pad = padded.new_zeros((pad_count, *padded.shape[1:]))
             padded = torch.cat([padded, zero_pad], dim=0)
 
-        if bounded_gpu:
+        if padded.device != device:
             padded = padded.to(device)
 
         with torch.inference_mode():
             batch_out = model(padded)
 
-        if bounded_gpu:
-            batch_out = batch_out.cpu()
+        if batch_out.device != accum_device:
+            batch_out = batch_out.to(accum_device)
+        elif progress_callback is not None and is_cuda:
+            # The GPU-resident path has no host sync per batch (that's the
+            # point), so without this the per-chunk events below would fire
+            # at kernel-enqueue time — racing ahead of the actual compute and
+            # rendering progress meaningless. Sync only when someone is
+            # watching; unobserved runs keep the free-running pipeline.
+            torch.cuda.synchronize(device)
 
         for i, (mix_idx, offset, chunk) in enumerate(batch_items):
             state = mix_states[mix_idx]

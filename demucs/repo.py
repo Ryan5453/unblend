@@ -10,7 +10,6 @@ import pickle
 import shutil
 import tempfile
 from hashlib import sha256
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,12 +25,17 @@ BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 
 def check_checksum(path: Path, checksum: str) -> None:
     """
-    Verify that a file matches an expected checksum.
+    Verify that a file matches an expected SHA-256 checksum.
 
     :param path: Path to the file to check
-    :param checksum: Expected SHA-256 checksum (first 8 characters)
-    :raises ModelLoadingError: If the actual checksum does not match the expected one
+    :param checksum: Expected SHA-256 hex digest — the full 64 characters from
+        metadata's ``sha256`` field, or a shorter prefix (upstream's 8-char
+        file-naming checksum) when no full digest is available
+    :raises ModelLoadingError: If the actual checksum does not match the expected
+        one, or the expected checksum is empty (which would match anything)
     """
+    if not checksum:
+        raise ModelLoadingError(f"Empty expected checksum for file {path}")
     sha = sha256()
     with open(path, "rb") as file:
         while True:
@@ -39,7 +43,7 @@ def check_checksum(path: Path, checksum: str) -> None:
             if not buf:
                 break
             sha.update(buf)
-    actual_checksum = sha.hexdigest()[:8]
+    actual_checksum = sha.hexdigest()[: len(checksum)]
     if actual_checksum != checksum:
         raise ModelLoadingError(
             f"Invalid checksum for file {path}, "
@@ -84,14 +88,18 @@ class ModelRepository:
                 "The expected format is a top-level 'models' dictionary."
             )
 
-        # Generate layer URLs from model remote paths
+        # Generate layer URLs from model remote paths. The short checksum is
+        # the cache filename / URL key; the full sha256 (when present) is what
+        # downloads and cache hits are verified against.
         self._layer_urls = {}
+        self._layer_sha256 = {}
         for model_name, model_info in self._models.items():
             if "models" in model_info:
                 for model_entry in model_info["models"]:
                     checksum = model_entry["checksum"]
                     remote_path = model_entry["remote"]
                     self._layer_urls[checksum] = f"{BASE_CDN_URL}/{remote_path}"
+                    self._layer_sha256[checksum] = model_entry.get("sha256", checksum)
 
     def get_cache_info(self) -> dict[str, dict]:
         """
@@ -155,6 +163,7 @@ class ModelRepository:
         :param url: URL to download the layer from
         :param cache_path: Local path to cache the downloaded layer
         :param expected_checksum: Expected SHA-256 checksum for verification
+            (full digest, or a shorter prefix when no full digest is known)
         :param progress_callback: Optional callback for download progress updates
         :param model_name: Name of the model being downloaded
         :param layer_index: Index of the current layer (1-based)
@@ -162,14 +171,16 @@ class ModelRepository:
         :return: The loaded model
         :raises ModelLoadingError: If download or loading fails
         """
-        # Download the file to memory first
+        # Stream the download straight into a temp file (no in-memory copy),
+        # verify it, then move it into the cache. A partial or corrupt
+        # download can never land at ``cache_path``.
+        tmp_path: Path | None = None
         try:
-            with httpx.stream("GET", url, follow_redirects=True) as response:
+            with httpx.stream(
+                "GET", url, follow_redirects=True, timeout=30.0
+            ) as response:
                 response.raise_for_status()
                 total_size = int(response.headers.get("content-length", 0))
-
-                # Download to memory first
-                buffer = BytesIO()
                 downloaded_size = 0
 
                 # Notify callback about layer start
@@ -184,131 +195,159 @@ class ModelRepository:
                         },
                     )
 
-                chunk_counter = 0
-                for chunk in response.iter_bytes(chunk_size=8192):
-                    buffer.write(chunk)
-                    downloaded_size += len(chunk)
-                    chunk_counter += 1
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".th"
+                ) as tmp_file:
+                    tmp_path = Path(tmp_file.name)
+                    chunk_counter = 0
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        tmp_file.write(chunk)
+                        downloaded_size += len(chunk)
+                        chunk_counter += 1
 
-                    # Update progress every few chunks to avoid too frequent updates
-                    if progress_callback and (chunk_counter % 20 == 0):
-                        if total_size and total_size > 0:
-                            progress_percent = (downloaded_size / total_size) * 100
-                        else:
-                            # Estimate progress based on chunks downloaded
-                            chunk_count = downloaded_size // 8192
-                            progress_percent = min(chunk_count * 0.5, 95)  # Cap at 95%
+                        # Update progress every few chunks to avoid too frequent updates
+                        if progress_callback and (chunk_counter % 20 == 0):
+                            if total_size and total_size > 0:
+                                progress_percent = (downloaded_size / total_size) * 100
+                            else:
+                                # Estimate progress based on chunks downloaded
+                                chunk_count = downloaded_size // 8192
+                                progress_percent = min(
+                                    chunk_count * 0.5, 95
+                                )  # Cap at 95%
 
-                        progress_callback(
-                            "layer_progress",
-                            {
-                                "model_name": model_name,
-                                "layer_index": layer_index,
-                                "total_layers": total_layers,
-                                "progress_percent": progress_percent,
-                                "downloaded_bytes": downloaded_size,
-                                "total_bytes": total_size,
-                            },
-                        )
+                            progress_callback(
+                                "layer_progress",
+                                {
+                                    "model_name": model_name,
+                                    "layer_index": layer_index,
+                                    "total_layers": total_layers,
+                                    "progress_percent": progress_percent,
+                                    "downloaded_bytes": downloaded_size,
+                                    "total_bytes": total_size,
+                                },
+                            )
 
-                buffer.seek(0)
+            # Verify integrity BEFORE unpickling. ``load_model`` /
+            # ``torch.load`` use ``weights_only=False`` because the
+            # checkpoint format pickles the model class and its init
+            # args (``weights_only=True`` refuses to reconstruct those),
+            # which means loading can execute arbitrary code. The full
+            # SHA-256 from the shipped metadata is the integrity gate, so
+            # it must pass before the bytes reach the unpickler. The
+            # cache-load paths in ``get_model`` already check_checksum
+            # before torch.load.
+            if progress_callback:
+                progress_callback(
+                    "layer_progress",
+                    {
+                        "model_name": model_name,
+                        "layer_index": layer_index,
+                        "total_layers": total_layers,
+                        "progress_percent": 95,
+                        "downloaded_bytes": downloaded_size,
+                        "total_bytes": total_size,
+                        "phase": "verifying",
+                    },
+                )
+            check_checksum(tmp_path, expected_checksum)
 
-                # Try to load as a PyTorch model directly from memory
-                tmp_path: Path | None = None
-                try:
-                    # Notify callback about loading phase
-                    if progress_callback:
-                        progress_callback(
-                            "layer_progress",
-                            {
-                                "model_name": model_name,
-                                "layer_index": layer_index,
-                                "total_layers": total_layers,
-                                "progress_percent": 90,
-                                "downloaded_bytes": downloaded_size,
-                                "total_bytes": total_size,
-                                "phase": "loading",
-                            },
-                        )
+            # Bytes are verified — now load and move into the cache.
+            model_data = torch.load(tmp_path, map_location="cpu", weights_only=False)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(tmp_path), str(cache_path))
+            tmp_path = None
 
-                    # Save to a temporary file first
-                    with tempfile.NamedTemporaryFile(
-                        delete=False, suffix=".th"
-                    ) as tmp_file:
-                        tmp_path = Path(tmp_file.name)
-                        tmp_file.write(buffer.getvalue())
+            # Notify callback about layer completion
+            if progress_callback:
+                progress_callback(
+                    "layer_complete",
+                    {
+                        "model_name": model_name,
+                        "layer_index": layer_index,
+                        "total_layers": total_layers,
+                    },
+                )
 
-                    # Verify integrity BEFORE unpickling. ``load_model`` /
-                    # ``torch.load`` use ``weights_only=False`` because the
-                    # checkpoint format pickles the model class and its init
-                    # args (``weights_only=True`` refuses to reconstruct those),
-                    # which means loading can execute arbitrary code. The
-                    # SHA-256 from the shipped metadata is the only integrity
-                    # gate we have, so it must pass before the bytes reach the
-                    # unpickler — not after, as it used to. The cache-load paths
-                    # in ``get_model`` already check_checksum before torch.load.
-                    if progress_callback:
-                        progress_callback(
-                            "layer_progress",
-                            {
-                                "model_name": model_name,
-                                "layer_index": layer_index,
-                                "total_layers": total_layers,
-                                "progress_percent": 95,
-                                "downloaded_bytes": downloaded_size,
-                                "total_bytes": total_size,
-                                "phase": "verifying",
-                            },
-                        )
-                    check_checksum(tmp_path, expected_checksum)
-
-                    # Bytes are verified — now load and move into the cache.
-                    model_data = torch.load(
-                        tmp_path, map_location="cpu", weights_only=False
-                    )
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(tmp_path), str(cache_path))
-
-                    # Notify callback about layer completion
-                    if progress_callback:
-                        progress_callback(
-                            "layer_complete",
-                            {
-                                "model_name": model_name,
-                                "layer_index": layer_index,
-                                "total_layers": total_layers,
-                            },
-                        )
-
-                    return load_model(model_data)
-
-                except Exception as e:
-                    # Clean up temp file. ``tmp_path`` may still be None if the
-                    # failure happened in the loading-phase callback above,
-                    # before the temp file was created.
-                    if tmp_path is not None and tmp_path.exists():
-                        tmp_path.unlink()
-                    raise ModelLoadingError(f"Failed to load model: {str(e)}")
+            return load_model(model_data)
 
         except httpx.HTTPError as e:
             raise ModelLoadingError(f"Failed to download {url}: {str(e)}")
+        except ModelLoadingError:
+            raise
+        except Exception as e:
+            raise ModelLoadingError(f"Failed to load model: {str(e)}")
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink()
 
-    def get_model(
-        self,
-        name: str,
-        only_load: str | None = None,
-        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
-    ) -> Model | ModelEnsemble:
+    def _load_first_layer_sources(self, name: str, model_info: dict) -> list[str]:
         """
-        Get a model by name, downloading if necessary.
+        Fallback for metadata without a ``sources`` field: download/load the
+        first layer just to read its stem names.
+
+        :param name: Model name (for download bookkeeping)
+        :param model_info: Metadata entry for the model
+        :return: The model's stem names
+        :raises ModelLoadingError: If the layer cannot be fetched or loaded
+        """
+        cache_dir = get_cache_dir()
+        first_checksum = model_info["models"][0]["checksum"]
+        first_cache_path = cache_dir / f"{first_checksum}.th"
+        expected = self._layer_sha256.get(first_checksum, first_checksum)
+
+        if not first_cache_path.exists():
+            if first_checksum not in self._layer_urls:
+                raise ModelLoadingError(f"Layer {first_checksum} not found in metadata")
+            first_model = self._download_and_load_layer(
+                url=self._layer_urls[first_checksum],
+                cache_path=first_cache_path,
+                expected_checksum=expected,
+                progress_callback=None,
+                model_name=name,
+                layer_index=1,
+                total_layers=1,
+            )
+        else:
+            try:
+                check_checksum(first_cache_path, expected)
+                first_model = load_model(
+                    torch.load(first_cache_path, map_location="cpu", weights_only=False)
+                )
+            except (
+                ModelLoadingError,
+                RuntimeError,
+                EOFError,
+                pickle.UnpicklingError,
+            ):
+                # The cached file is corrupt/unreadable: discard and redownload.
+                if first_cache_path.exists():
+                    first_cache_path.unlink()
+                first_model = self._download_and_load_layer(
+                    url=self._layer_urls[first_checksum],
+                    cache_path=first_cache_path,
+                    expected_checksum=expected,
+                    progress_callback=None,
+                    model_name=name,
+                    layer_index=1,
+                    total_layers=1,
+                )
+        return first_model.sources
+
+    def _select_layers(
+        self, name: str, only_load: str | None = None
+    ) -> tuple[list[str], dict]:
+        """
+        Resolve which layer checksums ``get_model`` needs, honouring the
+        ``only_load`` single-specialist optimisation for ensembles.
 
         :param name: Model name
-        :param only_load: If specified, load only the model specialized for this stem
-        :param progress_callback: Optional callback for download progress updates
-        :return: The requested model
-        :raises ModelLoadingError: If the model is not found or fails to load
+        :param only_load: If specified, select only the layer specialized for
+            this stem (when the model is an ensemble with a one-hot weight row)
+        :return: ``(layer_checksums, model_info)``; ``model_info`` has its
+            weights stripped when only the specialist layer was selected
+        :raises ModelLoadingError: If the model is not found
         """
-        # Only load models, not individual layers
         if name not in self._models:
             raise ModelLoadingError(
                 f"Could not find a model with name {name}. "
@@ -319,67 +358,16 @@ class ModelRepository:
         weights = model_info.get("weights")
         layer_checksums = [entry["checksum"] for entry in model_info["models"]]
 
-        # Check if we should load only a specific stem model
         if only_load and weights and len(weights) > 1:
-            # This is a model ensemble - try to find the specialized model for this stem
-            cache_dir = get_cache_dir()
+            # Stem names come from metadata; fall back to loading the first
+            # layer for metadata files that predate the ``sources`` field.
+            stem_names = model_info.get("sources")
+            if stem_names is None:
+                stem_names = self._load_first_layer_sources(name, model_info)
 
-            # Load first model to get stem names
-            first_checksum = layer_checksums[0]
-            first_cache_path = cache_dir / f"{first_checksum}.th"
-
-            # Download first model if needed to get stem names
-            if not first_cache_path.exists():
-                if first_checksum not in self._layer_urls:
-                    raise ModelLoadingError(
-                        f"Layer {first_checksum} not found in metadata"
-                    )
-
-                url = self._layer_urls[first_checksum]
-                first_model = self._download_and_load_layer(
-                    url=url,
-                    cache_path=first_cache_path,
-                    expected_checksum=first_checksum,
-                    progress_callback=None,
-                    model_name=name,
-                    layer_index=1,
-                    total_layers=1,
-                )
-            else:
-                try:
-                    check_checksum(first_cache_path, first_checksum)
-                    first_model = load_model(
-                        torch.load(
-                            first_cache_path, map_location="cpu", weights_only=False
-                        )
-                    )
-                except (
-                    ModelLoadingError,
-                    RuntimeError,
-                    EOFError,
-                    pickle.UnpicklingError,
-                ):
-                    # The cached file is corrupt/unreadable: discard and redownload.
-                    if first_cache_path.exists():
-                        first_cache_path.unlink()
-                    url = self._layer_urls[first_checksum]
-                    first_model = self._download_and_load_layer(
-                        url=url,
-                        cache_path=first_cache_path,
-                        expected_checksum=first_checksum,
-                        progress_callback=None,
-                        model_name=name,
-                        layer_index=1,
-                        total_layers=1,
-                    )
-
-            stem_names = first_model.sources
-
-            if only_load not in stem_names:
-                # Stem doesn't exist - fall through to load full model
-                # Validation will happen in Separator
-                pass
-            else:
+            # An unknown stem falls through to the full model; validation
+            # happens in Separator.
+            if only_load in stem_names:
                 # Find which model specializes in this stem
                 stem_index = stem_names.index(only_load)
                 model_index = None
@@ -398,12 +386,43 @@ class ModelRepository:
                         break
 
                 if model_index is not None:
-                    # Load only the specialized model
+                    # Load only the specialized model; remove weights so the
+                    # single layer is treated as identity.
                     layer_checksums = [layer_checksums[model_index]]
-                    # Update model_info to indicate this is now a single-model config
-                    # Remove weights so it's treated as identity
-                    model_info = dict(model_info)  # Make a copy
-                    model_info.pop("weights", None)  # Remove weights
+                    model_info = dict(model_info)
+                    model_info.pop("weights", None)
+
+        return layer_checksums, model_info
+
+    def required_layers(self, name: str, only_load: str | None = None) -> list[str]:
+        """
+        Return the layer checksums ``get_model(name, only_load)`` would load.
+        Useful for cache checks without touching the network.
+
+        :param name: Model name
+        :param only_load: Optional stem for the single-specialist optimisation
+        :return: List of layer checksums (cache filenames are ``{checksum}.th``)
+        :raises ModelLoadingError: If the model is not found
+        """
+        layer_checksums, _ = self._select_layers(name, only_load)
+        return layer_checksums
+
+    def get_model(
+        self,
+        name: str,
+        only_load: str | None = None,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> Model | ModelEnsemble:
+        """
+        Get a model by name, downloading if necessary.
+
+        :param name: Model name
+        :param only_load: If specified, load only the model specialized for this stem
+        :param progress_callback: Optional callback for download progress updates
+        :return: The requested model
+        :raises ModelLoadingError: If the model is not found or fails to load
+        """
+        layer_checksums, model_info = self._select_layers(name, only_load)
 
         # Download each layer
         layers = []
@@ -430,11 +449,13 @@ class ModelRepository:
             filename = f"{layer_checksum}.th"
             cache_path = cache_dir / filename
 
+            expected = self._layer_sha256.get(layer_checksum, layer_checksum)
+
             # Check if file exists and validate its integrity
             if cache_path.exists():
                 try:
                     # Validate checksum
-                    check_checksum(cache_path, layer_checksum)
+                    check_checksum(cache_path, expected)
 
                     # Try to load the model
                     layer = load_model(
@@ -468,7 +489,7 @@ class ModelRepository:
             layer = self._download_and_load_layer(
                 url=url,
                 cache_path=cache_path,
-                expected_checksum=layer_checksum,
+                expected_checksum=expected,
                 progress_callback=progress_callback,
                 model_name=name,
                 layer_index=i + 1,

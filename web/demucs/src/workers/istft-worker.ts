@@ -41,66 +41,86 @@ interface ISTFTMessage {
 interface ISTFTResponse {
     type: 'result';
     requestId: number;
+    success: true;
     // Per-source weighted interleaved audio chunks
     chunks: Float32Array[];
     segStart: number;
     segLength: number;
 }
 
+interface ISTFTErrorResponse {
+    type: 'result';
+    requestId: number;
+    success: false;
+    error: string;
+}
+
 self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
     const msg = event.data;
 
-    if (!istftBuffers) {
-        istftBuffers = createISTFTBuffers();
-    }
-
-    const {
-        specReal, specImag, wave,
-        numSources, numChannels, numBins, numFrames,
-        segStart, segLength, trimOffset,
-    } = msg;
-
-    const specSize = numChannels * numBins * numFrames;
-    const chunks: Float32Array[] = [];
-
-    for (let s = 0; s < numSources; s++) {
-        const specOffset = s * specSize;
-        sourceReal.set(specReal.subarray(specOffset, specOffset + specSize));
-        sourceImag.set(specImag.subarray(specOffset, specOffset + specSize));
-
-        const freqAudio = computeISTFT(
-            sourceReal, sourceImag,
-            numChannels, numBins, numFrames,
-            SEGMENT_SAMPLES, istftBuffers
-        );
-
-        // Combine freq + time branches, apply the triangular weight, write to
-        // the output chunk. Matches Python: center_trim to the chunk, then
-        // weight[:chunk_length] (the triangle indexed from 0, not centered).
-        const sourceWaveOffset = s * numChannels * SEGMENT_SAMPLES;
-        const chunk = new Float32Array(segLength * numChannels);
-
-        for (let i = 0; i < segLength; i++) {
-            const srcIdx = trimOffset + i;
-            const leftVal = freqAudio[srcIdx] + wave[sourceWaveOffset + srcIdx];
-            const rightVal = freqAudio[SEGMENT_SAMPLES + srcIdx] + wave[sourceWaveOffset + SEGMENT_SAMPLES + srcIdx];
-            const w = splitWeight[i];
-
-            chunk[i * numChannels] = leftVal * w;
-            chunk[i * numChannels + 1] = rightVal * w;
+    try {
+        if (!istftBuffers) {
+            istftBuffers = createISTFTBuffers();
         }
 
-        chunks.push(chunk);
+        const {
+            specReal, specImag, wave,
+            numSources, numChannels, numBins, numFrames,
+            segStart, segLength, trimOffset,
+        } = msg;
+
+        const specSize = numChannels * numBins * numFrames;
+        const chunks: Float32Array[] = [];
+
+        for (let s = 0; s < numSources; s++) {
+            const specOffset = s * specSize;
+            sourceReal.set(specReal.subarray(specOffset, specOffset + specSize));
+            sourceImag.set(specImag.subarray(specOffset, specOffset + specSize));
+
+            const freqAudio = computeISTFT(
+                sourceReal, sourceImag,
+                numChannels, numBins, numFrames,
+                SEGMENT_SAMPLES, istftBuffers
+            );
+
+            // Combine freq + time branches, apply the triangular weight, write to
+            // the output chunk. Matches Python: center_trim to the chunk, then
+            // weight[:chunk_length] (the triangle indexed from 0, not centered).
+            const sourceWaveOffset = s * numChannels * SEGMENT_SAMPLES;
+            const chunk = new Float32Array(segLength * numChannels);
+
+            for (let i = 0; i < segLength; i++) {
+                const srcIdx = trimOffset + i;
+                const leftVal = freqAudio[srcIdx] + wave[sourceWaveOffset + srcIdx];
+                const rightVal = freqAudio[SEGMENT_SAMPLES + srcIdx] + wave[sourceWaveOffset + SEGMENT_SAMPLES + srcIdx];
+                const w = splitWeight[i];
+
+                chunk[i * numChannels] = leftVal * w;
+                chunk[i * numChannels + 1] = rightVal * w;
+            }
+
+            chunks.push(chunk);
+        }
+
+        const response: ISTFTResponse = {
+            type: 'result',
+            requestId: msg.requestId,
+            success: true,
+            chunks,
+            segStart,
+            segLength,
+        };
+
+        // Transfer ownership of chunk buffers to avoid copying
+        self.postMessage(response, { transfer: chunks.map(c => c.buffer) as unknown as Transferable[] });
+    } catch (error) {
+        console.error('[istft-worker] process failed:', error);
+        const response: ISTFTErrorResponse = {
+            type: 'result',
+            requestId: msg.requestId,
+            success: false,
+            error: (error as Error).message,
+        };
+        self.postMessage(response);
     }
-
-    const response: ISTFTResponse = {
-        type: 'result',
-        requestId: msg.requestId,
-        chunks,
-        segStart,
-        segLength,
-    };
-
-    // Transfer ownership of chunk buffers to avoid copying
-    self.postMessage(response, { transfer: chunks.map(c => c.buffer) as unknown as Transferable[] });
 };

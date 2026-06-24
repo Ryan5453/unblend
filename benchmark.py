@@ -254,9 +254,7 @@ def _score_stems(
         if stem_name not in separated.sources:
             continue
         reference = separator._to_tensor(track.directory / f"{stem_name}.wav")
-        stem_scores[stem_name] = _compute_sdr(
-            separated.sources[stem_name], reference
-        )
+        stem_scores[stem_name] = _compute_sdr(separated.sources[stem_name], reference)
     return stem_scores
 
 
@@ -366,11 +364,12 @@ def _build_configs(
 
 
 def _ensure_upstream_venv(version: str, python_version: str) -> Path:
-    """Create (or reuse) an isolated venv with `demucs==<version>` installed.
+    """
+    Create (or reuse) an isolated venv with ``demucs==<version>`` installed.
 
-    Uses `uv` if available (fast); falls back to `python -m venv` + `pip`.
-    The venv lives at `.upstream-venv/<version>/` so multiple versions can
-    coexist and the layout is gitignored.
+    :param version: Git ref of upstream demucs to install.
+    :param python_version: Python interpreter version for the venv.
+    :return: Path to the prepared venv directory.
     """
     venv_dir = (UPSTREAM_VENV_ROOT / version).resolve()
     python_bin = venv_dir / "bin" / "python"
@@ -465,11 +464,18 @@ def _run_upstream_config(
     output_dir: Path,
     upstream_python_version: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run one upstream-variant config in a subprocess.
+    """
+    Run one upstream-variant config in a subprocess.
 
-    Returns (detail_rows, summary_extras) where summary_extras carries
-    aggregate fields (model_init_sec, error info, etc.) to be merged into
-    the summary row by the caller.
+    :param config: The upstream-variant benchmark config to run.
+    :param tracks: Tracks to separate and score.
+    :param device: Device string the subprocess runs on.
+    :param seed: Base seed recorded in the detail rows.
+    :param chunk_batch_size: Resolved chunk batch size recorded in the rows.
+    :param output_dir: Directory for the temporary tracks JSON payload.
+    :param upstream_python_version: Python version for the upstream venv.
+    :return: ``(detail_rows, summary_extras)`` where ``summary_extras`` carries
+        aggregate fields (model_init_sec, error info) for the summary row.
     """
     venv_dir = _ensure_upstream_venv(config.upstream_version, upstream_python_version)
     venv_python = venv_dir / "bin" / "python"
@@ -713,9 +719,13 @@ def _summary_row_base(
 
 
 def _resolve_device(device_flag: str | None) -> str:
-    """Pick the actual device string. ``auto`` picks the best available
-    accelerator, falling back to CPU. CPU is also explicitly selectable for
-    portability checks; only FP32 runs there."""
+    """
+    Pick the actual device string for the run.
+
+    :param device_flag: Requested device (``cuda``/``mps``/``cpu``/``auto``/None).
+    :return: Resolved device string.
+    :raises typer.BadParameter: If the requested device is unavailable or unknown.
+    """
     if device_flag in (None, "auto"):
         return default_device()
     if device_flag == "cuda":
@@ -863,11 +873,35 @@ def main(
 ) -> None:
     """
     Benchmark the MUSDB matrix on the chosen device and record SDR + timing.
+
+    :param musdb_root: Path to the MUSDB18-HQ split directory.
+    :param output_dir: Directory to write results into (auto-named if None).
+    :param limit: Limit benchmarking to the first N tracks.
+    :param seed: Base seed used to derive a deterministic per-track seed.
+    :param chunk_batch_size: Override for chunks processed per batch.
+    :param dataset_throughput: Measure whole-dataset wall via the batched path.
+    :param models: Model name(s) to benchmark.
+    :param precisions: Precision mode(s) to benchmark.
+    :param compile_modes: Compilation mode(s) to benchmark (``true``/``false``).
+    :param shifts_values: Shift count(s) to benchmark.
+    :param split_overlaps: Split overlap fraction(s) to benchmark.
+    :param device: Device to run on (``cuda``/``mps``/``cpu``/``auto``).
+    :param include_upstream: Also benchmark the upstream demucs release.
+    :param upstream_version: Git ref of upstream demucs to install.
+    :param upstream_python: Python version for the upstream venv.
     """
+
     # --compile-mode takes string values ("true"/"false"); a list[bool] Typer
     # option degenerates into a value-less flag (can't express "false only"),
     # so parse the strings to bools here before any truthiness checks below.
     def _parse_compile_mode(value: str) -> bool:
+        """
+        Parse a ``--compile-mode`` string into a bool.
+
+        :param value: The CLI string (``true``/``false`` and synonyms).
+        :return: The parsed boolean.
+        :raises typer.BadParameter: If the value is not a recognized boolean.
+        """
         v = value.strip().lower()
         if v in ("true", "1", "yes"):
             return True
@@ -1217,9 +1251,7 @@ def main(
             if measured_peak is not None:
                 peak_vram_bytes = max(peak_vram_bytes, measured_peak)
 
-        for track_index, track in enumerate(
-            [] if use_batched else tracks, start=1
-        ):
+        for track_index, track in enumerate([] if use_batched else tracks, start=1):
             detail_row = {
                 **_detail_row_base(config, effective_chunk_batch_size, seed, device),
                 "track_index": track_index,

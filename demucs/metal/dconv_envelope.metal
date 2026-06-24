@@ -39,9 +39,10 @@ kernel void norm_glu_ls_resid(
     const uint C = C2 >> 1;
     const uint total_in  = C2 * N;
     const uint total_out = C  * N;
-    device const SCALAR_T* z_b = z + b * total_in;
-    device const SCALAR_T* r_b = residual + b * total_out;
-    device SCALAR_T*       o_b = out + b * total_out;
+    // ulong base offsets: b * total overflows 32 bits on huge inputs.
+    device const SCALAR_T* z_b = z + (ulong)b * total_in;
+    device const SCALAR_T* r_b = residual + (ulong)b * total_out;
+    device SCALAR_T*       o_b = out + (ulong)b * total_out;
 
     // Shift by the batch's first element before summing so the one-pass
     // variance doesn't lose precision to cancellation on large-DC inputs
@@ -117,9 +118,9 @@ kernel void apply_norm_glu_ls_resid(
     float mean  = meanvar[b * 2 + 0];
     float scale = meanvar[b * 2 + 1];
 
-    device const SCALAR_T* z_b   = z        + b * total_in_per_b;
-    device const SCALAR_T* r_b   = residual + b * total_out_per_b;
-    device SCALAR_T*       o_b   = out      + b * total_out_per_b;
+    device const SCALAR_T* z_b   = z        + (ulong)b * total_in_per_b;
+    device const SCALAR_T* r_b   = residual + (ulong)b * total_out_per_b;
+    device SCALAR_T*       o_b   = out      + (ulong)b * total_out_per_b;
 
     for (uint i = start + tid; i < end; i += tgs) {
         uint c  = i / N;

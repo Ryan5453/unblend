@@ -23,6 +23,11 @@ dependencies = [
     "httpx>=0.28.1"
 ]
 
+[project.urls]
+Homepage = "https://github.com/Ryan5453/demucs-next"
+Repository = "https://github.com/Ryan5453/demucs-next"
+Changelog = "https://github.com/Ryan5453/demucs-next/blob/main/changelog.md"
+
 [project.optional-dependencies]
 dev = [
   "ruff",
@@ -57,4 +62,4 @@ extend-select = ["I"]
 
 [project.scripts]
 demucs = "demucs.cli:main"
-demucs-inference = "demucs.cli:main" # Provided for compatibility with uvx
+demucs-inference = "demucs.cli:main" # Secondary alias kept for compatibility with existing scripts

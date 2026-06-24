@@ -96,6 +96,7 @@ for each source:
     z = pad(z, freq=(0, 1), time=(2, 2))  # Reverse the trimming
     
     # iSTFT (same params as the forward STFT; see the normalization caveat above)
+    target_len = HOP * ceil(samples / HOP) + 2 * pad_amount
     freq_audio = istft(z, n_fft=NFFT, hop_length=HOP, win_length=NFFT,
                        window=hann, normalized=True, center=True, length=target_len)
     
@@ -120,4 +121,5 @@ metadata = {prop.key: prop.value for prop in model.metadata_props}
 sources = json.loads(metadata["sources"])         # ["drums", "bass", "other", "vocals"]
 sample_rate = int(metadata["sample_rate"])        # 44100
 audio_channels = int(metadata["audio_channels"])  # 2
+precision = metadata["precision"]                 # "fp32" or "fp16"
 ```

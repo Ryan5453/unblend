@@ -6,17 +6,26 @@
 
 import gc
 import random
+import wave
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 from torch import Tensor
 from torchcodec.decoders import AudioDecoder
 from torchcodec.encoders import AudioEncoder
 
 from . import __version__
-from .apply import Model, ModelEnsemble, apply_model, apply_model_multi
+from .apply import (
+    Model,
+    ModelEnsemble,
+    _gpu_accum_budget_bytes,
+    _gpu_accum_bytes_needed,
+    apply_model,
+    apply_model_multi,
+)
 from .audio import convert_audio, prevent_clip
 from .exceptions import (
     LoadAudioError,
@@ -86,7 +95,9 @@ class SeparatedSources:
 
         :param stem_name: Name of the stem to export
         :param path: Path to save the stem to. If None, returns raw audio bytes
-        :param format: Format to export the stem to, anything supported by FFmpeg
+        :param format: Format to export the stem to, anything supported by FFmpeg.
+            Only used when returning bytes or when ``path`` has no extension;
+            a ``path`` with an extension determines the container itself
         :param clip: Clipping mode to prevent audio distortion ("rescale", "clamp", "tanh", or None)
         :return: Path to saved file if path provided, otherwise raw audio bytes
         :raises ValidationError: If the stem name is not found
@@ -142,6 +153,31 @@ def default_device() -> str:
     return "cpu"
 
 
+def default_dtype(device: str) -> torch.dtype | None:
+    """
+    Pick the fastest inference dtype for a device that keeps separation
+    quality at FP32 level.
+
+    CUDA on Volta-or-newer (compute capability >= 7.0) picks FP16: tensor-core
+    convolutions/GEMMs run ~1.7x faster than FP32 and measure SDR-identical to
+    FP32 on MUSDB18 (within 0.001 dB — see the readme benchmarks). All
+    reduction-heavy ops (GroupNorm stats, attention softmax, conv accumulation)
+    accumulate in FP32 internally on CUDA, and HTDemucs normalises its inputs,
+    so FP16's range is not a hazard here. Older CUDA GPUs without FP16 tensor
+    cores stay at FP32. MPS picks FP16 (custom Metal kernels in
+    ``demucs.metal``); CPU stays FP32 (no faster path).
+
+    :param device: ``"cuda"``, ``"mps"``, or ``"cpu"``.
+    :return: Dtype to cast model weights to, or ``None`` to stay at FP32.
+    """
+    if device == "cuda":
+        major, _minor = torch.cuda.get_device_capability()
+        return torch.float16 if major >= 7 else None
+    if device == "mps":
+        return torch.float16
+    return None
+
+
 class Separator:
     """
     Audio source separation using Demucs models.
@@ -165,11 +201,19 @@ class Separator:
     # state speed. If it still over-shoots, the capture-verification loop in
     # ``_calibrate_chunk_batch_size`` halves until the batched warmup fits.
     _CUDAGRAPH_RESERVATION_FACTOR: float = 5.0
-    # Headroom for non-cudagraph GPU allocations during inference. With the
-    # output accumulator on CPU and chunks staged to GPU per-batch, the
-    # only non-cudagraph GPU state is the active chunk batch plus STFT
-    # scratch — both bounded by chunk_batch_size, not by input length.
-    # 1 GiB covers this with margin to spare.
+    # Eager (compile=False) has no CUDAGraphs private pool, so the per-chunk
+    # demand is just the steady working set plus allocator fragmentation /
+    # STFT scratch — 2.5x covers that with margin. Unlike compile=True, the
+    # eager throughput-vs-cbs curve is NOT flat: ~8% more throughput going
+    # from cbs 9 to 16 on an RTX A4000 at FP16, so under-sizing here costs
+    # real speed. There is no capture-verify loop on this path (the estimate
+    # is trusted), hence still conservative rather than exact.
+    _EAGER_RESERVATION_FACTOR: float = 2.5
+    # Headroom for non-cudagraph GPU allocations during inference: the active
+    # chunk batch plus STFT scratch — both bounded by chunk_batch_size, not by
+    # input length. 1 GiB covers this with margin to spare. (GPU-resident
+    # mixes/accumulators are gated separately against free VRAM at separate()
+    # time — see ``apply._gpu_accum_budget_bytes``.)
     _CUDA_VRAM_SAFETY_BYTES: int = 1 * 1024**3
     # Max halving attempts before giving up — bounds init time so that even
     # in pathological cases (wildly wrong initial estimate) we don't spin
@@ -243,6 +287,10 @@ class Separator:
         model.forward_core = torch.compile(
             model._uncompiled_forward_core, mode="reduce-overhead"
         )
+        # CUDAGraphs replay requires the captured batch shape, so apply_model
+        # must zero-pad sub-full tail batches up to chunk_batch_size for this
+        # model (eager models run tails at their natural size instead).
+        model._fixed_batch_shape = True
 
     def _measure_per_chunk_steady_bytes(self) -> int | None:
         """
@@ -274,18 +322,28 @@ class Separator:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             resident_before = torch.cuda.memory_allocated()
-            with torch.inference_mode():
-                dummy = torch.zeros(
-                    1,
-                    ref.audio_channels,
-                    training_length,
-                    device=device_obj,
-                    dtype=torch.float32,
-                )
-                # Full model forward — covers STFT + core + iSTFT, matching
-                # what a real chunk through ``apply_model`` exercises.
-                _ = ref(dummy)
-            torch.cuda.synchronize()
+            # Measure under heuristic algorithm selection even when the
+            # compile path has turned cudnn.benchmark on: the exhaustive
+            # autotune sweep allocates large transient workspaces that land
+            # in the peak reading and would halve the batch-size estimate.
+            # We want the steady per-chunk working set, not autotune scratch.
+            cudnn_benchmark_saved = torch.backends.cudnn.benchmark
+            torch.backends.cudnn.benchmark = False
+            try:
+                with torch.inference_mode():
+                    dummy = torch.zeros(
+                        1,
+                        ref.audio_channels,
+                        training_length,
+                        device=device_obj,
+                        dtype=torch.float32,
+                    )
+                    # Full model forward — covers STFT + core + iSTFT, matching
+                    # what a real chunk through ``apply_model`` exercises.
+                    _ = ref(dummy)
+                torch.cuda.synchronize()
+            finally:
+                torch.backends.cudnn.benchmark = cudnn_benchmark_saved
             peak = torch.cuda.max_memory_allocated()
             return max(1, peak - resident_before)
         except Exception:
@@ -321,13 +379,20 @@ class Separator:
             return 4
 
         available = max(0, free_bytes - self._CUDA_VRAM_SAFETY_BYTES)
-        transient_per_chunk = self._CUDAGRAPH_RESERVATION_FACTOR * per_chunk_steady
+        reservation_factor = (
+            self._CUDAGRAPH_RESERVATION_FACTOR
+            if self._compile_enabled
+            else self._EAGER_RESERVATION_FACTOR
+        )
+        transient_per_chunk = reservation_factor * per_chunk_steady
         if transient_per_chunk <= 0:
             return 4
         return max(1, int(available // transient_per_chunk))
 
     def _setup_compile(self) -> None:
-        """Apply (or re-apply) torch.compile to every HTDemucs in the model."""
+        """
+        Apply (or re-apply) torch.compile to every HTDemucs in the model.
+        """
         if isinstance(self.model, ModelEnsemble):
             for sub in self.model.models:
                 if isinstance(sub, HTDemucs):
@@ -357,6 +422,7 @@ class Separator:
             original = getattr(m, "_uncompiled_forward_core", None)
             if original is not None:
                 m.forward_core = original
+            m._fixed_batch_shape = False
         torch._dynamo.reset()
         gc.collect()
         if self.device == "cuda":
@@ -409,7 +475,23 @@ class Separator:
                 self._warmup_via_inference()
                 self._calibration_attempts = tried
                 return candidate
-            except torch.cuda.OutOfMemoryError as exc:
+            except RuntimeError as exc:
+                # CUDA OOM during capture doesn't always surface as
+                # torch.cuda.OutOfMemoryError — graph capture and cuBLAS
+                # workspace failures under memory pressure raise plain
+                # RuntimeErrors. Treat those as OOM too; anything else is a
+                # real bug and propagates.
+                message = str(exc).lower()
+                is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or any(
+                    marker in message
+                    for marker in (
+                        "out of memory",
+                        "cudaerrormemoryallocation",
+                        "cublas_status_alloc_failed",
+                    )
+                )
+                if not is_oom:
+                    raise
                 last_error = exc
                 self._teardown_compile_state()
                 if candidate <= 1:
@@ -501,7 +583,7 @@ class Separator:
         model: str | Model | ModelEnsemble = "htdemucs",
         device: str | None = None,
         only_load: str | None = None,
-        dtype: torch.dtype | None = None,
+        dtype: torch.dtype | str | None = "auto",
         compile: bool = False,
     ) -> None:
         """
@@ -520,12 +602,17 @@ class Separator:
                          ``separate(..., use_only_stem=...)``, which makes the
                          same choice per-call on an already-loaded full ensemble.
                          Ignored for single (non-ensemble) models.
-        :param dtype: Set to torch.float16 or torch.bfloat16 for reduced-precision
-                     inference on CUDA or MPS. Model weights are cast at init
-                     time. CPU is rejected (no faster path in PyTorch). On MPS,
-                     BF16 is supported but, as of PyTorch 2.11, ~22% slower than
-                     FP16 (BF16 native ops are not well-optimised yet); use it when
-                     you want BF16's FP32 exponent range — e.g. to skip the
+        :param dtype: Inference precision. The default ``"auto"`` picks the
+                     fastest dtype that keeps SDR at FP32 level for the device
+                     (FP16 on CUDA with tensor cores and on MPS; FP32 on CPU
+                     and older CUDA GPUs — see ``default_dtype``). Pass
+                     ``torch.float16`` or ``torch.bfloat16`` explicitly for
+                     reduced precision (weights are cast at init; CPU is
+                     rejected — no faster path in PyTorch), or ``None`` /
+                     ``torch.float32`` to force FP32. On MPS, BF16 is supported
+                     but, as of PyTorch 2.11, ~22% slower than FP16 (BF16
+                     native ops are not well-optimised yet); use it when you
+                     want BF16's FP32 exponent range — e.g. to skip the
                      FP16-overflow FP32-fallback cast in MyGroupNorm.
         :param compile: If True, apply ``torch.compile`` for faster inference after an
                        initial warmup. Best for API servers or batch processing; adds
@@ -544,7 +631,25 @@ class Separator:
             raise ValidationError(
                 f"Invalid device '{device}'. Must be one of: {', '.join(sorted(valid_devices))}"
             )
+        if device == "cuda" and not torch.cuda.is_available():
+            raise ValidationError(
+                "Device 'cuda' requested but CUDA is not available in this "
+                "PyTorch build/environment."
+            )
+        if device == "mps" and not torch.backends.mps.is_available():
+            raise ValidationError(
+                "Device 'mps' requested but MPS is not available on this system."
+            )
 
+        if isinstance(dtype, str):
+            if dtype != "auto":
+                raise ValidationError(
+                    f"Invalid dtype '{dtype}'. Use 'auto', None, or a torch.dtype "
+                    "(torch.float32, torch.float16, torch.bfloat16)."
+                )
+            dtype = default_dtype(device)
+        elif dtype == torch.float32:
+            dtype = None
         if dtype is not None:
             if dtype not in (torch.float16, torch.bfloat16):
                 raise ValidationError(
@@ -581,7 +686,14 @@ class Separator:
         self.sample_rate = self.model.samplerate
 
         if self.device == "cuda":
-            torch.backends.cudnn.benchmark = True
+            # cudnn autotune (``benchmark=True``) only for the compile path:
+            # there every forward has one fixed shape (tails are padded to the
+            # captured batch), so the exhaustive algorithm search is paid once.
+            # Eager runs see a different tail-batch shape on nearly every
+            # input; each new shape would re-trigger a multi-second search,
+            # while heuristic selection measures within ~1% of the tuned
+            # algorithms for these conv shapes — so eager leaves it off.
+            torch.backends.cudnn.benchmark = compile
             torch.set_float32_matmul_precision("high")
 
         if self.device in {"cuda", "mps"}:
@@ -633,10 +745,11 @@ class Separator:
         first live request.
 
         Called automatically at the end of ``__init__`` when ``compile=True``;
-        callers who construct with ``compile=False`` and turn compile on
-        later can invoke this explicitly. With tail-padding (every batch is
-        exactly ``self.chunk_batch_size``) there is only one batch shape to
-        warm, so no ``batch_sizes`` argument is needed any more.
+        calling it again later re-runs the dummy inferences (a no-op for
+        correctness, occasionally useful to re-realize the working set). With
+        tail-padding (every batch is exactly ``self.chunk_batch_size``) there
+        is only one batch shape to warm, so no ``batch_sizes`` argument is
+        needed any more.
 
         :raises ValidationError: If called on CPU/MPS or on a non-HTDemucs model.
         """
@@ -652,18 +765,47 @@ class Separator:
             )
         self._warmup_via_inference()
 
+    @staticmethod
+    def _read_pcm16_wav(path: Path | str) -> tuple[Tensor, int] | None:
+        """
+        Fast path for plain 16-bit PCM WAV files: header parse + one memcpy +
+        vectorised int16→float32, ~2x faster than going through the FFmpeg
+        demux pipeline in torchcodec. Sample-exact with torchcodec's output
+        (both normalise as ``int16 / 32768``).
+
+        :param path: Path to the candidate file.
+        :return: ``(waveform [channels, samples], sample_rate)`` if the file
+            is readable 16-bit PCM WAV, else ``None`` to fall back to
+            torchcodec (which handles every other format and codec).
+        """
+        try:
+            with wave.open(str(path), "rb") as w:
+                if w.getsampwidth() != 2 or w.getcomptype() != "NONE":
+                    return None
+                num_frames = w.getnframes()
+                channels = w.getnchannels()
+                sample_rate = w.getframerate()
+                raw = w.readframes(num_frames)
+        except (wave.Error, EOFError, OSError):
+            return None
+        if channels <= 0 or not raw:
+            return None
+        samples = np.frombuffer(raw, dtype="<i2").reshape(-1, channels)
+        wav = torch.from_numpy(samples.astype(np.float32).T / 32768.0)
+        return wav, sample_rate
+
     def _to_tensor(self, audio: tuple[Tensor, int] | Path | str | bytes) -> Tensor:
         """
         Convert various input types (tuple of Tensor and sample rate, path, bytes)
-        to a 2D float32 tensor on the configured device, matching the model's
-        sample rate and channels when possible.
+        to a 2D float32 tensor matching the model's sample rate and channels
+        when possible. Device staging happens later, inside ``apply_model``.
 
         :param audio: Audio input as a ``(Tensor, sample_rate)`` tuple, a file
             path (str/Path), or raw audio bytes.
         :return: A 2D ``[channels, samples]`` float32 waveform tensor.
         :raises LoadAudioError: If a path or bytes input cannot be decoded.
-        :raises ValueError: If the input is not a supported type.
-        :raises ValidationError: If the decoded audio is empty (zero samples).
+        :raises ValidationError: If the input is not a supported type or the
+            decoded audio is empty (zero samples).
         """
         wav: Tensor
         input_sr: int | None = None
@@ -671,17 +813,21 @@ class Separator:
         if isinstance(audio, tuple):
             wav, input_sr = audio
         elif isinstance(audio, (str, Path)):
-            try:
-                # Use native torchcodec AudioDecoder for better performance
-                decoder = AudioDecoder(str(Path(audio)))
-                audio_samples = decoder.get_all_samples()
-                wav = audio_samples.data
-                input_sr = audio_samples.sample_rate
-            except Exception as e:
-                raise LoadAudioError(
-                    f"Could not load file {audio} using torchcodec: {e}. "
-                    "Make sure the file format is supported."
-                )
+            pcm = self._read_pcm16_wav(audio)
+            if pcm is not None:
+                wav, input_sr = pcm
+            else:
+                try:
+                    # Use native torchcodec AudioDecoder for better performance
+                    decoder = AudioDecoder(str(Path(audio)))
+                    audio_samples = decoder.get_all_samples()
+                    wav = audio_samples.data
+                    input_sr = audio_samples.sample_rate
+                except Exception as e:
+                    raise LoadAudioError(
+                        f"Could not load file {audio} using torchcodec: {e}. "
+                        "Make sure the file format is supported."
+                    )
         elif isinstance(audio, bytes):
             audio_buffer = BytesIO(audio)
             try:
@@ -698,7 +844,7 @@ class Separator:
             finally:
                 audio_buffer.close()
         else:
-            raise ValueError(
+            raise ValidationError(
                 f"Unsupported audio input type: {type(audio)}. "
                 "Expected tuple of (Tensor, sample_rate), file path (str/Path), or bytes."
             )
@@ -848,12 +994,64 @@ class Separator:
             chunk_batch_size=chunk_batch_size,
         )
 
-    # (Runtime OOM-retry used to live here. With the output accumulator on
-    # CPU and inputs staged to the GPU per-batch instead of in full, runtime
-    # GPU usage is bounded by ``model + cudagraph_pool + active_batch``
-    # regardless of input length — so an OOM at separate() time would mean
-    # the at-init capture verification was wrong, which we'd rather see as a
-    # loud failure than silently halve and continue.)
+    # (Runtime OOM-retry used to live here. Inputs and accumulators are kept
+    # on the GPU only when they fit a conservative fraction of the VRAM that
+    # is actually free (see ``apply._gpu_accum_budget_bytes``); anything
+    # bigger falls back to the CPU-accumulation path whose GPU usage is
+    # bounded by ``model + cudagraph_pool + active_batch`` regardless of
+    # input length — so an OOM at separate() time would mean the at-init
+    # capture verification was wrong, which we'd rather see as a loud
+    # failure than silently halve and continue.)
+
+    def _stage_for_inference(self, wavs: list[Tensor]) -> list[Tensor]:
+        """
+        Move decoded waveforms to the GPU up front when the GPU-resident
+        separation pipeline will be used for them.
+
+        Staging before normalisation lets the normalise / un-normalise passes
+        and every chunk slice run on the GPU, and ``apply_model`` then returns
+        the separated sources still on the GPU (results come back on the
+        mix's device) so the stems make exactly one device→host trip. Uses
+        the same byte estimate as ``apply_model``'s own gate, summed over the
+        whole call (``apply_model_multi`` gates its accumulators on the call's
+        total, so staging must use the same all-or-nothing scope) — waveforms
+        are only staged when the accumulators will also fit. CPU/MPS inputs
+        are returned unchanged (``apply_model`` stages MPS itself).
+
+        :param wavs: Decoded ``[channels, samples]`` waveforms.
+        :return: The waveforms, possibly moved to the CUDA device.
+        """
+        if self.device != "cuda":
+            return wavs
+        total_needed = sum(
+            _gpu_accum_bytes_needed(
+                1, len(self.model.sources), w.shape[-2], w.shape[-1]
+            )
+            for w in wavs
+        )
+        if total_needed <= _gpu_accum_budget_bytes(self.device):
+            return [w.to(self.device) for w in wavs]
+        return wavs
+
+    def _unnormalized_cpu_sources(
+        self, sources_tensor: Tensor, mean: Tensor, std: Tensor
+    ) -> dict[str, Tensor]:
+        """
+        Reverse the track-level normalisation and return the per-stem dict.
+
+        Un-normalises on whatever device the sources came back on (GPU when
+        the input was staged), then makes the single device→host move; the
+        public ``SeparatedSources`` tensors are always CPU.
+
+        :param sources_tensor: ``[sources, channels, samples]`` model output.
+        :param mean: Normalisation mean recorded by ``_normalize``.
+        :param std: Normalisation std recorded by ``_normalize``.
+        :return: Mapping of stem name to CPU waveform.
+        """
+        unnormed = sources_tensor * (1e-5 + std) + mean
+        if unnormed.device.type != "cpu":
+            unnormed = unnormed.cpu()
+        return {name: unnormed[idx] for idx, name in enumerate(self.model.sources)}
 
     @staticmethod
     def _normalize(wav: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -865,7 +1063,8 @@ class Separator:
         identical for ``separate(x)`` and ``separate([x])[0]`` to match).
 
         :param wav: ``[channels, samples]`` waveform.
-        :return: ``(normalised_wav, mean, std)``; reverse with ``out * std + mean``.
+        :return: ``(normalised_wav, mean, std)``; reverse with
+            ``out * (1e-5 + std) + mean``.
         """
         ref = wav.mean(0)
         mean = ref.mean()
@@ -914,6 +1113,7 @@ class Separator:
         wav = self._to_tensor(audio)
         original = wav.clone()
 
+        wav = self._stage_for_inference([wav])[0]
         self._seed_rngs(seed)
         wav, mean, std = self._normalize(wav)
 
@@ -928,10 +1128,7 @@ class Separator:
             chunk_batch_size=chunk_batch_size,
         )[0]
 
-        sources = {}
-        for source_idx, source_name in enumerate(self.model.sources):
-            sources[source_name] = sources_tensor[source_idx] * std + mean
-
+        sources = self._unnormalized_cpu_sources(sources_tensor, mean, std)
         return SeparatedSources(sources, self.sample_rate, original=original)
 
     def _separate_batch(
@@ -964,6 +1161,8 @@ class Separator:
         wavs = [self._to_tensor(a) for a in audios]
         originals = [w.clone() for w in wavs]
 
+        wavs = self._stage_for_inference(wavs)
+
         # Per-input normalisation stats — applied locally and reversed after
         # the forward, via the same helper ``_separate_one`` uses.
         normed: list[Tensor] = []
@@ -987,10 +1186,7 @@ class Separator:
 
         results: list[SeparatedSources] = []
         for out, (mean, std), original in zip(outputs, stats, originals):
-            sources_tensor = out[0]
-            sources = {}
-            for source_idx, source_name in enumerate(self.model.sources):
-                sources[source_name] = sources_tensor[source_idx] * std + mean
+            sources = self._unnormalized_cpu_sources(out[0], mean, std)
             results.append(
                 SeparatedSources(sources, self.sample_rate, original=original)
             )

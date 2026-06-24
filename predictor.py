@@ -88,9 +88,11 @@ class Predictor(BasePredictor):
     traffic uses defaults, so the default queue carries everything.
     """
 
-    separators: dict[str, Separator] = {}
-
     async def setup(self) -> None:
+        """
+        Load the Demucs model and start the per-model coalescer machinery.
+        """
+        self.separators: dict[str, Separator] = {}
         use_cuda = torch.cuda.is_available()
         # This Cog serves htdemucs only. A ``compile=True`` Separator reserves
         # a CUDAGraphs private memory pool sized to its auto-detected
@@ -149,7 +151,11 @@ class Predictor(BasePredictor):
         # without rebuilding the image.
         try:
             self._batch_window_s = (
-                float(os.environ.get("COG_DEMUCS_BATCH_WINDOW_MS", _BATCH_WINDOW_MS_DEFAULT))
+                float(
+                    os.environ.get(
+                        "COG_DEMUCS_BATCH_WINDOW_MS", _BATCH_WINDOW_MS_DEFAULT
+                    )
+                )
                 / 1000.0
             )
         except ValueError:
@@ -163,7 +169,7 @@ class Predictor(BasePredictor):
         isolate_stem: str,
     ) -> tuple:
         """
-        The partition key for the coalescer queue.
+        Build the partition key for the coalescer queue.
 
         ``split_overlap`` is a client-supplied float and is the only key
         component with an unbounded value space. Each distinct key lazily
@@ -174,11 +180,22 @@ class Predictor(BasePredictor):
         this rounded overlap anyway (``separate`` takes a single value), the
         ≤0.0005 deviation from the request is numerically irrelevant to
         separation quality, and it caps the key space at ~1000 buckets.
+
+        :param model: model name to separate with
+        :param shifts: number of random shifts
+        :param split_overlap: overlap between segments
+        :param isolate_stem: stem to isolate, or "none"
+        :return: the quantised partition key tuple
         """
         return (model, shifts, round(split_overlap, 3), isolate_stem)
 
     def _get_queue(self, key: tuple) -> asyncio.Queue:
-        """Return (or lazily create) the queue + coalescer task for ``key``."""
+        """
+        Return (or lazily create) the queue + coalescer task for ``key``.
+
+        :param key: the partition key
+        :return: the asyncio queue for this key
+        """
         queue = self._queues.get(key)
         if queue is None:
             queue = asyncio.Queue()
@@ -198,6 +215,9 @@ class Predictor(BasePredictor):
         separation synchronously on the event loop's thread (NOT via
         ``asyncio.to_thread``) — see the class docstring for why the
         CUDAGraph TLS binding forces this.
+
+        :param key: the partition key for this coalescer
+        :param queue: the request queue to drain
         """
         model_name, shifts, split_overlap, isolate_stem = key
         separator = self.separators[model_name]
@@ -327,6 +347,15 @@ class Predictor(BasePredictor):
         Run separation on a single audio file. Concurrent requests with
         identical inference parameters share a forward pass via the per-model
         coalescer started in :meth:`setup`.
+
+        :param audio: the audio file to separate
+        :param model: model to use for separation
+        :param format: output audio format
+        :param isolate_stem: stem to isolate, or "none" for all stems
+        :param shifts: number of random shifts for equivariant stabilization
+        :param split_overlap: overlap between segments
+        :param clip_mode: method to prevent audio clipping in output
+        :return: the separated stems as output files
         """
         key = self._queue_key(model, shifts, split_overlap, isolate_stem)
         queue = self._get_queue(key)

@@ -32,13 +32,20 @@ export class ISTFTClient {
         );
 
         this.worker.onmessage = (
-            event: MessageEvent<ISTFTResult & { type: string; requestId: number }>
+            event: MessageEvent<
+                ISTFTResult & { type: string; requestId: number; success: boolean; error?: string }
+            >
         ) => {
             // Discard late replies from a superseded request (see OnnxClient).
             if (event.data.requestId !== this.pendingId) return;
             const resolve = this.pendingResolve;
+            const reject = this.pendingReject;
             this.pendingResolve = null;
             this.pendingReject = null;
+            if (event.data.success === false) {
+                reject?.(new Error(event.data.error || 'iSTFT worker failed'));
+                return;
+            }
             resolve?.(event.data);
         };
 

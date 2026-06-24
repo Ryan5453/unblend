@@ -24,10 +24,11 @@ except PackageNotFoundError:
 from .api import (
     SeparatedSources,
     Separator,
+    default_device,
     get_version,
     select_model,
 )
-from .apply import Model, ModelEnsemble
+from .apply import Model, ModelEnsemble, apply_model, apply_model_multi
 from .exceptions import (
     DemucsError,
     LoadAudioError,
@@ -43,6 +44,9 @@ __all__ = [
     "ModelRepository",
     "Model",
     "ModelEnsemble",
+    "apply_model",
+    "apply_model_multi",
+    "default_device",
     "get_version",
     "select_model",
     "DemucsError",

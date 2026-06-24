@@ -46,8 +46,10 @@ kernel void group_norm_g1(
     threadgroup float shared_sqsum[MAX_TGS];
 
     const uint total = C * N;
-    device const SCALAR_T* in_b = in_ + b * total;
-    device SCALAR_T*       out_b = out + b * total;
+    // Batch base offsets in ulong: b * total overflows 32 bits past ~4G
+    // elements into the buffer.
+    device const SCALAR_T* in_b = in_ + (ulong)b * total;
+    device SCALAR_T*       out_b = out + (ulong)b * total;
 
     // Shift every value by a reference (the batch's first element) before
     // summing. Variance is shift-invariant, but the shifted data is small
@@ -116,7 +118,7 @@ kernel void partial_reduce(
     uint start = (uint)((ulong)t * (ulong)total_per_b / (ulong)num_tiles);
     uint end   = (uint)((ulong)(t + 1) * (ulong)total_per_b / (ulong)num_tiles);
 
-    device const SCALAR_T* x_b = in_ + b * total_per_b;
+    device const SCALAR_T* x_b = in_ + (ulong)b * total_per_b;
 
     // Shift by the batch's first element (shared across all tiles of this
     // batch) so the partial sums feeding the variance don't lose precision to
@@ -185,7 +187,7 @@ kernel void finalize_meanvar(
         // adding K back. The variance is computed from the shifted sums, where
         // cancellation is negligible. K is the same reference partial_reduce
         // used: the batch's first element.
-        float K      = float(in_[b * total_per_b]);
+        float K      = float(in_[(ulong)b * total_per_b]);
         float invN   = 1.0f / float(total_per_b);
         float mean_d = sh_sum[0]   * invN;
         float var    = max(sh_sqsum[0] * invN - mean_d * mean_d, 0.0f);
@@ -215,8 +217,8 @@ kernel void apply_norm(
     float mean  = meanvar[b * 2 + 0];
     float scale = meanvar[b * 2 + 1];
 
-    device const SCALAR_T* x_b   = in_ + b * total_per_b;
-    device SCALAR_T*       out_b = out + b * total_per_b;
+    device const SCALAR_T* x_b   = in_ + (ulong)b * total_per_b;
+    device SCALAR_T*       out_b = out + (ulong)b * total_per_b;
 
     for (uint i = start + tid; i < end; i += tgs) {
         uint  c_idx = i / N;

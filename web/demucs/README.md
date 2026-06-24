@@ -10,7 +10,7 @@ For backend/server-side workflows, use the Python `demucs` package — it is sig
 npm install demucs-next
 ```
 
-`onnxruntime-web` is a regular dependency and is bundled for you; there is no separate peer install and no `<script>` tag. The package ships compiled ES modules plus type declarations from `./dist`. The three workers are referenced via `new Worker(new URL('./workers/*.js', import.meta.url))`, so you need a bundler that understands that pattern (Vite, Webpack 5). ORT's `.wasm` assets are loaded at runtime from the URL you pass as `wasmPaths`; they are never bundled.
+`onnxruntime-web` is a regular dependency and is bundled for you; there is no separate peer install and no `<script>` tag. The package ships compiled ES modules plus type declarations from `./dist`. The three workers are referenced via `new Worker(new URL('./workers/*.js', import.meta.url))`, so you need a bundler that understands that pattern (Vite, Webpack 5). ORT's `.wasm` assets are emitted into your bundle by default; pass `wasmPaths` to load them from a URL at runtime instead.
 
 ### Vite consumers
 
@@ -97,10 +97,12 @@ Each `Separator` instance owns its own three workers (STFT, ONNX, iSTFT). Multip
 ```ts
 interface SeparationOptions {
     onProgress?: (p: SeparationProgress) => void;
+    shifts?: number;    // random sub-second shifts to average, 1-20 (default 1);
+                        // each extra shift reruns the separation, so runtime scales linearly
 }
 
 interface SeparationProgress {
-    segIdx: number;     // 1-based index of the segment that just finished
+    segIdx: number;     // 1-based index of the segment that just finished (cumulative across shifts)
     totalSegs: number;
     fraction: number;   // segIdx / totalSegs ∈ (0, 1]
 }
@@ -109,7 +111,7 @@ interface SeparationResult {
     stems: Record<string, Float32Array>;  // stem name → interleaved L/R samples
     wallMs: number;       // total wall time including STFT/iSTFT
     inferenceMs: number;  // sum of ONNX inference time across segments
-    numSegments: number;
+    numSegments: number;  // summed across shift rounds
 }
 ```
 

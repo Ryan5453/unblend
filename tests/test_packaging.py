@@ -22,12 +22,24 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _normalize(requirement: str) -> str:
-    # Strip all whitespace so ordering and minor formatting differences between
-    # the two files don't register as drift.
+    """
+    Strip all whitespace from a requirement string.
+
+    This keeps ordering and minor formatting differences between the two files
+    from registering as drift.
+
+    :param requirement: a single dependency specifier
+    :return: the specifier with all whitespace removed
+    """
     return "".join(requirement.split())
 
 
 def _read_requirements_txt() -> set[str]:
+    """
+    Read and normalize the dependency specifiers from ``requirements.txt``.
+
+    :return: the set of normalized specifiers, with comments and blanks dropped
+    """
     reqs: set[str] = set()
     for raw in (ROOT / "requirements.txt").read_text().splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -37,13 +49,19 @@ def _read_requirements_txt() -> set[str]:
 
 
 def _read_pyproject_dependencies() -> set[str]:
+    """
+    Read and normalize ``[project].dependencies`` from ``pyproject.toml``.
+
+    :return: the set of normalized dependency specifiers
+    """
     with open(ROOT / "pyproject.toml", "rb") as f:
         data = tomllib.load(f)
     return {_normalize(dep) for dep in data["project"]["dependencies"]}
 
 
 def test_requirements_txt_matches_pyproject_dependencies() -> None:
-    """requirements.txt must mirror pyproject's [project].dependencies exactly.
+    """
+    requirements.txt must mirror pyproject's [project].dependencies exactly.
 
     Guards against the two drifting so the Cog image and the PyPI package always
     install the same dependency set.
@@ -58,7 +76,8 @@ def test_requirements_txt_matches_pyproject_dependencies() -> None:
 
 
 def test_cog_model_url_matches_metadata() -> None:
-    """The htdemucs layer URL baked into the Cog image must match metadata.json.
+    """
+    The htdemucs layer URL baked into the Cog image must match metadata.json.
 
     cog.yaml's build.run commands execute before the repo is mounted, so the
     URL is necessarily hardcoded there; this guards it against drifting from

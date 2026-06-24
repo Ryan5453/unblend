@@ -92,20 +92,41 @@ def _looks_like_audio_file(path: Path) -> bool:
     :return: True if the file extension matches a known audio format
     """
     return path.suffix.lower() in {
-        ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus",
-        ".mp4", ".webm", ".mkv", ".avi", ".mov", ".wma", ".alac",
-        ".aiff", ".aif", ".aifc", ".m4b", ".m4p", ".m4r", ".m4v"
+        ".mp3",
+        ".wav",
+        ".flac",
+        ".m4a",
+        ".aac",
+        ".ogg",
+        ".opus",
+        ".mp4",
+        ".webm",
+        ".mkv",
+        ".avi",
+        ".mov",
+        ".wma",
+        ".alac",
+        ".aiff",
+        ".aif",
+        ".aifc",
+        ".m4b",
+        ".m4p",
+        ".m4r",
+        ".m4v",
     }
 
 
-def expand_paths_to_audio_files(paths: list[Path]) -> list[Path]:
+def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
     """
     Expand directory paths to include all audio files, keep regular files as-is.
 
     :param paths: List of file or directory paths
-    :return: List of resolved audio file paths
+    :return: ``(audio_files, had_errors)`` — ``had_errors`` is True when any
+        input path didn't resolve to audio (nonexistent path, or a directory
+        with no audio files), so callers can exit nonzero
     """
     audio_files = []
+    had_errors = False
 
     for path in paths:
         if path.is_file():
@@ -124,10 +145,12 @@ def expand_paths_to_audio_files(paths: list[Path]) -> list[Path]:
                 found_files.sort()
                 audio_files.extend(found_files)
             else:
+                had_errors = True
                 console.print(
                     f"[yellow]Warning:[/yellow] No audio files found in '{path}'"
                 )
         else:
+            had_errors = True
             console.print(f"[red]Error:[/red] Path '{path}' does not exist")
 
-    return audio_files
+    return audio_files, had_errors

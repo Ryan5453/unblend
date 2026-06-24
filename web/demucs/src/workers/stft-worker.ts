@@ -16,33 +16,53 @@ interface STFTMessage {
 interface STFTResponse {
     type: 'result';
     requestId: number;
+    success: true;
     real: Float32Array;
     imag: Float32Array;
     numBins: number;
     numFrames: number;
 }
 
+interface STFTErrorResponse {
+    type: 'result';
+    requestId: number;
+    success: false;
+    error: string;
+}
+
 self.onmessage = (event: MessageEvent<STFTMessage>) => {
-    if (!stftBuffers) {
-        stftBuffers = createSTFTBuffers();
-    }
-
     const { requestId, segmentInterleaved } = event.data;
-    const stft = computeSTFT(segmentInterleaved, stftBuffers);
+    try {
+        if (!stftBuffers) {
+            stftBuffers = createSTFTBuffers();
+        }
 
-    // Copy results since computeSTFT returns references to shared buffers
-    const real = new Float32Array(stft.real);
-    const imag = new Float32Array(stft.imag);
+        const stft = computeSTFT(segmentInterleaved, stftBuffers);
 
-    const response: STFTResponse = {
-        type: 'result',
-        requestId,
-        real,
-        imag,
-        numBins: stft.numBins,
-        numFrames: stft.numFrames,
-    };
+        // Copy results since computeSTFT returns references to shared buffers
+        const real = new Float32Array(stft.real);
+        const imag = new Float32Array(stft.imag);
 
-    // Transfer ownership to avoid copying
-    self.postMessage(response, { transfer: [real.buffer, imag.buffer] as unknown as Transferable[] });
+        const response: STFTResponse = {
+            type: 'result',
+            requestId,
+            success: true,
+            real,
+            imag,
+            numBins: stft.numBins,
+            numFrames: stft.numFrames,
+        };
+
+        // Transfer ownership to avoid copying
+        self.postMessage(response, { transfer: [real.buffer, imag.buffer] as unknown as Transferable[] });
+    } catch (error) {
+        console.error('[stft-worker] process failed:', error);
+        const response: STFTErrorResponse = {
+            type: 'result',
+            requestId,
+            success: false,
+            error: (error as Error).message,
+        };
+        self.postMessage(response);
+    }
 };

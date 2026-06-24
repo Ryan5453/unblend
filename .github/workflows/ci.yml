@@ -20,8 +20,10 @@ jobs:
           python-version: "3.12"
       - name: Sync dependencies
         run: uv sync --extra dev
-      - name: Ruff
+      - name: Ruff lint
         run: uv run ruff check .
+      - name: Ruff format
+        run: uv run ruff format --check .
 
   test:
     runs-on: ubuntu-latest
@@ -40,6 +42,23 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra dev
       - name: Run fast tests
+        run: uv run pytest -m "not slow" -q
+
+  # Apple Silicon runner: exercises the custom Metal kernels on a real MPS
+  # device (they are skipped on the Linux jobs).
+  test-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --extra dev
+      - name: Run fast tests (incl. Metal kernels on MPS)
         run: uv run pytest -m "not slow" -q
 
   package:

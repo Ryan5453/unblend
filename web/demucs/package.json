@@ -31,8 +31,10 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "sideEffects": false,
   "files": [
@@ -44,7 +46,7 @@
   },
   "dependencies": {
     "fft.js": "^4.0.4",
-    "onnxruntime-web": "^1.26.0"
+    "onnxruntime-web": "1.26.0"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.40",

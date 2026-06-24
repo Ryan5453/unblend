@@ -190,6 +190,12 @@ class HTDemucs(nn.Module):
         self.nfft = nfft
         self.hop_length = nfft // 4
         self.freq_emb = None
+        # Contract with ``apply_model``: when True, every forward must run at
+        # exactly ``chunk_batch_size`` (sub-full tail batches get zero-padded
+        # up). Set by ``Separator``'s torch.compile path, whose CUDAGraphs
+        # capture replays a single batch shape; eager models keep it False and
+        # run tails at their natural size.
+        self._fixed_batch_shape = False
 
         self.encoder = nn.ModuleList()
         self.decoder = nn.ModuleList()

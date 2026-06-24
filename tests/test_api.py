@@ -28,7 +28,9 @@ def _make_sources() -> SeparatedSources:
 
 
 def test_get_version_matches_dunder() -> None:
-    """``get_version`` reports the package ``__version__``."""
+    """
+    ``get_version`` reports the package ``__version__``.
+    """
     assert get_version() == __version__
 
 
@@ -44,8 +46,15 @@ def test_get_version_matches_dunder() -> None:
         ("other", ("htdemucs_ft", "other")),
     ],
 )
-def test_select_model(isolate_stem: str | None, expected: tuple[str, str | None]) -> None:
-    """``select_model`` maps each stem to its recommended (model, only_load) pair."""
+def test_select_model(
+    isolate_stem: str | None, expected: tuple[str, str | None]
+) -> None:
+    """
+    ``select_model`` maps each stem to its recommended (model, only_load) pair.
+
+    :param isolate_stem: Stem name to isolate, or None
+    :param expected: Expected (model, only_load) pair
+    """
     assert select_model(isolate_stem=isolate_stem) == expected
 
 
@@ -64,7 +73,9 @@ def test_isolate_stem_builds_complement() -> None:
 
 
 def test_isolate_stem_unknown_name_raises() -> None:
-    """``isolate_stem`` rejects a stem name absent from the sources."""
+    """
+    ``isolate_stem`` rejects a stem name absent from the sources.
+    """
     with pytest.raises(ValidationError):
         _make_sources().isolate_stem("nope")
 
@@ -76,3 +87,17 @@ def test_export_stem_unknown_name_raises() -> None:
     """
     with pytest.raises(ValidationError):
         _make_sources().export_stem("nope")
+
+
+def test_normalize_denormalize_roundtrip() -> None:
+    """
+    ``_normalize``'s documented inverse (``out * (1e-5 + std) + mean``)
+    reconstructs the input exactly — the two must stay symmetric or every
+    separated stem carries a systematic gain error.
+    """
+    from demucs.api import Separator
+
+    wav = torch.randn(2, 1000) * 3.0 + 0.5
+    normed, mean, std = Separator._normalize(wav)
+    restored = normed * (1e-5 + std) + mean
+    assert torch.allclose(restored, wav, atol=1e-6)

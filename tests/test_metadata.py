@@ -11,13 +11,17 @@ EXPECTED_MODELS = {"htdemucs", "htdemucs_ft", "htdemucs_6s"}
 
 
 def test_repository_lists_expected_models() -> None:
-    """The shipped registry exposes the documented model names."""
+    """
+    The shipped registry exposes the documented model names.
+    """
     models = ModelRepository().list_models()
     assert EXPECTED_MODELS.issubset(models.keys())
 
 
 def test_every_layer_has_remote_and_checksum() -> None:
-    """Each model lists at least one layer with a remote path and a checksum."""
+    """
+    Each model lists at least one layer with a remote path and a checksum.
+    """
     for name, info in ModelRepository().list_models().items():
         layers = info.get("models")
         assert layers, f"{name} has no layers"
@@ -27,7 +31,9 @@ def test_every_layer_has_remote_and_checksum() -> None:
 
 
 def test_ensemble_weights_are_consistent() -> None:
-    """Where present, ``weights`` has one row per layer and uniform width."""
+    """
+    Where present, ``weights`` has one row per layer and uniform width.
+    """
     for name, info in ModelRepository().list_models().items():
         weights = info.get("weights")
         if weights is None:

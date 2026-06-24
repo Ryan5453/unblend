@@ -16,7 +16,8 @@ from .transformer import LayerScale
 
 
 def unfold(a: Tensor, kernel_size: int, stride: int) -> Tensor:
-    """Extract frames from input with given stride, padding so that F = ceil(T / K).
+    """
+    Extract frames from input with given stride, padding so that F = ceil(T / K).
 
     :param a: Input tensor of size [*OT, T]
     :param kernel_size: Size of each extracted frame
@@ -34,7 +35,8 @@ def unfold(a: Tensor, kernel_size: int, stride: int) -> Tensor:
 
 
 def center_trim(tensor: Tensor, reference: Tensor | int) -> Tensor:
-    """Center trim ``tensor`` with respect to ``reference`` along the last dimension.
+    """
+    Center trim ``tensor`` with respect to ``reference`` along the last dimension.
 
     :param tensor: Tensor to trim
     :param reference: Reference tensor or integer length to trim to
@@ -75,8 +77,11 @@ def _hann_window(size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     return win
 
 
-def spectro(x: Tensor, n_fft: int = 512, hop_length: int | None = None, pad: int = 0) -> Tensor:
-    """Compute the STFT of the input signal.
+def spectro(
+    x: Tensor, n_fft: int = 512, hop_length: int | None = None, pad: int = 0
+) -> Tensor:
+    """
+    Compute the STFT of the input signal.
 
     :param x: Input tensor
     :param n_fft: FFT size
@@ -134,31 +139,42 @@ def _istft_fold(
     frames = frames * window[None, :, None]
 
     output_length = (n_frames - 1) * hop_length + n_fft
-    out = functional.fold(
-        frames,
-        output_size=(output_length, 1),
-        kernel_size=(n_fft, 1),
-        stride=(hop_length, 1),
-    ).squeeze(-1).squeeze(1)
+    out = (
+        functional.fold(
+            frames,
+            output_size=(output_length, 1),
+            kernel_size=(n_fft, 1),
+            stride=(hop_length, 1),
+        )
+        .squeeze(-1)
+        .squeeze(1)
+    )
 
     win_sq_frames = (window * window)[None, :, None].expand(1, n_fft, n_frames)
-    norm = functional.fold(
-        win_sq_frames,
-        output_size=(output_length, 1),
-        kernel_size=(n_fft, 1),
-        stride=(hop_length, 1),
-    ).squeeze(-1).squeeze(1)
+    norm = (
+        functional.fold(
+            win_sq_frames,
+            output_size=(output_length, 1),
+            kernel_size=(n_fft, 1),
+            stride=(hop_length, 1),
+        )
+        .squeeze(-1)
+        .squeeze(1)
+    )
     out = out / norm
 
     if length is None:
         out = out[..., n_fft // 2 : -(n_fft // 2)]
     else:
         out = out[..., n_fft // 2 : n_fft // 2 + length]
-    return out * (n_fft ** 0.5)
+    return out * (n_fft**0.5)
 
 
-def ispectro(z: Tensor, hop_length: int | None = None, length: int | None = None, pad: int = 0) -> Tensor:
-    """Compute the inverse STFT of a complex spectrogram.
+def ispectro(
+    z: Tensor, hop_length: int | None = None, length: int | None = None, pad: int = 0
+) -> Tensor:
+    """
+    Compute the inverse STFT of a complex spectrogram.
 
     :param z: Complex STFT tensor
     :param hop_length: Hop length between frames
@@ -203,8 +219,15 @@ class BLSTM(nn.Module):
     chunks and the LSTM applied separately on each chunk.
     """
 
-    def __init__(self, dim: int, layers: int = 1, max_steps: int | None = None, skip: bool = False) -> None:
-        """Initialize BLSTM.
+    def __init__(
+        self,
+        dim: int,
+        layers: int = 1,
+        max_steps: int | None = None,
+        skip: bool = False,
+    ) -> None:
+        """
+        Initialize BLSTM.
 
         :param dim: Input and hidden dimension size
         :param layers: Number of LSTM layers
@@ -221,7 +244,8 @@ class BLSTM(nn.Module):
         self.skip = skip
 
     def forward(self, x: Tensor) -> Tensor:
-        """Run the BLSTM on the input, optionally chunking long sequences.
+        """
+        Run the BLSTM on the input, optionally chunking long sequences.
 
         :param x: Input tensor of shape (B, C, T)
         :return: Output tensor of shape (B, C, T)
@@ -262,8 +286,12 @@ class BLSTM(nn.Module):
         return x
 
 
-def rescale_conv(conv: nn.Conv1d | nn.Conv2d | nn.ConvTranspose1d | nn.ConvTranspose2d, reference: float) -> None:
-    """Rescale initial weight scale. It is unclear why it helps but it certainly does.
+def rescale_conv(
+    conv: nn.Conv1d | nn.Conv2d | nn.ConvTranspose1d | nn.ConvTranspose2d,
+    reference: float,
+) -> None:
+    """
+    Rescale initial weight scale. It is unclear why it helps but it certainly does.
 
     :param conv: Convolution module whose weights will be rescaled
     :param reference: Reference standard deviation for rescaling
@@ -276,7 +304,8 @@ def rescale_conv(conv: nn.Conv1d | nn.Conv2d | nn.ConvTranspose1d | nn.ConvTrans
 
 
 def rescale_module(module: nn.Module, reference: float) -> None:
-    """Rescale all convolution weights in a module.
+    """
+    Rescale all convolution weights in a module.
 
     :param module: Module whose convolution submodules will be rescaled
     :param reference: Reference standard deviation for rescaling
@@ -310,7 +339,8 @@ class DConv(nn.Module):
         gelu: bool = True,
         kernel: int = 3,
     ) -> None:
-        """Initialize DConv residual branch.
+        """
+        Initialize DConv residual branch.
 
         :param channels: Input/output channels for residual branch
         :param compress: Amount of channel compression inside the branch
@@ -370,7 +400,8 @@ class DConv(nn.Module):
             self.layers.append(layer)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply all residual dilated convolution layers.
+        """
+        Apply all residual dilated convolution layers.
 
         :param x: Input tensor
         :return: Output tensor with residual connections applied
@@ -387,8 +418,11 @@ class LocalState(nn.Module):
     Also a failed experiments with trying to provide some frequency based attention.
     """
 
-    def __init__(self, channels: int, heads: int = 4, nfreqs: int = 0, ndecay: int = 4) -> None:
-        """Initialize LocalState attention module.
+    def __init__(
+        self, channels: int, heads: int = 4, nfreqs: int = 0, ndecay: int = 4
+    ) -> None:
+        """
+        Initialize LocalState attention module.
 
         :param channels: Number of input channels, must be divisible by heads
         :param heads: Number of attention heads
@@ -414,7 +448,8 @@ class LocalState(nn.Module):
         self.proj = nn.Conv1d(channels + heads * nfreqs, channels, 1)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply local attention with optional decay and frequency components.
+        """
+        Apply local attention with optional decay and frequency components.
 
         :param x: Input tensor of shape (B, C, T)
         :return: Output tensor of shape (B, C, T) with attention applied
@@ -432,23 +467,15 @@ class LocalState(nn.Module):
         dots = torch.einsum("bhct,bhcs->bhts", keys, queries)
         dots /= keys.shape[2] ** 0.5
         if self.nfreqs:
-            periods = torch.arange(
-                1, self.nfreqs + 1, device=x.device, dtype=x.dtype
-            )
+            periods = torch.arange(1, self.nfreqs + 1, device=x.device, dtype=x.dtype)
             freq_kernel = torch.cos(2 * math.pi * delta / periods.view(-1, 1, 1))
-            freq_q = (
-                self.query_freqs(x).view(B, heads, -1, T) / self.nfreqs**0.5
-            )
+            freq_q = self.query_freqs(x).view(B, heads, -1, T) / self.nfreqs**0.5
             dots += torch.einsum("fts,bhfs->bhts", freq_kernel, freq_q)
         if self.ndecay:
-            decays = torch.arange(
-                1, self.ndecay + 1, device=x.device, dtype=x.dtype
-            )
+            decays = torch.arange(1, self.ndecay + 1, device=x.device, dtype=x.dtype)
             decay_q = self.query_decay(x).view(B, heads, -1, T)
             decay_q = torch.sigmoid(decay_q) / 2
-            decay_kernel = (
-                -decays.view(-1, 1, 1) * delta.abs() / self.ndecay**0.5
-            )
+            decay_kernel = -decays.view(-1, 1, 1) * delta.abs() / self.ndecay**0.5
             dots += torch.einsum("fts,bhfs->bhts", decay_kernel, decay_q)
 
         # Kill self reference.
@@ -472,7 +499,8 @@ def pad1d(
     mode: str = "constant",
     value: float = 0.0,
 ) -> Tensor:
-    """Wrapper around F.pad to allow reflect padding on small input.
+    """
+    Wrapper around F.pad to allow reflect padding on small input.
 
     :param x: Input tensor
     :param paddings: Left and right padding amounts
@@ -505,9 +533,14 @@ class ScaledEmbedding(nn.Module):
     """
 
     def __init__(
-        self, num_embeddings: int, embedding_dim: int, scale: float = 10.0, smooth: bool = False
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        scale: float = 10.0,
+        smooth: bool = False,
     ) -> None:
-        """Initialize ScaledEmbedding.
+        """
+        Initialize ScaledEmbedding.
 
         :param num_embeddings: Number of embeddings
         :param embedding_dim: Dimension of each embedding
@@ -528,14 +561,16 @@ class ScaledEmbedding(nn.Module):
 
     @property
     def weight(self) -> Tensor:
-        """Scaled embedding weight.
+        """
+        Scaled embedding weight.
 
         :return: Embedding weights multiplied by scale factor
         """
         return self.embedding.weight * self.scale
 
     def forward(self, x: Tensor) -> Tensor:
-        """Look up and scale embeddings.
+        """
+        Look up and scale embeddings.
 
         :param x: Input indices tensor
         :return: Scaled embedding vectors
@@ -561,7 +596,8 @@ class HEncLayer(nn.Module):
         pad: bool = True,
         rewrite: bool = True,
     ) -> None:
-        """Encoder layer used by both time and frequency branches.
+        """
+        Encoder layer used by both time and frequency branches.
 
         :param chin: Number of input channels
         :param chout: Number of output channels
@@ -612,7 +648,8 @@ class HEncLayer(nn.Module):
             self.dconv = DConv(chout, **dconv_kw)
 
     def forward(self, x: Tensor, inject: Tensor | None = None) -> Tensor:
-        """Apply the encoder layer.
+        """
+        Apply the encoder layer.
 
         :param x: Input tensor
         :param inject: Optional injection from the time branch into the frequency branch
@@ -660,8 +697,11 @@ class MultiWrap(nn.Module):
     the frequency bands, but it is possible the naive implementation would work as well...
     """
 
-    def __init__(self, layer: "HEncLayer | HDecLayer", split_ratios: list[float]) -> None:
-        """Initialize MultiWrap.
+    def __init__(
+        self, layer: "HEncLayer | HDecLayer", split_ratios: list[float]
+    ) -> None:
+        """
+        Initialize MultiWrap.
 
         :param layer: Module to clone, must be either HEncLayer or HDecLayer
         :param split_ratios: Ratios indicating which fraction to keep for each band
@@ -686,8 +726,11 @@ class MultiWrap(nn.Module):
                     m.reset_parameters()
             self.layers.append(lay)
 
-    def forward(self, x: Tensor, skip: Tensor | None = None, length: int | None = None) -> Tensor | tuple[Tensor, None]:
-        """Apply wrapped layers across frequency bands.
+    def forward(
+        self, x: Tensor, skip: Tensor | None = None, length: int | None = None
+    ) -> Tensor | tuple[Tensor, None]:
+        """
+        Apply wrapped layers across frequency bands.
 
         :param x: Input tensor of shape (B, C, Fr, T)
         :param skip: Optional skip connection tensor (for decoder layers)
@@ -774,7 +817,8 @@ class HDecLayer(nn.Module):
         context_freq: bool = True,
         rewrite: bool = True,
     ) -> None:
-        """Decoder layer, mirror of HEncLayer.
+        """
+        Decoder layer, mirror of HEncLayer.
 
         :param chin: Number of input channels
         :param chout: Number of output channels
@@ -835,8 +879,11 @@ class HDecLayer(nn.Module):
         if dconv:
             self.dconv = DConv(chin, **dconv_kw)
 
-    def forward(self, x: Tensor, skip: Tensor | None, length: int) -> tuple[Tensor, Tensor]:
-        """Apply the decoder layer.
+    def forward(
+        self, x: Tensor, skip: Tensor | None, length: int
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Apply the decoder layer.
 
         :param x: Input tensor
         :param skip: Skip connection tensor from the encoder

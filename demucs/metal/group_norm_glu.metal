@@ -41,8 +41,9 @@ kernel void group_norm_g1_glu(
     const uint C_half = C >> 1;
     const uint total_in  = C * N;
     const uint total_out = C_half * N;
-    device const SCALAR_T* in_b = in_ + b * total_in;
-    device SCALAR_T*       out_b = out + b * total_out;
+    // ulong base offsets: b * total overflows 32 bits on huge inputs.
+    device const SCALAR_T* in_b = in_ + (ulong)b * total_in;
+    device SCALAR_T*       out_b = out + (ulong)b * total_out;
 
     // Shift by the batch's first element before summing so the one-pass
     // variance doesn't lose precision to cancellation on large-DC inputs
@@ -117,8 +118,8 @@ kernel void apply_norm_glu(
     float mean  = meanvar[b * 2 + 0];
     float scale = meanvar[b * 2 + 1];
 
-    device const SCALAR_T* x_b   = in_  + b * total_in_per_b;
-    device SCALAR_T*       out_b = out  + b * total_out_per_b;
+    device const SCALAR_T* x_b   = in_  + (ulong)b * total_in_per_b;
+    device SCALAR_T*       out_b = out  + (ulong)b * total_out_per_b;
 
     for (uint i = start + tid; i < end; i += tgs) {
         uint c_out = i / N;

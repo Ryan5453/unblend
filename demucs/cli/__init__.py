@@ -19,9 +19,12 @@ def version_command() -> None:
     typer.echo(f"Demucs version: {__version__}")
 
 
-def main() -> None:
+def build_app() -> typer.Typer:
     """
-    Entry point for the Demucs CLI.
+    Build the Typer application (factored out of ``main`` so tests can drive
+    the CLI through ``typer.testing.CliRunner``).
+
+    :return: The fully wired Typer app.
     """
     app = typer.Typer(
         add_completion=False,
@@ -31,7 +34,8 @@ def main() -> None:
     )
 
     models_app = typer.Typer(
-        help="Download, list and manage models", no_args_is_help=True,
+        help="Download, list and manage models",
+        no_args_is_help=True,
         rich_markup_mode="rich",
     )
     # Explicit ``help=`` strings keep the reST ``:param`` docstrings (required
@@ -61,7 +65,14 @@ def main() -> None:
         help="Export a HTDemucs model to ONNX (internal developer tool).",
     )(export_onnx_command)
 
-    app()
+    return app
+
+
+def main() -> None:
+    """
+    Entry point for the Demucs CLI.
+    """
+    build_app()()
 
 
 if __name__ == "__main__":

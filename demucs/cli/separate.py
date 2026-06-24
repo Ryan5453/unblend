@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -10,6 +11,7 @@ from typing import Annotated
 import click
 import torch
 import typer
+from torchcodec.encoders import AudioEncoder
 
 from ..api import Separator, default_device, select_model
 from ..exceptions import ValidationError
@@ -17,6 +19,24 @@ from .models import ensure_model_available
 from .progress import FileProgressTracker
 from .types import ClipMode, DeviceType, ModelName, Precision, StemName
 from .utils import console, expand_paths_to_audio_files, format_output_path
+
+
+def _validate_output_format(format: str) -> None:
+    """
+    Fail fast on an unsupported --format by encoding a tiny silent clip the
+    same way ``export_stem`` will (torchcodec keys the container off the
+    file extension), instead of erroring after an expensive separation.
+
+    :param format: Output format/extension to validate
+    :raises typer.Exit: If the format is not encodable
+    """
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            encoder = AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100)
+            encoder.to_file(Path(tmp) / f"probe.{format}")
+    except Exception as error:
+        console.print(f"[red]✗[/red] Unsupported output format '{format}': {error}")
+        raise typer.Exit(1)
 
 
 def separate_command(
@@ -87,7 +107,7 @@ def separate_command(
         Precision,
         typer.Option(
             "--precision",
-            help="Inference precision; auto picks bf16 on CUDA, fp16 on MPS, fp32 on CPU",
+            help="Inference precision; auto picks fp16 on CUDA (with tensor cores) and MPS, fp32 on CPU",
             rich_help_panel="Processing",
         ),
     ] = Precision.auto,
@@ -138,8 +158,8 @@ def separate_command(
     :param seed: Random seed for reproducible shift-based inference
     :param compile_model: Compile the HTDemucs neural network core on CUDA; improves
         steady-state throughput for long-running jobs, but adds a heavy warmup cost
-    :param precision: Inference precision; auto picks bf16 on CUDA, fp16 on MPS,
-        fp32 on CPU
+    :param precision: Inference precision; auto picks fp16 on CUDA (with tensor
+        cores) and MPS, fp32 on CPU
     :param output: Output path template; variables are {model}, {track}, {stem},
         {ext}, {date}, {time}, {timestamp}
     :param isolate_stem: Only creates a {stem} and no_{stem} stem/file
@@ -156,11 +176,15 @@ def separate_command(
     if device is None:
         device = DeviceType(default_device())
 
-    audio_files = expand_paths_to_audio_files(tracks)
+    audio_files, had_path_errors = expand_paths_to_audio_files(tracks)
 
     if not audio_files:
         console.print("[red]No audio files found to process.[/red]")
         raise typer.Exit(1)
+
+    # Catch an unsupported --format before any model download or separation
+    # work: encode a tiny silent clip the same way export_stem will.
+    _validate_output_format(format)
 
     if model.value == ModelName.auto.value:
         selected_model_name, only_load_stem = select_model(
@@ -173,21 +197,15 @@ def separate_command(
         selected_model_name = model.value
         only_load_stem = isolate_stem.value if isolate_stem else None
 
-    if not ensure_model_available(selected_model_name):
+    # only_load keeps the download to the single specialist layer when set.
+    if not ensure_model_available(selected_model_name, only_load=only_load_stem):
         raise typer.Exit(1)
 
-    # Resolve --precision auto → the best-known dtype for the device:
-    # CUDA picks bf16 (native tensor cores at the same throughput as fp16,
-    # with FP32 exponent range); MPS picks fp16 (custom Metal kernels in
-    # ``demucs.metal``; BF16 on MPS works but is slower on PyTorch 2.11);
-    # CPU stays at fp32 (no faster path).
+    # Resolve --precision auto → the API's default_dtype for the device:
+    # FP16 on CUDA-with-tensor-cores and MPS, FP32 on CPU and older CUDA
+    # GPUs. One source of truth with Separator's own ``dtype="auto"``.
     if precision is Precision.auto:
-        if device.value == DeviceType.cuda.value:
-            dtype: torch.dtype | None = torch.bfloat16
-        elif device.value == DeviceType.mps.value:
-            dtype = torch.float16
-        else:
-            dtype = None
+        dtype: torch.dtype | str | None = "auto"
     elif precision is Precision.fp32:
         dtype = None
     elif precision is Precision.fp16:
@@ -277,6 +295,19 @@ def separate_command(
     )
     console.print(f"{message} '{resolved_template}'")
 
+    # A literal extension in the template overrides --format (export keys the
+    # container off the path suffix). Warn when -f was passed explicitly but
+    # the template ignores it.
+    template_ext = resolved_template.suffix.lstrip(".")
+    if template_ext and template_ext != format:
+        ctx = click.get_current_context(silent=True)
+        source = ctx.get_parameter_source("format") if ctx else None
+        if source is not None and source.name == "COMMANDLINE":
+            console.print(
+                f"[yellow]Warning:[/yellow] output template extension "
+                f"'.{template_ext}' overrides --format '{format}'"
+            )
+
     had_error = False
     with FileProgressTracker(len(audio_files)) as progress_tracker:
         for track in audio_files:
@@ -318,7 +349,8 @@ def separate_command(
                 progress_tracker.error_file(file_key)
                 console.print(f"[red]✗[/red] Error processing {track.name}: {e}")
 
-    # If any track failed, exit nonzero so scripts/pipelines can detect it,
-    # while still having processed every other track.
-    if had_error:
+    # If any track failed — or any input path didn't resolve to audio — exit
+    # nonzero so scripts/pipelines can detect it, while still having processed
+    # every other track.
+    if had_error or had_path_errors:
         raise typer.Exit(1)

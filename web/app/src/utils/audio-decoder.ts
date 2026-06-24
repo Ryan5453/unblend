@@ -288,78 +288,85 @@ async function decodeWithMediabunny(
         debug('Could not extract metadata tags:', e);
     }
 
-    // Get audio track
-    const audioTrack = await input.getPrimaryAudioTrack();
-    if (!audioTrack) {
-        input.dispose();
-        throw new Error('No audio track found in file');
-    }
-
-    // Check if we can decode this track
-    const canDecode = await audioTrack.canDecode();
-    if (!canDecode) {
-        input.dispose();
-        throw new Error(`Cannot decode audio codec: ${audioTrack.codec || 'unknown'}`);
-    }
-
-    // Get audio properties
-    const sampleRate = audioTrack.sampleRate;
-    const numberOfChannels = audioTrack.numberOfChannels;
-    const duration = await audioTrack.computeDuration();
-
-    // Calculate total samples
-    const totalSamples = Math.ceil(duration * sampleRate);
-
-    // Create output AudioBuffer (reuse the caller's AudioContext to avoid
-    // leaking contexts; browsers cap the number of live AudioContexts).
-    const buffer = audioContext.createBuffer(
-        numberOfChannels,
-        totalSamples,
-        sampleRate
-    );
-
-    // Use AudioSampleSink to decode all samples
-    const sink = new AudioSampleSink(audioTrack);
-
-    let samplesWritten = 0;
-
-    for await (const sample of sink.samples()) {
-        // Copy each channel
-        for (let ch = 0; ch < numberOfChannels; ch++) {
-            const channelBytesNeeded = sample.allocationSize({ planeIndex: ch, format: 'f32-planar' });
-            const channelData = new Float32Array(channelBytesNeeded / 4);
-            sample.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
-
-            // Copy to output buffer
-            const outputChannel = buffer.getChannelData(ch);
-            const framesToCopy = Math.min(channelData.length, totalSamples - samplesWritten);
-            for (let i = 0; i < framesToCopy; i++) {
-                outputChannel[samplesWritten + i] = channelData[i];
-            }
+    // From here on, any failure must revoke the artwork object URL created
+    // above or it would leak (the caller never sees it on the throw path).
+    try {
+        // Get audio track
+        const audioTrack = await input.getPrimaryAudioTrack();
+        if (!audioTrack) {
+            input.dispose();
+            throw new Error('No audio track found in file');
         }
 
-        samplesWritten += sample.numberOfFrames;
-        sample.close();
-    }
+        // Check if we can decode this track
+        const canDecode = await audioTrack.canDecode();
+        if (!canDecode) {
+            input.dispose();
+            throw new Error(`Cannot decode audio codec: ${audioTrack.codec || 'unknown'}`);
+        }
 
-    input.dispose();
+        // Get audio properties
+        const sampleRate = audioTrack.sampleRate;
+        const numberOfChannels = audioTrack.numberOfChannels;
+        const duration = await audioTrack.computeDuration();
 
-    // Resample if needed
-    if (sampleRate !== targetSampleRate) {
-        const offlineCtx = new OfflineAudioContext(
+        // Calculate total samples
+        const totalSamples = Math.ceil(duration * sampleRate);
+
+        // Create output AudioBuffer (reuse the caller's AudioContext to avoid
+        // leaking contexts; browsers cap the number of live AudioContexts).
+        const buffer = audioContext.createBuffer(
             numberOfChannels,
-            Math.ceil(samplesWritten * targetSampleRate / sampleRate),
-            targetSampleRate
+            totalSamples,
+            sampleRate
         );
-        const source = offlineCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(offlineCtx.destination);
-        source.start();
-        const resampledBuffer = await offlineCtx.startRendering();
-        return { buffer: resampledBuffer, artwork, title, artist };
-    }
 
-    return { buffer, artwork, title, artist };
+        // Use AudioSampleSink to decode all samples
+        const sink = new AudioSampleSink(audioTrack);
+
+        let samplesWritten = 0;
+
+        for await (const sample of sink.samples()) {
+            // Copy each channel
+            for (let ch = 0; ch < numberOfChannels; ch++) {
+                const channelBytesNeeded = sample.allocationSize({ planeIndex: ch, format: 'f32-planar' });
+                const channelData = new Float32Array(channelBytesNeeded / 4);
+                sample.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
+
+                // Copy to output buffer
+                const outputChannel = buffer.getChannelData(ch);
+                const framesToCopy = Math.min(channelData.length, totalSamples - samplesWritten);
+                for (let i = 0; i < framesToCopy; i++) {
+                    outputChannel[samplesWritten + i] = channelData[i];
+                }
+            }
+
+            samplesWritten += sample.numberOfFrames;
+            sample.close();
+        }
+
+        input.dispose();
+
+        // Resample if needed
+        if (sampleRate !== targetSampleRate) {
+            const offlineCtx = new OfflineAudioContext(
+                numberOfChannels,
+                Math.ceil(samplesWritten * targetSampleRate / sampleRate),
+                targetSampleRate
+            );
+            const source = offlineCtx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(offlineCtx.destination);
+            source.start();
+            const resampledBuffer = await offlineCtx.startRendering();
+            return { buffer: resampledBuffer, artwork, title, artist };
+        }
+
+        return { buffer, artwork, title, artist };
+    } catch (error) {
+        if (artwork) URL.revokeObjectURL(artwork);
+        throw error;
+    }
 }
 
 /**

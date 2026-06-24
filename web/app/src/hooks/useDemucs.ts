@@ -21,6 +21,7 @@ export function useDemucs() {
     const [audioError, setAudioError] = useState<string | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const separatorRef = useRef<Separator | null>(null);
+    const modelLoadInFlightRef = useRef(false);
 
     // Store pre-created blob URLs
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
@@ -64,17 +65,25 @@ export function useDemucs() {
         backend: 'webgpu' | 'wasm' = 'webgpu',
         precision: ModelPrecision = 'fp16',
     ) => {
-        // If a model is already loaded, tear it down before loading another.
-        if (separatorRef.current) {
-            await separatorRef.current.unload();
-            separatorRef.current = null;
+        // Reject concurrent loads: a second call racing the first would tear
+        // down or leak the separator the first one is still creating.
+        if (modelLoadInFlightRef.current) {
+            addLog('A model load is already in progress', 'error');
+            return false;
         }
-
-        setState(prev => ({ ...prev, modelLoading: true }));
-        addLog(`Loading ${model} (${precision})...`, 'info');
-        const start = performance.now();
+        modelLoadInFlightRef.current = true;
 
         try {
+            // If a model is already loaded, tear it down before loading another.
+            if (separatorRef.current) {
+                await separatorRef.current.unload();
+                separatorRef.current = null;
+            }
+
+            setState(prev => ({ ...prev, modelLoading: true, modelLoaded: false }));
+            addLog(`Loading ${model} (${precision})...`, 'info');
+            const start = performance.now();
+
             const separator = await Separator.load(model, {
                 backend,
                 precision,
@@ -97,6 +106,8 @@ export function useDemucs() {
             addLog(`Failed to load ${model}: ${(err as Error).message}`, 'error');
             setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
             return false;
+        } finally {
+            modelLoadInFlightRef.current = false;
         }
     }, [addLog]);
 

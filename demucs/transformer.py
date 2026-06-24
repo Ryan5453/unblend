@@ -16,7 +16,11 @@ import torch.nn.functional as F
 
 @torch.no_grad()
 def create_sin_embedding(
-    length: int, dim: int, shift: int = 0, device: str = "cpu", max_period: float = 10000
+    length: int,
+    dim: int,
+    shift: int = 0,
+    device: str = "cpu",
+    max_period: float = 10000,
 ) -> torch.Tensor:
     """
     Create sinusoidal positional embedding in TBC format.
@@ -36,9 +40,7 @@ def create_sin_embedding(
             -1, 1, 1
         )
         half_dim = dim // 2
-        adim = torch.arange(dim // 2, device=device, dtype=torch.float32).view(
-            1, 1, -1
-        )
+        adim = torch.arange(dim // 2, device=device, dtype=torch.float32).view(1, 1, -1)
         phase = pos / (max_period ** (adim / (half_dim - 1)))
         return torch.cat(
             [
@@ -51,7 +53,11 @@ def create_sin_embedding(
 
 @torch.no_grad()
 def create_2d_sin_embedding(
-    d_model: int, height: int, width: int, device: str = "cpu", max_period: float = 10000
+    d_model: int,
+    height: int,
+    width: int,
+    device: str = "cpu",
+    max_period: float = 10000,
 ) -> torch.Tensor:
     """
     Create 2D sinusoidal positional embedding.
@@ -93,16 +99,10 @@ def create_2d_sin_embedding(
             .repeat(1, height, 1)
         )
         pe[d_model::2, :, :] = (
-            torch.sin(pos_h * div_term)
-            .transpose(0, 1)
-            .unsqueeze(2)
-            .repeat(1, 1, width)
+            torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
         )
         pe[d_model + 1 :: 2, :, :] = (
-            torch.cos(pos_h * div_term)
-            .transpose(0, 1)
-            .unsqueeze(2)
-            .repeat(1, 1, width)
+            torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
         )
 
         return pe[None, :].to(device)
@@ -114,24 +114,18 @@ def create_sin_embedding_cape(
     dim: int,
     batch_size: int,
     mean_normalize: bool,
-    augment: bool,  # True during training
-    max_global_shift: float = 0.0,  # delta max
-    max_local_shift: float = 0.0,  # epsilon max
-    max_scale: float = 1.0,
     device: str = "cpu",
     max_period: float = 10000.0,
 ) -> torch.Tensor:
     """
-    Create sinusoidal positional embedding with CAPE augmentation.
+    Create sinusoidal CAPE positional embedding. The training-time CAPE
+    augmentation (global/local shifts, scaling) was removed with the rest of
+    the training code; this is the inference (un-augmented) variant only.
 
     :param length: Sequence length
     :param dim: Embedding dimension (must be even)
     :param batch_size: Batch size
     :param mean_normalize: Whether to mean-normalize positions
-    :param augment: Whether to apply CAPE augmentation (typically True during training)
-    :param max_global_shift: Maximum global position shift (delta max)
-    :param max_local_shift: Maximum local position shift (epsilon max)
-    :param max_scale: Maximum scaling factor
     :param device: Device to create tensor on
     :param max_period: Maximum period for sinusoidal encoding
     :return: Positional embedding tensor of shape (length, batch_size, dim)
@@ -148,9 +142,7 @@ def create_sin_embedding_cape(
         pos = pos.to(device)
 
         half_dim = dim // 2
-        adim = torch.arange(dim // 2, device=device, dtype=torch.float32).view(
-            1, 1, -1
-        )
+        adim = torch.arange(dim // 2, device=device, dtype=torch.float32).view(1, 1, -1)
         phase = pos / (max_period ** (adim / (half_dim - 1)))
         return torch.cat(
             [
@@ -206,7 +198,9 @@ class LayerScale(nn.Module):
     This rescales diagonaly residual outputs close to 0 initially, then learnt.
     """
 
-    def __init__(self, channels: int, init: float = 0, channel_last: bool = False) -> None:
+    def __init__(
+        self, channels: int, init: float = 0, channel_last: bool = False
+    ) -> None:
         """
         Initialize learnable diagonal rescaling for residual outputs.
 
@@ -673,7 +667,9 @@ class CrossTransformerEncoder(nn.Module):
             self._pos_emb_t_cache[key] = emb
         return emb
 
-    def forward(self, x: torch.Tensor, xt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, xt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through alternating self-attention and cross-attention layers.
 
@@ -712,7 +708,9 @@ class CrossTransformerEncoder(nn.Module):
         xt = xt.permute(0, 2, 1)  # "b t2 c -> b c t2"
         return x, xt
 
-    def _get_pos_embedding(self, T: int, B: int, C: int, device: torch.device | str) -> torch.Tensor:
+    def _get_pos_embedding(
+        self, T: int, B: int, C: int, device: torch.device | str
+    ) -> torch.Tensor:
         """
         Compute positional embedding based on the configured embedding type.
 
@@ -735,7 +733,6 @@ class CrossTransformerEncoder(nn.Module):
                 device=device,
                 max_period=self.max_period,
                 mean_normalize=self.cape_mean_normalize,
-                augment=False,
             )
 
         elif self.emb == "scaled":

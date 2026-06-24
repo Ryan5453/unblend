@@ -49,7 +49,9 @@ def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
     return wav
 
 
-def convert_audio(wav: Tensor, from_samplerate: int, to_samplerate: int, channels: int) -> Tensor:
+def convert_audio(
+    wav: Tensor, from_samplerate: int, to_samplerate: int, channels: int
+) -> Tensor:
     """
     Convert audio to a target sample rate and number of channels.
 

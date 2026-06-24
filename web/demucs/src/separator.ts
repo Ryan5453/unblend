@@ -113,7 +113,20 @@ export class Separator {
                 ? 'webgpu'
                 : 'wasm';
         const precision: ModelPrecision = options.precision ?? 'fp32';
-        const modelUrl = MODEL_URLS[model][precision];
+        const modelUrls = MODEL_URLS[model];
+        if (!modelUrls) {
+            throw new Error(
+                `Unknown model '${model}'. Valid models: ` +
+                `${Object.keys(MODEL_URLS).join(', ')}.`
+            );
+        }
+        const modelUrl = modelUrls[precision];
+        if (!modelUrl) {
+            throw new Error(
+                `Unknown precision '${precision}'. Valid precisions: ` +
+                `${Object.keys(modelUrls).join(', ')}.`
+            );
+        }
 
         let onnx = new OnnxClient();
         const workerOptions = {

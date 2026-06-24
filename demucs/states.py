@@ -35,7 +35,9 @@ _DEPRECATED_PARAMS = frozenset(
 )
 
 
-def load_model(path_or_package: dict | str | Path, strict: bool = False) -> torch.nn.Module:
+def load_model(
+    path_or_package: dict | str | Path, strict: bool = False
+) -> torch.nn.Module:
     """
     Load a model from a serialized dict or a file path.
 
@@ -56,8 +58,9 @@ def load_model(path_or_package: dict | str | Path, strict: bool = False) -> torc
             # package["klass"]/["args"]/["kwargs"]), which weights_only=True
             # refuses to unpickle. This means loading can execute arbitrary
             # code, so callers must only pass files whose integrity has been
-            # verified — ModelRepository checksums every layer (SHA-256 against
-            # the shipped metadata) before handing the path/bytes here.
+            # verified — ModelRepository checks every layer against the full
+            # SHA-256 digest in the shipped metadata before handing the
+            # path/bytes here.
             package = torch.load(path, "cpu", weights_only=False)
     else:
         raise ValueError(f"Invalid type for {path_or_package}.")
@@ -73,9 +76,7 @@ def load_model(path_or_package: dict | str | Path, strict: bool = False) -> torc
         for key in list(kwargs):
             if key not in sig.parameters:
                 if key not in _DEPRECATED_PARAMS:
-                    warnings.warn(
-                        "Dropping nonexistent parameter " + key, stacklevel=2
-                    )
+                    warnings.warn("Dropping nonexistent parameter " + key, stacklevel=2)
                 del kwargs[key]
         model = klass(*args, **kwargs)
 

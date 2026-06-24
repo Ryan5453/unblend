@@ -13,7 +13,9 @@ import pathlib
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent / "demucs"
 
 
-def _iter_functions() -> list[tuple[pathlib.Path, ast.FunctionDef | ast.AsyncFunctionDef]]:
+def _iter_functions() -> list[
+    tuple[pathlib.Path, ast.FunctionDef | ast.AsyncFunctionDef]
+]:
     """
     Collect every function/method definition in the ``demucs`` package.
 
@@ -62,7 +64,9 @@ def _returns_value(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 
 def test_all_functions_fully_typed() -> None:
-    """Every function/method annotates all parameters and its return type."""
+    """
+    Every function/method annotates all parameters and its return type.
+    """
     problems: list[str] = []
     for path, node in _iter_functions():
         a = node.args
@@ -78,12 +82,16 @@ def test_all_functions_fully_typed() -> None:
         if node.returns is None:
             missing.append("<return>")
         if missing:
-            problems.append(f"{path.name}:{node.lineno} {node.name} -> {', '.join(missing)}")
+            problems.append(
+                f"{path.name}:{node.lineno} {node.name} -> {', '.join(missing)}"
+            )
     assert not problems, "Functions missing type annotations:\n" + "\n".join(problems)
 
 
 def test_all_functions_have_rest_docstrings() -> None:
-    """Every function/method has a reST docstring covering its params and return."""
+    """
+    Every function/method has a reST docstring covering its params and return.
+    """
     problems: list[str] = []
     for path, node in _iter_functions():
         doc = ast.get_docstring(node)
@@ -93,11 +101,17 @@ def test_all_functions_have_rest_docstrings() -> None:
         for name in _param_names(node):
             if not any(
                 marker in doc
-                for marker in (f":param {name}:", f":param *{name}:", f":param **{name}:")
+                for marker in (
+                    f":param {name}:",
+                    f":param *{name}:",
+                    f":param **{name}:",
+                )
             ):
                 problems.append(
                     f"{path.name}:{node.lineno} {node.name} -> missing ':param {name}:'"
                 )
         if _returns_value(node) and ":return" not in doc:
-            problems.append(f"{path.name}:{node.lineno} {node.name} -> missing ':return:'")
+            problems.append(
+                f"{path.name}:{node.lineno} {node.name} -> missing ':return:'"
+            )
     assert not problems, "Docstring issues:\n" + "\n".join(problems)

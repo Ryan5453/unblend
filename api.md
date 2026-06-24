@@ -11,7 +11,7 @@ separator = Separator(
     model: str | Model | ModelEnsemble = "htdemucs",
     device: str | None = None,
     only_load: str | None = None,
-    dtype: torch.dtype | None = None,
+    dtype: torch.dtype | str | None = "auto",
     compile: bool = False,
 )
 ```
@@ -21,7 +21,7 @@ A `Separator` takes the following parameters:
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. If left as `None` (the default), Demucs auto-selects the best available backend at construction time (cuda > mps > cpu). Pass `"cpu"`, `"cuda"`, or `"mps"` to force one.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft). This is a **performance optimization** (smaller download and memory footprint) — it does **not** filter the output to one stem; the result still contains all of the model's sources, with only the named stem at full quality. Use `SeparatedSources.isolate_stem` to actually isolate a stem.
-- `dtype` - Optional, set to `torch.float16` or `torch.bfloat16` for reduced-precision inference. Supported on CUDA and MPS (CPU is rejected). On CUDA, BF16 runs natively on tensor cores at the same throughput as FP16 with FP32 exponent range — generally the fastest option. On MPS, FP16 is the recommended path (custom Metal kernels in `demucs.metal`); BF16 is supported but, as of PyTorch 2.11, ~22 % slower than FP16 (its native ops aren't well-optimized on MPS yet). If `None`, uses default float32.
+- `dtype` - Inference precision. The default `"auto"` picks the fastest dtype that keeps SDR at FP32 level: FP16 on CUDA GPUs with tensor cores (compute capability ≥ 7.0) and on MPS; FP32 on CPU and older CUDA GPUs. FP16 and BF16 both measure SDR-equal to FP32 on MUSDB18 (within 0.01 dB) at ~1.7× the speed — FP16 tracks FP32 slightly closer, which is why auto prefers it. Pass `torch.float16` or `torch.bfloat16` explicitly to force reduced precision (CUDA/MPS only; CPU is rejected), or `None` / `torch.float32` to force FP32. On MPS, FP16 uses custom Metal kernels in `demucs.metal`; BF16 works but, as of PyTorch 2.11, is ~22 % slower than FP16 (its native ops aren't well-optimized on MPS yet) — use it when you want BF16's FP32 exponent range.
 - `compile` - Optional, if `True`, applies `torch.compile` (CUDAGraphs / Inductor) to the HTDemucs neural network core. Significantly improves steady-state throughput on CUDA at the cost of a heavy first-call compile (~7–55 s depending on dtype). Silently ignored on MPS and CPU (`torch.compile` on MPS hits dynamo recompile limits on the Metal kernels' varying channel counts).
 
 ### Attributes
@@ -33,7 +33,7 @@ After construction, the following attributes are available on a `Separator` inst
 - `model` - The loaded model instance (`Model | ModelEnsemble`).
 - `audio_channels` - Number of audio channels the model expects (`int`).
 - `sample_rate` - Sample rate the model operates at (`int`).
-- `chunk_batch_size` - Number of segments processed per forward call. On CUDA this is auto-detected at init time from a single eager forward measurement + `mem_get_info` + a capture-verify step that halves on `CUDAOutOfMemoryError` (max 4 attempts). Read this attribute after construction to see the value picked for your GPU. On MPS/CPU it falls back to a small default.
+- `chunk_batch_size` - Number of segments processed per forward call. On CUDA this is auto-detected at init time from a single eager forward measurement + `mem_get_info`; with `compile=True` the estimate is additionally capture-verified, halving on CUDA OOM (max 4 attempts), while `compile=False` trusts the estimate directly. Read this attribute after construction to see the value picked for your GPU. On MPS/CPU it falls back to a small default.
 
 If you enable `compile=True`, warmup happens automatically at the end of `__init__` (via a zero-tensor pass through `Separator.separate`, so the CUDAGraph captured is the same one real requests reuse). You can call `separator.warmup()` again later to re-prime if needed; the method takes no arguments because tail-padding inside `apply_model` guarantees a single batch shape per session.
 
@@ -70,7 +70,7 @@ When separating audio, you have the ability to specify the following parameters:
 
 The model's training segment length (`max_allowed_segment * samplerate`, e.g. 7.8s for HTDemucs) is used internally for every chunk; it isn't a knob because there's no useful range — shorter chunks get padded back up to that length before inference (so they're strictly slower without quality benefit) and longer chunks would extrapolate the cross-transformer's positional embeddings past their training range (degrading quality).
 
-**Bounded GPU memory.** Output accumulators live on CPU on CUDA, with per-batch GPU→CPU transfers after each forward. This means GPU VRAM usage is bounded by `model + cudagraph_pool + active_batch` regardless of audio length — a 10-hour file uses the same VRAM as a 6-minute one. The per-batch transfer adds ~10 % wall time vs the old all-on-GPU path, traded for predictable VRAM and no length-dependent OOMs. On MPS (unified memory) the accumulator stays on-device.
+**Bounded GPU memory.** On CUDA, the input waveform and output accumulators stay GPU-resident when they fit a conservative fraction of the *currently free* VRAM (~30 % after a 2 GiB reserve) — the normal case for songs, where the whole separation then runs on-GPU with a single GPU→CPU transfer at the end. Inputs too long for that budget (think hours of audio) automatically fall back to CPU accumulation with per-batch GPU→CPU transfers, which bounds VRAM usage by `model + cudagraph_pool + active_batch` regardless of audio length — a 10-hour file uses the same VRAM as a 6-minute one, just with the old per-batch transfer cost. On MPS (unified memory) the accumulator always stays on-device.
 
 Example:
 
@@ -115,7 +115,7 @@ When exporting a stem, you have the ability to specify the following parameters:
 
 - `stem_name` - The name of the stem to export.
 - `path` - The path to save the stem to. If not provided, the stem will be returned as raw audio bytes.
-- `format` - The format to export the stem to. Anything supported by FFmpeg.
+- `format` - The format to export the stem to. Anything supported by FFmpeg. Only used when returning bytes or when `path` has no extension; a `path` with an extension determines the container itself.
 - `clip` - The clipping mode to use to prevent audio distortion.
 
 However, Demucs provides an option to be able to isolate a single stem from the `SeparatedSources` instance. This returns a new `SeparatedSources` instance with the chosen stem and an accompanying complement stem (no_{STEM}) that is the sum of all other stems.
@@ -201,7 +201,8 @@ This will return a dictionary of all available models.
 ```python
 {
     "model_name": {
-        "models": list,  # Layer entries, each {"checksum": str, "remote": str}
+        "sources": list, # Stem names, in output order
+        "models": list,  # Layer entries, each {"checksum": str, "remote": str, "sha256": str}
         "weights": list, # Bag-of-models only: per-source mixing weights
     }
 }
@@ -257,7 +258,7 @@ When using `ModelRepository.get_model` (or creating a `Separator` which calls it
   - `progress_percent`: Percentage complete (0-100).
   - `downloaded_bytes`: Bytes downloaded so far.
   - `total_bytes`: Total bytes to download.
-  - `phase`: Optional. Can be "loading" or "verifying" during those stages.
+  - `phase`: Optional. Set to "verifying" during checksum verification.
 - `layer_complete`: Fired when a layer is successfully loaded and cached.
   - `model_name`: Name of the model.
   - `layer_index`: Index of the current layer.

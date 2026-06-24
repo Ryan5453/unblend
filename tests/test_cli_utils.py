@@ -11,7 +11,9 @@ from demucs.cli.utils import (
 
 
 def test_format_file_size_units() -> None:
-    """Sizes are rendered with the largest fitting binary unit."""
+    """
+    Sizes are rendered with the largest fitting binary unit.
+    """
     assert format_file_size(512) == "512 B"
     assert format_file_size(1536) == "1.5 KB"
     assert format_file_size(5 * 1024 * 1024) == "5.0 MB"
@@ -19,7 +21,9 @@ def test_format_file_size_units() -> None:
 
 
 def test_format_output_path_substitutes_variables() -> None:
-    """Template placeholders are replaced; ``{track}`` drops the extension."""
+    """
+    Template placeholders are replaced; ``{track}`` drops the extension.
+    """
     out = format_output_path(
         "{model}/{track}/{stem}.{ext}",
         model="htdemucs",
@@ -31,22 +35,49 @@ def test_format_output_path_substitutes_variables() -> None:
 
 
 def test_looks_like_audio_file_extension_check() -> None:
-    """The heuristic matches known audio extensions case-insensitively."""
+    """
+    The heuristic matches known audio extensions case-insensitively.
+    """
     assert _looks_like_audio_file(Path("track.MP3"))
     assert _looks_like_audio_file(Path("track.flac"))
     assert not _looks_like_audio_file(Path("notes.txt"))
 
 
 def test_expand_paths_directory_and_file(tmp_path: Path) -> None:
-    """Directories expand to their audio files (sorted, dotfiles skipped);
-    explicit file paths pass through untouched."""
+    """
+    Directories expand to their audio files (sorted, dotfiles skipped);
+    explicit file paths pass through untouched.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
     (tmp_path / "b.wav").write_bytes(b"")
     (tmp_path / "a.mp3").write_bytes(b"")
     (tmp_path / "notes.txt").write_bytes(b"")
     (tmp_path / ".hidden.wav").write_bytes(b"")
 
-    expanded = expand_paths_to_audio_files([tmp_path])
+    expanded, had_errors = expand_paths_to_audio_files([tmp_path])
     assert expanded == [tmp_path / "a.mp3", tmp_path / "b.wav"]
+    assert not had_errors
 
     explicit = tmp_path / "notes.txt"
-    assert expand_paths_to_audio_files([explicit]) == [explicit]
+    assert expand_paths_to_audio_files([explicit]) == ([explicit], False)
+
+
+def test_expand_paths_flags_unresolvable_inputs(tmp_path: Path) -> None:
+    """
+    Nonexistent paths and audio-free directories set the error flag while
+    still returning whatever did resolve.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    (tmp_path / "a.mp3").write_bytes(b"")
+
+    expanded, had_errors = expand_paths_to_audio_files(
+        [tmp_path, tmp_path / "missing.wav"]
+    )
+    assert expanded == [tmp_path / "a.mp3"]
+    assert had_errors
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert expand_paths_to_audio_files([empty]) == ([], True)

@@ -38,7 +38,9 @@ def create_model_progress_bar() -> Progress:
     )
 
 
-def create_progress_callback(progress_bar: Progress, task: TaskID) -> Callable[[str, dict], None]:
+def create_progress_callback(
+    progress_bar: Progress, task: TaskID
+) -> Callable[[str, dict], None]:
     """
     Create a progress callback that updates a Rich progress bar.
 
@@ -141,7 +143,9 @@ class FileProgressTracker:
         self.progress_bar.__enter__()
         return self
 
-    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> None:
+    def __exit__(
+        self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object
+    ) -> None:
         """
         Exit the progress tracker context.
 
