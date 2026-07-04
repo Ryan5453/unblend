@@ -1,3 +1,8 @@
+/**
+ * Worker-only module. The module-level FFT/window state is private to each
+ * worker; importing this file from the main thread would share that state
+ * across the STFT worker, which is unsafe.
+ */
 import FFT from 'fft.js';
 import type { STFTResult } from './constants';
 import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES } from './constants';

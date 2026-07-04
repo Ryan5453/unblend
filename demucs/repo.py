@@ -28,14 +28,10 @@ def check_checksum(path: Path, checksum: str) -> None:
     Verify that a file matches an expected SHA-256 checksum.
 
     :param path: Path to the file to check
-    :param checksum: Expected SHA-256 hex digest — the full 64 characters from
-        metadata's ``sha256`` field (the repository requires a full digest per
-        layer at load time, so this is never a truncated prefix in practice)
-    :raises ModelLoadingError: If the actual checksum does not match the expected
-        one, or the expected checksum is empty (which would match anything)
+    :param checksum: Full 64-character SHA-256 hex digest from metadata's
+        ``sha256`` field
+    :raises ModelLoadingError: If the actual digest does not match
     """
-    if not checksum:
-        raise ModelLoadingError(f"Empty expected checksum for file {path}")
     sha = sha256()
     with open(path, "rb") as file:
         while True:
@@ -43,7 +39,7 @@ def check_checksum(path: Path, checksum: str) -> None:
             if not buf:
                 break
             sha.update(buf)
-    actual_checksum = sha.hexdigest()[: len(checksum)]
+    actual_checksum = sha.hexdigest()
     if actual_checksum != checksum:
         raise ModelLoadingError(
             f"Invalid checksum for file {path}, "
@@ -66,15 +62,17 @@ def get_cache_dir() -> Path:
 class ModelRepository:
     """Repository system for accessing models."""
 
-    def __init__(self) -> None:
+    def __init__(self, metadata_path: Path | None = None) -> None:
         """
         Initialize the model repository from metadata.json.
 
+        :param metadata_path: Path to a metadata file; defaults to the shipped
+            ``demucs/metadata.json``. Mainly useful in tests.
         :raises ModelLoadingError: If the metadata structure is invalid
         """
-        # Determine metadata_path relative to this file
-        current_file_path = Path(__file__)
-        self.metadata_path = current_file_path.parent / "metadata.json"
+        if metadata_path is None:
+            metadata_path = Path(__file__).parent / "metadata.json"
+        self.metadata_path = metadata_path
 
         # Load metadata
         with open(self.metadata_path, "r") as f:
@@ -89,28 +87,37 @@ class ModelRepository:
             )
 
         # Generate layer URLs from model remote paths. The short checksum is
-        # the cache filename / URL key; the full sha256 (when present) is what
-        # downloads and cache hits are verified against.
+        # the cache filename / URL key; the full sha256 is what downloads and
+        # cache hits are verified against.
         self._layer_urls = {}
         self._layer_sha256 = {}
         for model_name, model_info in self._models.items():
-            if "models" in model_info:
-                for model_entry in model_info["models"]:
-                    checksum = model_entry["checksum"]
-                    remote_path = model_entry["remote"]
-                    self._layer_urls[checksum] = f"{BASE_CDN_URL}/{remote_path}"
-                    # Loading runs ``torch.load(weights_only=False)``, which can
-                    # execute arbitrary pickle code, so a full 64-char SHA-256 is
-                    # the integrity gate. Refuse to register a layer that lacks
-                    # one rather than silently fall back to the 8-char filename
-                    # checksum (a 32-bit check is not an integrity guarantee).
-                    sha = model_entry.get("sha256")
-                    if not isinstance(sha, str) or len(sha) != 64:
-                        raise ModelLoadingError(
-                            f"Layer {checksum} of model {model_name} is missing a "
-                            "full 64-character sha256 in metadata; refusing to load."
-                        )
-                    self._layer_sha256[checksum] = sha
+            if "models" not in model_info:
+                continue
+            # ``sources`` is required so the only_load specialist optimisation
+            # can resolve stem names without downloading a layer just to peek
+            # at them.
+            sources = model_info.get("sources")
+            if not (
+                isinstance(sources, list) and all(isinstance(s, str) for s in sources)
+            ):
+                raise ModelLoadingError(
+                    f"Model {model_name} is missing a 'sources' list in metadata."
+                )
+            for model_entry in model_info["models"]:
+                checksum = model_entry["checksum"]
+                remote_path = model_entry["remote"]
+                self._layer_urls[checksum] = f"{BASE_CDN_URL}/{remote_path}"
+                # Loading runs ``torch.load(weights_only=False)``, which can
+                # execute arbitrary pickle code, so a full 64-char SHA-256 is
+                # the integrity gate.
+                sha = model_entry.get("sha256")
+                if not isinstance(sha, str) or len(sha) != 64:
+                    raise ModelLoadingError(
+                        f"Layer {checksum} of model {model_name} is missing a "
+                        "full 64-character sha256 in metadata; refusing to load."
+                    )
+                self._layer_sha256[checksum] = sha
 
     def get_cache_info(self) -> dict[str, dict]:
         """
@@ -295,59 +302,6 @@ class ModelRepository:
             if tmp_path is not None and tmp_path.exists():
                 tmp_path.unlink()
 
-    def _load_first_layer_sources(self, name: str, model_info: dict) -> list[str]:
-        """
-        Fallback for metadata without a ``sources`` field: download/load the
-        first layer just to read its stem names.
-
-        :param name: Model name (for download bookkeeping)
-        :param model_info: Metadata entry for the model
-        :return: The model's stem names
-        :raises ModelLoadingError: If the layer cannot be fetched or loaded
-        """
-        cache_dir = get_cache_dir()
-        first_checksum = model_info["models"][0]["checksum"]
-        first_cache_path = cache_dir / f"{first_checksum}.th"
-        expected = self._layer_sha256.get(first_checksum, first_checksum)
-
-        if not first_cache_path.exists():
-            if first_checksum not in self._layer_urls:
-                raise ModelLoadingError(f"Layer {first_checksum} not found in metadata")
-            first_model = self._download_and_load_layer(
-                url=self._layer_urls[first_checksum],
-                cache_path=first_cache_path,
-                expected_checksum=expected,
-                progress_callback=None,
-                model_name=name,
-                layer_index=1,
-                total_layers=1,
-            )
-        else:
-            try:
-                check_checksum(first_cache_path, expected)
-                first_model = load_model(
-                    torch.load(first_cache_path, map_location="cpu", weights_only=False)
-                )
-            except (
-                ModelLoadingError,
-                RuntimeError,
-                EOFError,
-                pickle.UnpicklingError,
-            ):
-                # The cached file is corrupt/unreadable: discard and redownload.
-                if first_cache_path.exists():
-                    first_cache_path.unlink()
-                first_model = self._download_and_load_layer(
-                    url=self._layer_urls[first_checksum],
-                    cache_path=first_cache_path,
-                    expected_checksum=expected,
-                    progress_callback=None,
-                    model_name=name,
-                    layer_index=1,
-                    total_layers=1,
-                )
-        return first_model.sources
-
     def _select_layers(
         self, name: str, only_load: str | None = None
     ) -> tuple[list[str], dict]:
@@ -373,11 +327,9 @@ class ModelRepository:
         layer_checksums = [entry["checksum"] for entry in model_info["models"]]
 
         if only_load and weights and len(weights) > 1:
-            # Stem names come from metadata; fall back to loading the first
-            # layer for metadata files that predate the ``sources`` field.
-            stem_names = model_info.get("sources")
-            if stem_names is None:
-                stem_names = self._load_first_layer_sources(name, model_info)
+            # Stem names come from metadata; the constructor enforces ``sources``
+            # is present on every registered model.
+            stem_names = model_info["sources"]
 
             # An unknown stem falls through to the full model; validation
             # happens in Separator.
@@ -421,6 +373,17 @@ class ModelRepository:
         layer_checksums, _ = self._select_layers(name, only_load)
         return layer_checksums
 
+    def layer_sha256(self, checksum: str) -> str:
+        """
+        Return the full 64-character SHA-256 the layer with the given short
+        checksum is expected to hash to.
+
+        :param checksum: Short (8-char) checksum that names the cache file.
+        :return: Full 64-character SHA-256 digest from metadata.
+        :raises KeyError: If ``checksum`` is not a registered layer.
+        """
+        return self._layer_sha256[checksum]
+
     def get_model(
         self,
         name: str,
@@ -463,7 +426,7 @@ class ModelRepository:
             filename = f"{layer_checksum}.th"
             cache_path = cache_dir / filename
 
-            expected = self._layer_sha256.get(layer_checksum, layer_checksum)
+            expected = self._layer_sha256[layer_checksum]
 
             # Check if file exists and validate its integrity
             if cache_path.exists():

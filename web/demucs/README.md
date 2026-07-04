@@ -1,6 +1,6 @@
 # demucs-next
 
-Browser-side audio source separation using ONNX [Demucs](https://github.com/Ryan5453/demucs-next) models. Runs HTDemucs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
+Browser-side audio source separation using ONNX [Demucs](https://github.com/adefossez/demucs) models. Runs HTDemucs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
 
 For backend/server-side workflows, use the Python `demucs` package — it is significantly faster than the in-browser ONNX path.
 
@@ -37,7 +37,7 @@ Cross-Origin-Embedder-Policy: require-corp
 ## Input Requirements
 
 - **Sample rate:** exactly 44.1 kHz. The STFT parameters and segment length are baked into the ONNX graph and cannot be changed. Resample with `OfflineAudioContext` before calling.
-- **Channels:** 1 or 2. Mono is duplicated to fake-stereo internally. 3+ channel input is not supported — downmix to stereo first.
+- **Channels:** 1 or 2. Mono is duplicated to fake-stereo internally. 3+ channel input is silently truncated to the first two channels (mirroring the Python `convert_audio_channels` contract); downmix yourself if you need a different stereo image.
 - `separate` takes a Web Audio `AudioBuffer`; channel interleaving is handled for you.
 
 Output is always 2 channels per stem regardless of input channel count.
@@ -99,6 +99,10 @@ interface SeparationOptions {
     onProgress?: (p: SeparationProgress) => void;
     shifts?: number;    // random sub-second shifts to average, 1-20 (default 1);
                         // each extra shift reruns the separation, so runtime scales linearly
+    seed?: number;      // optional integer seed for the shift-offset PRNG. With a fixed
+                        // seed the offsets — and outputs — are deterministic. Defaults to
+                        // non-deterministic (Math.random()). Reduced mod 2^32; independent
+                        // of Python's RNG so same-seed parity is within JS only.
 }
 
 interface SeparationProgress {

@@ -82,6 +82,12 @@ def download_models_command(
     :param names: Model names to download
     :param all_models: If True, download all available models
     """
+    if all_models and names:
+        console.print(
+            "[red]Error:[/red] [bold]--all[/bold] and explicit model names are mutually exclusive."
+        )
+        raise typer.Exit(1)
+
     if not all_models and (names is None or not names):
         console.print("[red]Error:[/red] No models specified for download.")
         console.print("Please either:")
@@ -115,6 +121,12 @@ def remove_models_command(
     :param names: Model names to remove
     :param all_models: If True, remove all downloaded models
     """
+    if all_models and names:
+        console.print(
+            "[red]Error:[/red] [bold]--all[/bold] and explicit model names are mutually exclusive."
+        )
+        raise typer.Exit(1)
+
     model_repo = ModelRepository()
 
     if all_models:
@@ -293,6 +305,11 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
 
     cache_dir = get_cache_dir()
     if all((cache_dir / f"{checksum}.th").exists() for checksum in required):
+        # Existence-only — the download path sha256-verifies before moving into
+        # cache, and ``get_model`` re-verifies on load. Re-hashing the whole
+        # cache here would add ~1–3 s to every ``demucs separate`` invocation
+        # on htdemucs_ft for the rare case of a user-corrupted cache file,
+        # which the load-path catch already recovers from.
         return True
 
     return _download_model_with_progress(name, only_load=only_load)

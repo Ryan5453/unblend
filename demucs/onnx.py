@@ -108,7 +108,11 @@ def compute_stft_for_export(
     z = z[..., :-1, :]  # Remove last frequency bin
     # Same alignment sanity check HTDemucs._spec makes — guards against the
     # padding math here silently drifting out of sync with the model's STFT.
-    assert z.shape[-1] == le + 4, (z.shape, le)
+    # Not an ``assert`` so it survives ``python -O``.
+    if z.shape[-1] != le + 4:
+        raise RuntimeError(
+            f"STFT frame count {z.shape[-1]} does not match expected {le + 4}"
+        )
     z = z[..., 2 : 2 + le]  # Trim time dimension
 
     # Split into real and imaginary

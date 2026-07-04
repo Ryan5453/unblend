@@ -2,9 +2,63 @@
 
 import pytest
 import torch
+from torch import nn
 
-from demucs.apply import TensorChunk, apply_model, tensor_chunk
+from demucs.apply import (
+    TensorChunk,
+    _should_restore_submodel_device,
+    apply_model,
+    tensor_chunk,
+)
 from demucs.exceptions import ValidationError
+
+
+def test_should_restore_submodel_device_same_device_is_noop() -> None:
+    """
+    No restore needed when the sub-model already lives on the inference device.
+    """
+    sub = nn.Linear(1, 1)
+    device = torch.device("cpu")
+    assert _should_restore_submodel_device(sub, device, device) is False
+
+
+def test_should_restore_submodel_device_no_params_is_noop() -> None:
+    """
+    A sub-model without parameters has no original device to restore to, so
+    nothing to do.
+    """
+    sub = nn.Linear(1, 1)
+    assert _should_restore_submodel_device(sub, None, torch.device("cuda")) is False
+
+
+def test_should_restore_submodel_device_uncompiled_returns_true() -> None:
+    """
+    Eager sub-models get restored — the classic BagOfModels behavior — so
+    only the active member stays resident on the inference device.
+    """
+    sub = nn.Linear(1, 1)
+    assert (
+        _should_restore_submodel_device(
+            sub, torch.device("cpu"), torch.device("cuda")
+        )
+        is True
+    )
+
+
+def test_should_restore_submodel_device_compiled_skips_restore() -> None:
+    """
+    Compiled sub-models stay on the inference device — bouncing them off
+    invalidates the CUDAGraphs capture and forces a re-compile.
+    """
+    sub = nn.Linear(1, 1)
+    # Marker attribute set by Separator._compile_htdemucs_forward_core.
+    sub._uncompiled_forward_core = lambda *_a, **_kw: None
+    assert (
+        _should_restore_submodel_device(
+            sub, torch.device("cpu"), torch.device("cuda")
+        )
+        is False
+    )
 
 
 def _ramp() -> torch.Tensor:

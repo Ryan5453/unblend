@@ -4,12 +4,15 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import sys
+
 import typer
 
 from .. import __version__
 from .models import download_models_command, list_models_command, remove_models_command
 from .onnx import export_onnx_command
 from .separate import separate_command
+from .utils import console
 
 
 def version_command() -> None:
@@ -72,7 +75,13 @@ def main() -> None:
     """
     Entry point for the Demucs CLI.
     """
-    build_app()()
+    try:
+        build_app()()
+    except KeyboardInterrupt:
+        # Standard "killed by SIGINT" exit code (128 + 2). Keeps shell pipelines
+        # and CI runners correctly distinguishing a Ctrl-C from a hard failure.
+        console.print("[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

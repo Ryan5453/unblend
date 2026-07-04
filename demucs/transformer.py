@@ -77,15 +77,15 @@ def create_2d_sin_embedding(
         )
     # Force FP32 for numerical stability — exp/sin/cos of large values overflow in FP16
     with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
-        pe = torch.zeros(d_model, height, width, dtype=torch.float32)
+        pe = torch.zeros(d_model, height, width, dtype=torch.float32, device=device)
         # Each dimension use half of d_model
         d_model = int(d_model / 2)
         div_term = torch.exp(
-            torch.arange(0.0, d_model, 2, dtype=torch.float32)
+            torch.arange(0.0, d_model, 2, dtype=torch.float32, device=device)
             * -(math.log(max_period) / d_model)
         )
-        pos_w = torch.arange(0.0, width, dtype=torch.float32).unsqueeze(1)
-        pos_h = torch.arange(0.0, height, dtype=torch.float32).unsqueeze(1)
+        pos_w = torch.arange(0.0, width, dtype=torch.float32, device=device).unsqueeze(1)
+        pos_h = torch.arange(0.0, height, dtype=torch.float32, device=device).unsqueeze(1)
         pe[0:d_model:2, :, :] = (
             torch.sin(pos_w * div_term)
             .transpose(0, 1)
@@ -105,7 +105,7 @@ def create_2d_sin_embedding(
             torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
         )
 
-        return pe[None, :].to(device)
+        return pe[None, :]
 
 
 @torch.no_grad()

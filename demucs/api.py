@@ -685,59 +685,74 @@ class Separator:
         self.audio_channels = self.model.audio_channels
         self.sample_rate = self.model.samplerate
 
-        if self.device == "cuda":
-            # cudnn autotune (``benchmark=True``) only for the compile path:
-            # there every forward has one fixed shape (tails are padded to the
-            # captured batch), so the exhaustive algorithm search is paid once.
-            # Eager runs see a different tail-batch shape on nearly every
-            # input; each new shape would re-trigger a multi-second search,
-            # while heuristic selection measures within ~1% of the tuned
-            # algorithms for these conv shapes — so eager leaves it off.
-            torch.backends.cudnn.benchmark = compile
-            torch.set_float32_matmul_precision("high")
-
-        if self.device in {"cuda", "mps"}:
-            self.model.to(self.device)
-
-        # Cast weights to the requested dtype.
-        if self.dtype is not None:
-            if isinstance(self.model, ModelEnsemble):
-                for m in self.model.models:
-                    m.to(dtype=self.dtype)
-            else:
-                self.model.to(dtype=self.dtype)
-
-        # MPS-specific low-precision optimisations: PyTorch 2.11's MPS backend
-        # has slow paths for FP16/BF16 GroupNorm and SDPA. We swap in custom
-        # Metal kernels and a wrapped attention module that route around those.
-        # The SCALAR_T-templated kernels compile for either ``half`` or
-        # ``bfloat`` and dispatch by tensor dtype at call time. No-op for CUDA
-        # (handled by tensor cores) and CPU (no low-precision path).
-        if self.dtype in (torch.float16, torch.bfloat16) and self.device == "mps":
-            from .metal import apply_metal_optimizations
-
-            if isinstance(self.model, ModelEnsemble):
-                for m in self.model.models:
-                    apply_metal_optimizations(m)
-            else:
-                apply_metal_optimizations(self.model)
-
-        # Compute an initial chunk_batch_size from a single eager forward
-        # measurement. No per-GPU table — the math uses ``mem_get_info`` and
-        # the measured per-chunk cost. For compile=True we then *verify* this
-        # estimate by actually capturing a cudagraph at that batch size and
-        # halving on OOM (see ``_calibrate_chunk_batch_size``); this is what
-        # makes the path work on arbitrary GPUs without hardcoded thresholds.
-        self._compile_enabled = compile and self.device == "cuda"
-        # Records the chunk_batch_size values tried during calibration. Only the
-        # CUDA+compile path actually iterates; initialise it here so the
-        # attribute always exists (CPU/MPS/compile-disabled return early).
-        self._calibration_attempts: list[int] = []
-        initial_cbs = self._initial_chunk_batch_size_estimate()
-        self.chunk_batch_size = self._calibrate_chunk_batch_size(
-            initial_guess=initial_cbs,
-            compile_enabled=self._compile_enabled,
+        prev_cudnn_benchmark = (
+            torch.backends.cudnn.benchmark if self.device == "cuda" else None
         )
+        prev_matmul_precision = (
+            torch.get_float32_matmul_precision() if self.device == "cuda" else None
+        )
+        try:
+            if self.device == "cuda":
+                # cudnn autotune (``benchmark=True``) only for the compile path:
+                # there every forward has one fixed shape (tails are padded to the
+                # captured batch), so the exhaustive algorithm search is paid once.
+                # Eager runs see a different tail-batch shape on nearly every
+                # input; each new shape would re-trigger a multi-second search,
+                # while heuristic selection measures within ~1% of the tuned
+                # algorithms for these conv shapes — so eager leaves it off.
+                torch.backends.cudnn.benchmark = compile
+                torch.set_float32_matmul_precision("high")
+
+            if self.device in {"cuda", "mps"}:
+                self.model.to(self.device)
+
+            # Cast weights to the requested dtype.
+            if self.dtype is not None:
+                if isinstance(self.model, ModelEnsemble):
+                    for m in self.model.models:
+                        m.to(dtype=self.dtype)
+                else:
+                    self.model.to(dtype=self.dtype)
+
+            # MPS-specific low-precision optimisations: PyTorch 2.11's MPS backend
+            # has slow paths for FP16/BF16 GroupNorm and SDPA. We swap in custom
+            # Metal kernels and a wrapped attention module that route around those.
+            # The SCALAR_T-templated kernels compile for either ``half`` or
+            # ``bfloat`` and dispatch by tensor dtype at call time. No-op for CUDA
+            # (handled by tensor cores) and CPU (no low-precision path).
+            if self.dtype in (torch.float16, torch.bfloat16) and self.device == "mps":
+                from .metal import apply_metal_optimizations
+
+                if isinstance(self.model, ModelEnsemble):
+                    for m in self.model.models:
+                        apply_metal_optimizations(m)
+                else:
+                    apply_metal_optimizations(self.model)
+
+            # Compute an initial chunk_batch_size from a single eager forward
+            # measurement. No per-GPU table — the math uses ``mem_get_info`` and
+            # the measured per-chunk cost. For compile=True we then *verify* this
+            # estimate by actually capturing a cudagraph at that batch size and
+            # halving on OOM (see ``_calibrate_chunk_batch_size``); this is what
+            # makes the path work on arbitrary GPUs without hardcoded thresholds.
+            self._compile_enabled = compile and self.device == "cuda"
+            # Records the chunk_batch_size values tried during calibration. Only the
+            # CUDA+compile path actually iterates; initialise it here so the
+            # attribute always exists (CPU/MPS/compile-disabled return early).
+            self._calibration_attempts: list[int] = []
+            initial_cbs = self._initial_chunk_batch_size_estimate()
+            self.chunk_batch_size = self._calibrate_chunk_batch_size(
+                initial_guess=initial_cbs,
+                compile_enabled=self._compile_enabled,
+            )
+        except Exception:
+            # Don't leave global cuDNN / matmul precision state flipped if
+            # init failed.
+            if prev_cudnn_benchmark is not None:
+                torch.backends.cudnn.benchmark = prev_cudnn_benchmark
+            if prev_matmul_precision is not None:
+                torch.set_float32_matmul_precision(prev_matmul_precision)
+            raise
 
     def warmup(self) -> None:
         """
@@ -788,7 +803,7 @@ class Separator:
                 raw = w.readframes(num_frames)
         except (wave.Error, EOFError, OSError):
             return None
-        if channels <= 0 or not raw:
+        if channels <= 0 or sample_rate <= 0 or not raw:
             return None
         # A truncated data chunk (byte count not a whole number of frames)
         # can't be reshaped; fall back to torchcodec rather than crash.
@@ -949,10 +964,17 @@ class Separator:
         if chunk_batch_size is None:
             chunk_batch_size = self.chunk_batch_size
 
-        # Validate chunk_batch_size parameter
+        # Validate chunk_batch_size parameter. The upper bound is a sanity
+        # guard against typos like ``chunk_batch_size=10000`` that would OOM
+        # before the calibration loop has a chance to intervene; real workloads
+        # never need a four-figure batch on these models.
         if not isinstance(chunk_batch_size, int) or chunk_batch_size < 1:
             raise ValidationError(
                 f"chunk_batch_size must be a positive integer, got {chunk_batch_size}"
+            )
+        if chunk_batch_size > 1024:
+            raise ValidationError(
+                f"chunk_batch_size must be <= 1024, got {chunk_batch_size}"
             )
 
         # An unknown use_only_stem is a caller mistake (e.g. a typo) — fail
@@ -1073,7 +1095,12 @@ class Separator:
         unnormed = sources_tensor * (1e-5 + std) + mean
         if unnormed.device.type != "cpu":
             unnormed = unnormed.cpu()
-        return {name: unnormed[idx] for idx, name in enumerate(self.model.sources)}
+        # Per-stem clone so user mutation (e.g. ``sources["vocals"][:] = 0``)
+        # doesn't alias across stems via the shared underlying buffer.
+        return {
+            name: unnormed[idx].clone()
+            for idx, name in enumerate(self.model.sources)
+        }
 
     @staticmethod
     def _normalize(wav: Tensor) -> tuple[Tensor, Tensor, Tensor]:

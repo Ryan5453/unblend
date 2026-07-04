@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from rich.progress import (
     BarColumn,
@@ -40,7 +41,7 @@ def create_model_progress_bar() -> Progress:
 
 def create_progress_callback(
     progress_bar: Progress, task: TaskID
-) -> Callable[[str, dict], None]:
+) -> Callable[[str, dict[str, Any]], None]:
     """
     Create a progress callback that updates a Rich progress bar.
 
@@ -49,7 +50,7 @@ def create_progress_callback(
     :return: Callback function for model download progress
     """
 
-    def callback(event_type: str, data: dict) -> None:
+    def callback(event_type: str, data: dict[str, Any]) -> None:
         """
         Update the progress bar in response to a download event.
 
@@ -223,7 +224,9 @@ class FileProgressTracker:
             task_id, completed=total, description=f"[red]✗[/red] {label}"
         )
 
-    def create_audio_callback(self, filename: str) -> Callable[[str, dict], None]:
+    def create_audio_callback(
+        self, filename: str
+    ) -> Callable[[str, dict[str, Any]], None]:
         """
         Create a callback for audio processing progress.
 
@@ -231,7 +234,7 @@ class FileProgressTracker:
         :return: Callback function for audio processing events
         """
 
-        def callback(event_type: str, data: dict) -> None:
+        def callback(event_type: str, data: dict[str, Any]) -> None:
             """
             Forward an audio processing event to the file progress tracker.
 

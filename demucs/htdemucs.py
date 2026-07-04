@@ -21,6 +21,7 @@ from .blocks import (
     rescale_module,
     spectro,
 )
+from .exceptions import ValidationError
 from .states import capture_init
 from .transformer import CrossTransformerEncoder
 
@@ -447,11 +448,11 @@ class HTDemucs(nn.Module):
 
         :param length: Requested input length in samples
         :return: Training length for consistent segment processing
-        :raises ValueError: If length exceeds the training length
+        :raises ValidationError: If length exceeds the training length
         """
         training_length = int(self.max_allowed_segment * self.samplerate)
         if training_length < length:
-            raise ValueError(
+            raise ValidationError(
                 f"Given length {length} is longer than "
                 f"training length {training_length}"
             )

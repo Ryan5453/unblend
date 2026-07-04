@@ -278,6 +278,31 @@ def _split_weight(
     return weight
 
 
+def _should_restore_submodel_device(
+    sub_model: nn.Module,
+    sub_device: torch.device | None,
+    device: torch.device,
+) -> bool:
+    """
+    Whether the ensemble loop should move ``sub_model`` back to ``sub_device``.
+
+    Compiled sub-models keep a CUDAGraphs capture tied to their current
+    device; bouncing them off the inference device throws that capture away
+    and forces a re-compile on the next forward. The marker attribute
+    ``_uncompiled_forward_core`` is set by ``_compile_htdemucs_forward_core``.
+
+    :param sub_model: The just-run ensemble member.
+    :param sub_device: Device the sub-model was on before the ensemble call,
+        or ``None`` if no parameters were present.
+    :param device: Inference device the ensemble call ran on.
+    :return: ``True`` to restore via ``.to(sub_device)``, ``False`` to leave
+        the sub-model where it is.
+    """
+    if sub_device is None or sub_device == device:
+        return False
+    return not hasattr(sub_model, "_uncompiled_forward_core")
+
+
 def apply_model(
     model: ModelEnsemble | Model,
     mix: Tensor | TensorChunk,
@@ -550,10 +575,7 @@ def apply_model_multi(
                 chunk_batch_size=chunk_batch_size,
             )
             sub_models_done += 1
-            # Restore the sub-model to where the caller had it (mirrors
-            # upstream BagOfModels): at most one sub-model stays resident on
-            # the inference device at a time. No-op when they already match.
-            if sub_device is not None and sub_device != device:
+            if _should_restore_submodel_device(sub_model, sub_device, device):
                 sub_model.to(sub_device)
             for k, inst_weight in enumerate(model_weights):
                 totals[k] += inst_weight
@@ -661,10 +683,15 @@ def apply_model_multi(
             for i, (partial, offset) in enumerate(zip(partials, offsets_per_mix)):
                 trimmed = partial[..., max_shift - offset :]
                 trimmed = trimmed[..., : mixes[i].shape[-1]]
+                # Accumulate in-place to avoid a per-round full-output
+                # allocation. The first round clones because ``trimmed`` is a
+                # view into the (otherwise-discarded) round's partial, and a
+                # subsequent ``add_`` would mutate that backing storage rather
+                # than build an accumulator.
                 if accumulators[i] is None:
-                    accumulators[i] = trimmed
+                    accumulators[i] = trimmed.clone()
                 else:
-                    accumulators[i] = accumulators[i] + trimmed
+                    accumulators[i].add_(trimmed)
         if progress_callback is not None:
             progress_callback("processing_complete", {"total_chunks": total_chunks})
         assert all(a is not None for a in accumulators)

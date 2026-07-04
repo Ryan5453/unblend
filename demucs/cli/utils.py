@@ -118,7 +118,8 @@ def _looks_like_audio_file(path: Path) -> bool:
 
 def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
     """
-    Expand directory paths to include all audio files, keep regular files as-is.
+    Expand directory paths to include all audio files (recursively), keep
+    regular files as-is.
 
     :param paths: List of file or directory paths
     :return: ``(audio_files, had_errors)`` — ``had_errors`` is True when any
@@ -134,12 +135,16 @@ def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
             # This allows users to try any file they want (including obscure formats FFmpeg can handle)
             audio_files.append(path)
         elif path.is_dir():
-            # For directories, use extension heuristic for performance
-            # Otherwise we'd have to probe every single file which could be very slow
-            all_files = [
-                f for f in path.iterdir() if f.is_file() and not f.name.startswith(".")
+            # Recurse into the directory. Extension heuristic is the cheap
+            # filter; probing every file with torchcodec would be slow on
+            # large libraries. Dotfiles and dot-directories are skipped.
+            found_files = [
+                f
+                for f in path.rglob("*")
+                if f.is_file()
+                and not any(part.startswith(".") for part in f.relative_to(path).parts)
+                and _looks_like_audio_file(f)
             ]
-            found_files = [f for f in all_files if _looks_like_audio_file(f)]
 
             if found_files:
                 found_files.sort()

@@ -35,6 +35,27 @@ export interface SeparationOptions {
      * [1, 20]; defaults to 1.
      */
     shifts?: number;
+    /**
+     * Optional integer seed for the shift-offset PRNG. With a fixed seed the
+     * offsets — and therefore the output samples — are deterministic across
+     * runs. Defaults to non-deterministic (``Math.random()``). The PRNG is
+     * independent of Python's, so same-seed parity is within JS only. The
+     * seed is reduced modulo 2³² (so e.g. ``2**32`` and ``0`` collide, as do
+     * ``-1`` and ``2**32 - 1``).
+     */
+    seed?: number;
+}
+
+/** Mulberry32: a 32-bit deterministic PRNG seeded from a single integer. */
+function mulberry32(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
 }
 
 export interface SeparationResult {
@@ -67,6 +88,10 @@ export async function runPipeline(
             `shifts must be an integer between 1 and 20 (inclusive), got ${shifts}`
         );
     }
+    if (options.seed !== undefined && !Number.isInteger(options.seed)) {
+        throw new Error(`seed must be an integer if provided, got ${options.seed}`);
+    }
+    const rand = options.seed !== undefined ? mulberry32(options.seed) : Math.random;
     const { onnx, stft, istft } = pipeline;
     const numChannels = 2;
     const numSamples = audioBuffer.length;
@@ -134,7 +159,7 @@ export async function runPipeline(
     const offsets: number[] = [];
     let totalSegs = 0;
     for (let r = 0; r < shifts; r++) {
-        const offset = Math.floor(Math.random() * (MAX_SHIFT + 1));
+        const offset = Math.floor(rand() * (MAX_SHIFT + 1));
         offsets.push(offset);
         totalSegs += Math.ceil((numSamples + MAX_SHIFT - offset) / STEP);
     }

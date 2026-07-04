@@ -93,7 +93,8 @@ demucs separate audio_file.mp3
 # Separate multiple audio files
 demucs separate audio_file_1.mp3 audio_file_2.mp3
 
-# Separate all audio files in a directory
+# Separate every audio file in a directory tree (recurses into subdirectories;
+# dotfiles and dot-directories are skipped).
 demucs separate /path/to/music/folder
 ```
 

@@ -63,6 +63,31 @@ def test_expand_paths_directory_and_file(tmp_path: Path) -> None:
     assert expand_paths_to_audio_files([explicit]) == ([explicit], False)
 
 
+def test_expand_paths_recurses_subdirectories(tmp_path: Path) -> None:
+    """
+    Audio files in nested subdirectories are picked up; dot-files and dot-
+    directories are skipped at any depth.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    (tmp_path / "top.wav").write_bytes(b"")
+    (tmp_path / "album").mkdir()
+    (tmp_path / "album" / "track.flac").write_bytes(b"")
+    (tmp_path / "album" / "disc 2").mkdir()
+    (tmp_path / "album" / "disc 2" / "deeper.mp3").write_bytes(b"")
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "skip-me.wav").write_bytes(b"")
+    (tmp_path / "album" / ".hidden.wav").write_bytes(b"")
+
+    expanded, had_errors = expand_paths_to_audio_files([tmp_path])
+    assert expanded == [
+        tmp_path / "album" / "disc 2" / "deeper.mp3",
+        tmp_path / "album" / "track.flac",
+        tmp_path / "top.wav",
+    ]
+    assert not had_errors
+
+
 def test_expand_paths_flags_unresolvable_inputs(tmp_path: Path) -> None:
     """
     Nonexistent paths and audio-free directories set the error flag while
