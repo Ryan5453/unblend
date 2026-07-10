@@ -46,7 +46,7 @@ dev = [
   "pytest",
 ]
 onnx = [
-  "onnx>=1.14.0",
+  "onnx>=1.22.0",
 ]
 
 [build-system]
