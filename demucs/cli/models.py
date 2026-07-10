@@ -7,6 +7,7 @@ import time
 from typing import Annotated
 
 import typer
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
@@ -166,7 +167,7 @@ def remove_models_command(
     unknown = [name for name in model_names if name not in known_models]
     for name in unknown:
         console.print(
-            f"[red]✗[/red] [bold]{name}[/bold]: Unknown model. "
+            f"[red]✗[/red] [bold]{escape(name)}[/bold]: Unknown model. "
             f"Available models: {', '.join(known_models)}"
         )
     model_names = [name for name in model_names if name in known_models]
@@ -196,20 +197,26 @@ def remove_models_command(
 
         failed_removals = []
         for name in model_names:
-            progress_bar.update(task, description=f"[cyan]Removing {name}...[/cyan]")
+            progress_bar.update(
+                task, description=f"[cyan]Removing {escape(name)}...[/cyan]"
+            )
 
             try:
                 success = model_repo.remove_model(name)
             except ModelLoadingError as error:
-                console.print(f"[red]✗[/red] [bold]{name}[/bold]: {error}")
+                console.print(
+                    f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}"
+                )
                 failed_removals.append(name)
                 progress_bar.update(task, advance=1)
                 continue
             if success:
-                console.print(f"[green]✓[/green] Removed model [bold]{name}[/bold]")
+                console.print(
+                    f"[green]✓[/green] Removed model [bold]{escape(name)}[/bold]"
+                )
             else:
                 console.print(
-                    f"[yellow]![/yellow] Model [bold]{name}[/bold] not found in cache"
+                    f"[yellow]![/yellow] Model [bold]{escape(name)}[/bold] not found in cache"
                 )
 
             progress_bar.update(task, advance=1)
@@ -258,7 +265,7 @@ def _format_download_summary(
             speed = size_bytes / download_time
             speed_str = f" at {format_file_size(speed)}/s"
 
-    return f"[green]✓[/green] [bold]{name}[/bold]: {model_type} with {num_sources} sources{size_str}{speed_str}"
+    return f"[green]✓[/green] [bold]{escape(name)}[/bold]: {model_type} with {num_sources} sources{size_str}{speed_str}"
 
 
 def _download_model_with_progress(name: str, only_load: str | None = None) -> bool:
@@ -277,15 +284,17 @@ def _download_model_with_progress(name: str, only_load: str | None = None) -> bo
     try:
         layer_count = len(model_repo.required_layers(name, only_load=only_load))
     except ModelLoadingError as error:
-        console.print(f"[red]✗[/red] [bold]{name}[/bold]: {error}")
+        console.print(f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}")
         return False
 
     layer_word = "layer" if layer_count == 1 else "layers"
-    console.print(f"[bold]Downloading {name} ({layer_count} {layer_word})...[/bold]")
+    console.print(
+        f"[bold]Downloading {escape(name)} ({layer_count} {layer_word})...[/bold]"
+    )
 
     with create_model_progress_bar() as progress_bar:
         task = progress_bar.add_task(
-            f"[cyan]Downloading {name} ({layer_count} {layer_word})[/cyan]",
+            f"[cyan]Downloading {escape(name)} ({layer_count} {layer_word})[/cyan]",
             total=100,
             completed=0,
         )
@@ -312,7 +321,9 @@ def _download_model_with_progress(name: str, only_load: str | None = None) -> bo
 
         except Exception as error:
             progress_bar.remove_task(task)
-            console.print(f"[red]✗[/red] [bold]{name}[/bold]: {error}")
+            console.print(
+                f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}"
+            )
             return False
 
 
@@ -329,7 +340,7 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
     try:
         required = model_repo.required_layers(name, only_load=only_load)
     except ModelLoadingError as error:
-        console.print(f"[red]✗[/red] [bold]{name}[/bold]: {error}")
+        console.print(f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}")
         return False
 
     cache_dir = get_cache_dir()
@@ -362,7 +373,7 @@ def _download_models_batch(model_names: list[str]) -> None:
     unknown = [name for name in model_names if name not in models]
     for name in unknown:
         console.print(
-            f"[red]✗[/red] [bold]{name}[/bold]: Unknown model. "
+            f"[red]✗[/red] [bold]{escape(name)}[/bold]: Unknown model. "
             f"Available models: {', '.join(models)}"
         )
 
@@ -378,7 +389,7 @@ def _download_models_batch(model_names: list[str]) -> None:
             size_bytes = cache_info[name]["size_bytes"]
             size_str = f" ({format_file_size(size_bytes)})"
             console.print(
-                f"[green]✓[/green] [bold]{name}[/bold]: Already downloaded ({layer_count} {layer_word}{size_str})"
+                f"[green]✓[/green] [bold]{escape(name)}[/bold]: Already downloaded ({layer_count} {layer_word}{size_str})"
             )
         else:
             to_download.append(name)
@@ -425,7 +436,7 @@ def _download_single_model_in_batch(
     layer_count = len(models[name]["models"])
     layer_word = "layer" if layer_count == 1 else "layers"
     task = progress_bar.add_task(
-        f"[cyan]Downloading {name} ({layer_count} {layer_word})[/cyan]",
+        f"[cyan]Downloading {escape(name)} ({layer_count} {layer_word})[/cyan]",
         total=100,
         completed=0,
     )
@@ -450,9 +461,12 @@ def _download_single_model_in_batch(
 
     except ModelLoadingError as error:
         progress_bar.remove_task(task)
-        console.print(f"[red]✗[/red] [bold]{name}[/bold]: {error}")
+        console.print(f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}")
         return False
     except Exception as e:
         progress_bar.remove_task(task)
-        console.print(f"[red]✗[/red] [bold]{name}[/bold]: Unexpected error: {str(e)}")
+        console.print(
+            f"[red]✗[/red] [bold]{escape(name)}[/bold]: Unexpected error: "
+            f"{escape(str(e))}"
+        )
         return False

@@ -19,7 +19,7 @@ export function Privacy() {
                     <h2>Local Processing</h2>
                     <p>
                         All audio separation is performed using WebGPU or WebAssembly directly in your browser.
-                        The model is downloaded once and cached locally by your browser. No audio data ever leaves your device.
+                        The model is downloaded from HuggingFace when loaded. No audio data ever leaves your device.
                     </p>
 
                     <h2>Cookies & Analytics</h2>

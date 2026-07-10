@@ -1,7 +1,7 @@
 """
 Custom Metal kernels for low-precision (FP16/BF16) inference on Apple Silicon (MPS).
 
-PyTorch's MPS backend in 2.11 has slow paths for several FP16 ops that are
+PyTorch's MPS backend has slow paths for several FP16 ops that are
 hot in HTDemucs — most notably ``aten::native_group_norm`` (3.5x slower in
 FP16 than FP32) and ``aten::scaled_dot_product_attention`` (~50% slower in
 FP16 due to implicit upcasts at op boundaries). This module ships drop-in

@@ -64,6 +64,16 @@ def test_models_remove_unknown_model_fails() -> None:
     assert "Unknown model" in result.output
 
 
+def test_models_remove_markup_model_name_renders_literally() -> None:
+    """
+    A model name containing Rich markup must not raise ``MarkupError``.
+    """
+    result = _invoke(["models", "remove", "[/red]evil"])
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Unknown model" in result.output
+
+
 def test_separate_nonexistent_input_fails() -> None:
     """
     A nonexistent input path makes ``separate`` exit nonzero.
@@ -84,6 +94,228 @@ def test_separate_unsupported_format_fails_before_separation(tmp_path: Path) -> 
     result = _invoke(["separate", str(wav_path), "-f", "definitelynotaformat"])
     assert result.exit_code == 1
     assert "Unsupported output format" in result.output
+
+
+class _StubSeparator:
+    """Stands in for Separator so the path pre-checks run without a model."""
+
+    class _Model:
+        sources = ["drums", "bass", "other", "vocals"]
+
+    def __init__(self, **kwargs: object) -> None:
+        self.model = self._Model()
+
+
+def _stub_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Make ``separate`` reach its output-path pre-checks network-free.
+
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    monkeypatch.setattr(
+        "demucs.cli.separate.ensure_model_available", lambda *a, **k: True
+    )
+    monkeypatch.setattr("demucs.cli.separate.Separator", _StubSeparator)
+
+
+def test_separate_collision_check_uses_written_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Planned paths that differ only by the container appended at write time
+    (``mix.wav.flac`` vs ``mix.flac``) are caught as collisions.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    _stub_model_loading(monkeypatch)
+    for name in ("mix.wav.flac", "mix.flac"):
+        AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(
+            tmp_path / name
+        )
+
+    result = _invoke(
+        [
+            "separate",
+            str(tmp_path / "mix.wav.flac"),
+            str(tmp_path / "mix.flac"),
+            "-o",
+            str(tmp_path / "out" / "{stem}" / "{track}"),
+        ]
+    )
+    assert result.exit_code == 1
+    assert "colliding paths" in result.output
+
+
+def test_separate_dotted_track_container_fails_before_separation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dot leaked from the track name into the written path's suffix is
+    validated as a container before separation, not after.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    _stub_model_loading(monkeypatch)
+    track = tmp_path / "Song feat. Artist.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(track)
+
+    result = _invoke(["separate", str(track), "-o", str(tmp_path / "{track}_{stem}")])
+    assert result.exit_code == 1
+    assert "Unsupported output format" in result.output
+
+
+def test_separate_case_aliasing_paths_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Planned paths differing only by letter case can alias the same file on
+    case-insensitive filesystems; the CLI warns rather than refusing (they
+    are distinct files on case-sensitive filesystems).
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    _stub_model_loading(monkeypatch)
+    (tmp_path / "d1").mkdir()
+    (tmp_path / "d2").mkdir()
+    for rel in ("d1/MIX.wav", "d2/mix.wav"):
+        AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(
+            tmp_path / rel
+        )
+
+    result = _invoke(
+        [
+            "separate",
+            str(tmp_path / "d1" / "MIX.wav"),
+            str(tmp_path / "d2" / "mix.wav"),
+            "-o",
+            str(tmp_path / "out" / "{track}" / "{stem}"),
+        ]
+    )
+    assert "differ only by letter case" in result.output
+    # The aliasing is a warning, not a refusal: the run must proceed.
+    assert "will be stored using template" in result.output
+
+
+def test_separate_markup_in_paths_renders_literally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Rich markup sequences spanning path components (``[/…]``) must render
+    literally instead of raising an uncaught ``MarkupError``.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    _stub_model_loading(monkeypatch)
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(
+        [
+            "separate",
+            str(wav_path),
+            "-o",
+            str(tmp_path / "out[" / "{track}]" / "{stem}"),
+        ]
+    )
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "out[" in result.output
+
+
+@pytest.mark.parametrize("template", ["", ".", "/"])
+def test_separate_empty_name_output_template_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, template: str
+) -> None:
+    """
+    A template resolving to an empty filename exits 1 with a clean message
+    instead of an uncaught ``ValueError`` from ``with_suffix``.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param template: Output template that resolves to an empty pathlib name
+    """
+    _stub_model_loading(monkeypatch)
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(["separate", str(wav_path), "-o", template])
+    assert result.exit_code == 1
+    assert "empty filename" in result.output
+    assert not isinstance(result.exception, ValueError)
+
+
+def test_separate_format_with_path_separator_fails_cleanly(
+    tmp_path: Path,
+) -> None:
+    """
+    A --format containing a path separator exits 1 with the full format in a
+    clean message instead of an uncaught ``ValueError`` (and the pre-flight
+    probe must not validate a truncated version of it).
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(["separate", str(wav_path), "-f", "x/wav"])
+    assert result.exit_code == 1
+    assert "Unsupported output format" in result.output
+    assert "x/wav" in result.output
+    assert not isinstance(result.exception, ValueError)
+
+
+@pytest.mark.parametrize("bad_format", ["./wav", "wav/", ""])
+def test_separate_path_normalized_format_fails_before_download(
+    tmp_path: Path, bad_format: str
+) -> None:
+    """
+    Formats that ``Path()`` would normalize ("./wav" → "wav") must be
+    rejected up front with the format as typed, not validated in their
+    normalized form and failed (or silently altered) after model download.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param bad_format: Format string that Path-normalizes to something else
+    """
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(["separate", str(wav_path), "-f", bad_format])
+    assert result.exit_code == 1
+    assert "Unsupported output format" in result.output
+    assert f"'{bad_format}'" in result.output
+    # Rejected before model selection — no download work.
+    assert "Auto-selected model" not in result.output
+
+
+def test_separate_leading_dot_format_treated_as_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``-f .wav`` means "wav" — the leading dot must not produce doubled-dot
+    output names like ``drums..wav``.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    _stub_model_loading(monkeypatch)
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(["separate", str(wav_path), "-f", ".wav", "-o", "o/{stem}.{ext}"])
+    assert "o/{stem}.wav'" in result.output
+    assert "..wav" not in result.output
+
+
+def test_export_onnx_markup_model_name_renders_literally() -> None:
+    """
+    Markup in the ``export-onnx`` model name must not raise ``MarkupError``.
+    """
+    result = _invoke(["export-onnx", "--model", "[/red]evil"])
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
 def test_models_remove_all_empty_cache_exits_zero(

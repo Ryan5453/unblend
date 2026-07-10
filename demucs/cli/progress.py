@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
@@ -166,7 +167,9 @@ class FileProgressTracker:
             same-named files in different directories from colliding.
         :return: Task ID for the progress bar entry
         """
-        label = Path(filename).name.strip()
+        # escape(): the basename is user-derived and the progress TextColumn
+        # renders descriptions as markup.
+        label = escape(Path(filename).name.strip())
         task_id = self.progress_bar.add_task(label, total=100, completed=0)
         self.file_tasks[filename] = task_id
         return task_id
@@ -183,7 +186,7 @@ class FileProgressTracker:
             return
 
         task_id = self.file_tasks[filename]
-        label = Path(filename).name.strip()
+        label = escape(Path(filename).name.strip())
 
         if event_type == "processing_start":
             self.progress_bar.update(
@@ -214,7 +217,7 @@ class FileProgressTracker:
             return
 
         task_id = self.file_tasks[filename]
-        label = Path(filename).name.strip()
+        label = escape(Path(filename).name.strip())
         # Fill the bar to its current total (which is 100 before processing
         # starts, then the chunk count once it does) rather than a hardcoded
         # 100 that overshoots a chunk-count total.

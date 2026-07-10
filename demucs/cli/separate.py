@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import tempfile
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -11,6 +12,7 @@ from typing import Annotated
 import click
 import torch
 import typer
+from rich.markup import escape
 from torchcodec.encoders import AudioEncoder
 
 from ..api import Separator, default_device, select_model
@@ -35,7 +37,10 @@ def _validate_output_format(format: str) -> None:
             encoder = AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100)
             encoder.to_file(Path(tmp) / f"probe.{format}")
     except Exception as error:
-        console.print(f"[red]✗[/red] Unsupported output format '{format}': {error}")
+        console.print(
+            f"[red]✗[/red] Unsupported output format '{escape(format)}': "
+            f"{escape(str(error))}"
+        )
         raise typer.Exit(1)
 
 
@@ -182,6 +187,23 @@ def separate_command(
         console.print("[red]No audio files found to process.[/red]")
         raise typer.Exit(1)
 
+    # A format is used as a file suffix, so anything Path() would normalize
+    # away ("./wav", "wav/", "") can pass a probe built from the normalized
+    # string yet fail (or silently differ) at write time — reject it up front.
+    if "/" in format or "\\" in format or format != str(Path(format)):
+        console.print(
+            f"[red]✗[/red] Unsupported output format '{escape(format)}': "
+            "not a valid file extension."
+        )
+        raise typer.Exit(1)
+
+    # "-f .wav" is a natural spelling for "wav": the leading dot is extension
+    # syntax, not part of the format name — drop it so writes don't produce
+    # doubled-dot filenames ("drums..wav"). After the guard, so rejection
+    # messages above stay as-typed.
+    if format.startswith(".") and format.lstrip("."):
+        format = format.lstrip(".")
+
     # Catch an unsupported output container before any model download or
     # separation work: encode a tiny silent clip the same way export_stem
     # will. A literal extension in the template (e.g. ``out/{stem}.flac``)
@@ -193,9 +215,13 @@ def separate_command(
         # will actually key off: ``.{ext}`` → --format, while e.g.
         # ``.{timestamp}`` resolves to digits and fails here rather than
         # per-track after the model download.
-        template_suffix = format_output_path(
-            template_suffix, "model", Path("track.wav"), "stem", format
-        ).name
+        # str(), not .name: .name would silently truncate a format containing
+        # a path separator (e.g. "x/wav" → "wav") and validate the wrong thing.
+        template_suffix = str(
+            format_output_path(
+                template_suffix, "model", Path("track.wav"), "stem", format
+            )
+        )
     effective_format = template_suffix if template_suffix else format
     _validate_output_format(effective_format)
 
@@ -242,7 +268,8 @@ def separate_command(
         )
     except (ValidationError, ModelLoadingError) as error:
         console.print(
-            f"[red]✗[/red] [bold]{selected_model_name}[/bold]: error: {error}"
+            f"[red]✗[/red] [bold]{selected_model_name}[/bold]: error: "
+            f"{escape(str(error))}"
         )
         raise typer.Exit(1)
 
@@ -258,9 +285,10 @@ def separate_command(
     # Detect output-path collisions up front, before doing any expensive
     # separation. Compute the actual resolved path for every (track, stem) pair
     # the run will write; if any two pairs map to the same path, the second
-    # would silently overwrite the first. This catches every cause — same
-    # basename in different directories, a missing {track} across multiple
-    # files, or a missing {stem} collapsing all stems onto one file.
+    # would silently overwrite the first. Exact-path collisions are a hard
+    # error; paths that differ only by case or Unicode form can still alias
+    # the same file on case-insensitive filesystems (macOS/Windows), which
+    # isn't knowable up front, so those only warn below.
     if isolate_stem is not None:
         planned_stems = [isolate_stem.value, f"no_{isolate_stem.value}"]
     else:
@@ -274,14 +302,43 @@ def separate_command(
     now = datetime.now()
 
     planned_paths: dict[str, list[str]] = {}
+    planned_containers: set[str] = set()
     for track in audio_files:
         for stem_name in planned_stems:
-            path = str(
-                format_output_path(
-                    output, selected_model_name, track, stem_name, format, now=now
-                )
+            path = format_output_path(
+                output, selected_model_name, track, stem_name, format, now=now
             )
-            planned_paths.setdefault(path, []).append(f"{track.name} → {stem_name}")
+            # Mirror export_stem: a suffix-less path gets ``.{format}`` appended
+            # at write time, and an existing suffix (possibly leaked from a dot
+            # in the track name) becomes the container. Collision-check and
+            # container-validate the paths as they will actually be written.
+            # ``with_suffix`` raises on an empty-name path ("", ".", "/");
+            # such templates can never name a file, so refuse cleanly.
+            if not path.name:
+                console.print(
+                    "[red]✗[/red] Output template resolves to an empty filename "
+                    f"('{escape(str(path))}' for {escape(track.name)} → "
+                    f"{stem_name}). Add a filename component such as "
+                    "[bold]{track}[/bold] or [bold]{stem}[/bold]."
+                )
+                raise typer.Exit(1)
+            if not path.suffix:
+                try:
+                    path = path.with_suffix(f".{format}")
+                except ValueError:
+                    # e.g. a format containing a path separator.
+                    console.print(
+                        f"[red]✗[/red] Unsupported output format "
+                        f"'{escape(format)}': not a valid file extension."
+                    )
+                    raise typer.Exit(1)
+            planned_containers.add(path.suffix.lstrip("."))
+            planned_paths.setdefault(str(path), []).append(
+                f"{track.name} → {stem_name}"
+            )
+
+    for container in sorted(planned_containers - {effective_format}):
+        _validate_output_format(container)
 
     collisions = {p: srcs for p, srcs in planned_paths.items() if len(srcs) > 1}
     if collisions:
@@ -291,8 +348,24 @@ def separate_command(
             "[bold]{stem}[/bold] to the template to make each path unique:"
         )
         for path, srcs in collisions.items():
-            console.print(f"  [bold]{path}[/bold] ← {', '.join(srcs)}")
+            console.print(f"  [bold]{escape(path)}[/bold] ← {escape(', '.join(srcs))}")
         raise typer.Exit(1)
+
+    folded_groups: dict[str, set[str]] = {}
+    for planned in planned_paths:
+        key = unicodedata.normalize("NFC", planned).casefold()
+        folded_groups.setdefault(key, set()).add(planned)
+    aliasing_groups = [
+        sorted(aliases) for aliases in folded_groups.values() if len(aliases) > 1
+    ]
+    if aliasing_groups:
+        console.print(
+            "[yellow]![/yellow] Some output paths differ only by letter case or "
+            "Unicode form; on filesystems that treat those as the same file "
+            "(e.g. macOS/Windows) they may overwrite each other:"
+        )
+        for aliases in aliasing_groups:
+            console.print(f"  {escape(', '.join(aliases))}")
 
     # Reuse format_output_path so the displayed template can never drift from the
     # paths actually written. Keep {stem} as a literal placeholder (and {track}
@@ -308,7 +381,7 @@ def separate_command(
     resolved_template = format_output_path(
         output, selected_model_name, track, "{stem}", format, now=now
     )
-    console.print(f"{message} '{resolved_template}'")
+    console.print(f"{message} '{escape(str(resolved_template))}'")
 
     # A literal extension in the template overrides --format (export keys the
     # container off the path suffix). Warn when -f was passed explicitly but
@@ -320,7 +393,7 @@ def separate_command(
         if source is not None and source.name == "COMMANDLINE":
             console.print(
                 f"[yellow]Warning:[/yellow] output template extension "
-                f"'.{template_ext}' overrides --format '{format}'"
+                f"'.{escape(template_ext)}' overrides --format '{escape(format)}'"
             )
 
     had_error = False
@@ -362,7 +435,10 @@ def separate_command(
             except Exception as e:
                 had_error = True
                 progress_tracker.error_file(file_key)
-                console.print(f"[red]✗[/red] Error processing {track.name}: {e}")
+                console.print(
+                    f"[red]✗[/red] Error processing {escape(track.name)}: "
+                    f"{escape(str(e))}"
+                )
 
     # If any track failed — or any input path didn't resolve to audio — exit
     # nonzero so scripts/pipelines can detect it, while still having processed

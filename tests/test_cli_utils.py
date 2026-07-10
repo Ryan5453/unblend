@@ -117,3 +117,14 @@ def test_format_output_path_does_not_rescan_substituted_values() -> None:
         "out/{track}.wav", "m", Path("my{stem}.flac"), "vocals", "wav"
     )
     assert out == Path("out/my{stem}.wav")
+
+
+def test_format_output_path_dotfile_track_keeps_name() -> None:
+    """
+    An extensionless dotfile track must not resolve {track} to "" (which
+    would collapse a leading "{track}/" into an absolute path).
+    """
+    out = format_output_path(
+        "{track}/{stem}.{ext}", "m", Path(".hidden"), "vocals", "wav"
+    )
+    assert out == Path(".hidden/vocals.wav")

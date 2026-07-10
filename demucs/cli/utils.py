@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 
 console = Console()
 
@@ -57,7 +58,9 @@ def format_output_path(
         now = datetime.now()
     variables = {
         "model": model,
-        "track": track.name.rsplit(".", 1)[0],
+        # ``or track.name`` keeps dotfiles like ".hidden" from resolving to ""
+        # (which could collapse "{track}/..." into an absolute path).
+        "track": track.name.rsplit(".", 1)[0] or track.name,
         "stem": stem,
         "ext": ext,
         "date": now.strftime("%Y-%m-%d"),
@@ -154,10 +157,13 @@ def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
             else:
                 had_errors = True
                 console.print(
-                    f"[yellow]Warning:[/yellow] No audio files found in '{path}'"
+                    f"[yellow]Warning:[/yellow] No audio files found in "
+                    f"'{escape(str(path))}'"
                 )
         else:
             had_errors = True
-            console.print(f"[red]Error:[/red] Path '{path}' does not exist")
+            console.print(
+                f"[red]Error:[/red] Path '{escape(str(path))}' does not exist"
+            )
 
     return audio_files, had_errors

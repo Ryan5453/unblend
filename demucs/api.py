@@ -642,7 +642,7 @@ class Separator:
                      reduced precision (weights are cast at init; CPU is
                      rejected — no faster path in PyTorch), or ``None`` /
                      ``torch.float32`` to force FP32. On MPS, BF16 is supported
-                     but, as of PyTorch 2.11, ~22% slower than FP16 (BF16
+                     but measures ~22% slower than FP16 (BF16
                      native ops are not well-optimised yet); use it when you
                      want BF16's FP32 exponent range — e.g. to skip the
                      FP16-overflow FP32-fallback cast in MyGroupNorm.
@@ -744,7 +744,7 @@ class Separator:
                 else:
                     self.model.to(dtype=self.dtype)
 
-            # MPS-specific low-precision optimisations: PyTorch 2.11's MPS backend
+            # MPS-specific low-precision optimisations: PyTorch's MPS backend
             # has slow paths for FP16/BF16 GroupNorm and SDPA. We swap in custom
             # Metal kernels and a wrapped attention module that route around those.
             # The SCALAR_T-templated kernels compile for either ``half`` or

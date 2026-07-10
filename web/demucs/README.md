@@ -73,7 +73,7 @@ await separator.unload();
 
 ### `Separator.load(model, options)`
 
-Loads a model and returns a ready-to-use `Separator`. The model is fetched from HuggingFace (`Ryan5453/demucs-onnx`) on first load and cached by the browser.
+Loads a model and returns a ready-to-use `Separator`. The model is fetched from HuggingFace (`Ryan5453/demucs-next`) when loaded.
 
 - `model`: `'htdemucs'` (4 stems: drums, bass, other, vocals) | `'htdemucs_6s'` (6 stems: drums, bass, other, vocals, guitar, piano)
 - `options.backend`: `'webgpu'` (default) | `'wasm'`. WebGPU falls back to WASM automatically if unavailable or if session creation fails.

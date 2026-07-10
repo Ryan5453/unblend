@@ -7,6 +7,7 @@
 from typing import Annotated
 
 import typer
+from rich.markup import escape
 
 from ..onnx import export_to_onnx
 from .utils import console
@@ -70,8 +71,8 @@ def export_onnx_command(
             fp16=fp16,
         )
     except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
         raise typer.Exit(1)
     except Exception as e:
-        console.print(f"[red]Error exporting model:[/red] {e}")
+        console.print(f"[red]Error exporting model:[/red] {escape(str(e))}")
         raise typer.Exit(1)

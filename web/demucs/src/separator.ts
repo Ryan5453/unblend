@@ -12,12 +12,12 @@ export type ModelPrecision = 'fp32' | 'fp16';
 
 const MODEL_URLS: Record<ModelType, Record<ModelPrecision, string>> = {
     'htdemucs': {
-        fp32: 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs_fp32.onnx',
-        fp16: 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs_fp16.onnx',
+        fp32: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_fp32.onnx',
+        fp16: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_fp16.onnx',
     },
     'htdemucs_6s': {
-        fp32: 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs_6s_fp32.onnx',
-        fp16: 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs_6s_fp16.onnx',
+        fp32: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_6s_fp32.onnx',
+        fp16: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_6s_fp16.onnx',
     },
 };
 
