@@ -6,10 +6,12 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,6 +81,7 @@ def main() -> int:
     parser.add_argument("--shifts", type=int, required=True)
     parser.add_argument("--overlap", type=float, required=True)
     parser.add_argument("--tracks-json", required=True)
+    parser.add_argument("--no-sdr", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -119,11 +122,12 @@ def main() -> int:
             _, separated = separator.separate_audio_file(Path(track["mixture_path"]))
             elapsed = time.perf_counter() - t0
             stem_scores = {}
-            for stem_name, ref_path in stem_paths.items():
-                if stem_name not in separated:
-                    continue
-                reference, _ = torchaudio.load(ref_path)
-                stem_scores[stem_name] = _compute_sdr(separated[stem_name], reference)
+            if not args.no_sdr:
+                for stem_name, ref_path in stem_paths.items():
+                    if stem_name not in separated:
+                        continue
+                    reference, _ = torchaudio.load(ref_path)
+                    stem_scores[stem_name] = _compute_sdr(separated[stem_name], reference)
             _emit({"event": "track_complete", "track_name": track_name,
                    "elapsed_sec": elapsed, "stem_scores": stem_scores})
         except Exception as exc:
@@ -239,7 +243,10 @@ def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 def _score_stems(
-    separator: Separator, track: BenchmarkTrack, separated: Any
+    separator: Separator,
+    track: BenchmarkTrack,
+    separated: Any,
+    only_stem: str | None = None,
 ) -> dict[str, float]:
     """
     Compute per-stem SDR for one separated track against its references.
@@ -247,10 +254,17 @@ def _score_stems(
     :param separator: The separator (used for its ``_to_tensor`` loader).
     :param track: The track whose reference stems to score against.
     :param separated: The ``SeparatedSources`` returned for this track.
+    :param only_stem: If set, score only this stem (the others are
+        deliberately degraded under ``use_only_stem``).
     :return: Mapping of stem name to SDR in dB.
     """
     stem_scores: dict[str, float] = {}
-    for stem_name in track.reference_stems:
+    scored = (
+        tuple(s for s in track.reference_stems if s == only_stem)
+        if only_stem is not None
+        else track.reference_stems
+    )
+    for stem_name in scored:
         if stem_name not in separated.sources:
             continue
         reference = separator._to_tensor(track.directory / f"{stem_name}.wav")
@@ -463,6 +477,7 @@ def _run_upstream_config(
     chunk_batch_size: int | None,
     output_dir: Path,
     upstream_python_version: str,
+    compute_sdr: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     Run one upstream-variant config in a subprocess.
@@ -474,6 +489,7 @@ def _run_upstream_config(
     :param chunk_batch_size: Resolved chunk batch size recorded in the rows.
     :param output_dir: Directory for the temporary tracks JSON payload.
     :param upstream_python_version: Python version for the upstream venv.
+    :param compute_sdr: Score stems against references in the worker.
     :return: ``(detail_rows, summary_extras)`` where ``summary_extras`` carries
         aggregate fields (model_init_sec, error info) for the summary row.
     """
@@ -515,6 +531,8 @@ def _run_upstream_config(
         "--tracks-json",
         str(tracks_json_path),
     ]
+    if not compute_sdr:
+        cmd.append("--no-sdr")
 
     detail_rows: list[dict[str, Any]] = []
     init_sec: float | None = None
@@ -531,10 +549,20 @@ def _run_upstream_config(
         text=True,
         bufsize=1,
     )
-    assert proc.stdin is not None
-    proc.stdin.write(_build_upstream_worker_source())
-    proc.stdin.close()
+    rss_sampler = _PeakRssSampler(proc.pid)
+    rss_sampler.start()
     try:
+        # Inside the try: a worker that dies before reading stdin raises
+        # BrokenPipeError here, and the finally must still stop the sampler.
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(_build_upstream_worker_source())
+            proc.stdin.close()
+        except BrokenPipeError:
+            # Worker died before reading its stdin. Fall through: stdout
+            # EOFs immediately and the unreported tracks become
+            # WorkerCrashed rows carrying the stderr tail.
+            pass
         assert proc.stdout is not None
         for raw_line in proc.stdout:
             line = raw_line.rstrip("\n")
@@ -603,6 +631,7 @@ def _run_upstream_config(
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        rss_sampler.stop()
         tracks_json_path.unlink(missing_ok=True)
 
     stderr_tail = ""
@@ -634,6 +663,7 @@ def _run_upstream_config(
         "error_type": init_error_type,
         "error_message": init_error_message
         or (stderr_tail[-300:] if proc.returncode != 0 else ""),
+        "peak_rss_mb": rss_sampler.stop(),
     }
     return detail_rows, summary_extras
 
@@ -661,6 +691,7 @@ def _detail_row_base(
     chunk_batch_size: int | None,
     base_seed: int | None,
     device: str,
+    use_only_stem: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the prefix of identifying columns shared by every per-track row
@@ -670,6 +701,7 @@ def _detail_row_base(
     :param chunk_batch_size: Resolved chunk batch size (None if auto).
     :param base_seed: Base seed used to derive per-track seeds.
     :param device: Device string the run executed on.
+    :param use_only_stem: Stem restriction the run used, if any.
     :return: Dict of identifying columns.
     """
     return {
@@ -684,6 +716,7 @@ def _detail_row_base(
         "split_overlap": config.split_overlap,
         "chunk_batch_size": chunk_batch_size,
         "base_seed": base_seed,
+        "use_only_stem": use_only_stem,
     }
 
 
@@ -692,6 +725,7 @@ def _summary_row_base(
     chunk_batch_size: int | None,
     base_seed: int | None,
     device: str,
+    use_only_stem: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the prefix of identifying columns shared by every config-level
@@ -701,6 +735,7 @@ def _summary_row_base(
     :param chunk_batch_size: Resolved chunk batch size (None if auto).
     :param base_seed: Base seed used to derive per-track seeds.
     :param device: Device string the run executed on.
+    :param use_only_stem: Stem restriction the run used, if any.
     :return: Dict of identifying columns.
     """
     return {
@@ -715,6 +750,7 @@ def _summary_row_base(
         "split_overlap": config.split_overlap,
         "chunk_batch_size": chunk_batch_size,
         "base_seed": base_seed,
+        "use_only_stem": use_only_stem,
     }
 
 
@@ -782,6 +818,83 @@ def _reset_peak_memory(device: str) -> None:
         torch.cuda.reset_peak_memory_stats()
 
 
+class _PeakRssSampler:
+    """
+    Samples a process's resident set size on a background thread via
+    ``ps -o rss=`` (KB on both Linux and macOS), tracking the peak.
+
+    Sampling (rather than ``ru_maxrss``) is deliberate: the rusage high-water
+    mark is monotonic for the life of the process, so it can't isolate one
+    benchmark config from the previous one. A 200 ms sampler can miss
+    sub-interval spikes; treat readings as a floor, not an exact peak.
+
+    When sampling the benchmark process itself over a multi-config run,
+    allocators rarely return freed pages to the OS, so later configs inherit
+    earlier configs' heap floor (bias upward). A SLURM shard bounds this to
+    one (model, precision, compile) cell — its shifts/overlap sweep still
+    shares a process, so compare RSS across shards, not within one. Upstream
+    rows are immune (fresh subprocess per config).
+    """
+
+    def __init__(self, pid: int, interval_sec: float = 0.2) -> None:
+        """
+        :param pid: Process ID to sample (self or a subprocess).
+        :param interval_sec: Seconds between samples.
+        """
+        self.pid = pid
+        self.interval_sec = interval_sec
+        self._peak_kb = 0
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
+
+    def start(self) -> None:
+        """
+        Begin sampling on the background thread.
+        """
+        self._started = True
+        self._thread.start()
+
+    def stop(self) -> float | None:
+        """
+        Stop sampling and return the observed peak.
+
+        Idempotent; safe to call from a ``finally`` after an explicit call.
+
+        :return: Peak RSS in MB, or ``None`` if no sample succeeded.
+        """
+        if self._started and not self._stop_event.is_set():
+            self._stop_event.set()
+            self._thread.join()
+        return self._peak_kb / 1024 if self._peak_kb > 0 else None
+
+    def _sample_kb(self) -> int:
+        """
+        Read the process's current RSS.
+
+        :return: RSS in KB, or 0 if the process is gone or ``ps`` failed.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(self.pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return int(out.stdout.strip() or 0)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return 0
+
+    def _run(self) -> None:
+        """
+        Sampler loop: poll until stopped, then take one final sample.
+        """
+        while not self._stop_event.is_set():
+            self._peak_kb = max(self._peak_kb, self._sample_kb())
+            self._stop_event.wait(self.interval_sec)
+        self._peak_kb = max(self._peak_kb, self._sample_kb())
+
+
 @app.command()
 def main(
     musdb_root: Path = typer.Option(
@@ -818,6 +931,22 @@ def main(
         "path (apply_model_multi) instead of per-track latency. Local configs "
         "only; upstream stays file-per-file (its total wall is still recorded "
         "for the comparison). Reports tracks/sec + dataset_wall_sec.",
+    ),
+    compute_sdr: bool = typer.Option(
+        True,
+        "--sdr/--no-sdr",
+        help="Score separated stems against references. Disable for pure "
+        "timing/memory shards (SDR is device-independent, so quality only "
+        "needs measuring once per model/precision/shifts/overlap combo).",
+    ),
+    use_only_stem: str | None = typer.Option(
+        None,
+        "--use-only-stem",
+        help="Load only this stem's specialist (only_load) and run separation "
+        "with use_only_stem, scoring just this stem. Pairs with a normal run "
+        "of the same config to verify the single-specialist path scores "
+        "identically to the full ensemble on its stem (htdemucs_ft). Local "
+        "configs only — incompatible with --include-upstream.",
     ),
     models: list[str] = typer.Option(
         DEFAULT_MODELS,
@@ -880,6 +1009,8 @@ def main(
     :param seed: Base seed used to derive a deterministic per-track seed.
     :param chunk_batch_size: Override for chunks processed per batch.
     :param dataset_throughput: Measure whole-dataset wall via the batched path.
+    :param compute_sdr: Score stems against references; disable for timing-only shards.
+    :param use_only_stem: Load/run only this stem's specialist and score only it.
     :param models: Model name(s) to benchmark.
     :param precisions: Precision mode(s) to benchmark.
     :param compile_modes: Compilation mode(s) to benchmark (``true``/``false``).
@@ -913,6 +1044,18 @@ def main(
 
     compile_modes = [_parse_compile_mode(c) for c in compile_modes]
 
+    if use_only_stem is not None and not use_only_stem.strip():
+        # "" would skip Separator's truthiness-based only_load validation,
+        # load the full ensemble, then fail on every track.
+        raise typer.BadParameter(
+            "--use-only-stem needs a stem name (got an empty string)."
+        )
+    if use_only_stem is not None and include_upstream:
+        raise typer.BadParameter(
+            "--use-only-stem is a local-only comparison (upstream has no "
+            "only_load equivalent); drop --include-upstream."
+        )
+
     device = _resolve_device(device)
     # ``compile`` is CUDA-only (Inductor codegen errors on MPS for HTDemucs;
     # CPU compile path is not exercised here).
@@ -924,6 +1067,12 @@ def main(
         compile_modes = [c for c in compile_modes if not c]
         if not compile_modes:
             compile_modes = [False]
+
+    if dataset_throughput and device not in ("cuda", "mps"):
+        typer.echo(
+            f"Note: device={device}; --dataset-throughput is cuda/mps-only, "
+            "falling back to per-track latency mode."
+        )
 
     reduced_for_cpu = {"fp16", "bf16"}
     if device == "cpu":
@@ -996,6 +1145,7 @@ def main(
                 chunk_batch_size=chunk_batch_size,
                 output_dir=output_dir,
                 upstream_python_version=upstream_python,
+                compute_sdr=compute_sdr,
             )
             details_rows.extend(upstream_details)
             ok_rows = [row for row in upstream_details if row.get("status") == "ok"]
@@ -1089,6 +1239,7 @@ def main(
                         else float("nan")
                     ),
                     "peak_vram_mb": None,
+                    "peak_rss_mb": upstream_extras.get("peak_rss_mb"),
                     **{
                         f"{stem}_mean_sdr": value
                         for stem, value in per_stem_summary.items()
@@ -1100,7 +1251,13 @@ def main(
         if not ensure_model_available(config.model):
             summary_rows.append(
                 {
-                    **_summary_row_base(config, chunk_batch_size, seed, device),
+                    **_summary_row_base(
+                        config,
+                        chunk_batch_size,
+                        seed,
+                        device,
+                        use_only_stem=use_only_stem,
+                    ),
                     "status": "model_unavailable",
                     "error_type": "ModelUnavailable",
                     "error_message": f"Could not download or load model '{config.model}'",
@@ -1109,23 +1266,38 @@ def main(
             )
             continue
 
+        # Started before Separator init so model-load RSS counts toward the
+        # config's peak.
+        rss_sampler = _PeakRssSampler(os.getpid())
+        rss_sampler.start()
+
         init_started_at = perf_counter()
         try:
             separator = Separator(
                 model=config.model,
                 device=device,
+                only_load=use_only_stem,
                 dtype=_precision_to_dtype(config.precision),
                 compile=config.compile,
             )
         except Exception as error:
             summary_rows.append(
                 {
-                    **_summary_row_base(config, chunk_batch_size, seed, device),
+                    **_summary_row_base(
+                        config,
+                        chunk_batch_size,
+                        seed,
+                        device,
+                        use_only_stem=use_only_stem,
+                    ),
                     "status": "error",
                     "error_type": type(error).__name__,
                     "error_message": str(error),
                     "num_tracks": len(tracks),
                     "model_init_sec": perf_counter() - init_started_at,
+                    # Init-time RSS matters most when init fails from memory
+                    # pressure.
+                    "peak_rss_mb": rss_sampler.stop(),
                 }
             )
             typer.echo(f"Failed to initialize {config.config_id}: {error}")
@@ -1177,6 +1349,7 @@ def main(
                         shifts=config.shifts,
                         split_overlap=config.split_overlap,
                         seed=seed,
+                        use_only_stem=use_only_stem,
                         chunk_batch_size=chunk_batch_size,
                     )
                     sep_wall += perf_counter() - grp_t0  # times separation only
@@ -1204,10 +1377,20 @@ def main(
                 # Score + record each track in the group, then drop the audio.
                 for track, separated in zip(group, group_results):
                     bi += 1
-                    stem_scores = _score_stems(separator, track, separated)
+                    stem_scores = (
+                        _score_stems(
+                            separator, track, separated, only_stem=use_only_stem
+                        )
+                        if compute_sdr
+                        else {}
+                    )
                     detail_row = {
                         **_detail_row_base(
-                            config, effective_chunk_batch_size, seed, device
+                            config,
+                            effective_chunk_batch_size,
+                            seed,
+                            device,
+                            use_only_stem=use_only_stem,
                         ),
                         "track_index": bi,
                         "track_name": track.name,
@@ -1253,7 +1436,13 @@ def main(
 
         for track_index, track in enumerate([] if use_batched else tracks, start=1):
             detail_row = {
-                **_detail_row_base(config, effective_chunk_batch_size, seed, device),
+                **_detail_row_base(
+                    config,
+                    effective_chunk_batch_size,
+                    seed,
+                    device,
+                    use_only_stem=use_only_stem,
+                ),
                 "track_index": track_index,
                 "track_name": track.name,
                 "track_seed": None
@@ -1268,22 +1457,32 @@ def main(
                     shifts=config.shifts,
                     split_overlap=config.split_overlap,
                     seed=detail_row["track_seed"],
+                    use_only_stem=use_only_stem,
                     chunk_batch_size=chunk_batch_size,
                 )
                 elapsed_sec = perf_counter() - started_at
                 detail_row["elapsed_sec"] = elapsed_sec
 
                 stem_scores: dict[str, float] = {}
-                for stem_name in track.reference_stems:
-                    if stem_name not in separated.sources:
-                        continue
-                    reference = separator._to_tensor(
-                        track.directory / f"{stem_name}.wav"
+                if compute_sdr:
+                    # With use_only_stem, other stems are deliberately
+                    # degraded (they come from the one specialist) — scoring
+                    # them would only pollute the summary means.
+                    scored_stems = (
+                        tuple(s for s in track.reference_stems if s == use_only_stem)
+                        if use_only_stem is not None
+                        else track.reference_stems
                     )
-                    stem_scores[stem_name] = _compute_sdr(
-                        separated.sources[stem_name],
-                        reference,
-                    )
+                    for stem_name in scored_stems:
+                        if stem_name not in separated.sources:
+                            continue
+                        reference = separator._to_tensor(
+                            track.directory / f"{stem_name}.wav"
+                        )
+                        stem_scores[stem_name] = _compute_sdr(
+                            separated.sources[stem_name],
+                            reference,
+                        )
 
                 detail_row["status"] = "ok"
                 detail_row["error_type"] = ""
@@ -1370,9 +1569,17 @@ def main(
                 statistics.fmean(stem_values) if stem_values else float("nan")
             )
 
+        peak_rss_mb = rss_sampler.stop()
+
         summary_rows.append(
             {
-                **_summary_row_base(config, effective_chunk_batch_size, seed, device),
+                **_summary_row_base(
+                    config,
+                    effective_chunk_batch_size,
+                    seed,
+                    device,
+                    use_only_stem=use_only_stem,
+                ),
                 "status": "ok" if len(ok_rows) == len(tracks) else "partial",
                 "error_type": config_error_type,
                 "error_message": config_error_message,
@@ -1441,6 +1648,7 @@ def main(
                 "peak_vram_mb": peak_vram_bytes / (1024 * 1024)
                 if peak_vram_bytes
                 else None,
+                "peak_rss_mb": peak_rss_mb,
                 **{
                     f"{stem}_mean_sdr": value
                     for stem, value in per_stem_summary.items()
@@ -1468,6 +1676,7 @@ def main(
         "split_overlap",
         "chunk_batch_size",
         "base_seed",
+        "use_only_stem",
         "track_index",
         "track_name",
         "track_seed",
@@ -1502,6 +1711,7 @@ def main(
         "split_overlap",
         "chunk_batch_size",
         "base_seed",
+        "use_only_stem",
         "status",
         "error_type",
         "error_message",
@@ -1521,6 +1731,7 @@ def main(
         "dataset_wall_sec",
         "tracks_per_sec",
         "peak_vram_mb",
+        "peak_rss_mb",
         "mean_sdr",
         "median_sdr",
         *[f"{stem}_mean_sdr" for stem in REFERENCE_STEMS],
@@ -1548,6 +1759,8 @@ def main(
         "seed": seed,
         "limit": limit,
         "dataset_throughput": dataset_throughput,
+        "compute_sdr": compute_sdr,
+        "use_only_stem": use_only_stem,
         "num_tracks": len(tracks),
         "num_configs": len(configs),
         "include_upstream": include_upstream,
