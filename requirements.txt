@@ -3,7 +3,7 @@
 # (used for the PyPI package). Keep the two in sync by hand; they can drift.
 
 numpy>=2.0.0
-torch>=2.9.0
+torch>=2.13.0
 torchcodec>=0.8.1
 typer>=0.19.1,<0.26
 click>=8.1.0

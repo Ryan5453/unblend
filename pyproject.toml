@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=2.0.0",
-    "torch>=2.9.0",
+    "torch>=2.13.0",
     "torchaudio>=2.9.0",
     "torchcodec>=0.8.1",
     # <0.26: the CLI uses click.get_current_context(), which typer 0.26+
