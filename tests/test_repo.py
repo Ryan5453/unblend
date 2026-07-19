@@ -1,5 +1,5 @@
 """
-Offline checks for ``demucs.repo`` integrity gates.
+Offline checks for ``unblend.repo`` integrity gates.
 
 These cover the SHA-256 verification branch and metadata-shape requirements
 that guard ``torch.load(weights_only=False)`` from running on tampered data.
@@ -11,15 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from demucs.exceptions import ModelLoadingError
-from demucs.repo import ModelRepository, check_checksum, get_cache_dir
+from unblend.exceptions import ModelLoadingError
+from unblend.repo import ModelRepository, check_checksum, get_cache_dir
 
 
 def _good_metadata() -> dict:
     """
     Minimal valid metadata blob accepted by ``ModelRepository.__init__``.
 
-    :return: A metadata dict shaped like ``demucs/metadata.json``.
+    :return: A metadata dict shaped like ``unblend/metadata.json``.
     """
     return {
         "models": {
@@ -132,7 +132,7 @@ def test_get_cache_info_empty_cache(tmp_path: Path, monkeypatch: object) -> None
     """
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     assert repo.get_cache_info() == {}
 
@@ -149,7 +149,7 @@ def test_get_cache_info_lists_present_layers(
     """
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
     (cache_dir / "abcd1234.th").write_bytes(b"x" * 1024)
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
@@ -181,7 +181,7 @@ def test_remove_model_unlinks_cached_layers(
     """
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
     layer = cache_dir / "abcd1234.th"
     layer.write_bytes(b"x")
 
@@ -219,7 +219,7 @@ def test_get_model_redownloads_corrupt_cached_layer(
     # check_checksum and exercises the redownload branch.
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
 
     corrupt_path = cache_dir / "abcd1234.th"
     corrupt_path.write_bytes(b"this is not a real model checkpoint")
@@ -286,7 +286,7 @@ def test_get_model_recovers_from_each_cache_exception_type(
     """
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
 
     bad_path = cache_dir / "abcd1234.th"
     bad_path.write_bytes(b"placeholder; we'll bypass real load")
@@ -304,7 +304,7 @@ def test_get_model_recovers_from_each_cache_exception_type(
 
     # Force the failure inside the cache-load ``try`` block by making
     # ``check_checksum`` raise. The remaining downloader is stubbed out.
-    monkeypatch.setattr("demucs.repo.check_checksum", raise_exc)
+    monkeypatch.setattr("unblend.repo.check_checksum", raise_exc)
 
     download_calls: list[dict] = []
 
@@ -339,16 +339,16 @@ def test_get_cache_dir_env_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    ``DEMUCS_CACHE_DIR`` relocates the model cache away from ``~/.demucs``,
+    ``UNBLEND_CACHE_DIR`` relocates the model cache away from ``~/.unblend``,
     with tilde expansion (Docker ENV / systemd values are not shell-expanded),
     and without creating the directory (that happens on first download).
     """
     target = tmp_path / "custom-cache"
-    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(target))
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(target))
     assert get_cache_dir() == target
     assert not target.exists()
 
-    monkeypatch.setenv("DEMUCS_CACHE_DIR", "~/some-demucs-cache")
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", "~/some-demucs-cache")
     assert get_cache_dir() == Path.home() / "some-demucs-cache"
 
 
@@ -363,7 +363,7 @@ def test_get_cache_info_reports_partial_models(
     """
     cache = tmp_path / "cache"
     cache.mkdir()
-    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(cache))
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(cache))
 
     metadata = _good_metadata()
     metadata["models"]["fakemodel"]["models"].append(
@@ -395,7 +395,7 @@ def test_sweep_stale_downloads_removes_staging_files(
     """
     cache = tmp_path / "cache"
     cache.mkdir()
-    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(cache))
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(cache))
 
     (cache / "tmpabc123.th").write_bytes(b"partial download")
     (cache / "abcd1234.th").write_bytes(b"cached layer")
@@ -447,7 +447,7 @@ def test_get_model_preserves_cache_on_read_failures(
     """
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
 
     cached = cache_dir / "abcd1234.th"
     cached.write_bytes(b"valid-looking cached layer")
@@ -467,7 +467,7 @@ def test_get_model_preserves_cache_on_read_failures(
             raise exc
         raise exc from cause
 
-    monkeypatch.setattr("demucs.repo.check_checksum", raise_exc)
+    monkeypatch.setattr("unblend.repo.check_checksum", raise_exc)
 
     def fail_download(*_args: object, **_kwargs: object) -> None:
         """
@@ -490,3 +490,112 @@ def test_get_model_preserves_cache_on_read_failures(
         assert excinfo.value.__cause__ is exc
     else:
         assert excinfo.value is exc
+
+
+def test_load_model_accepts_upstream_demucs_pickles(tmp_path) -> None:
+    """
+    The Meta-CDN ``.th`` checkpoints pickle the model class under its
+    *upstream* module path (``demucs.htdemucs.HTDemucs``); the alias installed
+    by ``unblend.states`` must keep them loading after the package rename.
+    Regression test for the rename silently breaking every Demucs model load
+    (only real-download slow tests would otherwise exercise this).
+    """
+    import torch
+
+    from unblend.htdemucs import HTDemucs
+    from unblend.states import load_model
+
+    kwargs = dict(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    model = HTDemucs(**kwargs)
+
+    # Re-point the class's pickle identity at the upstream module path so the
+    # saved bytes are byte-authentic to a real upstream checkpoint.
+    original_module = HTDemucs.__module__
+    HTDemucs.__module__ = "demucs.htdemucs"
+    try:
+        package = {
+            "klass": HTDemucs,
+            "args": (),
+            "kwargs": kwargs,
+            "state": model.state_dict(),
+        }
+        path = tmp_path / "upstream_style.th"
+        torch.save(package, path)
+    finally:
+        HTDemucs.__module__ = original_module
+
+    loaded = load_model(path)
+    assert isinstance(loaded, HTDemucs)
+    assert loaded.sources == ["a", "b"]
+
+
+def test_tensor_package_layer_loads_weights_only(tmp_path, monkeypatch) -> None:
+    """
+    A registry layer in the unblend tensor-package format (plain config +
+    state dict, ``weights_only=True``-safe) builds through ``get_model``
+    without touching the legacy pickle path — the format the re-hosted
+    Demucs checkpoints use.
+    """
+    import hashlib
+    import json
+
+    import torch
+
+    from unblend import repo as repo_module
+    from unblend.htdemucs import HTDemucs
+
+    kwargs = dict(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    model = HTDemucs(**kwargs)
+    blob = {
+        "format": "unblend-htdemucs-v1",
+        "config": kwargs,
+        "state": model.state_dict(),
+    }
+    packed = tmp_path / "layer.th"
+    torch.save(blob, packed)
+    digest = hashlib.sha256(packed.read_bytes()).hexdigest()
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / f"{digest[:8]}.th").write_bytes(packed.read_bytes())
+    monkeypatch.setattr(repo_module, "get_cache_dir", lambda: cache_dir)
+
+    metadata = {
+        "models": {
+            "tiny": {
+                "sources": ["a", "b"],
+                "models": [
+                    {
+                        # Absolute remote: must be used verbatim (no CDN prefix).
+                        "remote": "https://example.invalid/layer.th",
+                        "checksum": digest[:8],
+                        "sha256": digest,
+                    }
+                ],
+            }
+        }
+    }
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata))
+
+    repo = repo_module.ModelRepository(metadata_path)
+    assert repo._layer_urls[digest[:8]] == "https://example.invalid/layer.th"
+    loaded = repo.get_model("tiny")
+    assert isinstance(loaded, HTDemucs)
+    assert loaded.sources == ["a", "b"]

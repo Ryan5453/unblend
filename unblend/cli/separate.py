@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import math
 import tempfile
 import unicodedata
 from datetime import datetime
@@ -13,14 +14,196 @@ import click
 import torch
 import typer
 from rich.markup import escape
+from torchcodec.decoders import AudioDecoder
 from torchcodec.encoders import AudioEncoder
 
 from ..api import Separator, default_device, select_model
+from ..apply import ModelEnsemble
 from ..exceptions import ModelLoadingError, ValidationError
+from ..htdemucs import HTDemucs
+from ..roformer import BSRoformer, MelBandRoformer
 from .models import ensure_model_available
 from .progress import FileProgressTracker
 from .types import ClipMode, DeviceType, ModelName, Precision, StemName
 from .utils import console, expand_paths_to_audio_files, format_output_path
+
+# Cache-free auto-compile policy. Values are conservative break-even amounts
+# of predicted eager GPU work, not raw chunk counts: a runtime batch-1 timing
+# adapts the same architecture/dtype threshold to T4, V100, A100/Hopper, etc.
+# RoFormer FP16 values include a margin over the worst measured break-even
+# eager time (T4/V100/H200); unmeasured precision/family combinations are more
+# conservative until their matrix is filled in.
+_AUTO_COMPILE_EAGER_SECONDS: dict[tuple[str, str], int] = {
+    ("htdemucs", "fp32"): 240,
+    ("htdemucs", "fp16"): 200,
+    ("htdemucs", "bf16"): 200,
+    ("bs_roformer", "fp32"): 160,
+    ("bs_roformer", "fp16"): 120,
+    ("bs_roformer", "bf16"): 160,
+    ("mel_band_roformer", "fp32"): 180,
+    ("mel_band_roformer", "fp16"): 135,
+    ("mel_band_roformer", "bf16"): 180,
+}
+
+
+def _compile_profile_key(separator: Separator) -> tuple[str, str] | None:
+    """
+    Resolve the architecture/dtype key used by the auto-compile policy.
+
+    :param separator: Initialized eager separator.
+    :return: ``(architecture, precision)`` or ``None`` when unsupported.
+    """
+    model = separator.model.models[0] if isinstance(separator.model, ModelEnsemble) else separator.model
+    if isinstance(model, HTDemucs):
+        architecture = "htdemucs"
+    elif isinstance(model, BSRoformer):
+        architecture = "bs_roformer"
+    elif isinstance(model, MelBandRoformer):
+        architecture = "mel_band_roformer"
+    else:
+        return None
+
+    parameter = next(model.parameters(), None)
+    dtype = parameter.dtype if parameter is not None else torch.float32
+    precision = {
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+    }.get(dtype, "fp32")
+    return architecture, precision
+
+
+def _audio_duration_seconds(path: Path) -> float | None:
+    """
+    Read audio duration from container metadata without decoding samples.
+
+    :param path: Input audio path.
+    :return: Positive duration in seconds, or ``None`` when unavailable.
+    """
+    try:
+        duration = AudioDecoder(str(path)).metadata.duration_seconds
+    except Exception:
+        return None
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        return None
+    return float(duration)
+
+
+def _estimate_compile_chunks(
+    separator: Separator,
+    audio_files: list[Path],
+    *,
+    shifts: int,
+    split_overlap: float,
+) -> tuple[int, float, int]:
+    """
+    Estimate total model chunks from metadata durations and inference options.
+
+    Shift offsets are random in ``[0, 0.5s]``; using their 0.25-second mean
+    makes the estimate unbiased without consuming or perturbing the run's RNG.
+    Ensemble work multiplies by its sub-model count because each member runs
+    the complete chunk stream.
+
+    :param separator: Eager separator providing segment/sample-rate metadata.
+    :param audio_files: Expanded input file list.
+    :param shifts: Shift rounds per input.
+    :param split_overlap: Fractional chunk overlap.
+    :return: ``(estimated_chunks, known_duration_seconds, unknown_file_count)``.
+    """
+    sample_rate = separator.model.samplerate
+    segment_samples = int(
+        round(separator.model.max_allowed_segment * sample_rate)
+    )
+    stride = int((1 - split_overlap) * segment_samples)
+    model_count = (
+        len(separator.model.models)
+        if isinstance(separator.model, ModelEnsemble)
+        else 1
+    )
+    total_chunks = 0
+    total_duration = 0.0
+    unknown_files = 0
+    expected_shift_padding = int(0.25 * sample_rate)
+    for path in audio_files:
+        duration = _audio_duration_seconds(path)
+        if duration is None:
+            unknown_files += 1
+            continue
+        total_duration += duration
+        samples = int(math.ceil(duration * sample_rate))
+        chunks_per_shift = math.ceil(
+            (samples + expected_shift_padding) / stride
+        )
+        total_chunks += shifts * chunks_per_shift
+    return total_chunks * model_count, total_duration, unknown_files
+
+
+def _maybe_enable_auto_compile(
+    separator: Separator,
+    audio_files: list[Path],
+    *,
+    shifts: int,
+    split_overlap: float,
+) -> bool:
+    """
+    Apply the cache-free CUDA auto-compile policy to an eager separator.
+
+    :param separator: Initialized eager CUDA separator.
+    :param audio_files: Complete expanded CLI workload.
+    :param shifts: Shift rounds per input.
+    :param split_overlap: Fractional chunk overlap.
+    :return: ``True`` when compilation was enabled successfully.
+    """
+    profile_key = _compile_profile_key(separator)
+    threshold = (
+        _AUTO_COMPILE_EAGER_SECONDS.get(profile_key)
+        if profile_key is not None
+        else None
+    )
+    estimated_chunks, known_duration, unknown_files = _estimate_compile_chunks(
+        separator,
+        audio_files,
+        shifts=shifts,
+        split_overlap=split_overlap,
+    )
+    probe_seconds = separator._eager_probe_seconds
+    if threshold is None or probe_seconds is None:
+        console.print(
+            "[cyan]Auto compile:[/cyan] keeping eager execution — "
+            "no supported timing profile was available"
+        )
+        return False
+
+    estimated_eager_seconds = estimated_chunks * probe_seconds
+    detail = (
+        f"{estimated_chunks:,} estimated chunks, "
+        f"{known_duration / 60:.1f} min known audio, "
+        f"{estimated_eager_seconds:.1f}s predicted eager GPU work "
+        f"(threshold {threshold}s)"
+    )
+    if unknown_files:
+        suffix = "s" if unknown_files != 1 else ""
+        detail += f", {unknown_files} duration{suffix} unavailable"
+    if estimated_eager_seconds < threshold:
+        console.print(
+            f"[cyan]Auto compile:[/cyan] keeping eager execution — {detail}"
+        )
+        return False
+
+    console.print(
+        f"[cyan]Auto compile:[/cyan] enabling CUDA compilation — {detail}"
+    )
+    try:
+        separator.enable_compile()
+    except Exception as error:
+        # Auto mode is opportunistic: enable_compile restores the eager
+        # callable/batch size before re-raising, so an unsupported
+        # compiler/toolchain should not kill the job.
+        console.print(
+            f"[yellow]![/yellow] CUDA compile setup failed; "
+            f"continuing eager: {escape(str(error))}"
+        )
+        return False
+    return True
 
 
 def _validate_output_format(format: str) -> None:
@@ -101,13 +284,13 @@ def separate_command(
         ),
     ] = None,
     compile_model: Annotated[
-        bool,
+        bool | None,
         typer.Option(
             "--compile/--no-compile",
-            help="Compile the HTDemucs neural network core on CUDA. Improves steady-state throughput for long-running jobs, but adds a heavy warmup cost. Ignored on non-CUDA devices.",
+            help="CUDA compilation policy. By default, estimate the complete workload and compile only past the architecture/dtype break-even point; --compile and --no-compile force either choice.",
             rich_help_panel="Processing",
         ),
-    ] = False,
+    ] = None,
     precision: Annotated[
         Precision,
         typer.Option(
@@ -161,8 +344,9 @@ def separate_command(
     :param split_overlap: Overlap between split chunks; higher values improve
         quality at chunk boundaries
     :param seed: Random seed for reproducible shift-based inference
-    :param compile_model: Compile the HTDemucs neural network core on CUDA; improves
-        steady-state throughput for long-running jobs, but adds a heavy warmup cost
+    :param compile_model: CUDA compile override: ``True`` forces compile,
+        ``False`` forces eager, and ``None`` automatically compares estimated
+        eager GPU work with the architecture/dtype break-even threshold.
     :param precision: Inference precision; auto picks fp16 on CUDA (with tensor
         cores) and MPS, fp32 on CPU
     :param output: Output path template; variables are {model}, {track}, {stem},
@@ -264,7 +448,7 @@ def separate_command(
             device=device.value,
             only_load=only_load_stem,
             dtype=dtype,
-            compile=compile_model,
+            compile=compile_model is True,
         )
     except (ValidationError, ModelLoadingError) as error:
         console.print(
@@ -272,6 +456,18 @@ def separate_command(
             f"{escape(str(error))}"
         )
         raise typer.Exit(1)
+
+    # Default CLI policy is workload-aware on CUDA. The Separator's mandatory
+    # VRAM-sizing probe already recorded a steady eager batch-1 time, so this
+    # adds only cheap container-metadata reads — no persistent calibration
+    # cache and no GPU-name/PyTorch-version table.
+    if compile_model is None and device is DeviceType.cuda:
+        _maybe_enable_auto_compile(
+            separator,
+            audio_files,
+            shifts=shifts,
+            split_overlap=split_overlap,
+        )
 
     # Also covers the case where --isolate-stem is set but only_load is not (the
     # auto path can pick a single model where only_load is a no-op): the stem

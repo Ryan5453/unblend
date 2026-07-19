@@ -1,8 +1,8 @@
-"""Unit tests for the path/formatting helpers in ``demucs.cli.utils``."""
+"""Unit tests for the path/formatting helpers in ``unblend.cli.utils``."""
 
 from pathlib import Path
 
-from demucs.cli.utils import (
+from unblend.cli.utils import (
     _looks_like_audio_file,
     expand_paths_to_audio_files,
     format_file_size,

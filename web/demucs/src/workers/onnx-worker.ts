@@ -24,9 +24,10 @@ interface RunMessage {
     requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
-    audio: Float32Array;
+    /** Absent for models without an audio input (RoFormer). */
+    audio?: Float32Array;
     specShape: number[];
-    audioShape: number[];
+    audioShape?: number[];
 }
 
 interface UnloadMessage {
@@ -129,14 +130,19 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             owned.push(specReal);
             const specImag = new onnx.Tensor('float32', msg.specImag, msg.specShape);
             owned.push(specImag);
-            const audio = new onnx.Tensor('float32', msg.audio, msg.audioShape);
-            owned.push(audio);
 
-            const results = await session.run({
+            const feeds: Record<string, onnx.Tensor> = {
                 spec_real: specReal,
                 spec_imag: specImag,
-                audio,
-            });
+            };
+            // RoFormer graphs have no audio input / time branch.
+            if (msg.audio !== undefined) {
+                const audio = new onnx.Tensor('float32', msg.audio, msg.audioShape!);
+                owned.push(audio);
+                feeds.audio = audio;
+            }
+
+            const results = await session.run(feeds);
             for (const tensor of Object.values(results)) {
                 owned.push(tensor);
             }
@@ -149,12 +155,17 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             // graphs). The .data casts below are unchecked, so a model whose
             // outputs are some other dtype would be silently mis-wrapped as
             // Float32Array. Verify the dtype up front so a mismatched model
-            // fails loudly instead.
-            for (const [name, tensor] of [
+            // fails loudly instead. out_wave exists only on HTDemucs graphs;
+            // it is checked when present and its absence is reported to the
+            // client (which knows whether the model should have one).
+            const expected: [string, onnx.Tensor | undefined][] = [
                 ['out_spec_real', outSpecReal],
                 ['out_spec_imag', outSpecImag],
-                ['out_wave', outWave],
-            ] as const) {
+            ];
+            if (outWave !== undefined) {
+                expected.push(['out_wave', outWave]);
+            }
+            for (const [name, tensor] of expected) {
                 if (tensor === undefined) {
                     throw new Error(`Model produced no '${name}' output`);
                 }
@@ -180,9 +191,11 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             // segment of every track.
             const outSpecRealData = new Float32Array(outSpecReal.data as Float32Array);
             const outSpecImagData = new Float32Array(outSpecImag.data as Float32Array);
-            const outWaveData = new Float32Array(outWave.data as Float32Array);
+            const outWaveData = outWave
+                ? new Float32Array(outWave.data as Float32Array)
+                : undefined;
             const outSpecShape = outSpecReal.dims as number[];
-            const outWaveShape = outWave.dims as number[];
+            const outWaveShape = outWave ? (outWave.dims as number[]) : undefined;
 
             const response: RunResponse = {
                 type: 'run',
@@ -198,11 +211,14 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             // Transfer the fresh buffers — they're owned by this scope and no
             // longer needed here, so handing ownership to the client avoids a
             // structured-clone copy.
-            self.postMessage(response, [
+            const transfer: Transferable[] = [
                 outSpecRealData.buffer,
                 outSpecImagData.buffer,
-                outWaveData.buffer,
-            ]);
+            ];
+            if (outWaveData) {
+                transfer.push(outWaveData.buffer);
+            }
+            self.postMessage(response, transfer);
         } catch (error) {
             console.error('[onnx-worker] run failed:', error);
             const response: RunResponse = {

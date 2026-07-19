@@ -1,5 +1,5 @@
 [project]
-name = "demucs-next"
+name = "unblend"
 version = "1.0.0"
 description = "Audio source separation for music."
 readme = "readme.md"
@@ -36,9 +36,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Ryan5453/demucs-next"
-Repository = "https://github.com/Ryan5453/demucs-next"
-Changelog = "https://github.com/Ryan5453/demucs-next/blob/main/changelog.md"
+Homepage = "https://github.com/Ryan5453/unblend"
+Repository = "https://github.com/Ryan5453/unblend"
+Changelog = "https://github.com/Ryan5453/unblend/blob/main/changelog.md"
 
 [project.optional-dependencies]
 dev = [
@@ -47,6 +47,8 @@ dev = [
 ]
 onnx = [
   "onnx>=1.22.0",
+  # Required by the dynamo ONNX exporter (RoFormer export path).
+  "onnxscript>=0.2.0",
 ]
 
 [build-system]
@@ -54,11 +56,11 @@ requires = ["uv_build>=0.7.21,<0.8.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = "demucs"
+module-name = "unblend"
 module-root = ""
 
-source-include = ["demucs/metal/*.metal"]
-wheel-include = ["demucs/metal/*.metal"]
+source-include = ["unblend/metal/*.metal"]
+wheel-include = ["unblend/metal/*.metal"]
 
 [tool.pytest.ini_options]
 addopts = "-m 'not slow'"
@@ -73,5 +75,6 @@ extend-select = ["I"]
 "__init__.py" = ["E402"]
 
 [project.scripts]
-demucs = "demucs.cli:main"
-demucs-inference = "demucs.cli:main" # Secondary alias kept for compatibility with existing scripts
+unblend = "unblend.cli:main"
+demucs = "unblend.cli:main" # Compatibility alias for the former package name
+demucs-inference = "unblend.cli:main" # Secondary alias kept for compatibility with existing scripts

@@ -17,6 +17,9 @@ class ModelName(str, Enum):
     htdemucs = "htdemucs"
     htdemucs_ft = "htdemucs_ft"
     htdemucs_6s = "htdemucs_6s"
+    # RoFormer backends (non-commercial weights — see ``models list``).
+    bs_roformer_sw = "bs_roformer_sw"
+    melband_roformer_kim = "melband_roformer_kim"
 
 
 class StemName(str, Enum):

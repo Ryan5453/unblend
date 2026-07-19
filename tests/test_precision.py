@@ -7,9 +7,9 @@ import pathlib
 import pytest
 import torch
 
-from demucs.api import Separator, default_dtype
-from demucs.apply import _gpu_accum_budget_bytes, _gpu_accum_bytes_needed
-from demucs.exceptions import ValidationError
+from unblend.api import Separator, default_dtype
+from unblend.apply import _gpu_accum_budget_bytes, _gpu_accum_bytes_needed
+from unblend.exceptions import ValidationError
 
 
 def test_default_dtype_cpu_is_fp32() -> None:

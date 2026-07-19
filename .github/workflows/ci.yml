@@ -74,9 +74,9 @@ jobs:
       - name: Verify wheel contents
         run: |
           listing=$(unzip -l dist/*.whl)
-          echo "$listing" | grep -q "demucs/metadata.json"
+          echo "$listing" | grep -q "unblend/metadata.json"
           echo "$listing" | grep -qi "licenses/LICENSE"
-          for kernel in demucs/metal/*.metal; do
+          for kernel in unblend/metal/*.metal; do
             echo "$listing" | grep -q "$kernel"
           done
 
@@ -93,9 +93,29 @@ jobs:
       - name: Sync dependencies (with onnx extra)
         run: uv sync --extra dev --extra onnx
       - name: Smoke-test ONNX import
-        run: uv run python -c "import onnx; import demucs.onnx; print('onnx', onnx.__version__)"
+        run: uv run python -c "import onnx; import unblend.onnx; print('onnx', onnx.__version__)"
+      - name: Install onnxruntime (export verification)
+        run: uv pip install onnxruntime
       - name: Run ONNX tests
-        run: uv run pytest -m "not slow" -q tests/test_onnx_stft.py
+        run: uv run pytest -m "not slow" -q tests/test_onnx_stft.py tests/test_onnx_roformer.py
+
+  mps:
+    # Apple-silicon runner with a real MPS device: runs the RoFormer MPS
+    # parity/policy tests and the Metal kernel suite (both skip everywhere
+    # else, so this job is their only CI coverage).
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --extra dev
+      - name: Run RoFormer MPS tests
+        run: uv run pytest -m "not slow" -q tests/test_roformer_mps.py
+      - name: Run Metal kernel tests
+        run: uv run pytest -m "not slow" -q tests/test_metal_kernels.py
 
   web:
     runs-on: ubuntu-latest

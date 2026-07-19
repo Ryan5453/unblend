@@ -7,12 +7,26 @@
 
 import functools
 import inspect
+import sys
 import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import torch
+
+from . import htdemucs as _htdemucs
+
+# The Demucs ``.th`` checkpoints pickle the model *class by reference*
+# (``demucs.htdemucs.HTDemucs`` — the upstream module path they were saved
+# under), so unpickling imports that path. Alias it to this package so the
+# checkpoints keep loading after the demucs → unblend rename. ``setdefault``
+# leaves a genuinely-installed upstream ``demucs`` untouched — but note that
+# unpickling through a real upstream demucs would produce upstream class
+# instances, so unblend still cannot share a process with an imported
+# upstream demucs.
+sys.modules.setdefault("demucs", sys.modules[__package__])
+sys.modules.setdefault("demucs.htdemucs", _htdemucs)
 
 # Known deprecated parameters that are present in older model checkpoints
 # but are no longer used in the current model classes. These are silently ignored.
@@ -33,6 +47,22 @@ _DEPRECATED_PARAMS = frozenset(
         "t_auto_sparsity",
     }
 )
+
+
+def load_tensor_package(package: dict) -> torch.nn.Module:
+    """
+    Build an HTDemucs from an unblend tensor package: a plain
+    ``{"format": "unblend-htdemucs-v1", "config": {...}, "state": {...}}``
+    dict holding only tensors and primitives, loadable with
+    ``torch.load(weights_only=True)`` — no class pickling, no code execution
+    on load, no dependence on historical module paths.
+
+    :param package: The loaded tensor package.
+    :return: The constructed model with weights loaded (strictly).
+    """
+    model = _htdemucs.HTDemucs(**package["config"])
+    set_state(model, package["state"])
+    return model
 
 
 def load_model(

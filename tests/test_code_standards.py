@@ -2,7 +2,7 @@
 Repo-wide code-standard checks.
 
 These enforce the project convention that *every* function and method in the
-``demucs`` package is fully type-annotated and carries a reST-style docstring
+``unblend`` package is fully type-annotated and carries a reST-style docstring
 that documents each parameter and any return value. They are pure-AST checks:
 fast, network-free, and safe to run in CI.
 """
@@ -10,14 +10,14 @@ fast, network-free, and safe to run in CI.
 import ast
 import pathlib
 
-PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent / "demucs"
+PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent / "unblend"
 
 
 def _iter_functions() -> list[
     tuple[pathlib.Path, ast.FunctionDef | ast.AsyncFunctionDef]
 ]:
     """
-    Collect every function/method definition in the ``demucs`` package.
+    Collect every function/method definition in the ``unblend`` package.
 
     :return: List of ``(path, node)`` pairs, including nested functions.
     """

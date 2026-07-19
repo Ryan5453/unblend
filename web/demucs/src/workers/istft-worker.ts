@@ -3,27 +3,37 @@
  * Runs ISTFT + freq/time branch combination + overlap-add weighting. Lives in
  * its own worker so it overlaps with the STFT and ONNX workers rather than
  * blocking the main thread.
+ *
+ * The client sends one 'configure' message (model DSP geometry) before the
+ * first 'process'; unconfigured workers fall back to the HTDemucs defaults.
+ * RoFormer models have no time branch: 'process' arrives without ``wave`` and
+ * the chunk is the weighted iSTFT alone.
  */
 
-import { computeISTFT, createISTFTBuffers, type ISTFTBuffers } from '../audio-processor.js';
-import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES, createSplitWeight } from '../constants.js';
+import { createDSP, type DSP } from '../audio-processor.js';
+import {
+    NFFT, HOP_LENGTH, SEGMENT_SAMPLES, createSplitWeight,
+    type DSPConfig,
+} from '../constants.js';
 
-let istftBuffers: ISTFTBuffers | null = null;
-const splitWeight = createSplitWeight();
-// Largest per-channel spectrogram the ONNX model can emit for one segment:
-// OUT_BINS (Nyquist dropped → NFFT/2) × OUT_FRAMES (ceil(SEGMENT/HOP)), ×2
-// channels. Derived from the constants so it can't silently undersize if the
-// FFT/hop/segment sizes change (the STFT producer uses the same constants).
-const MAX_SPEC_SIZE = 2 * (NFFT / 2) * Math.ceil(SEGMENT_SAMPLES / HOP_LENGTH);
-const sourceReal = new Float32Array(MAX_SPEC_SIZE);
-const sourceImag = new Float32Array(sourceReal.length);
+let dsp: DSP | null = null;
+let splitWeight: Float32Array | null = null;
+let sourceReal: Float32Array | null = null;
+let sourceImag: Float32Array | null = null;
 
-interface ISTFTMessage {
+interface ConfigureMessage {
+    type: 'configure';
+    requestId: number;
+    config: DSPConfig;
+}
+
+interface ProcessMessage {
     type: 'process';
     requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
-    wave: Float32Array;
+    /** Absent for models without a time-domain branch (RoFormer). */
+    wave?: Float32Array;
     numSources: number;
     numChannels: number;
     numBins: number;
@@ -38,6 +48,8 @@ interface ISTFTMessage {
     trimOffset: number;
 }
 
+type ISTFTMessage = ConfigureMessage | ProcessMessage;
+
 interface ISTFTResponse {
     type: 'result';
     requestId: number;
@@ -48,6 +60,13 @@ interface ISTFTResponse {
     segLength: number;
 }
 
+interface ConfigureResponse {
+    type: 'result';
+    requestId: number;
+    success: true;
+    chunks?: undefined;
+}
+
 interface ISTFTErrorResponse {
     type: 'result';
     requestId: number;
@@ -55,12 +74,50 @@ interface ISTFTErrorResponse {
     error: string;
 }
 
+function setup(config: DSPConfig): void {
+    dsp = createDSP(config);
+    splitWeight = createSplitWeight(config.segmentSamples);
+    // Largest per-channel spectrogram the ONNX model can emit for one
+    // segment, ×2 channels. Derived from the DSP so it can't silently
+    // undersize (the STFT producer uses the same geometry).
+    const maxSpecSize = 2 * dsp.numBins * dsp.numFrames;
+    sourceReal = new Float32Array(maxSpecSize);
+    sourceImag = new Float32Array(maxSpecSize);
+}
+
 self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
     const msg = event.data;
 
+    if (msg.type === 'configure') {
+        try {
+            setup(msg.config);
+            const response: ConfigureResponse = {
+                type: 'result',
+                requestId: msg.requestId,
+                success: true,
+            };
+            self.postMessage(response);
+        } catch (error) {
+            console.error('[istft-worker] configure failed:', error);
+            const response: ISTFTErrorResponse = {
+                type: 'result',
+                requestId: msg.requestId,
+                success: false,
+                error: (error as Error).message,
+            };
+            self.postMessage(response);
+        }
+        return;
+    }
+
     try {
-        if (!istftBuffers) {
-            istftBuffers = createISTFTBuffers();
+        if (!dsp) {
+            setup({
+                family: 'htdemucs',
+                nfft: NFFT,
+                hopLength: HOP_LENGTH,
+                segmentSamples: SEGMENT_SAMPLES,
+            });
         }
 
         const {
@@ -68,32 +125,37 @@ self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
             numSources, numChannels, numBins, numFrames,
             segStart, segLength, trimOffset,
         } = msg;
+        const segmentSamples = dsp!.segmentSamples;
 
         const specSize = numChannels * numBins * numFrames;
         const chunks: Float32Array[] = [];
 
         for (let s = 0; s < numSources; s++) {
             const specOffset = s * specSize;
-            sourceReal.set(specReal.subarray(specOffset, specOffset + specSize));
-            sourceImag.set(specImag.subarray(specOffset, specOffset + specSize));
+            sourceReal!.set(specReal.subarray(specOffset, specOffset + specSize));
+            sourceImag!.set(specImag.subarray(specOffset, specOffset + specSize));
 
-            const freqAudio = computeISTFT(
-                sourceReal, sourceImag,
-                numChannels, numBins, numFrames,
-                SEGMENT_SAMPLES, istftBuffers
+            const freqAudio = dsp!.computeISTFT(
+                sourceReal!, sourceImag!,
+                numChannels, numBins, numFrames
             );
 
-            // Combine freq + time branches, apply the triangular weight, write to
-            // the output chunk. Matches Python: center_trim to the chunk, then
-            // weight[:chunk_length] (the triangle indexed from 0, not centered).
-            const sourceWaveOffset = s * numChannels * SEGMENT_SAMPLES;
+            // Combine freq + time branches (when the model has one), apply the
+            // triangular weight, write to the output chunk. Matches Python:
+            // center_trim to the chunk, then weight[:chunk_length] (the
+            // triangle indexed from 0, not centered).
+            const sourceWaveOffset = s * numChannels * segmentSamples;
             const chunk = new Float32Array(segLength * numChannels);
 
             for (let i = 0; i < segLength; i++) {
                 const srcIdx = trimOffset + i;
-                const leftVal = freqAudio[srcIdx] + wave[sourceWaveOffset + srcIdx];
-                const rightVal = freqAudio[SEGMENT_SAMPLES + srcIdx] + wave[sourceWaveOffset + SEGMENT_SAMPLES + srcIdx];
-                const w = splitWeight[i];
+                let leftVal = freqAudio[srcIdx];
+                let rightVal = freqAudio[segmentSamples + srcIdx];
+                if (wave) {
+                    leftVal += wave[sourceWaveOffset + srcIdx];
+                    rightVal += wave[sourceWaveOffset + segmentSamples + srcIdx];
+                }
+                const w = splitWeight![i];
 
                 chunk[i * numChannels] = leftVal * w;
                 chunk[i * numChannels + 1] = rightVal * w;

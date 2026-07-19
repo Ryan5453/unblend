@@ -17,9 +17,9 @@ from .utils import console
 
 def version_command() -> None:
     """
-    Show the installed version of Demucs.
+    Show the installed version of unblend.
     """
-    typer.echo(f"Demucs version: {__version__}")
+    typer.echo(f"unblend version: {__version__}")
 
 
 def build_app() -> typer.Typer:
@@ -58,14 +58,14 @@ def build_app() -> typer.Typer:
         name="separate", help="Separate audio tracks into their component stems."
     )(separate_command)
     app.add_typer(models_app, name="models")
-    app.command(name="version", help="Show the installed version of Demucs.")(
+    app.command(name="version", help="Show the installed version of unblend.")(
         version_command
     )
 
     app.command(
         name="export-onnx",
         hidden=True,
-        help="Export a HTDemucs model to ONNX (internal developer tool).",
+        help="Export a model to ONNX (internal developer tool).",
     )(export_onnx_command)
 
     return app
@@ -73,7 +73,7 @@ def build_app() -> typer.Typer:
 
 def main() -> None:
     """
-    Entry point for the Demucs CLI.
+    Entry point for the unblend CLI.
     """
     try:
         build_app()()

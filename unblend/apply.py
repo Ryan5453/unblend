@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from typing import (
     Any,
@@ -21,8 +22,40 @@ from torch.nn import functional as F
 from .blocks import center_trim
 from .exceptions import ValidationError
 from .htdemucs import HTDemucs
+from .roformer import _RoformerBase
 
-Model: TypeAlias = HTDemucs
+logger = logging.getLogger(__name__)
+
+
+def _looks_like_cuda_oom(exc: BaseException) -> bool:
+    """
+    Whether an exception is a CUDA out-of-memory failure.
+
+    CUDA OOM doesn't always surface as ``torch.cuda.OutOfMemoryError`` —
+    graph capture and cuBLAS workspace failures under memory pressure raise
+    plain RuntimeErrors.
+
+    :param exc: The exception to classify.
+    :return: True if the exception indicates CUDA memory exhaustion.
+    """
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "out of memory",
+            "cudaerrormemoryallocation",
+            "cublas_status_alloc_failed",
+        )
+    )
+
+
+# Both backends satisfy the same inference contract used below — ``sources``,
+# ``samplerate``, ``audio_channels``, ``max_allowed_segment``, and a
+# ``[B, S, C, T]`` forward — so the chunking / overlap-add / tail-pooling
+# machinery is shared verbatim across Demucs and RoFormer.
+Model: TypeAlias = HTDemucs | _RoformerBase
 
 
 class ModelEnsemble(nn.Module):
@@ -219,12 +252,19 @@ def _require_cuda_available() -> None:
         )
 
 
-def _gpu_accum_budget_bytes(device: torch.device | str) -> int:
+def _gpu_accum_budget_bytes(
+    device: torch.device | str, forward_reserve_bytes: int | None = None
+) -> int:
     """
     VRAM budget (bytes) available for keeping mixes and overlap-add
     accumulators resident on the GPU.
 
     :param device: CUDA device to query.
+    :param forward_reserve_bytes: Measured per-batch working set of the eager
+        forward (Separator plumbs ``model._forward_reserve_bytes``); the
+        reserve carved out of the budget is the larger of this and the flat
+        default, so batch-scaled eager activations (e.g. the iSTFT of a full
+        chunk batch) always have room. ``None`` keeps the flat default.
     :return: Usable byte budget; 0 if free memory cannot be determined.
     """
     try:
@@ -239,9 +279,8 @@ def _gpu_accum_budget_bytes(device: torch.device | str) -> int:
         device
     )
     usable = free_bytes + max(0, reserved_slack)
-    return max(
-        0, int(_GPU_ACCUM_VRAM_FRACTION * (usable - _GPU_ACCUM_VRAM_RESERVE_BYTES))
-    )
+    reserve = max(_GPU_ACCUM_VRAM_RESERVE_BYTES, forward_reserve_bytes or 0)
+    return max(0, int(_GPU_ACCUM_VRAM_FRACTION * (usable - reserve)))
 
 
 def _gpu_accum_bytes_needed(
@@ -303,8 +342,9 @@ def _should_restore_submodel_device(
 
     Compiled sub-models keep a CUDAGraphs capture tied to their current
     device; bouncing them off the inference device throws that capture away
-    and forces a re-compile on the next forward. The marker attribute
-    ``_uncompiled_forward_core`` is set by ``_compile_htdemucs_forward_core``.
+    and forces a re-compile on the next forward. Family-specific compile
+    setup records either ``_uncompiled_forward_core`` (HTDemucs) or
+    ``_uncompiled_run_transformers`` (RoFormer).
 
     :param sub_model: The just-run ensemble member.
     :param sub_device: Device the sub-model was on before the ensemble call,
@@ -315,7 +355,10 @@ def _should_restore_submodel_device(
     """
     if sub_device is None or sub_device == device:
         return False
-    return not hasattr(sub_model, "_uncompiled_forward_core")
+    return not (
+        hasattr(sub_model, "_uncompiled_forward_core")
+        or hasattr(sub_model, "_uncompiled_run_transformers")
+    )
 
 
 def apply_model(
@@ -328,6 +371,7 @@ def apply_model(
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     use_only_stem: str | None = None,
     chunk_batch_size: int = 1,
+    oom_backoff_state: dict[str, int] | None = None,
 ) -> Tensor:
     """
     Apply model to a given mixture, tiling into segments of the model's
@@ -340,7 +384,8 @@ def apply_model(
     :param overlap: Overlap ratio between consecutive segments.
     :param transition_power: Exponent on the triangular crossfade weight.
     :param progress_callback: Optional ``callback(event_type, data)``; events:
-        ``processing_start``, ``chunk_complete``, ``processing_complete``. For a
+        ``processing_start``, ``chunk_complete``, ``processing_complete``.
+        Payloads include aggregate totals and per-input chunk fields. For a
         ``ModelEnsemble`` that runs all sub-models, the reported totals span the
         whole ensemble (``total_chunks = per_model_chunks * num_sub_models``), so
         progress advances monotonically instead of restarting per sub-model.
@@ -353,6 +398,10 @@ def apply_model(
         ``SeparatedSources.isolate_stem`` for that). Silently has no effect when
         the model is not such an ensemble or no sub-model matches one-hot.
     :param chunk_batch_size: Chunks processed in parallel.
+    :param oom_backoff_state: Mutable ``{"chunk_batch_size": n}`` opting into
+        runtime CUDA-OOM halving for auto-sized eager runs (Separator
+        internal). Halvings persist in the dict for the caller; ``None``
+        disables backoff (OOM propagates).
     :return: Separated sources tensor.
     :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
         device is invalid, out of range, or is CUDA/MPS without that backend
@@ -375,6 +424,7 @@ def apply_model(
         progress_callback=progress_callback,
         use_only_stem=use_only_stem,
         chunk_batch_size=chunk_batch_size,
+        oom_backoff_state=oom_backoff_state,
     )[0]
 
 
@@ -388,6 +438,7 @@ def apply_model_multi(
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     use_only_stem: str | None = None,
     chunk_batch_size: int = 1,
+    oom_backoff_state: dict[str, int] | None = None,
 ) -> list[Tensor]:
     """
     Apply model to multiple mixes simultaneously, pooling tail chunks across
@@ -416,7 +467,9 @@ def apply_model_multi(
     :param transition_power: Exponent on the triangular crossfade weight.
     :param progress_callback: Optional ``callback(event_type, data)``; events:
         ``processing_start``, ``chunk_complete``, ``processing_complete``.
-        Chunk counts are summed across all mixes. For a ``ModelEnsemble`` that
+        Chunk counts are summed across all mixes; start/complete payloads include
+        ``input_total_chunks``, while chunk events identify ``input_index`` and
+        that input's completed/total counts. For a ``ModelEnsemble`` that
         runs all sub-models, the totals also span every sub-model
         (``total_chunks = per_model_chunks * num_sub_models``), so the progress
         bar advances continuously rather than restarting once per sub-model.
@@ -429,6 +482,10 @@ def apply_model_multi(
         ``SeparatedSources.isolate_stem`` for that). Silently has no effect when
         the model is not such an ensemble or no sub-model matches one-hot.
     :param chunk_batch_size: Chunks processed in parallel per forward pass.
+    :param oom_backoff_state: Mutable ``{"chunk_batch_size": n}`` opting into
+        runtime CUDA-OOM halving for auto-sized eager runs (Separator
+        internal); halvings persist in the dict for the caller. ``None``
+        disables backoff (OOM propagates).
     :return: One separated-sources tensor per input mix, same shape as
         ``apply_model`` would have produced.
     :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
@@ -511,6 +568,7 @@ def apply_model_multi(
             progress_callback=progress_callback,
             use_only_stem=use_only_stem,
             chunk_batch_size=chunk_batch_size,
+            oom_backoff_state=oom_backoff_state,
         )
         results: list[Tensor] = []
         row = 0
@@ -552,6 +610,7 @@ def apply_model_multi(
                         transition_power=transition_power,
                         progress_callback=progress_callback,
                         chunk_batch_size=chunk_batch_size,
+                        oom_backoff_state=oom_backoff_state,
                     )
 
         # Run every sub-model with the same pooling, then weighted-average.
@@ -563,6 +622,7 @@ def apply_model_multi(
         num_sub_models = len(model.models)
         sub_models_done = 0
         sub_total_chunks: int | None = None
+        sub_input_total_chunks: list[int] | None = None
 
         def ensemble_progress(event_type: str, data: dict[str, Any]) -> None:
             """
@@ -572,18 +632,27 @@ def apply_model_multi(
             :param event_type: Progress event name (``"processing_start"`` or
                 ``"chunk_complete"``); per-sub-model ``"processing_complete"``
                 events are swallowed.
-            :param data: Event payload with ``total_chunks`` and, for
-                ``"chunk_complete"``, ``completed_chunks``.
+            :param data: Aggregate and per-input progress payload.
             :return: None.
             """
-            nonlocal sub_total_chunks
+            nonlocal sub_input_total_chunks, sub_total_chunks
             assert progress_callback is not None
             if event_type == "processing_start":
                 if sub_total_chunks is None:
                     sub_total_chunks = int(data.get("total_chunks", 0))
+                    sub_input_total_chunks = [
+                        int(value) for value in data.get("input_total_chunks", [])
+                    ]
                     progress_callback(
                         "processing_start",
-                        {"total_chunks": sub_total_chunks * num_sub_models},
+                        {
+                            "total_chunks": sub_total_chunks * num_sub_models,
+                            "total_inputs": len(mixes),
+                            "input_total_chunks": [
+                                value * num_sub_models
+                                for value in sub_input_total_chunks
+                            ],
+                        },
                     )
             elif event_type == "chunk_complete":
                 # Use the latched first sub-model total for the span math and
@@ -595,11 +664,20 @@ def apply_model_multi(
                 completed = sub_models_done * per_model + min(
                     int(data.get("completed_chunks", 0)), per_model
                 )
+                mix_index = int(data["input_index"])
+                assert sub_input_total_chunks is not None
+                per_input = sub_input_total_chunks[mix_index]
+                input_completed = sub_models_done * per_input + min(
+                    int(data.get("input_completed_chunks", 0)), per_input
+                )
                 progress_callback(
                     "chunk_complete",
                     {
                         "completed_chunks": completed,
                         "total_chunks": per_model * num_sub_models,
+                        "input_index": mix_index,
+                        "input_completed_chunks": input_completed,
+                        "input_total_chunks": per_input * num_sub_models,
                     },
                 )
             # Swallow per-sub-model "processing_complete"; one is emitted for
@@ -621,6 +699,7 @@ def apply_model_multi(
                 transition_power=transition_power,
                 progress_callback=sub_callback,
                 chunk_batch_size=chunk_batch_size,
+                oom_backoff_state=oom_backoff_state,
             )
             sub_models_done += 1
             if _should_restore_submodel_device(sub_model, sub_device, device):
@@ -638,10 +717,20 @@ def apply_model_multi(
         for acc in results:
             for k in range(acc.shape[1]):
                 acc[:, k, :, :] /= totals[k]
-        if progress_callback and sub_total_chunks is not None:
+        if (
+            progress_callback
+            and sub_total_chunks is not None
+            and sub_input_total_chunks is not None
+        ):
             progress_callback(
                 "processing_complete",
-                {"total_chunks": sub_total_chunks * num_sub_models},
+                {
+                    "total_chunks": sub_total_chunks * num_sub_models,
+                    "total_inputs": len(mixes),
+                    "input_total_chunks": [
+                        value * num_sub_models for value in sub_input_total_chunks
+                    ],
+                },
             )
         return results
 
@@ -667,7 +756,7 @@ def apply_model_multi(
         # Same validation as the unshifted helper, but raised before any
         # progress events fire — otherwise a doomed run emits a
         # ``processing_start`` with ``total_chunks: 0`` first.
-        segment_length = int(model.samplerate * model.max_allowed_segment)
+        segment_length = int(round(model.samplerate * model.max_allowed_segment))
         stride = int((1 - overlap) * segment_length)
         if stride < 1:
             raise ValidationError(
@@ -676,13 +765,17 @@ def apply_model_multi(
 
         inner_callback = progress_callback
         if progress_callback is not None:
-            total_chunks = 0
+            input_total_chunks = [0] * len(mixes)
             # Mirrors ``range(0, length, stride)`` in the unshifted helper.
             for offsets_per_mix in all_offsets:
-                for mix, offset in zip(mixes, offsets_per_mix):
+                for mix_index, (mix, offset) in enumerate(
+                    zip(mixes, offsets_per_mix)
+                ):
                     shifted_length = mix.shape[-1] + max_shift - offset
-                    total_chunks += -(-shifted_length // stride)
+                    input_total_chunks[mix_index] += -(-shifted_length // stride)
+            total_chunks = sum(input_total_chunks)
             completed_total = 0
+            input_completed_chunks = [0] * len(mixes)
 
             def shift_progress(event_type: str, data: dict[str, Any]) -> None:
                 """
@@ -697,17 +790,31 @@ def apply_model_multi(
                 nonlocal completed_total
                 assert progress_callback is not None
                 if event_type == "chunk_complete":
+                    mix_index = int(data["input_index"])
                     completed_total += 1
+                    input_completed_chunks[mix_index] += 1
                     progress_callback(
                         "chunk_complete",
                         {
                             "completed_chunks": completed_total,
                             "total_chunks": total_chunks,
+                            "input_index": mix_index,
+                            "input_completed_chunks": input_completed_chunks[
+                                mix_index
+                            ],
+                            "input_total_chunks": input_total_chunks[mix_index],
                         },
                     )
 
             inner_callback = shift_progress
-            progress_callback("processing_start", {"total_chunks": total_chunks})
+            progress_callback(
+                "processing_start",
+                {
+                    "total_chunks": total_chunks,
+                    "total_inputs": len(mixes),
+                    "input_total_chunks": input_total_chunks,
+                },
+            )
 
         accumulators: list[Tensor | None] = [None] * len(mixes)
         for offsets_per_mix in all_offsets:
@@ -727,6 +834,7 @@ def apply_model_multi(
                 transition_power=transition_power,
                 progress_callback=inner_callback,
                 chunk_batch_size=chunk_batch_size,
+                oom_backoff_state=oom_backoff_state,
             )
             for i, (partial, offset) in enumerate(zip(partials, offsets_per_mix)):
                 trimmed = partial[..., max_shift - offset :]
@@ -741,7 +849,14 @@ def apply_model_multi(
                 else:
                     accumulators[i].add_(trimmed)
         if progress_callback is not None:
-            progress_callback("processing_complete", {"total_chunks": total_chunks})
+            progress_callback(
+                "processing_complete",
+                {
+                    "total_chunks": total_chunks,
+                    "total_inputs": len(mixes),
+                    "input_total_chunks": input_total_chunks,
+                },
+            )
         assert all(a is not None for a in accumulators)
         return [a / shifts for a in accumulators]  # type: ignore[operator]
 
@@ -753,6 +868,7 @@ def apply_model_multi(
         transition_power=transition_power,
         progress_callback=progress_callback,
         chunk_batch_size=chunk_batch_size,
+        oom_backoff_state=oom_backoff_state,
     )
 
 
@@ -765,6 +881,7 @@ def _apply_model_multi_unshifted(
     transition_power: float,
     chunk_batch_size: int,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    oom_backoff_state: dict[str, int] | None = None,
 ) -> list[Tensor]:
     """
     Multi-mix forward without shift averaging — pools tail chunks across
@@ -781,7 +898,11 @@ def _apply_model_multi_unshifted(
     :param overlap: Overlap between segments, used to derive the chunk stride.
     :param transition_power: Exponent for the triangular overlap-add weighting.
     :param chunk_batch_size: Number of chunks per forward pass.
-    :param progress_callback: Optional callback for progress updates.
+    :param progress_callback: Optional aggregate/per-input progress callback.
+    :param oom_backoff_state: Mutable ``{"chunk_batch_size": n}`` opting into
+        runtime CUDA-OOM halving for auto-sized eager runs (Separator
+        internal); halvings persist in the dict for the caller. ``None``
+        disables backoff (OOM propagates).
     :return: One separated-sources tensor per input mix, in input order.
     :raises ValidationError: If ``overlap`` produces a non-positive segment
         stride (range validation happens in ``apply_model_multi``).
@@ -792,7 +913,7 @@ def _apply_model_multi_unshifted(
     assert device.type != "cuda" or device.index is not None
     segment = model.max_allowed_segment
     assert segment > 0.0
-    segment_length: int = int(model.samplerate * segment)
+    segment_length: int = int(round(model.samplerate * segment))
     stride = int((1 - overlap) * segment_length)
     if stride < 1:
         raise ValidationError(
@@ -822,7 +943,9 @@ def _apply_model_multi_unshifted(
                 bytes_needed += (
                     batch_dim * inner.shape[-2] * (inner.shape[-1] - mix_length) * 4
                 )
-        gpu_resident = bytes_needed <= _gpu_accum_budget_bytes(device)
+        gpu_resident = bytes_needed <= _gpu_accum_budget_bytes(
+            device, getattr(model, "_forward_reserve_bytes", None)
+        )
     else:
         gpu_resident = True
     accum_device = device if gpu_resident else torch.device("cpu")
@@ -840,6 +963,7 @@ def _apply_model_multi_unshifted(
     mix_states: list[dict[str, Any]] = []
     full_pool: list[tuple[int, int, TensorChunk]] = []  # (mix_idx, offset, chunk)
     tail_pool: list[tuple[int, int, TensorChunk]] = []
+    input_total_chunks: list[int] = []
 
     for mix_idx, mix in enumerate(mixes):
         # GPU-resident path moves each mix to the inference device once and
@@ -889,6 +1013,7 @@ def _apply_model_multi_unshifted(
             (offset, TensorChunk(mix_dev, offset, segment_length)) for offset in offsets
         ]
         n = len(chunks_for_mix)
+        input_total_chunks.append(n)
         n_full = (n // chunk_batch_size) * chunk_batch_size
         for offset, chunk in chunks_for_mix[:n_full]:
             full_pool.append((mix_idx, offset, chunk))
@@ -899,16 +1024,27 @@ def _apply_model_multi_unshifted(
     # just that mix's chunk count, matching the old single-mix ``apply_model``).
     total_chunks = len(full_pool) + len(tail_pool)
     completed_chunks = 0
+    input_completed_chunks = [0] * len(mixes)
     if progress_callback:
-        progress_callback("processing_start", {"total_chunks": total_chunks})
+        progress_callback(
+            "processing_start",
+            {
+                "total_chunks": total_chunks,
+                "total_inputs": len(mixes),
+                "input_total_chunks": input_total_chunks,
+            },
+        )
 
-    def run_batch(batch_items: list[tuple[int, int, TensorChunk]]) -> None:
+    def run_batch(
+        batch_items: list[tuple[int, int, TensorChunk]],
+    ) -> list[dict[str, int]]:
         """
         Run one forward pass for ``batch_items`` and accumulate into per-mix state.
 
         :param batch_items: List of ``(mix_idx, offset, chunk)`` tuples to run
             together as a single batch.
-        :return: None.
+        :return: Progress payloads to emit once the batch is out of the
+            OOM-retry boundary.
         """
         nonlocal completed_chunks
         padded = torch.cat(
@@ -944,36 +1080,115 @@ def _apply_model_multi_unshifted(
             # watching; unobserved runs keep the free-running pipeline.
             torch.cuda.synchronize(device)
 
+        # Phase 1 — everything that allocates (trims are views, but the
+        # weighted product materialises a tensor per chunk). Kept strictly
+        # before the commits below so an OOM anywhere in this batch leaves
+        # the accumulators untouched: _drain can then re-run the whole batch
+        # without double-counting chunks that had already been added.
+        contributions: list[tuple[int, int, Tensor, Tensor]] = []
         for i, (mix_idx, offset, chunk) in enumerate(batch_items):
-            state = mix_states[mix_idx]
             chunk_out = center_trim(batch_out[i : i + 1], chunk.length)
             chunk_length = chunk_out.shape[-1]
             w = weight[:chunk_length]
-            state["out"][..., offset : offset + segment_length] += w * chunk_out
+            contributions.append((mix_idx, offset, w * chunk_out, w))
+
+        # Phase 2 — pure in-place adds into preallocated accumulators: no
+        # allocation, so this phase cannot OOM partway through. Progress
+        # payloads are returned rather than emitted here: a user callback
+        # raising an OOM-shaped error inside the retry boundary would
+        # otherwise re-run a batch whose commits already landed.
+        pending_events: list[dict[str, int]] = []
+        for mix_idx, offset, weighted, w in contributions:
+            state = mix_states[mix_idx]
+            state["out"][..., offset : offset + segment_length] += weighted
             state["sum_weight"][offset : offset + segment_length] += w
 
             completed_chunks += 1
-            if progress_callback:
-                progress_callback(
-                    "chunk_complete",
-                    {
-                        "completed_chunks": completed_chunks,
-                        "total_chunks": total_chunks,
-                    },
-                )
+            input_completed_chunks[mix_idx] += 1
+            pending_events.append(
+                {
+                    "completed_chunks": completed_chunks,
+                    "total_chunks": total_chunks,
+                    "input_index": mix_idx,
+                    "input_completed_chunks": input_completed_chunks[mix_idx],
+                    "input_total_chunks": input_total_chunks[mix_idx],
+                }
+            )
+        return pending_events
 
-    # Full-size batches first — by construction each block has exactly
-    # ``chunk_batch_size`` items, so no padding is needed.
-    for batch_start in range(0, len(full_pool), chunk_batch_size):
-        run_batch(full_pool[batch_start : batch_start + chunk_batch_size])
+    def _effective_cbs() -> int:
+        """
+        The batch size currently in force: the backoff dict's live value when
+        the caller opted in, else the fixed argument.
+
+        :return: Current chunks-per-forward batch size (>= 1).
+        """
+        if oom_backoff_state is not None:
+            return max(1, int(oom_backoff_state["chunk_batch_size"]))
+        return chunk_batch_size
+
+    def _drain(pool: list[tuple[int, int, TensorChunk]]) -> None:
+        """
+        Run ``pool`` in batches, halving on CUDA OOM when the caller opted
+        into backoff. Backoff never applies to compiled models
+        (``fixed_batch_shape`` — the captured shape can't change here; the
+        Separator recaptures instead) and re-raises at batch size 1, where
+        the model genuinely doesn't fit.
+
+        :param pool: ``(mix_idx, offset, chunk)`` tuples to run.
+        """
+        idx = 0
+        while idx < len(pool):
+            batch = pool[idx : idx + _effective_cbs()]
+            try:
+                pending_events = run_batch(batch)
+            except RuntimeError as exc:
+                current = _effective_cbs()
+                if (
+                    oom_backoff_state is None
+                    or fixed_batch_shape
+                    or current <= 1
+                    or not _looks_like_cuda_oom(exc)
+                ):
+                    raise
+                new_cbs = max(1, current // 2)
+                oom_backoff_state["chunk_batch_size"] = new_cbs
+                logger.warning(
+                    "GPU OOM at chunk_batch_size=%d; retrying the failed "
+                    "batch at %d (sticky for the rest of this run).",
+                    current,
+                    new_cbs,
+                )
+                if is_cuda:
+                    torch.cuda.empty_cache()
+                elif device.type == "mps" and hasattr(torch.mps, "empty_cache"):
+                    torch.mps.empty_cache()
+                continue
+            idx += len(batch)
+            # Outside the try: a raising progress callback propagates as the
+            # caller's own error instead of masquerading as a batch OOM.
+            if progress_callback:
+                for payload in pending_events:
+                    progress_callback("chunk_complete", payload)
+
+    # Full-size batches first — blocks were built at the original
+    # ``chunk_batch_size``, so no padding is needed even if backoff later
+    # shrinks the slice size.
+    _drain(full_pool)
 
     # Drain the cross-mix tail pool. The final batch tail-pads if the pool's
     # length isn't a clean multiple of ``chunk_batch_size``.
-    for batch_start in range(0, len(tail_pool), chunk_batch_size):
-        run_batch(tail_pool[batch_start : batch_start + chunk_batch_size])
+    _drain(tail_pool)
 
     if progress_callback:
-        progress_callback("processing_complete", {"total_chunks": total_chunks})
+        progress_callback(
+            "processing_complete",
+            {
+                "total_chunks": total_chunks,
+                "total_inputs": len(mixes),
+                "input_total_chunks": input_total_chunks,
+            },
+        )
 
     results: list[Tensor] = []
     for state in mix_states:

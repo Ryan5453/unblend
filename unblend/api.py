@@ -5,11 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import gc
+import logging
 import os
 import random
 import wave
 from io import BytesIO
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 
 import numpy as np
@@ -24,6 +26,7 @@ from .apply import (
     ModelEnsemble,
     _gpu_accum_budget_bytes,
     _gpu_accum_bytes_needed,
+    _looks_like_cuda_oom,
     _require_cuda_available,
     apply_model,
     apply_model_multi,
@@ -36,6 +39,9 @@ from .exceptions import (
 )
 from .htdemucs import HTDemucs
 from .repo import ModelRepository
+from .roformer import _RoformerBase
+
+logger = logging.getLogger(__name__)
 
 
 class SeparatedSources:
@@ -185,7 +191,7 @@ def default_dtype(device: str) -> torch.dtype | None:
     accumulate in FP32 internally on CUDA, and HTDemucs normalises its inputs,
     so FP16's range is not a hazard here. Older CUDA GPUs without FP16 tensor
     cores stay at FP32. MPS picks FP16 (custom Metal kernels in
-    ``demucs.metal``); CPU stays FP32 (no faster path).
+    ``unblend.metal``); CPU stays FP32 (no faster path).
 
     :param device: ``"cuda"``, ``"mps"``, or ``"cpu"``.
     :return: Dtype to cast model weights to, or ``None`` to stay at FP32.
@@ -201,6 +207,39 @@ def default_dtype(device: str) -> torch.dtype | None:
     if device == "cpu":
         return None
     raise ValidationError(f"Invalid device '{device}'. Must be one of: cpu, cuda, mps")
+
+
+def _validate_chunk_batch_size(value: object) -> None:
+    """
+    Validate a chunk_batch_size value (init param or per-call override).
+
+    The upper bound is a sanity guard against typos like ``10000`` that no
+    real workload needs on these models.
+
+    :param value: Candidate chunk_batch_size.
+    :raises ValidationError: If not a positive int <= 1024 (bools rejected).
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValidationError(
+            f"chunk_batch_size must be a positive integer, got {value}"
+        )
+    if value > 1024:
+        raise ValidationError(f"chunk_batch_size must be <= 1024, got {value}")
+
+
+def _contains_htdemucs(model: "Model | ModelEnsemble") -> bool:
+    """
+    Whether ``model`` is (or contains) an HTDemucs, used to gate the
+    HTDemucs-specific MPS module-replacement pass.
+
+    :param model: A loaded model or ensemble.
+    :return: True for HTDemucs / ensembles with an HTDemucs member.
+    """
+    if isinstance(model, HTDemucs):
+        return True
+    return isinstance(model, ModelEnsemble) and any(
+        isinstance(m, HTDemucs) for m in model.models
+    )
 
 
 class Separator:
@@ -317,24 +356,76 @@ class Separator:
         # model (eager models run tails at their natural size instead).
         model._fixed_batch_shape = True
 
+    @staticmethod
+    def _prefill_roformer_caches(model: _RoformerBase) -> None:
+        """
+        Materialize RoFormer rotary phases before CUDAGraph compilation.
+
+        The two axial sequence lengths are fixed by the checkpoint's training
+        segment: STFT frames for the time axis and band count for the frequency
+        axis. Building these complex64 tables eagerly keeps persistent cache
+        tensors out of the CUDAGraph private pool.
+
+        :param model: RoFormer whose shared rotary caches should be populated.
+        """
+        segment_length = int(round(model.max_allowed_segment * model.samplerate))
+        hop_length = int(model.stft_kwargs["hop_length"])
+        sequence_lengths = (
+            segment_length // hop_length + 1,
+            len(model.band_split.dim_inputs),
+        )
+        device = next(model.parameters()).device
+        seen: set[int] = set()
+        for transformer_pair in model.layers:
+            for axis, transformer in enumerate(transformer_pair):
+                for attention, _feed_forward in transformer.layers:
+                    rotary = attention.rotary_embed
+                    if rotary is None or id(rotary) in seen:
+                        continue
+                    rotary._phases(sequence_lengths[axis], device)
+                    rotary._rotations(sequence_lengths[axis], device)
+                    seen.add(id(rotary))
+
+    @staticmethod
+    def _compile_roformer_transformer_core(model: _RoformerBase) -> None:
+        """
+        Compile the heavy axial transformer trunk of a RoFormer.
+
+        STFT/iSTFT, complex mask reconstruction, and the small per-band heads
+        remain eager. This mirrors HTDemucs's core-only strategy while putting
+        the roughly 90% transformer hot path under Inductor/CUDAGraphs.
+
+        :param model: BS- or Mel-Band RoFormer to compile.
+        """
+        if not hasattr(model, "_uncompiled_run_transformers"):
+            model._uncompiled_run_transformers = model._run_transformers
+        Separator._prefill_roformer_caches(model)
+        model._run_transformers = torch.compile(
+            model._uncompiled_run_transformers, mode="reduce-overhead"
+        )
+        model._fixed_batch_shape = True
+
     def _measure_per_chunk_steady_bytes(self) -> int | None:
         """
-        Run one eager forward at batch=1 and return the peak VRAM delta
-        in bytes. This is the per-chunk steady-state working set, NOT the
+        Warm once, time one eager batch-1 forward, and return its peak VRAM
+        delta in bytes. This is the per-chunk steady-state working set, NOT the
         CUDAGraphs private-pool reservation — the cudagraph factor is
         applied separately.
 
-        Returns ``None`` for non-HTDemucs models / non-CUDA devices, in
-        which case the caller should pick a conservative default.
+        Returns ``None`` for unsupported models / non-CUDA devices, in which
+        case the caller should pick a conservative default.
 
-        :return: Peak per-chunk VRAM delta in bytes, or ``None`` for
-            non-HTDemucs models / non-CUDA devices.
+        :return: Peak per-chunk VRAM delta in bytes, or ``None`` when it cannot
+            be measured.
         """
         if self.device != "cuda":
             return None
+        supported = (HTDemucs, _RoformerBase)
         if isinstance(self.model, ModelEnsemble):
-            ref = next((m for m in self.model.models if isinstance(m, HTDemucs)), None)
-        elif isinstance(self.model, HTDemucs):
+            ref = next(
+                (m for m in self.model.models if isinstance(m, supported)), None
+            )
+        elif isinstance(self.model, supported):
             ref = self.model
         else:
             ref = None
@@ -355,22 +446,31 @@ class Separator:
             cudnn_benchmark_saved = torch.backends.cudnn.benchmark
             torch.backends.cudnn.benchmark = False
             try:
+                dummy = torch.zeros(
+                    1,
+                    ref.audio_channels,
+                    training_length,
+                    device=device_obj,
+                    dtype=torch.float32,
+                )
+                # First pass realizes lazy backend state and model caches; the
+                # second is the steady batch-1 timing used by CLI auto-compile.
                 with torch.inference_mode():
-                    dummy = torch.zeros(
-                        1,
-                        ref.audio_channels,
-                        training_length,
-                        device=device_obj,
-                        dtype=torch.float32,
-                    )
+                    _ = ref(dummy)
+                torch.cuda.synchronize()
+                probe_started = perf_counter()
+                with torch.inference_mode():
                     # Full model forward — covers STFT + core + iSTFT, matching
                     # what a real chunk through ``apply_model`` exercises.
                     _ = ref(dummy)
                 torch.cuda.synchronize()
+                self._eager_probe_seconds = perf_counter() - probe_started
             finally:
                 torch.backends.cudnn.benchmark = cudnn_benchmark_saved
             peak = torch.cuda.max_memory_allocated()
-            return max(1, peak - resident_before)
+            measured = max(1, peak - resident_before)
+            self._per_chunk_steady_bytes = measured
+            return measured
         except Exception:
             return None
 
@@ -392,11 +492,25 @@ class Separator:
         if self.device == "cpu":
             return 1
         if self.device == "mps":
+            # Size from the unified-memory working set Metal recommends:
+            # batch 8 measured ~7.5 GB peak driver memory, batch 4 roughly
+            # half that. Larger batches are worth ~1.5-3% end-to-end;
+            # low-RAM machines keep the conservative 2 to stay out of swap.
+            try:
+                budget = torch.mps.recommended_max_memory()
+            except Exception:
+                return 2
+            if budget >= 20e9:
+                return 8
+            if budget >= 10e9:
+                return 4
             return 2
 
-        per_chunk_steady = self._measure_per_chunk_steady_bytes()
+        per_chunk_steady = getattr(self, "_per_chunk_steady_bytes", None)
         if per_chunk_steady is None:
-            return 4  # fallback for non-HTDemucs / measurement failure
+            per_chunk_steady = self._measure_per_chunk_steady_bytes()
+        if per_chunk_steady is None:
+            return 4  # fallback for unsupported models / measurement failure
 
         try:
             free_bytes, _total = torch.cuda.mem_get_info()
@@ -415,46 +529,69 @@ class Separator:
         # Clamp to the same sanity cap ``separate()`` enforces, so a
         # pathological measurement can't produce a default that separate()
         # would then reject.
-        return max(1, min(1024, int(available // transient_per_chunk)))
+        estimate = max(1, min(1024, int(available // transient_per_chunk)))
+
+        # Compiled RoFormer throughput is flat across nearby batch sizes, but
+        # every CUDAGraph tail must pad to the captured shape. Snapping the
+        # memory-maximized estimate down to a power of two (capped at 8) cuts
+        # common tail waste (V100: SW 6→4, Kim 9→8), measuring 1.50x/1.34x
+        # faster than eager instead of flat/slower at the unsnapped sizes.
+        has_roformer = isinstance(self.model, _RoformerBase) or (
+            isinstance(self.model, ModelEnsemble)
+            and any(isinstance(model, _RoformerBase) for model in self.model.models)
+        )
+        if self._compile_enabled and has_roformer:
+            return min(8, 1 << (estimate.bit_length() - 1))
+        return estimate
 
     def _setup_compile(self) -> None:
         """
-        Apply (or re-apply) torch.compile to every HTDemucs in the model.
+        Apply (or re-apply) the family-specific CUDA compile target.
         """
-        if isinstance(self.model, ModelEnsemble):
-            for sub in self.model.models:
-                if isinstance(sub, HTDemucs):
-                    self._compile_htdemucs_forward_core(sub)
-        elif isinstance(self.model, HTDemucs):
-            self._compile_htdemucs_forward_core(self.model)
+        models = (
+            list(self.model.models)
+            if isinstance(self.model, ModelEnsemble)
+            else [self.model]
+        )
+        for model in models:
+            if isinstance(model, HTDemucs):
+                self._compile_htdemucs_forward_core(model)
+            elif isinstance(model, _RoformerBase):
+                self._compile_roformer_transformer_core(model)
 
     def _teardown_compile_state(self) -> None:
         """
         Reverse ``_setup_compile`` and release CUDAGraphs / Inductor state
         so the next attempt starts clean.
 
-        Restores ``forward_core`` to the saved uncompiled version (so the
-        next ``_setup_compile`` doesn't double-wrap), resets Dynamo, and
+        Restores the family-specific compiled callable (HTDemucs
+        ``forward_core`` or RoFormer ``_run_transformers``) to its eager
+        version so retries do not double-wrap, resets Dynamo, and
         empties the CUDA caching allocator. ``torch._dynamo.reset()``
         drops Inductor's compile-cache references plus the cudagraph tree
         manager state, which is what frees the cudagraph private pool
         once the wrapper is released.
         """
-        if isinstance(self.model, ModelEnsemble):
-            models = [m for m in self.model.models if isinstance(m, HTDemucs)]
-        elif isinstance(self.model, HTDemucs):
-            models = [self.model]
-        else:
-            models = []
-        for m in models:
-            original = getattr(m, "_uncompiled_forward_core", None)
-            if original is not None:
-                m.forward_core = original
-                # Drop the marker too: it means "currently compiled" to
-                # _should_restore_submodel_device, and forward_core is eager
-                # again from here on.
-                del m._uncompiled_forward_core
-            m._fixed_batch_shape = False
+        models = (
+            list(self.model.models)
+            if isinstance(self.model, ModelEnsemble)
+            else [self.model]
+        )
+        for model in models:
+            original_forward = getattr(model, "_uncompiled_forward_core", None)
+            if original_forward is not None and isinstance(model, HTDemucs):
+                model.forward_core = original_forward
+                del model._uncompiled_forward_core
+
+            original_transformers = getattr(
+                model, "_uncompiled_run_transformers", None
+            )
+            if original_transformers is not None and isinstance(
+                model, _RoformerBase
+            ):
+                model._run_transformers = original_transformers
+                del model._uncompiled_run_transformers
+            model._fixed_batch_shape = False
         torch._dynamo.reset()
         gc.collect()
         if self.device == "cuda":
@@ -513,16 +650,7 @@ class Separator:
                 # workspace failures under memory pressure raise plain
                 # RuntimeErrors. Treat those as OOM too; anything else is a
                 # real bug and propagates.
-                message = str(exc).lower()
-                is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or any(
-                    marker in message
-                    for marker in (
-                        "out of memory",
-                        "cudaerrormemoryallocation",
-                        "cublas_status_alloc_failed",
-                    )
-                )
-                if not is_oom:
+                if not _looks_like_cuda_oom(exc):
                     raise
                 last_error = exc
                 self._teardown_compile_state()
@@ -572,11 +700,14 @@ class Separator:
         ``_calibrate_chunk_batch_size`` and we settle on a cbs that leaves
         room to actually serve.
         """
-        # Pick a reference HTDemucs to size the dummy (all sub-models in an
-        # ensemble share architecture and samplerate).
+        # Pick any supported member to size the dummy; ensemble members share
+        # samplerate, channels, and effective segment length.
+        supported = (HTDemucs, _RoformerBase)
         if isinstance(self.model, ModelEnsemble):
-            ref = next((m for m in self.model.models if isinstance(m, HTDemucs)), None)
-        elif isinstance(self.model, HTDemucs):
+            ref = next(
+                (m for m in self.model.models if isinstance(m, supported)), None
+            )
+        elif isinstance(self.model, supported):
             ref = self.model
         else:
             ref = None
@@ -617,6 +748,7 @@ class Separator:
         only_load: str | None = None,
         dtype: torch.dtype | str | None = "auto",
         compile: bool = False,
+        chunk_batch_size: int | None = None,
     ) -> None:
         """
         Initialize a Separator with the specified model and device.
@@ -642,16 +774,25 @@ class Separator:
                      reduced precision (weights are cast at init; CPU is
                      rejected — no faster path in PyTorch), or ``None`` /
                      ``torch.float32`` to force FP32. On MPS, BF16 is supported
-                     but measures ~22% slower than FP16 (BF16
+                     but measures ~27% slower than FP16 (BF16
                      native ops are not well-optimised yet); use it when you
                      want BF16's FP32 exponent range — e.g. to skip the
                      FP16-overflow FP32-fallback cast in MyGroupNorm.
-        :param compile: If True, apply ``torch.compile`` for faster inference after an
-                       initial warmup. Best for API servers or batch processing; adds
-                       significant latency to the first forward pass. CUDA only —
-                       silently ignored on CPU/MPS (no measured win there).
+        :param compile: If True, apply ``torch.compile`` to the architecture's
+                       heavy neural-network core after an automatic warmup.
+                       Best for API servers or batch processing; adds significant
+                       initialization latency. CUDA only — silently ignored on
+                       CPU/MPS (no measured win there).
+        :param chunk_batch_size: Explicit chunks-per-forward batch size,
+                       bypassing auto-detection. Explicit values are respected
+                       exactly: no OOM halving at init or at runtime — if it
+                       doesn't fit, you get the error. With ``compile=True``
+                       the CUDAGraph is captured at this size, which then
+                       cannot be changed per-call. ``None`` (default) sizes
+                       automatically from VRAM, with runtime OOM backoff.
         :raises ValidationError: If device is not valid or only_load stem doesn't exist
-        :raises ModelLoadingError: If model fails to load
+        :raises ModelLoadingError: If model fails to load, or an explicit
+                       ``chunk_batch_size`` OOMs during compile capture
         """
         # Resolve the device at call time (not import time): auto-select the
         # best available backend when the caller didn't specify one.
@@ -690,6 +831,10 @@ class Separator:
                     f"{dtype} inference is not supported on CPU. Use cuda or mps."
                 )
 
+        # Fail fast on a bad explicit batch size — before any model download.
+        if chunk_batch_size is not None:
+            _validate_chunk_batch_size(chunk_batch_size)
+
         self.device = device
         self.dtype = dtype
 
@@ -704,6 +849,15 @@ class Separator:
         if self.model is None:
             raise ModelLoadingError("Failed to load model")
         self.model.eval()
+
+        # Reduced-precision auto-defaults are per-backend, per-device
+        # measurements. RoFormer FP16 is validated over 10 full MUSDB18-HQ
+        # tracks. On CUDA/V100, vocals SDR mean Δ was +0.002 dB for Kim and
+        # -0.000 dB for SW (worst track 0.035 dB) at 2.2-2.4x speed. On an
+        # M2 Max with torch 2.10 and the MPS attention/RMSNorm paths, mean Δ
+        # was +0.00010 dB for both (max |Δ| 0.00065 dB) at 1.06-1.07x speed.
+        # The forward keeps STFT/iSTFT, complex mask math, norm reductions,
+        # and rotary phases in FP32 internally.
 
         # Validate only_load stem exists in the loaded model
         if only_load and only_load not in self.model.sources:
@@ -749,8 +903,14 @@ class Separator:
             # Metal kernels and a wrapped attention module that route around those.
             # The SCALAR_T-templated kernels compile for either ``half`` or
             # ``bfloat`` and dispatch by tensor dtype at call time. No-op for CUDA
-            # (handled by tensor cores) and CPU (no low-precision path).
-            if self.dtype in (torch.float16, torch.bfloat16) and self.device == "mps":
+            # (handled by tensor cores) and CPU (no low-precision path). The
+            # kernels target HTDemucs blocks, so other backends skip the pass
+            # (and its shader compilation) entirely.
+            if (
+                self.dtype in (torch.float16, torch.bfloat16)
+                and self.device == "mps"
+                and _contains_htdemucs(self.model)
+            ):
                 from .metal import apply_metal_optimizations
 
                 if isinstance(self.model, ModelEnsemble):
@@ -766,15 +926,54 @@ class Separator:
             # halving on OOM (see ``_calibrate_chunk_batch_size``); this is what
             # makes the path work on arbitrary GPUs without hardcoded thresholds.
             self._compile_enabled = compile and self.device == "cuda"
+            # The CUDA memory probe also records one eager batch-1 forward for
+            # the CLI's cache-free auto-compile workload estimate.
+            self._eager_probe_seconds: float | None = None
+            self._per_chunk_steady_bytes: int | None = None
             # Records the chunk_batch_size values tried during calibration. Only the
             # CUDA+compile path actually iterates; initialise it here so the
             # attribute always exists (CPU/MPS/compile-disabled return early).
             self._calibration_attempts: list[int] = []
-            initial_cbs = self._initial_chunk_batch_size_estimate()
-            self.chunk_batch_size = self._calibrate_chunk_batch_size(
-                initial_guess=initial_cbs,
-                compile_enabled=self._compile_enabled,
-            )
+            # Provenance gates the OOM machinery: auto-sized runs halve and
+            # retry; explicit sizes are respected exactly and raise.
+            self._chunk_batch_size_auto = chunk_batch_size is None
+            if chunk_batch_size is not None:
+                self.chunk_batch_size = chunk_batch_size
+                if self._compile_enabled:
+                    try:
+                        self._setup_compile()
+                        self._warmup_via_inference()
+                    except RuntimeError as exc:
+                        if not _looks_like_cuda_oom(exc):
+                            raise
+                        self._teardown_compile_state()
+                        raise ModelLoadingError(
+                            f"Explicit chunk_batch_size={chunk_batch_size} does "
+                            f"not fit on this GPU under compile (OOM during "
+                            f"capture). Lower it, or omit it for auto-sizing. "
+                            f"Original error: {exc}"
+                        ) from exc
+            else:
+                initial_cbs = self._initial_chunk_batch_size_estimate()
+                self.chunk_batch_size = self._calibrate_chunk_batch_size(
+                    initial_guess=initial_cbs,
+                    compile_enabled=self._compile_enabled,
+                )
+                per_chunk = getattr(self, "_per_chunk_steady_bytes", None)
+                if per_chunk is not None and self.device == "cuda":
+                    # The budget gates carve this out of free VRAM before
+                    # staging mixes/accumulators, so the eager side of the
+                    # forward (STFT/iSTFT scratch scales with batch size)
+                    # keeps room even when everything else fits. 1.5x margin
+                    # over the measured batch-scaled working set.
+                    reserve = int(1.5 * per_chunk * self.chunk_batch_size)
+                    targets = (
+                        list(self.model.models) + [self.model]
+                        if isinstance(self.model, ModelEnsemble)
+                        else [self.model]
+                    )
+                    for target in targets:
+                        target._forward_reserve_bytes = reserve
         except Exception:
             # Don't leave global cuDNN / matmul precision state flipped if
             # init failed.
@@ -783,6 +982,68 @@ class Separator:
             if prev_matmul_precision is not None:
                 torch.set_float32_matmul_precision(prev_matmul_precision)
             raise
+
+    def enable_compile(self) -> None:
+        """
+        Compile an already-initialized eager CUDA separator in place.
+
+        This supports workload-aware callers such as the CLI: they can inspect
+        the complete job, use the eager timing probe recorded at construction,
+        and pay Inductor/CUDAGraph setup only when it will amortize. Calling it
+        on an already-compiled separator is a no-op.
+
+        :raises ValidationError: If called on CPU/MPS or an unsupported model.
+        :raises ModelLoadingError: If no capture batch fits after OOM retries.
+        """
+        if self._compile_enabled:
+            return
+        if self.device != "cuda":
+            raise ValidationError(
+                "enable_compile() is only supported for CUDA separators."
+            )
+        supported = (HTDemucs, _RoformerBase)
+        is_supported = isinstance(self.model, supported) or (
+            isinstance(self.model, ModelEnsemble)
+            and any(isinstance(model, supported) for model in self.model.models)
+        )
+        if not is_supported:
+            raise ValidationError(
+                "enable_compile() is only supported for HTDemucs and RoFormer models."
+            )
+
+        previous_batch_size = self.chunk_batch_size
+        previous_cudnn_benchmark = torch.backends.cudnn.benchmark
+        self._compile_enabled = True
+        torch.backends.cudnn.benchmark = True
+        try:
+            if getattr(self, "_chunk_batch_size_auto", True):
+                initial_cbs = self._initial_chunk_batch_size_estimate()
+                self.chunk_batch_size = self._calibrate_chunk_batch_size(
+                    initial_guess=initial_cbs,
+                    compile_enabled=True,
+                )
+            else:
+                # Preserve an explicit constructor batch exactly, matching
+                # Separator(..., compile=True, chunk_batch_size=N).
+                self._setup_compile()
+                self._warmup_via_inference()
+        except Exception:
+            self._teardown_compile_state()
+            self._compile_enabled = False
+            self.chunk_batch_size = previous_batch_size
+            torch.backends.cudnn.benchmark = previous_cudnn_benchmark
+            raise
+
+        per_chunk = getattr(self, "_per_chunk_steady_bytes", None)
+        if per_chunk is not None:
+            reserve = int(1.5 * per_chunk * self.chunk_batch_size)
+            targets = (
+                list(self.model.models) + [self.model]
+                if isinstance(self.model, ModelEnsemble)
+                else [self.model]
+            )
+            for target in targets:
+                target._forward_reserve_bytes = reserve
 
     def warmup(self) -> None:
         """
@@ -798,17 +1059,18 @@ class Separator:
         is only one batch shape to warm, so no ``batch_sizes`` argument is
         needed any more.
 
-        :raises ValidationError: If called on CPU/MPS or on a non-HTDemucs model.
+        :raises ValidationError: If called on CPU/MPS or an unsupported model.
         """
         if self.device != "cuda":
             raise ValidationError("warmup() is only supported for CUDA separators.")
-        is_htdemucs_like = isinstance(self.model, HTDemucs) or (
+        supported = (HTDemucs, _RoformerBase)
+        is_supported = isinstance(self.model, supported) or (
             isinstance(self.model, ModelEnsemble)
-            and any(isinstance(m, HTDemucs) for m in self.model.models)
+            and any(isinstance(model, supported) for model in self.model.models)
         )
-        if not is_htdemucs_like:
+        if not is_supported:
             raise ValidationError(
-                "warmup() is only supported for HTDemucs-based models."
+                "warmup() is only supported for HTDemucs and RoFormer models."
             )
         self._warmup_via_inference()
 
@@ -1006,9 +1268,8 @@ class Separator:
         :param seed: Optional random seed for reproducible shift-based inference.
             Note: this seeds the process-global ``random`` and ``torch`` RNGs as
             a side effect, affecting other code in the host process.
-        :param progress_callback: Optional callback for progress updates. Only
-            applies to single-input mode; the batched path doesn't surface
-            per-input progress yet.
+        :param progress_callback: Optional callback for aggregate and per-input
+            progress updates. Supported for both single and list input.
         :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
             fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
             specialised for this stem, skipping the others. The result still
@@ -1019,11 +1280,16 @@ class Separator:
             on a model that can't specialise (single model, or no one-hot
             sub-model) just runs the full model normally.
         :param chunk_batch_size: Chunks processed in parallel. Defaults to
-            ``self.chunk_batch_size`` (auto-detected at init from VRAM on CUDA,
-            2 on MPS, 1 on CPU).
+            ``self.chunk_batch_size`` (auto-detected from memory on CUDA/MPS,
+            1 on CPU).
         :return: ``SeparatedSources`` for a single input, ``list[SeparatedSources]``
             for a list input.
         :raises ValidationError: If any parameter value is invalid.
+        :raises ModelLoadingError: Compiled + auto-sized only: a mid-run OOM
+            triggers a recapture at a smaller batch size, and the recapture
+            itself can exhaust its attempts. The separator is then left eager
+            but functional — it only attempts another capture if a later call
+            OOMs again (never once floored at batch size 1).
         """
         # Validate shifts parameter (bool is an int subclass — reject it)
         if (
@@ -1051,25 +1317,28 @@ class Separator:
                 f"split_overlap must be a float between 0.0 (inclusive) and 1.0 (exclusive), got {split_overlap}"
             )
 
+        per_call_chunk_batch_size = chunk_batch_size is not None
         if chunk_batch_size is None:
             chunk_batch_size = self.chunk_batch_size
+        else:
+            _validate_chunk_batch_size(chunk_batch_size)
+            if self._compile_enabled and chunk_batch_size != self.chunk_batch_size:
+                # A compiled separator's CUDAGraph is captured at one batch
+                # shape; a different per-call value would silently compile a
+                # second graph (another warmup-length stall + private pool).
+                raise ValidationError(
+                    f"This separator is compiled with a fixed "
+                    f"chunk_batch_size={self.chunk_batch_size}; per-call "
+                    f"overrides are not supported under compile. Pass "
+                    f"chunk_batch_size to Separator(...) instead."
+                )
 
-        # Validate chunk_batch_size parameter. The upper bound is a sanity
-        # guard against typos like ``chunk_batch_size=10000`` that would OOM
-        # before the calibration loop has a chance to intervene; real workloads
-        # never need a four-figure batch on these models.
-        if (
-            isinstance(chunk_batch_size, bool)
-            or not isinstance(chunk_batch_size, int)
-            or chunk_batch_size < 1
-        ):
-            raise ValidationError(
-                f"chunk_batch_size must be a positive integer, got {chunk_batch_size}"
-            )
-        if chunk_batch_size > 1024:
-            raise ValidationError(
-                f"chunk_batch_size must be <= 1024, got {chunk_batch_size}"
-            )
+        # Runtime OOM backoff only rescues sizes we picked; explicit sizes
+        # (init or per-call) are respected exactly and raise.
+        allow_oom_backoff = (
+            getattr(self, "_chunk_batch_size_auto", True)
+            and not per_call_chunk_batch_size
+        )
 
         # An unknown use_only_stem is a caller mistake (e.g. a typo) — fail
         # loudly rather than silently running the full model. A *valid* stem on
@@ -1081,47 +1350,136 @@ class Separator:
                 f"Available stems: {', '.join(self.model.sources)}"
             )
 
-        if isinstance(audio, list):
-            if not audio:
-                return []
-            if progress_callback is not None:
-                raise ValidationError(
-                    "progress_callback is not supported for list-input batched separation."
-                )
-
-            return self._separate_batch(
-                audio,
-                shifts=shifts,
-                split_overlap=split_overlap,
-                seed=seed,
-                use_only_stem=use_only_stem,
-                chunk_batch_size=chunk_batch_size,
-            )
-
-        # Validate progress_callback parameter
+        # Validate progress_callback before dispatching to either the single-
+        # or list-input path so both expose the same callback contract.
         if progress_callback is not None and not callable(progress_callback):
             raise ValidationError(
                 f"progress_callback must be callable if provided, got {type(progress_callback)}"
             )
 
-        return self._separate_one(
-            audio,
-            shifts=shifts,
-            split_overlap=split_overlap,
-            seed=seed,
-            progress_callback=progress_callback,
-            use_only_stem=use_only_stem,
-            chunk_batch_size=chunk_batch_size,
-        )
+        if isinstance(audio, list):
+            if not audio:
+                return []
+            batch_results = self._run_with_oom_backoff(
+                lambda cbs, state: self._separate_batch(
+                    audio,
+                    shifts=shifts,
+                    split_overlap=split_overlap,
+                    seed=seed,
+                    progress_callback=progress_callback,
+                    use_only_stem=use_only_stem,
+                    chunk_batch_size=cbs,
+                    oom_backoff_state=state,
+                ),
+                chunk_batch_size=chunk_batch_size,
+                allow=allow_oom_backoff,
+            )
+            self._release_mps_cache()
+            return batch_results
 
-    # (Runtime OOM-retry used to live here. Inputs and accumulators are kept
-    # on the GPU only when they fit a conservative fraction of the VRAM that
-    # is actually free (see ``apply._gpu_accum_budget_bytes``); anything
-    # bigger falls back to the CPU-accumulation path whose GPU usage is
-    # bounded by ``model + cudagraph_pool + active_batch`` regardless of
-    # input length — so an OOM at separate() time would mean the at-init
-    # capture verification was wrong, which we'd rather see as a loud
-    # failure than silently halve and continue.)
+        result = self._run_with_oom_backoff(
+            lambda cbs, state: self._separate_one(
+                audio,
+                shifts=shifts,
+                split_overlap=split_overlap,
+                seed=seed,
+                progress_callback=progress_callback,
+                use_only_stem=use_only_stem,
+                chunk_batch_size=cbs,
+                oom_backoff_state=state,
+            ),
+            chunk_batch_size=chunk_batch_size,
+            allow=allow_oom_backoff,
+        )
+        self._release_mps_cache()
+        return result
+
+    def _release_mps_cache(self) -> None:
+        """
+        Return cached Metal buffers to the OS after a separation.
+
+        The MPS caching allocator retains every distinctly-shaped buffer it
+        has ever allocated. Across many differently-sized tracks the hoard
+        measured 21 -> 35 GB of driver memory on a 32 GB machine (fp32,
+        MUSDB run), paging the whole system and inflating per-track time up
+        to ~20x by mid-run. Releasing per call keeps the footprint flat
+        (~11-16 GB measured on the same run) at negligible reallocation
+        cost.
+        """
+        if self.device == "mps" and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
+    def _run_with_oom_backoff(
+        self,
+        call: "Callable[[int, dict[str, int] | None], Any]",
+        *,
+        chunk_batch_size: int,
+        allow: bool,
+    ) -> Any:
+        """
+        Run one inference dispatch with the auto-size OOM guarantee.
+
+        (An earlier revision deliberately had NO runtime retry, reasoning
+        that the at-init capture verification made a mid-run OOM a loud bug.
+        A V100 incident disproved that: verification passed, then a batched
+        multi-track call's workload-dependent staging plus allocator
+        fragmentation OOMed the eager iSTFT anyway. Auto-sized runs now
+        degrade instead of dying; explicit sizes still fail loudly.)
+
+        Eager models halve *inside* ``apply``'s batch loop (cheap — only the
+        failed batch re-runs); the mutated state dict is read back here so
+        the downgrade sticks for future calls. Compiled models can't change
+        shape mid-run, so on OOM the whole request is retried after a
+        teardown + recapture at half size via the existing calibration loop.
+
+        :param call: Dispatch closure taking ``(chunk_batch_size, state)``.
+        :param chunk_batch_size: Resolved batch size for the first attempt.
+        :param allow: Whether backoff applies (auto-sized, no per-call
+            override); when False, any OOM propagates untouched.
+        :return: The dispatch result.
+        """
+        state = {"chunk_batch_size": chunk_batch_size} if allow else None
+        current = chunk_batch_size
+        attempts = 0
+        while True:
+            try:
+                result = call(current, state)
+            except RuntimeError as exc:
+                if (
+                    not allow
+                    or not self._compile_enabled
+                    or current <= 1
+                    or attempts >= self._CHUNK_BATCH_MAX_ATTEMPTS
+                    or not _looks_like_cuda_oom(exc)
+                ):
+                    raise
+                attempts += 1
+                previous = current
+                self._teardown_compile_state()
+                self.chunk_batch_size = self._calibrate_chunk_batch_size(
+                    initial_guess=max(1, previous // 2),
+                    compile_enabled=True,
+                )
+                current = self.chunk_batch_size
+                if state is not None:
+                    state["chunk_batch_size"] = current
+                logger.warning(
+                    "CUDA OOM mid-run at chunk_batch_size=%d (compiled); "
+                    "recaptured at %d and retrying the request from the "
+                    "start (progress restarts).",
+                    previous,
+                    current,
+                )
+                continue
+            if state is not None and state["chunk_batch_size"] < self.chunk_batch_size:
+                logger.warning(
+                    "chunk_batch_size lowered %d -> %d after CUDA OOM "
+                    "backoff (sticky for this separator).",
+                    self.chunk_batch_size,
+                    state["chunk_batch_size"],
+                )
+                self.chunk_batch_size = state["chunk_batch_size"]
+            return result
 
     def _stage_for_inference(self, wavs: list[Tensor], shifts: int) -> list[Tensor]:
         """
@@ -1165,9 +1523,29 @@ class Separator:
                 needed += channels * (length + 2 * max_shift) * 4
                 needed += n_sources * channels * length * 4
             total_needed += needed
-        if total_needed <= _gpu_accum_budget_bytes(self.device):
+        if total_needed <= _gpu_accum_budget_bytes(
+            self.device, getattr(self.model, "_forward_reserve_bytes", None)
+        ):
             return [w.to(self.device) for w in wavs]
         return wavs
+
+    def _cpu_sources(self, sources_tensor: Tensor) -> dict[str, Tensor]:
+        """
+        Move model output to CPU (a single device→host trip) and split it into
+        the per-stem dict. Used directly by backends trained on raw audio
+        (RoFormer), where there is no track-level normalisation to reverse.
+
+        :param sources_tensor: ``[sources, channels, samples]`` model output.
+        :return: Mapping of stem name to CPU waveform.
+        """
+        if sources_tensor.device.type != "cpu":
+            sources_tensor = sources_tensor.cpu()
+        # Per-stem clone so user mutation (e.g. ``sources["vocals"][:] = 0``)
+        # doesn't alias across stems via the shared underlying buffer.
+        return {
+            name: sources_tensor[idx].clone()
+            for idx, name in enumerate(self.model.sources)
+        }
 
     def _unnormalized_cpu_sources(
         self, sources_tensor: Tensor, mean: Tensor, std: Tensor
@@ -1184,14 +1562,7 @@ class Separator:
         :param std: Normalisation std recorded by ``_normalize``.
         :return: Mapping of stem name to CPU waveform.
         """
-        unnormed = sources_tensor * (1e-5 + std) + mean
-        if unnormed.device.type != "cpu":
-            unnormed = unnormed.cpu()
-        # Per-stem clone so user mutation (e.g. ``sources["vocals"][:] = 0``)
-        # doesn't alias across stems via the shared underlying buffer.
-        return {
-            name: unnormed[idx].clone() for idx, name in enumerate(self.model.sources)
-        }
+        return self._cpu_sources(sources_tensor * (1e-5 + std) + mean)
 
     @staticmethod
     def _normalize(wav: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -1234,6 +1605,7 @@ class Separator:
         progress_callback: Callable[[str, dict[str, Any]], None] | None,
         use_only_stem: str | None,
         chunk_batch_size: int,
+        oom_backoff_state: dict[str, int] | None = None,
     ) -> SeparatedSources:
         """
         Single-input separation. See ``separate`` for parameter semantics.
@@ -1248,6 +1620,8 @@ class Separator:
             sub-model in a ``ModelEnsemble``; the result still contains all
             sources.
         :param chunk_batch_size: Number of chunks processed in parallel.
+        :param oom_backoff_state: Mutable backoff dict from
+            ``_run_with_oom_backoff`` (``None`` disables runtime halving).
         :return: A ``SeparatedSources`` for the input.
         """
         wav = self._to_tensor(audio)
@@ -1255,7 +1629,12 @@ class Separator:
 
         wav = self._stage_for_inference([wav], shifts)[0]
         self._seed_rngs(seed)
-        wav, mean, std = self._normalize(wav)
+        # RoFormer checkpoints train on raw audio; Demucs expects the
+        # track-level mean/std normalisation. Gate both directions on the
+        # model so each backend gets exactly what it was trained for.
+        external_norm = getattr(self.model, "external_normalization", True)
+        if external_norm:
+            wav, mean, std = self._normalize(wav)
 
         sources_tensor = apply_model(
             self.model,
@@ -1266,9 +1645,13 @@ class Separator:
             progress_callback=progress_callback,
             use_only_stem=use_only_stem,
             chunk_batch_size=chunk_batch_size,
+            oom_backoff_state=oom_backoff_state,
         )[0]
 
-        sources = self._unnormalized_cpu_sources(sources_tensor, mean, std)
+        if external_norm:
+            sources = self._unnormalized_cpu_sources(sources_tensor, mean, std)
+        else:
+            sources = self._cpu_sources(sources_tensor)
         return SeparatedSources(sources, self.sample_rate, original=original)
 
     def _separate_batch(
@@ -1278,8 +1661,10 @@ class Separator:
         shifts: int,
         split_overlap: float,
         seed: int | None,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None,
         use_only_stem: str | None,
         chunk_batch_size: int,
+        oom_backoff_state: dict[str, int] | None = None,
     ) -> "list[SeparatedSources]":
         """
         Batched separation: pools tail chunks across inputs to keep every
@@ -1292,10 +1677,13 @@ class Separator:
         :param shifts: Number of random shifts for equivariant stabilization.
         :param split_overlap: Overlap between segments (0.0 to 1.0).
         :param seed: Optional random seed for reproducible shift-based inference.
+        :param progress_callback: Optional aggregate/per-input progress callback.
         :param use_only_stem: Optional stem name to run only its specialised
             sub-model in a ``ModelEnsemble``; each result still contains all
             sources.
         :param chunk_batch_size: Number of chunks processed in parallel.
+        :param oom_backoff_state: Mutable backoff dict from
+            ``_run_with_oom_backoff`` (``None`` disables runtime halving).
         :return: A ``list[SeparatedSources]`` in the same order as ``audios``.
         """
         wavs = [self._to_tensor(a) for a in audios]
@@ -1304,29 +1692,40 @@ class Separator:
         wavs = self._stage_for_inference(wavs, shifts)
 
         # Per-input normalisation stats — applied locally and reversed after
-        # the forward, via the same helper ``_separate_one`` uses.
-        normed: list[Tensor] = []
-        stats: list[tuple[Tensor, Tensor]] = []
+        # the forward, via the same helper ``_separate_one`` uses. Skipped for
+        # backends trained on raw audio (RoFormer), matching ``_separate_one``.
+        external_norm = getattr(self.model, "external_normalization", True)
+        staged: list[Tensor] = []
+        stats: list[tuple[Tensor, Tensor] | None] = []
         for w in wavs:
-            normed_w, mean, std = self._normalize(w)
-            normed.append(normed_w[None])
-            stats.append((mean, std))
+            if external_norm:
+                normed_w, mean, std = self._normalize(w)
+                staged.append(normed_w[None])
+                stats.append((mean, std))
+            else:
+                staged.append(w[None])
+                stats.append(None)
 
         self._seed_rngs(seed)
 
         outputs = apply_model_multi(
             self.model,
-            normed,
+            staged,
             device=self.device,
             shifts=shifts,
             overlap=split_overlap,
+            progress_callback=progress_callback,
             use_only_stem=use_only_stem,
             chunk_batch_size=chunk_batch_size,
+            oom_backoff_state=oom_backoff_state,
         )
 
         results: list[SeparatedSources] = []
-        for out, (mean, std), original in zip(outputs, stats, originals):
-            sources = self._unnormalized_cpu_sources(out[0], mean, std)
+        for out, stat, original in zip(outputs, stats, originals):
+            if stat is not None:
+                sources = self._unnormalized_cpu_sources(out[0], stat[0], stat[1])
+            else:
+                sources = self._cpu_sources(out[0])
             results.append(
                 SeparatedSources(sources, self.sample_rate, original=original)
             )
@@ -1374,7 +1773,7 @@ def select_model(
 
 def get_version() -> str:
     """
-    Get the version of Demucs you have installed.
+    Get the version of unblend you have installed.
 
     :return: Version string
     """

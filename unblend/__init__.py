@@ -16,7 +16,7 @@ warnings.filterwarnings(
 )
 
 try:
-    __version__ = version("demucs-next")
+    __version__ = version("unblend")
 except PackageNotFoundError:
     # Running from a source tree without an installed distribution.
     __version__ = "0.0.0+unknown"
@@ -34,6 +34,7 @@ from .exceptions import (
     DemucsError,
     LoadAudioError,
     ModelLoadingError,
+    UnblendError,
     ValidationError,
 )
 from .repo import ModelRepository
@@ -51,6 +52,7 @@ __all__ = [
     "default_dtype",
     "get_version",
     "select_model",
+    "UnblendError",
     "DemucsError",
     "LoadAudioError",
     "ModelLoadingError",

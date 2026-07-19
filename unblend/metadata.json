@@ -1,0 +1,173 @@
+{
+  "models": {
+    "htdemucs": {
+      "backend": "demucs",
+      "license": "unlicensed",
+      "license_note": "Code is MIT (Meta); the released weights carry no license grant (trained on MUSDB18-HQ + 800 proprietary songs).",
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "models": [
+        {
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs-0.th",
+          "checksum": "3e28d2b1",
+          "sha256": "3e28d2b17b930a176c8e10c0d0598c01a87424f5220344c25c9f4bb6c003d40a"
+        }
+      ]
+    },
+    "htdemucs_ft": {
+      "backend": "demucs",
+      "license": "unlicensed",
+      "license_note": "Code is MIT (Meta); the released weights carry no license grant (trained on MUSDB18-HQ + 800 proprietary songs).",
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "models": [
+        {
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-0.th",
+          "checksum": "c40a6577",
+          "sha256": "c40a65774abc835ea93aa619a08ac7008e127535d2cd23dbe1a2a4dcd5c86e2f"
+        },
+        {
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-1.th",
+          "checksum": "db977ae6",
+          "sha256": "db977ae63b142c23e78a15bb5aa4d065a0bb6305804d7dbb6ba82f78e09514fa"
+        },
+        {
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-2.th",
+          "checksum": "4b123cec",
+          "sha256": "4b123cec9ea944b13a0526bddf707cdf123f1c1d600323072712dd526976ab10"
+        },
+        {
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-3.th",
+          "checksum": "29903873",
+          "sha256": "299038731f0a6107cd1cd16e2dcf631874fc660e926878a1036ec328a424e591"
+        }
+      ],
+      "weights": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    "htdemucs_6s": {
+      "backend": "demucs",
+      "license": "unlicensed",
+      "license_note": "Code is MIT (Meta); the released weights carry no license grant (trained on MUSDB18-HQ + 800 proprietary songs).",
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals",
+        "guitar",
+        "piano"
+      ],
+      "models": [
+        {
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_6s-0.th",
+          "checksum": "1aa7b223",
+          "sha256": "1aa7b2234a1c2ba8a8c3a6e7caaa3b8f6741a98d567296aea64e7d0ae844786a"
+        }
+      ]
+    },
+    "bs_roformer_sw": {
+      "backend": "roformer",
+      "architecture": "bs_roformer",
+      "license": "CC-BY-NC-SA-4.0",
+      "license_note": "Non-commercial. BS-RoFormer-SW by jarredou; license per OpenMIRLab release metadata.",
+      "provenance": "BS-RoFormer-SW (jarredou); checkpoint mirror by enerjazzer",
+      "sources": [
+        "bass",
+        "drums",
+        "other",
+        "vocals",
+        "guitar",
+        "piano"
+      ],
+      "samplerate": 44100,
+      "segment_samples": 588800,
+      "config": {
+        "dim": 256,
+        "depth": 12,
+        "stereo": true,
+        "num_stems": 6,
+        "time_transformer_depth": 1,
+        "freq_transformer_depth": 1,
+        "dim_head": 64,
+        "heads": 8,
+        "attn_dropout": 0.1,
+        "ff_dropout": 0.1,
+        "stft_n_fft": 2048,
+        "stft_hop_length": 512,
+        "stft_win_length": 2048,
+        "mask_estimator_depth": 2,
+        "mlp_expansion_factor": 4
+      },
+      "checkpoint": {
+        "url": "https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/resolve/main/BS-Rofo-SW-Fixed.ckpt",
+        "sha256": "24e7d35ee9c64415673d3fd33e06a67cac2c103c5df6267ba1576459c775916e"
+      }
+    },
+    "melband_roformer_kim": {
+      "backend": "roformer",
+      "architecture": "mel_band_roformer",
+      "license": "CC-BY-NC-SA-4.0",
+      "license_note": "Non-commercial. Mel-Band Roformer vocals by Kimberley Jensen; upstream repo has no license file, label per OpenMIRLab release metadata.",
+      "provenance": "Mel-Band Roformer vocals (Kimberley Jensen); checkpoint on HF KimberleyJSN/melbandroformer",
+      "sources": [
+        "vocals",
+        "other"
+      ],
+      "samplerate": 44100,
+      "segment_samples": 352800,
+      "config": {
+        "dim": 384,
+        "depth": 6,
+        "stereo": true,
+        "num_stems": 1,
+        "time_transformer_depth": 1,
+        "freq_transformer_depth": 1,
+        "num_bands": 60,
+        "dim_head": 64,
+        "heads": 8,
+        "sample_rate": 44100,
+        "stft_n_fft": 2048,
+        "stft_hop_length": 441,
+        "stft_win_length": 2048,
+        "mask_estimator_depth": 2,
+        "mlp_expansion_factor": 4
+      },
+      "checkpoint": {
+        "url": "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+        "sha256": "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e"
+      }
+    }
+  }
+}

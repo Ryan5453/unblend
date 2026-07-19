@@ -5,15 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 
-class DemucsError(Exception):
+class UnblendError(Exception):
     """
-    Base exception class for all Demucs-specific errors.
+    Base exception class for all unblend-specific errors.
     """
 
     pass
 
 
-class LoadAudioError(DemucsError):
+class LoadAudioError(UnblendError):
     """
     Exception raised when audio loading fails.
     """
@@ -21,7 +21,7 @@ class LoadAudioError(DemucsError):
     pass
 
 
-class ModelLoadingError(DemucsError):
+class ModelLoadingError(UnblendError):
     """
     Exception raised when model loading fails.
     """
@@ -29,7 +29,7 @@ class ModelLoadingError(DemucsError):
     pass
 
 
-class ValidationError(DemucsError, ValueError):
+class ValidationError(UnblendError, ValueError):
     """
     Exception raised when a parameter value is invalid.
 
@@ -37,3 +37,8 @@ class ValidationError(DemucsError, ValueError):
     """
 
     pass
+
+
+# Backwards-compatible alias for the pre-rename name (when the package was
+# ``demucs``). Kept so existing callers that catch ``DemucsError`` keep working.
+DemucsError = UnblendError

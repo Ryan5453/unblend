@@ -12,9 +12,10 @@ interface RunInferenceMessage {
     requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
-    audio: Float32Array;
+    /** Absent for models without an audio input (RoFormer). */
+    audio?: Float32Array;
     specShape: number[];
-    audioShape: number[];
+    audioShape?: number[];
 }
 
 interface UnloadMessage {
@@ -58,9 +59,10 @@ type OutgoingMessage =
 export interface InferenceResult {
     outSpecReal: Float32Array;
     outSpecImag: Float32Array;
-    outWave: Float32Array;
+    /** Present only for models with a time-domain branch (HTDemucs). */
+    outWave?: Float32Array;
     outSpecShape: number[];
-    outWaveShape: number[];
+    outWaveShape?: number[];
 }
 
 export class OnnxClient {
@@ -120,16 +122,17 @@ export class OnnxClient {
     async runInference(
         specReal: Float32Array,
         specImag: Float32Array,
-        audio: Float32Array,
         specShape: number[],
-        audioShape: number[]
+        audio?: Float32Array,
+        audioShape?: number[]
     ): Promise<InferenceResult> {
         // Transfer the spectrogram buffers instead of structured-cloning them
         // every segment (they're multi-MB). The caller (pipeline) never reads
         // specReal/specImag again after handing them off, so detaching them
         // here is safe. ``audio`` is deliberately NOT transferred: it's one of
         // the pipeline's two reused double-buffers, and transferring it would
-        // detach the buffer the next segment writes into.
+        // detach the buffer the next segment writes into. RoFormer models take
+        // no audio input; the worker feeds only the spectrogram pair.
         const response = (await this.send({
             type: 'run',
             specReal,
@@ -146,9 +149,9 @@ export class OnnxClient {
         return {
             outSpecReal: response.outSpecReal!,
             outSpecImag: response.outSpecImag!,
-            outWave: response.outWave!,
+            outWave: response.outWave,
             outSpecShape: response.outSpecShape!,
-            outWaveShape: response.outWaveShape!,
+            outWaveShape: response.outWaveShape,
         };
     }
 

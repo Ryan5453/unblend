@@ -1,17 +1,32 @@
 /**
  * Web Worker for STFT computation. Lives in its own worker so it overlaps with
  * the ONNX and iSTFT workers rather than blocking the main thread.
+ *
+ * The client sends one 'configure' message (model DSP geometry) before the
+ * first 'process'; unconfigured workers fall back to the HTDemucs defaults.
  */
 
-import { computeSTFT, createSTFTBuffers, type STFTBuffers } from '../audio-processor.js';
+import { createDSP, type DSP } from '../audio-processor.js';
+import {
+    NFFT, HOP_LENGTH, SEGMENT_SAMPLES,
+    type DSPConfig,
+} from '../constants.js';
 
-let stftBuffers: STFTBuffers | null = null;
+let dsp: DSP | null = null;
 
-interface STFTMessage {
+interface ConfigureMessage {
+    type: 'configure';
+    requestId: number;
+    config: DSPConfig;
+}
+
+interface ProcessMessage {
     type: 'process';
     requestId: number;
     segmentInterleaved: Float32Array;
 }
+
+type STFTMessage = ConfigureMessage | ProcessMessage;
 
 interface STFTResponse {
     type: 'result';
@@ -23,6 +38,12 @@ interface STFTResponse {
     numFrames: number;
 }
 
+interface ConfigureResponse {
+    type: 'result';
+    requestId: number;
+    success: true;
+}
+
 interface STFTErrorResponse {
     type: 'result';
     requestId: number;
@@ -30,14 +51,47 @@ interface STFTErrorResponse {
     error: string;
 }
 
+function defaultDSP(): DSP {
+    return createDSP({
+        family: 'htdemucs',
+        nfft: NFFT,
+        hopLength: HOP_LENGTH,
+        segmentSamples: SEGMENT_SAMPLES,
+    });
+}
+
 self.onmessage = (event: MessageEvent<STFTMessage>) => {
-    const { requestId, segmentInterleaved } = event.data;
+    const msg = event.data;
+
+    if (msg.type === 'configure') {
+        try {
+            dsp = createDSP(msg.config);
+            const response: ConfigureResponse = {
+                type: 'result',
+                requestId: msg.requestId,
+                success: true,
+            };
+            self.postMessage(response);
+        } catch (error) {
+            console.error('[stft-worker] configure failed:', error);
+            const response: STFTErrorResponse = {
+                type: 'result',
+                requestId: msg.requestId,
+                success: false,
+                error: (error as Error).message,
+            };
+            self.postMessage(response);
+        }
+        return;
+    }
+
+    const { requestId, segmentInterleaved } = msg;
     try {
-        if (!stftBuffers) {
-            stftBuffers = createSTFTBuffers();
+        if (!dsp) {
+            dsp = defaultDSP();
         }
 
-        const stft = computeSTFT(segmentInterleaved, stftBuffers);
+        const stft = dsp.computeSTFT(segmentInterleaved);
 
         // Copy results since computeSTFT returns references to shared buffers
         const real = new Float32Array(stft.real);

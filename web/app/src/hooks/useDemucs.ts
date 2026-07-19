@@ -3,6 +3,7 @@ import type { DemucsState } from '../types';
 import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'demucs-next';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
+import { peaksFromInterleaved } from '../utils/peaks';
 import { ORT_WASM_PATHS } from '../onnx-config';
 
 const initialState: DemucsState = {
@@ -30,8 +31,12 @@ export function useDemucs() {
     // the UI is actually showing.
     const audioBufferRef = useRef<AudioBuffer | null>(null);
 
+    // Terminal-style log lines surfaced to the processing view.
+    const [logs, setLogs] = useState<string[]>([]);
     // Store pre-created blob URLs
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
+    // Precomputed waveform peaks per stem (0..1), for the studio lanes.
+    const [stemPeaks, setStemPeaks] = useState<Record<string, number[]>>({});
     // Store artwork URL (album art from audio file)
     const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
     // Mirror the latest object URLs into refs so the unmount cleanup can
@@ -50,7 +55,13 @@ export function useDemucs() {
         } else {
             console.log(`[demucs] ${message}`);
         }
+        setLogs(prev => {
+            const next = [...prev, message];
+            return next.length > 200 ? next.slice(next.length - 200) : next;
+        });
     }, []);
+
+    const clearLogs = useCallback(() => setLogs([]), []);
 
     const setStatus = useCallback((status: string) => {
         setState(prev => ({ ...prev, status }));
@@ -128,14 +139,14 @@ export function useDemucs() {
         setAudioError(null);
     }, []);
 
-    const loadAudio = useCallback(async (file: File) => {
+    const loadAudio = useCallback(async (file: File): Promise<boolean> => {
         // Swapping tracks mid-separation would publish the old track's stems
         // under the new track's metadata when the run finishes.
         if (separateInFlightRef.current) {
             const message = 'Cannot load a new track while separation is in progress';
             addLog(message, 'error');
             setAudioError(message);
-            return;
+            return false;
         }
         // Two racing decodes would interleave their state writes (and leak
         // the loser's artwork URL).
@@ -143,15 +154,17 @@ export function useDemucs() {
             const message = 'A track is already loading';
             addLog(message, 'error');
             setAudioError(message);
-            return;
+            return false;
         }
         loadAudioInFlightRef.current = true;
+        setLogs([]);
         try {
             // Revoke object URLs from the previous track before it is replaced.
             setStemUrls(prev => {
                 Object.values(prev).forEach(url => URL.revokeObjectURL(url));
                 return {};
             });
+            setStemPeaks({});
             setArtworkUrl(prev => {
                 if (prev) URL.revokeObjectURL(prev);
                 return null;
@@ -198,10 +211,12 @@ export function useDemucs() {
                 audioBuffer,
                 audioFile: file,
             }));
+            return true;
         } catch (error) {
             const errorMessage = (error as Error).message;
             addLog(`Failed to load audio: ${errorMessage}`, 'error');
             setAudioError(errorMessage);
+            return false;
         } finally {
             loadAudioInFlightRef.current = false;
         }
@@ -264,13 +279,16 @@ export function useDemucs() {
             setProgress(98);
 
             const urls: Record<string, string> = {};
+            const peaks: Record<string, number[]> = {};
 
             for (const [source, samples] of Object.entries(result.stems)) {
                 const blob = createWavBlob(samples, 2, SAMPLE_RATE);
                 urls[source] = URL.createObjectURL(blob);
+                peaks[source] = peaksFromInterleaved(samples, 2);
             }
 
             setStemUrls(urls);
+            setStemPeaks(peaks);
 
             setStatus('Complete!');
             setProgress(100);
@@ -313,7 +331,9 @@ export function useDemucs() {
 
     return {
         ...state,
+        logs,
         stemUrls,
+        stemPeaks,
         artworkUrl,
         trackTitle,
         trackArtist,
@@ -321,6 +341,7 @@ export function useDemucs() {
         loadModel,
         loadAudio,
         clearAudioError,
+        clearLogs,
         separateAudio,
     };
 }

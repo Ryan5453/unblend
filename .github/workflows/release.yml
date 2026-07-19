@@ -35,7 +35,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     # Trusted publishing (OIDC): register this repo + workflow + environment as
-    # a trusted publisher for demucs-next on pypi.org; no token needed.
+    # a trusted publisher for unblend on pypi.org; no token needed.
     environment: release
     permissions:
       id-token: write
@@ -50,9 +50,9 @@ jobs:
       - name: Verify wheel contents
         run: |
           listing=$(unzip -l dist/*.whl)
-          echo "$listing" | grep -q "demucs/metadata.json"
+          echo "$listing" | grep -q "unblend/metadata.json"
           echo "$listing" | grep -qi "licenses/LICENSE"
-          for kernel in demucs/metal/*.metal; do
+          for kernel in unblend/metal/*.metal; do
             echo "$listing" | grep -q "$kernel"
           done
       - name: Publish to PyPI

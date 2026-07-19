@@ -1,7 +1,10 @@
+import type { DSPConfig } from './constants.js';
+
 interface ISTFTRequest {
     specReal: Float32Array;
     specImag: Float32Array;
-    wave: Float32Array;
+    /** Absent for models without a time-domain branch (RoFormer). */
+    wave?: Float32Array;
     numSources: number;
     numChannels: number;
     numBins: number;
@@ -60,6 +63,21 @@ export class ISTFTClient {
         };
     }
 
+    /**
+     * Install the model's DSP geometry in the worker. Must resolve before the
+     * first process() call; unconfigured workers assume HTDemucs defaults.
+     */
+    configure(config: DSPConfig): Promise<void> {
+        this.failPending('Superseded by an iSTFT configure request');
+        const requestId = ++this.requestCounter;
+        this.pendingId = requestId;
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = () => resolve();
+            this.pendingReject = reject;
+            this.worker.postMessage({ type: 'configure', requestId, config });
+        });
+    }
+
     process(request: ISTFTRequest): Promise<ISTFTResult> {
         // Single in-flight request by contract (see OnnxClient.send): the
         // pipeline awaits each result before the next call, so this clears
@@ -72,14 +90,14 @@ export class ISTFTClient {
             this.pendingReject = reject;
             // Transfer the multi-MB spec/wave buffers instead of cloning them;
             // the caller hands over fresh copies it never reads again.
-            this.worker.postMessage(
-                { type: 'process', requestId, ...request },
-                [
-                    request.specReal.buffer,
-                    request.specImag.buffer,
-                    request.wave.buffer,
-                ] as unknown as Transferable[]
-            );
+            const transfer: Transferable[] = [
+                request.specReal.buffer,
+                request.specImag.buffer,
+            ];
+            if (request.wave) {
+                transfer.push(request.wave.buffer);
+            }
+            this.worker.postMessage({ type: 'process', requestId, ...request }, transfer);
         });
     }
 

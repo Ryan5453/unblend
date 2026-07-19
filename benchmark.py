@@ -22,8 +22,8 @@ from typing import Any
 import torch
 import typer
 
-from demucs.api import Separator, default_device
-from demucs.cli.models import ensure_model_available
+from unblend.api import Separator, default_device
+from unblend.cli.models import ensure_model_available
 
 REFERENCE_STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
 DEFAULT_MODELS = ["htdemucs", "htdemucs_ft"]
@@ -48,7 +48,7 @@ UPSTREAM_REPO = "https://github.com/adefossez/demucs.git"
 # Communicates with the parent via NDJSON on stdout: one JSON object per line.
 # Anything non-JSON on stdout is treated as upstream's own logging and surfaced
 # verbatim. The worker only depends on torch/torchaudio + upstream demucs and
-# must NOT import anything from the demucs-next repo (different interpreter).
+# must NOT import anything from the unblend repo (different interpreter).
 _UPSTREAM_WORKER_TEMPLATE = r'''
 from __future__ import annotations
 import argparse, json, math, sys, time, traceback
@@ -85,7 +85,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        from demucs.api import Separator
+        from unblend.api import Separator
     except Exception as exc:
         _emit({"event": "init_error", "error_type": type(exc).__name__,
                "error_message": "failed to import upstream demucs: " + str(exc)})
@@ -219,7 +219,7 @@ def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
     Compute SDR (in dB) for one estimated stem against its reference.
 
     This is the single SDR implementation for the whole benchmark: it scores
-    demucs-next in-process, and ``_build_upstream_worker_source`` injects its
+    unblend in-process, and ``_build_upstream_worker_source`` injects its
     source into the isolated upstream subprocess so both sides score identically.
 
     :param estimate: Separator output for the stem.
@@ -410,7 +410,7 @@ def _ensure_upstream_venv(version: str, python_version: str) -> Path:
         # distribution for torchaudio<2.2"). 2.1.2 is the newest pair that
         # satisfies upstream's cap and ships cp311 CUDA wheels. This is
         # upstream's own dependency reality — the comparison is "upstream as it
-        # ships" vs "demucs-next as it ships".
+        # ships" vs "unblend as it ships".
         "torch==2.1.2",
         "torchaudio==2.1.2",
         # torch 2.1.x was built against numpy 1 — pin to avoid "Numpy is not
@@ -512,7 +512,7 @@ def _run_upstream_config(
     tracks_json_path.write_text(json.dumps(tracks_payload))
 
     cmd = [
-        # ``-P`` keeps cwd (the demucs-next repo) off ``sys.path`` so the
+        # ``-P`` keeps cwd (the unblend repo) off ``sys.path`` so the
         # subprocess imports the upstream ``demucs`` from the venv rather than
         # our local checkout. ``-`` reads the worker source from stdin.
         str(venv_python),
@@ -549,8 +549,25 @@ def _run_upstream_config(
         text=True,
         bufsize=1,
     )
+    # Drain stderr concurrently: the worker can emit large volumes there
+    # (tqdm download bars, torch warnings), and a full pipe buffer would
+    # block the worker's writes — deadlocking the stdout loop below.
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        for err_line in proc.stderr:
+            stderr_chunks.append(err_line)
+            del stderr_chunks[:-50]
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
     rss_sampler = _PeakRssSampler(proc.pid)
     rss_sampler.start()
+    vram_sampler = None
+    if device == "cuda":
+        vram_sampler = _PeakVramSampler(proc.pid)
+        vram_sampler.start()
     try:
         # Inside the try: a worker that dies before reading stdin raises
         # BrokenPipeError here, and the finally must still stop the sampler.
@@ -632,11 +649,12 @@ def _run_upstream_config(
             proc.kill()
             proc.wait()
         rss_sampler.stop()
+        if vram_sampler:
+            vram_sampler.stop()
         tracks_json_path.unlink(missing_ok=True)
 
-    stderr_tail = ""
-    if proc.stderr is not None:
-        stderr_tail = proc.stderr.read() or ""
+    stderr_thread.join(timeout=5.0)
+    stderr_tail = "".join(stderr_chunks)
 
     # Tracks the worker never reported (e.g., if it died mid-loop).
     for track in tracks:
@@ -664,6 +682,7 @@ def _run_upstream_config(
         "error_message": init_error_message
         or (stderr_tail[-300:] if proc.returncode != 0 else ""),
         "peak_rss_mb": rss_sampler.stop(),
+        "peak_vram_smi_mb": vram_sampler.stop() if vram_sampler else None,
     }
     return detail_rows, summary_extras
 
@@ -796,6 +815,11 @@ def _peak_memory_bytes(device: str) -> int | None:
     """
     Best-effort peak GPU memory in bytes for the run.
 
+    CUDA note: ``max_memory_allocated`` cannot see CUDAGraph private pools,
+    so compiled configs under-report badly (a compiled htdemucs_ft measured
+    7.6 GB here vs 27.7 GB device-truth on a V100); ``peak_vram_smi_mb``
+    from ``_PeakVramSampler`` is the honest number.
+
     :param device: Device string to query.
     :return: Peak allocation in bytes, or ``None`` if the backend does not
         expose a peak-memory API.
@@ -893,6 +917,45 @@ class _PeakRssSampler:
             self._peak_kb = max(self._peak_kb, self._sample_kb())
             self._stop_event.wait(self.interval_sec)
         self._peak_kb = max(self._peak_kb, self._sample_kb())
+
+
+class _PeakVramSampler(_PeakRssSampler):
+    """
+    Samples a process's device-level GPU memory via
+    ``nvidia-smi --query-compute-apps``, tracking the peak.
+
+    This is NVML ground truth — caching-allocator segments, CUDAGraph private
+    pools, CUDA context, and cuDNN workspaces all included — unlike
+    ``torch.cuda.max_memory_allocated``, which cannot see CUDAGraph private
+    pools and badly under-reports compiled configs. Returns None (via
+    ``stop()``) on hosts without ``nvidia-smi``.
+    """
+
+    def _sample_kb(self) -> int:
+        """
+        Read the process's current GPU memory across all devices.
+
+        :return: GPU memory in KB (MiB * 1024), or 0 if unavailable.
+        """
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            total_mib = 0
+            for line in out.stdout.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 2 and parts[0] == str(self.pid):
+                    total_mib += int(parts[1])
+            return total_mib * 1024
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return 0
 
 
 @app.command()
@@ -1239,6 +1302,7 @@ def main(
                         else float("nan")
                     ),
                     "peak_vram_mb": None,
+                    "peak_vram_smi_mb": upstream_extras.get("peak_vram_smi_mb"),
                     "peak_rss_mb": upstream_extras.get("peak_rss_mb"),
                     **{
                         f"{stem}_mean_sdr": value
@@ -1270,15 +1334,25 @@ def main(
         # config's peak.
         rss_sampler = _PeakRssSampler(os.getpid())
         rss_sampler.start()
+        # NVML-truth GPU memory (sees CUDAGraph pools that the torch
+        # allocator metric misses); None off-CUDA.
+        vram_sampler = None
+        if device == "cuda":
+            vram_sampler = _PeakVramSampler(os.getpid())
+            vram_sampler.start()
 
         init_started_at = perf_counter()
         try:
+            # chunk_batch_size goes to init, not per-call: compiled
+            # separators capture the batch size at init and reject per-call
+            # overrides.
             separator = Separator(
                 model=config.model,
                 device=device,
                 only_load=use_only_stem,
                 dtype=_precision_to_dtype(config.precision),
                 compile=config.compile,
+                chunk_batch_size=chunk_batch_size,
             )
         except Exception as error:
             summary_rows.append(
@@ -1298,6 +1372,7 @@ def main(
                     # Init-time RSS matters most when init fails from memory
                     # pressure.
                     "peak_rss_mb": rss_sampler.stop(),
+                    "peak_vram_smi_mb": (vram_sampler.stop() if vram_sampler else None),
                 }
             )
             typer.echo(f"Failed to initialize {config.config_id}: {error}")
@@ -1350,7 +1425,6 @@ def main(
                         split_overlap=config.split_overlap,
                         seed=seed,
                         use_only_stem=use_only_stem,
-                        chunk_batch_size=chunk_batch_size,
                     )
                     sep_wall += perf_counter() - grp_t0  # times separation only
                 except Exception as error:
@@ -1394,9 +1468,9 @@ def main(
                         ),
                         "track_index": bi,
                         "track_name": track.name,
-                        "track_seed": None
-                        if seed is None
-                        else _build_track_seed(seed, track.name),
+                        # Batched calls run on the base seed once per group,
+                        # not per-track derived seeds — record what was used.
+                        "track_seed": seed,
                         # Per-track wall isn't individually observable inside a
                         # batched call; attributed evenly below once the total
                         # is known. ``dataset_wall_sec`` is the authoritative
@@ -1458,7 +1532,6 @@ def main(
                     split_overlap=config.split_overlap,
                     seed=detail_row["track_seed"],
                     use_only_stem=use_only_stem,
-                    chunk_batch_size=chunk_batch_size,
                 )
                 elapsed_sec = perf_counter() - started_at
                 detail_row["elapsed_sec"] = elapsed_sec
@@ -1570,6 +1643,7 @@ def main(
             )
 
         peak_rss_mb = rss_sampler.stop()
+        peak_vram_smi_mb = vram_sampler.stop() if vram_sampler else None
 
         summary_rows.append(
             {
@@ -1648,6 +1722,7 @@ def main(
                 "peak_vram_mb": peak_vram_bytes / (1024 * 1024)
                 if peak_vram_bytes
                 else None,
+                "peak_vram_smi_mb": peak_vram_smi_mb,
                 "peak_rss_mb": peak_rss_mb,
                 **{
                     f"{stem}_mean_sdr": value
@@ -1731,6 +1806,7 @@ def main(
         "dataset_wall_sec",
         "tracks_per_sec",
         "peak_vram_mb",
+        "peak_vram_smi_mb",
         "peak_rss_mb",
         "mean_sdr",
         "median_sdr",

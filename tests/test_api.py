@@ -1,17 +1,19 @@
 from types import SimpleNamespace
+from typing import Any, Callable
 
 import numpy as np
 import pytest
 import torch
 
-from demucs import (
+from unblend import (
     SeparatedSources,
     __version__,
     get_version,
     select_model,
 )
-from demucs.api import Separator
-from demucs.exceptions import LoadAudioError, ValidationError
+from unblend.api import Separator
+from unblend.exceptions import LoadAudioError, ValidationError
+from unblend.roformer import BSRoformer, RotaryEmbedding
 
 
 def _stub_separator(
@@ -28,8 +30,45 @@ def _stub_separator(
     """
     sep = object.__new__(Separator)
     sep.chunk_batch_size = 4
+    sep._compile_enabled = False
+    sep._chunk_batch_size_auto = True
     sep.model = SimpleNamespace(sources=list(sources))
     return sep
+
+
+class _ProgressModel(torch.nn.Module):
+    """Tiny pointwise model for exercising ``Separator`` progress wiring."""
+
+    sources = ["one", "two"]
+    samplerate = 100
+    audio_channels = 1
+    max_allowed_segment = 1.0
+    external_normalization = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Return the input and its double as two sources.
+
+        :param x: Input ``[batch, channels, samples]``.
+        :return: Output ``[batch, sources, channels, samples]``.
+        """
+        return torch.stack([x, 2 * x], dim=1)
+
+
+def _progress_separator() -> Separator:
+    """
+    Build a CPU ``Separator`` around :class:`_ProgressModel` without loading.
+
+    :return: Configured test separator.
+    """
+    separator = object.__new__(Separator)
+    separator.model = _ProgressModel()
+    separator.device = "cpu"
+    separator.dtype = None
+    separator.sample_rate = 100
+    separator.audio_channels = 1
+    separator.chunk_batch_size = 2
+    return separator
 
 
 def _make_sources() -> SeparatedSources:
@@ -152,6 +191,25 @@ def test_separate_rejects_chunk_batch_size_non_integer() -> None:
         _stub_separator().separate(audio=b"", chunk_batch_size=2.5)
 
 
+def test_separate_list_input_forwards_progress_callback() -> None:
+    """
+    Public list-input separation forwards aggregate and per-input progress
+    instead of rejecting callbacks.
+    """
+    events: list[tuple[str, dict]] = []
+    results = _progress_separator().separate(
+        [(torch.randn(1, 250), 100), (torch.randn(1, 170), 100)],
+        shifts=1,
+        progress_callback=lambda event, data: events.append((event, dict(data))),
+    )
+
+    assert len(results) == 2
+    assert events[0][0] == "processing_start"
+    assert events[-1][0] == "processing_complete"
+    assert events[0][1]["total_inputs"] == 2
+    assert {data["input_index"] for event, data in events if event == "chunk_complete"} == {0, 1}
+
+
 def test_separate_rejects_unknown_use_only_stem() -> None:
     """
     ``use_only_stem`` must name one of the loaded model's sources; an unknown
@@ -231,16 +289,157 @@ def test_warmup_rejects_mps_separator() -> None:
         sep.warmup()
 
 
-def test_warmup_rejects_non_htdemucs_model() -> None:
+def test_warmup_rejects_unsupported_model() -> None:
     """
-    ``warmup()`` only makes sense for HTDemucs-based models (the only ones
-    the CUDAGraphs compile path supports). It raises before invocation.
+    ``warmup()`` rejects objects outside the HTDemucs/RoFormer compile targets.
     """
     sep = _stub_separator()
     sep.device = "cuda"
-    # ``model`` is a plain SimpleNamespace, neither HTDemucs nor ModelEnsemble.
-    with pytest.raises(ValidationError, match="HTDemucs"):
+    with pytest.raises(ValidationError, match="HTDemucs and RoFormer"):
         sep.warmup()
+
+
+def test_compiled_roformer_batch_estimate_snaps_to_power_of_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    RoFormer CUDAGraph batches snap down from the memory ceiling to reduce
+    fixed-shape tail padding without using GPU-specific lookup tables.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    separator = object.__new__(Separator)
+    separator.device = "cuda"
+    separator.model = BSRoformer(
+        dim=32,
+        depth=1,
+        stereo=True,
+        num_stems=1,
+        time_transformer_depth=1,
+        freq_transformer_depth=1,
+        dim_head=16,
+        heads=2,
+    )
+    separator._compile_enabled = True
+    separator._measure_per_chunk_steady_bytes = lambda: 100
+    available = 6 * separator._CUDAGRAPH_RESERVATION_FACTOR * 100
+    free = separator._CUDA_VRAM_SAFETY_BYTES + int(available)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (free, free))
+
+    assert separator._initial_chunk_batch_size_estimate() == 4
+
+
+def test_enable_compile_promotes_eager_cuda_separator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Workload-aware callers can switch an initialized RoFormer from eager to
+    the normal compile/calibration path without reconstructing the model.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    separator = object.__new__(Separator)
+    separator.model = BSRoformer(
+        dim=32,
+        depth=1,
+        stereo=True,
+        num_stems=1,
+        time_transformer_depth=1,
+        freq_transformer_depth=1,
+        dim_head=16,
+        heads=2,
+    )
+    separator.device = "cuda"
+    separator.chunk_batch_size = 2
+    separator._compile_enabled = False
+    separator._calibration_attempts = []
+    monkeypatch.setattr(
+        separator, "_initial_chunk_batch_size_estimate", lambda: 4
+    )
+    monkeypatch.setattr(
+        separator,
+        "_calibrate_chunk_batch_size",
+        lambda *, initial_guess, compile_enabled: initial_guess,
+    )
+    previous_benchmark = torch.backends.cudnn.benchmark
+    try:
+        separator.enable_compile()
+        assert separator._compile_enabled is True
+        assert separator.chunk_batch_size == 4
+        assert torch.backends.cudnn.benchmark is True
+    finally:
+        torch.backends.cudnn.benchmark = previous_benchmark
+
+
+def test_compile_roformer_targets_transformer_core_without_state_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    RoFormer compilation wraps only ``_run_transformers``, pre-fills rotary
+    caches, fixes the batch shape, and leaves checkpoint keys/output unchanged.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    compile_modes: list[str] = []
+
+    def fake_compile(
+        function: Callable[..., Any], *, mode: str
+    ) -> Callable[..., Any]:
+        """
+        Record the compile mode and return the eager callable.
+
+        :param function: Callable passed to ``torch.compile``.
+        :param mode: Requested compile mode.
+        :return: The original callable.
+        """
+        compile_modes.append(mode)
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model = BSRoformer(
+        dim=32,
+        depth=1,
+        stereo=True,
+        num_stems=1,
+        time_transformer_depth=1,
+        freq_transformer_depth=1,
+        dim_head=16,
+        heads=2,
+    ).eval()
+    model.configure_inference(
+        sources=["vocals", "other"], samplerate=44100, segment_samples=44100
+    )
+    audio = torch.randn(1, 2, 44100)
+    with torch.no_grad():
+        expected = model(audio)
+    state_keys = set(model.state_dict())
+    for module in model.modules():
+        if isinstance(module, RotaryEmbedding):
+            module._phase_cache.clear()
+
+    Separator._compile_roformer_transformer_core(model)
+    with torch.no_grad():
+        actual = model(audio)
+
+    assert compile_modes == ["reduce-overhead"]
+    assert hasattr(model, "_uncompiled_run_transformers")
+    assert model._fixed_batch_shape is True
+    assert set(model.state_dict()) == state_keys
+    assert torch.equal(actual, expected)
+    rotary_modules = [
+        module for module in model.modules() if isinstance(module, RotaryEmbedding)
+    ]
+    assert rotary_modules
+    assert all(module._phase_cache for module in rotary_modules)
+    assert all(module._rotation_cache for module in rotary_modules)
+
+    separator = object.__new__(Separator)
+    separator.model = model
+    separator.device = "cpu"
+    monkeypatch.setattr(torch._dynamo, "reset", lambda: None)
+    separator._teardown_compile_state()
+    assert not hasattr(model, "_uncompiled_run_transformers")
+    assert model._fixed_batch_shape is False
 
 
 def test_read_pcm16_wav_rejects_non_pcm(tmp_path: object) -> None:
@@ -424,7 +623,7 @@ def test_is_url_classification(tmp_path: object) -> None:
     """
     from pathlib import Path as _P
 
-    from demucs.api import _is_url
+    from unblend.api import _is_url
 
     existing = tmp_path / "dir:"  # type: ignore[operator]
     existing.mkdir()
@@ -458,3 +657,133 @@ def test_separate_rejects_bool_numeric_params() -> None:
     ):
         with pytest.raises(ValidationError):
             sep.separate(audio=b"", **kwargs)
+
+
+def test_init_rejects_invalid_chunk_batch_size_before_model_load() -> None:
+    """
+    A bad explicit ``chunk_batch_size`` fails fast at init (before any model
+    download), for zero, negative, bool, and over-cap values.
+    """
+    for bad in (0, -3, True, 4096):
+        with pytest.raises(ValidationError, match="chunk_batch_size"):
+            Separator(device="cpu", chunk_batch_size=bad)
+
+
+def test_separate_rejects_per_call_cbs_when_compiled() -> None:
+    """
+    A compiled separator's captured batch shape is fixed; per-call overrides
+    are rejected with a pointer to the init param.
+    """
+    sep = _stub_separator()
+    sep._compile_enabled = True
+    with pytest.raises(ValidationError, match="per-call overrides"):
+        sep.separate(audio=b"", chunk_batch_size=8)
+
+
+def test_separate_allows_matching_cbs_when_compiled() -> None:
+    """
+    Passing the already-captured value is a harmless no-op: the call gets
+    past the compile guard (and fails later on the unrelated bogus stem).
+    """
+    sep = _stub_separator()
+    sep._compile_enabled = True
+    with pytest.raises(ValidationError, match="not a source"):
+        sep.separate(audio=b"", chunk_batch_size=4, use_only_stem="banjo")
+
+
+def test_run_with_oom_backoff_compiled_recaptures_at_half() -> None:
+    """
+    Compiled + auto: an OOM mid-run tears down, recalibrates at half, and
+    retries the request with the new size.
+    """
+    sep = _stub_separator()
+    sep._compile_enabled = True
+    events: list = []
+
+    def fake_teardown() -> None:
+        """
+        Record the teardown call.
+        """
+        events.append("teardown")
+
+    def fake_calibrate(initial_guess: int, compile_enabled: bool) -> int:
+        """
+        Record and accept the halved guess.
+
+        :param initial_guess: Starting candidate.
+        :param compile_enabled: Ignored.
+        :return: The accepted chunk_batch_size.
+        """
+        events.append(initial_guess)
+        sep.chunk_batch_size = initial_guess
+        return initial_guess
+
+    sep._teardown_compile_state = fake_teardown
+    sep._calibrate_chunk_batch_size = fake_calibrate
+    calls = {"n": 0}
+
+    def dispatch(cbs: int, state: dict | None):
+        """
+        OOM once, then succeed.
+
+        :param cbs: Batch size for this attempt.
+        :param state: Backoff state dict.
+        :return: Sentinel with the winning batch size.
+        """
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("CUDA out of memory (fake)")
+        return ("ok", cbs)
+
+    result = sep._run_with_oom_backoff(dispatch, chunk_batch_size=4, allow=True)
+    assert result == ("ok", 2)
+    assert events == ["teardown", 2]
+
+
+def test_run_with_oom_backoff_disallowed_or_eager_raises() -> None:
+    """
+    Explicit sizes (allow=False) and eager separators (whose in-apply
+    backoff already exhausted) both propagate the OOM.
+    """
+
+    def dispatch(cbs: int, state: dict | None):
+        """
+        Always raise fake OOM.
+
+        :param cbs: Ignored.
+        :param state: Ignored.
+        :return: Never returns.
+        """
+        raise RuntimeError("CUDA out of memory (fake)")
+
+    compiled = _stub_separator()
+    compiled._compile_enabled = True
+    with pytest.raises(RuntimeError, match="out of memory"):
+        compiled._run_with_oom_backoff(dispatch, chunk_batch_size=4, allow=False)
+
+    eager = _stub_separator()
+    with pytest.raises(RuntimeError, match="out of memory"):
+        eager._run_with_oom_backoff(dispatch, chunk_batch_size=4, allow=True)
+
+
+def test_run_with_oom_backoff_sticky_eager_downgrade() -> None:
+    """
+    An eager in-apply halving (reflected in the state dict) sticks to the
+    separator for subsequent calls.
+    """
+    sep = _stub_separator()
+
+    def dispatch(cbs: int, state: dict | None):
+        """
+        Simulate apply-level halving via the state dict.
+
+        :param cbs: Batch size for this attempt.
+        :param state: Backoff state dict (mutated).
+        :return: Sentinel.
+        """
+        assert state is not None
+        state["chunk_batch_size"] = 2
+        return "done"
+
+    assert sep._run_with_oom_backoff(dispatch, chunk_batch_size=4, allow=True) == "done"
+    assert sep.chunk_batch_size == 2

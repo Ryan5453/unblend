@@ -9,7 +9,7 @@ Run it explicitly with ``pytest -m slow``.
 import pytest
 import torch
 
-from demucs.api import Separator
+from unblend.api import Separator
 
 
 @pytest.mark.slow

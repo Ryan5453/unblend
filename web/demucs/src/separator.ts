@@ -1,4 +1,10 @@
-import { SAMPLE_RATE, type ModelType } from './constants.js';
+import {
+    MODEL_CONFIGS,
+    SAMPLE_RATE,
+    dspConfig,
+    type ModelConfig,
+    type ModelType,
+} from './constants.js';
 import { OnnxClient } from './onnx-client.js';
 import { STFTClient } from './stft-client.js';
 import { ISTFTClient } from './istft-client.js';
@@ -19,12 +25,16 @@ const MODEL_URLS: Record<ModelType, Record<ModelPrecision, string>> = {
         fp32: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_6s_fp32.onnx',
         fp16: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_6s_fp16.onnx',
     },
-};
-
-// Must match the source order baked into the trained model.
-const MODEL_SOURCES: Record<ModelType, string[]> = {
-    'htdemucs': ['drums', 'bass', 'other', 'vocals'],
-    'htdemucs_6s': ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano'],
+    // RoFormer weights are CC-BY-NC-SA-4.0 (non-commercial) — surfaced on
+    // Separator.license; see MODEL_CONFIGS in constants.ts.
+    'bs_roformer_sw': {
+        fp32: 'https://huggingface.co/Ryan5453/unblend/resolve/main/bs_roformer_sw_fp32.onnx',
+        fp16: 'https://huggingface.co/Ryan5453/unblend/resolve/main/bs_roformer_sw_fp16.onnx',
+    },
+    'melband_roformer_kim': {
+        fp32: 'https://huggingface.co/Ryan5453/unblend/resolve/main/melband_roformer_kim_fp32.onnx',
+        fp16: 'https://huggingface.co/Ryan5453/unblend/resolve/main/melband_roformer_kim_fp16.onnx',
+    },
 };
 
 export interface LoadModelOptions {
@@ -72,7 +82,14 @@ export class Separator {
     readonly sources: string[];
     readonly backend: 'webgpu' | 'wasm';
     readonly precision: ModelPrecision;
+    /**
+     * License of the model weights. HTDemucs weights carry no license grant
+     * (``'unlicensed'``); the RoFormer checkpoints are CC-BY-NC-SA-4.0
+     * (non-commercial). Surface this in your app where appropriate.
+     */
+    readonly license: string;
 
+    private readonly config: ModelConfig;
     private readonly onnx: OnnxClient;
     private readonly stft: STFTClient;
     private readonly istft: ISTFTClient;
@@ -80,7 +97,7 @@ export class Separator {
 
     private constructor(
         model: ModelType,
-        sources: string[],
+        config: ModelConfig,
         backend: 'webgpu' | 'wasm',
         precision: ModelPrecision,
         onnx: OnnxClient,
@@ -88,7 +105,9 @@ export class Separator {
         istft: ISTFTClient,
     ) {
         this.model = model;
-        this.sources = sources;
+        this.config = config;
+        this.sources = config.sources;
+        this.license = config.license;
         this.backend = backend;
         this.precision = precision;
         this.onnx = onnx;
@@ -169,19 +188,27 @@ export class Separator {
         // CSP blocks worker creation). If that happens, the onnx worker is
         // already loaded — tear it down (and any stft client we did manage to
         // create) before rethrowing so we don't leak a live worker.
+        const config = MODEL_CONFIGS[model];
         let stft: STFTClient | null = null;
         let istft: ISTFTClient | null = null;
         try {
             stft = new STFTClient();
             istft = new ISTFTClient();
+            // Install the model's DSP geometry (FFT size, hop, segment) in
+            // both workers before any processing.
+            await Promise.all([
+                stft.configure(dspConfig(config)),
+                istft.configure(dspConfig(config)),
+            ]);
         } catch (err) {
             onnx.terminate();
             stft?.terminate();
+            istft?.terminate();
             throw err;
         }
         // Both are non-null here: the try block either assigns both or rethrows.
         return new Separator(
-            model, MODEL_SOURCES[model], backend, precision, onnx, stft!, istft!
+            model, config, backend, precision, onnx, stft!, istft!
         );
     }
 
@@ -211,7 +238,7 @@ export class Separator {
         return runPipeline(
             { onnx: this.onnx, stft: this.stft, istft: this.istft },
             audioBuffer,
-            this.sources,
+            this.config,
             options
         );
     }

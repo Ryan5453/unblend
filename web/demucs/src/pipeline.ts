@@ -1,13 +1,16 @@
 /**
  * Shared STFT → ONNX → iSTFT pipeline. Pure: takes the worker clients and
- * source list it needs, no module-level state.
+ * model config it needs, no module-level state. Family differences are
+ * config-driven: HTDemucs normalizes the input and combines a time-domain
+ * branch; RoFormer feeds raw audio, has no time branch, and single-mask
+ * checkpoints get a ``mixture - stem`` complement computed at the end.
  */
 
 import {
     SAMPLE_RATE,
-    SEGMENT_SAMPLES,
-    SEGMENT_OVERLAP,
     createSplitWeight,
+    specDims,
+    type ModelConfig,
 } from './constants.js';
 import type { OnnxClient } from './onnx-client.js';
 import type { STFTClient } from './stft-client.js';
@@ -15,6 +18,7 @@ import type { ISTFTClient, ISTFTResult } from './istft-client.js';
 
 /** Maximum random shift in samples (Python: int(0.5 * model.samplerate)). */
 const MAX_SHIFT = Math.floor(0.5 * SAMPLE_RATE);
+const SEGMENT_OVERLAP = 0.25;
 
 export interface SeparationProgress {
     /** 1-based segment index that just finished (cumulative across shift rounds). */
@@ -91,7 +95,7 @@ export interface Pipeline {
 export async function runPipeline(
     pipeline: Pipeline,
     audioBuffer: AudioBuffer,
-    sources: string[],
+    config: ModelConfig,
     options: SeparationOptions = {}
 ): Promise<SeparationResult> {
     const { onProgress } = options;
@@ -108,6 +112,9 @@ export async function runPipeline(
     const { onnx, stft, istft } = pipeline;
     const numChannels = 2;
     const numSamples = audioBuffer.length;
+    const SEGMENT_SAMPLES = config.segmentSamples;
+    const modelSources = config.modelSources;
+    const { numBins: expectBins, numFrames: expectFrames } = specDims(config);
 
     const left = audioBuffer.getChannelData(0);
     // Mono is duplicated to both channels; for >2 channels we take the first
@@ -117,23 +124,31 @@ export async function runPipeline(
         ? audioBuffer.getChannelData(1)
         : left;
 
-    // Track-level normalization (Python demucs/api.py _normalize): mean/std
+    // Track-level normalization (Python unblend/api.py _normalize): mean/std
     // are scalars over the channel-mean reference signal, std is unbiased
     // (divide by N-1). Denormalized after separation with the same
-    // ``1e-5 + std`` factor.
-    let refSum = 0;
-    for (let i = 0; i < numSamples; i++) {
-        refSum += (left[i] + right[i]) / 2;
+    // ``1e-5 + std`` factor. RoFormer checkpoints are trained on raw audio,
+    // so the whole normalize/denormalize pair is skipped for them (matching
+    // the Python Separator's external_normalization gate).
+    let mean = 0;
+    let norm = 1;
+    let denormStd = 0;
+    if (config.normalizeInput) {
+        let refSum = 0;
+        for (let i = 0; i < numSamples; i++) {
+            refSum += (left[i] + right[i]) / 2;
+        }
+        mean = refSum / numSamples;
+        let refVar = 0;
+        for (let i = 0; i < numSamples; i++) {
+            const d = (left[i] + right[i]) / 2 - mean;
+            refVar += d * d;
+        }
+        // Deliberate guard: the reference's unbiased std is NaN for 1-sample input.
+        const std = numSamples > 1 ? Math.sqrt(refVar / (numSamples - 1)) : 0;
+        norm = 1 / (1e-5 + std);
+        denormStd = std;
     }
-    const mean = refSum / numSamples;
-    let refVar = 0;
-    for (let i = 0; i < numSamples; i++) {
-        const d = (left[i] + right[i]) / 2 - mean;
-        refVar += d * d;
-    }
-    // Deliberate guard: the reference's unbiased std is NaN for 1-sample input.
-    const std = numSamples > 1 ? Math.sqrt(refVar / (numSamples - 1)) : 0;
-    const norm = 1 / (1e-5 + std);
 
     // Normalized input zero-padded by MAX_SHIFT on each side for the shift
     // trick (Python apply.py: TensorChunk.padded(length + 2 * max_shift)).
@@ -147,25 +162,25 @@ export async function runPipeline(
         padded[idx + 1] = (right[i] - mean) * norm;
     }
 
-    // Mirror the Python chunking exactly (demucs/apply.py): segments start at
+    // Mirror the Python chunking exactly (unblend/apply.py): segments start at
     // every multiple of the stride, the window for a short final chunk is
     // centered on it (real left context from the padded track, zeros past the
     // end), and chunks are blended with the triangular weight normalized by
     // the per-sample weight sum.
     const STEP = Math.floor(SEGMENT_SAMPLES * (1 - SEGMENT_OVERLAP));
-    const weight = createSplitWeight();
+    const weight = createSplitWeight(SEGMENT_SAMPLES);
 
     // Final accumulators across shift rounds; divided by ``shifts`` and
     // denormalized at the end. These are the returned stem buffers.
     const outputs: Record<string, Float32Array> = {};
-    for (const source of sources) {
+    for (const source of modelSources) {
         outputs[source] = new Float32Array(numSamples * numChannels);
     }
 
     // Per-round buffers, sized for the longest possible view (offset = 0)
     // and reused across rounds.
     const maxViewLength = numSamples + MAX_SHIFT;
-    const roundOut = sources.map(() => new Float32Array(maxViewLength * numChannels));
+    const roundOut = modelSources.map(() => new Float32Array(maxViewLength * numChannels));
     const sumWeight = new Float32Array(maxViewLength);
 
     // Draw all offsets up front so totalSegs is known for progress reporting.
@@ -178,11 +193,14 @@ export async function runPipeline(
         totalSegs += Math.ceil((numSamples + MAX_SHIFT - offset) / STEP);
     }
 
-    // Double-buffer so we can prepare the next segment while inference reads the current one.
-    const planarBuffers = [
-        new Float32Array(SEGMENT_SAMPLES * numChannels),
-        new Float32Array(SEGMENT_SAMPLES * numChannels),
-    ];
+    // Double-buffer so we can prepare the next segment while inference reads
+    // the current one (HTDemucs only — RoFormer graphs take no audio input).
+    const planarBuffers = config.hasTimeBranch
+        ? [
+            new Float32Array(SEGMENT_SAMPLES * numChannels),
+            new Float32Array(SEGMENT_SAMPLES * numChannels),
+        ]
+        : null;
     let pendingPlanarIndex = 0;
 
     const startTime = performance.now();
@@ -206,7 +224,7 @@ export async function runPipeline(
 
         function accumulate(result: ISTFTResult) {
             const { chunks, segStart, segLength } = result;
-            for (let s = 0; s < sources.length; s++) {
+            for (let s = 0; s < modelSources.length; s++) {
                 const chunk = chunks[s];
                 const out = roundOut[s];
                 for (let i = 0; i < segLength; i++) {
@@ -257,7 +275,9 @@ export async function runPipeline(
         const seg0 = segmentWindow(0);
         let pendingStft = stft.process(prepareInterleaved(seg0.windowStart));
         pendingStft.catch(() => {});
-        let pendingPlanar = preparePlanar(planarBuffers[pendingPlanarIndex], seg0.windowStart);
+        let pendingPlanar = planarBuffers
+            ? preparePlanar(planarBuffers[pendingPlanarIndex], seg0.windowStart)
+            : undefined;
         let prevIstftPromise: Promise<ISTFTResult> | null = null;
 
         for (let seg = 0; seg < numSegments; seg++) {
@@ -278,17 +298,20 @@ export async function runPipeline(
 
             const inferenceStart = performance.now();
             const inferencePromise = onnx.runInference(
-                stftResult.real, stftResult.imag, currentPlanar, specShape, audioShape
+                stftResult.real, stftResult.imag, specShape,
+                currentPlanar, currentPlanar ? audioShape : undefined
             );
 
             if (seg + 1 < numSegments) {
                 const next = segmentWindow(seg + 1);
                 pendingStft = stft.process(prepareInterleaved(next.windowStart));
                 pendingStft.catch(() => {});
-                pendingPlanarIndex = 1 - pendingPlanarIndex;
-                pendingPlanar = preparePlanar(
-                    planarBuffers[pendingPlanarIndex], next.windowStart
-                );
+                if (planarBuffers) {
+                    pendingPlanarIndex = 1 - pendingPlanarIndex;
+                    pendingPlanar = preparePlanar(
+                        planarBuffers[pendingPlanarIndex], next.windowStart
+                    );
+                }
             }
 
             const results = await inferencePromise;
@@ -299,9 +322,14 @@ export async function runPipeline(
             // wrong/zero audio. Fail loudly instead (like the ONNX worker's
             // dtype check).
             assertShape('out_spec', results.outSpecShape,
-                [1, sources.length, numChannels, stftResult.numBins, stftResult.numFrames]);
-            assertShape('out_wave', results.outWaveShape,
-                [1, sources.length, numChannels, SEGMENT_SAMPLES]);
+                [1, modelSources.length, numChannels, expectBins, expectFrames]);
+            if (config.hasTimeBranch) {
+                if (!results.outWave || !results.outWaveShape) {
+                    throw new Error("Model produced no 'out_wave' output");
+                }
+                assertShape('out_wave', results.outWaveShape,
+                    [1, modelSources.length, numChannels, SEGMENT_SAMPLES]);
+            }
 
             if (prevIstftPromise) {
                 accumulate(await prevIstftPromise);
@@ -312,8 +340,8 @@ export async function runPipeline(
             prevIstftPromise = istft.process({
                 specReal: results.outSpecReal,
                 specImag: results.outSpecImag,
-                wave: results.outWave,
-                numSources: sources.length,
+                wave: config.hasTimeBranch ? results.outWave : undefined,
+                numSources: modelSources.length,
                 numChannels,
                 numBins: stftResult.numBins,
                 numFrames: stftResult.numFrames,
@@ -339,8 +367,8 @@ export async function runPipeline(
         // [..., :length]). Every retained sample is covered by at least one
         // chunk, so sumWeight > 0.
         const trimStart = MAX_SHIFT - viewOffset;
-        for (let s = 0; s < sources.length; s++) {
-            const out = outputs[sources[s]];
+        for (let s = 0; s < modelSources.length; s++) {
+            const out = outputs[modelSources[s]];
             const round = roundOut[s];
             for (let i = 0; i < numSamples; i++) {
                 const w = sumWeight[trimStart + i];
@@ -352,12 +380,28 @@ export async function runPipeline(
     }
 
     // Average the shift rounds and denormalize (Python: out * (1e-5 + std) + mean).
-    const denormScale = (1e-5 + std) / shifts;
-    for (const source of sources) {
+    // Without input normalization this reduces to the plain shift average.
+    const denormScale = config.normalizeInput
+        ? (1e-5 + denormStd) / shifts
+        : 1 / shifts;
+    for (const source of modelSources) {
         const out = outputs[source];
         for (let i = 0; i < numSamples * numChannels; i++) {
             out[i] = out[i] * denormScale + mean;
         }
+    }
+
+    // Single-mask models: the second stem is mixture - stem. All the steps
+    // above are linear, so the full-track subtraction equals the Python
+    // backend's per-chunk complement.
+    if (config.complement) {
+        const stem = outputs[config.complement.stem];
+        const complement = new Float32Array(numSamples * numChannels);
+        for (let i = 0; i < numSamples; i++) {
+            complement[i * 2] = left[i] - stem[i * 2];
+            complement[i * 2 + 1] = right[i] - stem[i * 2 + 1];
+        }
+        outputs[config.complement.name] = complement;
     }
 
     return {

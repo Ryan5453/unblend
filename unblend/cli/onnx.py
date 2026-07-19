@@ -34,7 +34,7 @@ def export_onnx_command(
     opset: Annotated[
         int,
         typer.Option(
-            help="ONNX opset version",
+            help="ONNX opset version (raised to 18 for RoFormer models)",
         ),
     ] = 17,
     fp16: Annotated[
@@ -47,7 +47,7 @@ def export_onnx_command(
     ] = False,
 ) -> None:
     """
-    Export a HTDemucs model to the ONNX format.
+    Export a model (HTDemucs or RoFormer) to the ONNX format.
 
     This is an internal developer tool for creating ONNX models for deployment.
 

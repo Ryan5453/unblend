@@ -6,13 +6,13 @@ build:
   system_packages:
     - "ffmpeg"
   run:
-    - mkdir -p /root/.demucs/models
+    - mkdir -p /root/.unblend/models
     # This Cog serves htdemucs only (see predictor.py), so bake just that
     # model's single layer into the image to avoid downloading it on cold
-    # start. The checksum and remote path come from demucs/metadata.json; the
-    # cache filename is the second hash segment, matching demucs.repo's naming.
+    # start. The URL and checksum come from unblend/metadata.json; the cache
+    # filename is the short checksum, matching unblend.repo's naming.
     # predictor.setup() would otherwise download htdemucs by name on first boot.
-    - curl -L -o /root/.demucs/models/8726e21a.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th
+    - curl -L -o /root/.unblend/models/3e28d2b1.th https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs-0.th
     - python -c "import site; open(site.getsitepackages()[0] + '/sitecustomize.py', 'w').write('import os\nos.environ.pop(\"LD_LIBRARY_PATH\", None)\n')"
 
 predict: "predictor.py:Predictor"

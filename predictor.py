@@ -13,7 +13,7 @@ from pathlib import Path as PathlibPath
 import torch
 from cog import BaseModel, BasePredictor, Input, Path
 
-from demucs import Separator
+from unblend import Separator
 
 
 class Output(BaseModel):

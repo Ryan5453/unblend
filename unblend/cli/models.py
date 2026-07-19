@@ -25,6 +25,22 @@ from .progress import create_model_progress_bar, create_progress_callback
 from .utils import console, format_file_size, get_models
 
 
+def _model_layer_count(info: dict) -> int:
+    """
+    Return the number of independently downloaded files for a model.
+
+    Demucs ensembles describe their files in ``models``; a RoFormer has one
+    checkpoint instead. Keeping that registry difference here prevents CLI
+    progress and summary code from assuming a Demucs-only metadata shape.
+
+    :param info: One model's registry metadata.
+    :return: Number of checkpoint files used by the model.
+    """
+    if info.get("backend") == "roformer":
+        return 1
+    return len(info["models"])
+
+
 def list_models_command() -> None:
     """
     List all available models and show which ones are downloaded.
@@ -34,18 +50,20 @@ def list_models_command() -> None:
 
     cache_info = model_repo.get_cache_info()
 
-    table = Table(title="Available Demucs Models")
+    table = Table(title="Available Models")
     table.add_column("Model Name", style="cyan")
     table.add_column("Layers", style="blue")
     table.add_column("Stems", style="yellow")
+    table.add_column("License", style="dim")
     table.add_column("Size", style="magenta")
     table.add_column("Status", style="bright_green")
 
     for name in models.keys():
         info = models[name]
 
-        layer_count = len(info.get("models", []))
+        layer_count = _model_layer_count(info)
         stems = ", ".join(info.get("sources", [])) or "N/A"
+        license_label = info.get("license", "unknown")
 
         entry = cache_info.get(name)
         if entry is None:
@@ -68,6 +86,7 @@ def list_models_command() -> None:
             name,
             str(layer_count) + (" layer" if layer_count == 1 else " layers"),
             stems,
+            license_label,
             model_size,
             status,
         )
@@ -104,7 +123,7 @@ def download_models_command(
         console.print("Please either:")
         console.print("  1. Specify one or more model names to download")
         console.print("  2. Use [bold]--all[/bold] to download all available models")
-        console.print("\nTo see available models, run: [bold]demucs models list[/bold]")
+        console.print("\nTo see available models, run: [bold]unblend models list[/bold]")
         raise typer.Exit(1)
 
     if all_models:
@@ -248,7 +267,7 @@ def _format_download_summary(
     """
     num_sources = len(model.sources)
     if layer_count is None and name in models:
-        layer_count = len(models[name]["models"])
+        layer_count = _model_layer_count(models[name])
     if layer_count is not None:
         layer_word = "layer" if layer_count == 1 else "layers"
         model_type = f"{layer_count} {layer_word}"
@@ -282,7 +301,11 @@ def _download_model_with_progress(name: str, only_load: str | None = None) -> bo
     model_repo = ModelRepository()
 
     try:
-        layer_count = len(model_repo.required_layers(name, only_load=only_load))
+        info = models.get(name)
+        if info is not None and info.get("backend") == "roformer":
+            layer_count = _model_layer_count(info)
+        else:
+            layer_count = len(model_repo.required_layers(name, only_load=only_load))
     except ModelLoadingError as error:
         console.print(f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}")
         return False
@@ -337,6 +360,21 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
     :return: True if model is available, False otherwise
     """
     model_repo = ModelRepository()
+    models = model_repo.list_models()
+    info = models.get(name)
+    if info is None:
+        console.print(
+            f"[red]✗[/red] [bold]{escape(name)}[/bold]: Unknown model. "
+            f"Available models: {', '.join(models)}"
+        )
+        return False
+
+    if info.get("backend") == "roformer":
+        cached = model_repo.get_cache_info().get(name, {}).get("complete", False)
+        if cached:
+            return True
+        return _download_model_with_progress(name, only_load=only_load)
+
     try:
         required = model_repo.required_layers(name, only_load=only_load)
     except ModelLoadingError as error:
@@ -347,7 +385,7 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
     if all((cache_dir / f"{checksum}.th").exists() for checksum in required):
         # Existence-only — the download path sha256-verifies before moving into
         # cache, and ``get_model`` re-verifies on load. Re-hashing the whole
-        # cache here would add ~1–3 s to every ``demucs separate`` invocation
+        # cache here would add ~1–3 s to every ``unblend separate`` invocation
         # on htdemucs_ft for the rare case of a user-corrupted cache file,
         # which the load-path catch already recovers from.
         return True
@@ -384,7 +422,7 @@ def _download_models_batch(model_names: list[str]) -> None:
         # Partially-cached models (interrupted downloads) still need the
         # download pass; get_model fetches only the missing layers.
         if cache_info.get(name, {}).get("complete"):
-            layer_count = len(models[name]["models"])
+            layer_count = _model_layer_count(models[name])
             layer_word = "layer" if layer_count == 1 else "layers"
             size_bytes = cache_info[name]["size_bytes"]
             size_str = f" ({format_file_size(size_bytes)})"
@@ -401,7 +439,7 @@ def _download_models_batch(model_names: list[str]) -> None:
         return
 
     if len(to_download) > 1:
-        total_layers = sum(len(models[name]["models"]) for name in to_download)
+        total_layers = sum(_model_layer_count(models[name]) for name in to_download)
         console.print(
             f"[bold]Downloading {len(to_download)} models ({total_layers} total layers)...[/bold]"
         )
@@ -433,7 +471,7 @@ def _download_single_model_in_batch(
     :return: True if successful, False otherwise
     """
 
-    layer_count = len(models[name]["models"])
+    layer_count = _model_layer_count(models[name])
     layer_word = "layer" if layer_count == 1 else "layers"
     task = progress_bar.add_task(
         f"[cyan]Downloading {escape(name)} ({layer_count} {layer_word})[/cyan]",

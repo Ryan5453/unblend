@@ -5,6 +5,8 @@ download, and the format probe runs before model resolution.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -12,8 +14,12 @@ from click.testing import Result
 from torchcodec.encoders import AudioEncoder
 from typer.testing import CliRunner
 
-from demucs.cli import build_app
-from demucs.repo import ModelRepository
+from unblend.cli import build_app
+from unblend.cli.separate import (
+    _estimate_compile_chunks,
+    _maybe_enable_auto_compile,
+)
+from unblend.repo import ModelRepository
 
 runner = CliRunner()
 
@@ -30,7 +36,7 @@ def _invoke(args: list[str]) -> Result:
 
 def test_version_exits_zero() -> None:
     """
-    ``demucs version`` succeeds and prints the version.
+    ``unblend version`` succeeds and prints the version.
     """
     result = _invoke(["version"])
     assert result.exit_code == 0
@@ -39,7 +45,7 @@ def test_version_exits_zero() -> None:
 
 def test_models_list_exits_zero() -> None:
     """
-    ``demucs models list`` succeeds and lists the shipped models.
+    ``unblend models list`` succeeds and lists the shipped models.
     """
     result = _invoke(["models", "list"])
     assert result.exit_code == 0
@@ -53,6 +59,160 @@ def test_models_download_unknown_model_fails() -> None:
     result = _invoke(["models", "download", "not_a_real_model"])
     assert result.exit_code == 1
     assert "not_a_real_model" in result.output
+
+
+def test_models_download_accepts_roformer_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Batch download progress treats each RoFormer checkpoint as one layer
+    instead of requiring the Demucs-only ``models`` metadata field.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import unblend.cli.models as models_cli
+
+    class DownloadedModel:
+        """Minimal model returned by the network-free repository stub."""
+
+        sources = ["vocals", "other"]
+
+        def eval(self) -> "DownloadedModel":
+            """
+            Mirror ``nn.Module.eval`` for the download command.
+
+            :return: This stub model.
+            """
+            return self
+
+    roformers = {
+        "roformer_a": {"backend": "roformer"},
+        "roformer_b": {"backend": "roformer"},
+    }
+    monkeypatch.setattr(models_cli, "get_models", lambda: roformers)
+    monkeypatch.setattr(ModelRepository, "get_cache_info", lambda self: {})
+    monkeypatch.setattr(
+        ModelRepository,
+        "get_model",
+        lambda self, **kwargs: DownloadedModel(),
+    )
+
+    result = _invoke(["models", "download", "roformer_a", "roformer_b"])
+    assert result.exit_code == 0
+    assert "2 total layers" in result.output
+
+
+def test_ensure_model_available_downloads_uncached_roformer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The benchmark/CLI availability preflight can download a RoFormer whose
+    metadata has one ``checkpoint`` instead of a Demucs ``models`` list.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import unblend.cli.models as models_cli
+
+    class DownloadedModel:
+        """Minimal model returned by the network-free repository stub."""
+
+        sources = ["vocals", "other"]
+
+        def eval(self) -> "DownloadedModel":
+            """
+            Mirror ``nn.Module.eval`` for the download command.
+
+            :return: This stub model.
+            """
+            return self
+
+    roformer = {"roformer": {"backend": "roformer"}}
+    monkeypatch.setattr(models_cli, "get_models", lambda: roformer)
+    monkeypatch.setattr(ModelRepository, "list_models", lambda self: roformer)
+    monkeypatch.setattr(ModelRepository, "get_cache_info", lambda self: {})
+    monkeypatch.setattr(
+        ModelRepository,
+        "get_model",
+        lambda self, **kwargs: DownloadedModel(),
+    )
+
+    assert models_cli.ensure_model_available("roformer") is True
+
+
+def test_auto_compile_chunk_estimate_uses_duration_shifts_and_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    CLI auto-compile estimates model work from metadata duration rather than
+    encoded file size, including shift rounds and overlap-derived stride.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    separator = SimpleNamespace(
+        model=SimpleNamespace(samplerate=100, max_allowed_segment=10.0)
+    )
+    durations = iter([12.0, 3.0])
+    monkeypatch.setattr(
+        "unblend.cli.separate._audio_duration_seconds",
+        lambda path: next(durations),
+    )
+
+    chunks, duration, unknown = _estimate_compile_chunks(
+        separator,
+        [Path("a.flac"), Path("b.wav")],
+        shifts=2,
+        split_overlap=0.5,
+    )
+
+    assert chunks == 8
+    assert duration == 15.0
+    assert unknown == 0
+
+
+@pytest.mark.parametrize(
+    "chunks, expected",
+    [(119, False), (120, True)],
+)
+def test_auto_compile_uses_predicted_eager_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+    chunks: int,
+    expected: bool,
+) -> None:
+    """
+    Auto mode enables compilation exactly when chunks × runtime probe reaches
+    the architecture/dtype GPU-seconds threshold.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param chunks: Estimated workload chunks.
+    :param expected: Whether compilation should be enabled.
+    """
+    enable_compile = Mock()
+    separator = SimpleNamespace(
+        _eager_probe_seconds=1.0,
+        enable_compile=enable_compile,
+    )
+    monkeypatch.setattr(
+        "unblend.cli.separate._compile_profile_key",
+        lambda separator: ("bs_roformer", "fp16"),
+    )
+    monkeypatch.setattr(
+        "unblend.cli.separate._estimate_compile_chunks",
+        lambda separator, audio_files, *, shifts, split_overlap: (
+            chunks,
+            60.0,
+            0,
+        ),
+    )
+
+    enabled = _maybe_enable_auto_compile(
+        separator,
+        [Path("track.wav")],
+        shifts=1,
+        split_overlap=0.25,
+    )
+
+    assert enabled is expected
+    assert enable_compile.call_count == int(expected)
 
 
 def test_models_remove_unknown_model_fails() -> None:
@@ -113,9 +273,9 @@ def _stub_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
     :param monkeypatch: pytest monkeypatch fixture
     """
     monkeypatch.setattr(
-        "demucs.cli.separate.ensure_model_available", lambda *a, **k: True
+        "unblend.cli.separate.ensure_model_available", lambda *a, **k: True
     )
-    monkeypatch.setattr("demucs.cli.separate.Separator", _StubSeparator)
+    monkeypatch.setattr("unblend.cli.separate.Separator", _StubSeparator)
 
 
 def test_separate_collision_check_uses_written_paths(
@@ -328,8 +488,8 @@ def test_models_remove_all_empty_cache_exits_zero(
     :param tmp_path: pytest temporary directory fixture
     :param monkeypatch: pytest monkeypatch fixture
     """
-    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: tmp_path)
-    monkeypatch.setattr("demucs.cli.models.get_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr("unblend.cli.models.get_cache_dir", lambda: tmp_path)
 
     result = _invoke(["models", "remove", "--all"])
     assert result.exit_code == 0
@@ -372,7 +532,7 @@ def test_models_remove_all_sweeps_partial_and_temp_files(
     interrupted multi-layer download) and leftover download temp files,
     not just fully-cached models.
     """
-    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path))
     # One layer of the multi-layer ensemble = a genuinely partial cache.
     checksum = ModelRepository().list_models()["htdemucs_ft"]["models"][0]["checksum"]
     partial_layer = tmp_path / f"{checksum}.th"

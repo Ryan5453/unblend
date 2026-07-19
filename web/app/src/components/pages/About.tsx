@@ -1,13 +1,11 @@
 export function About() {
     return (
-        <div className="w-full max-w-3xl mx-auto px-6 py-12 flex-1">
-            {/* Content */}
-            <div className="content-card">
-                <h1 className="content-title">About</h1>
+        <div className="content-page">
+            <h1 className="content-title">About</h1>
 
-                <div className="content-body">
+            <div className="content-body">
                     <p>
-                        <strong>demucs.app</strong> is a free, open-source audio stem separation tool powered by
+                        <strong>un/blend</strong> is a free, open-source audio stem separation tool powered by
                         Meta AI's Demucs model. Everything runs entirely in your browser, so your audio files
                         never leave your device.
                     </p>
@@ -25,7 +23,6 @@ export function About() {
                         uses your browser's native decoders where possible. For formats that can't be decoded
                         natively, the app falls back to <a href="https://ffmpegwasm.netlify.app/">ffmpeg.wasm</a>.
                     </p>
-                </div>
             </div>
         </div>
     );

@@ -1,17 +1,17 @@
 {
   "name": "demucs-next",
   "version": "1.0.0",
-  "description": "Browser-side audio source separation using ONNX Demucs models. Designed to be embedded in a web app.",
+  "description": "Browser-side audio source separation using ONNX Demucs and RoFormer models. Designed to be embedded in a web app.",
   "license": "MIT",
   "author": "Ryan Fahey <git@ryan.science>",
-  "homepage": "https://github.com/Ryan5453/demucs-next#readme",
+  "homepage": "https://github.com/Ryan5453/unblend#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ryan5453/demucs-next.git",
+    "url": "git+https://github.com/Ryan5453/unblend.git",
     "directory": "web/demucs"
   },
   "bugs": {
-    "url": "https://github.com/Ryan5453/demucs-next/issues"
+    "url": "https://github.com/Ryan5453/unblend/issues"
   },
   "keywords": [
     "demucs",

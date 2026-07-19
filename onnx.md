@@ -1,19 +1,19 @@
 # ONNX Export
 
-`demucs-next` includes the ability to export Demucs models to the ONNX format for deployment in browsers, mobile, or other runtimes. 
-This is how [demucs.app](https://demucs.app) runs Demucs in-browser.
+`unblend` includes the ability to export its models (HTDemucs and the RoFormer family) to the ONNX format for deployment in browsers, mobile, or other runtimes.
+This is how [demucs.app](https://demucs.app) runs Demucs in-browser. HTDemucs specifics are below; RoFormer differences are in [RoFormer models](#roformer-models) at the end.
 
 ## Export
 
-ONNX export is an internal developer tool, exposed as a hidden CLI command (it won't show in `demucs --help`):
+ONNX export is an internal developer tool, exposed as a hidden CLI command (it won't show in `unblend --help`):
 
 ```bash
 # FP32 (default). Output defaults to {model}_fp32.onnx
-demucs export-onnx --model htdemucs
+unblend export-onnx --model htdemucs
 
 # Weight-only FP16 — roughly halves file size; weights are rounded to fp16
 # but compute and IO stay fp32, so output is near-identical (not bit-exact)
-demucs export-onnx --model htdemucs --fp16 --output htdemucs_fp16.onnx
+unblend export-onnx --model htdemucs --fp16 --output htdemucs_fp16.onnx
 ```
 
 Flags: `-m/--model` (default `htdemucs`), `-o/--output`, `--opset` (default `17`), `--fp16`.
@@ -123,3 +123,18 @@ sample_rate = int(metadata["sample_rate"])        # 44100
 audio_channels = int(metadata["audio_channels"])  # 2
 precision = metadata["precision"]                 # "fp32" or "fp16"
 ```
+
+## RoFormer models
+
+RoFormer models (`bs_roformer_sw`, `melband_roformer_kim`, …) export through the same command and the same STFT-outside-the-graph boundary, with these differences:
+
+```bash
+unblend export-onnx --model bs_roformer_sw --fp16
+```
+
+- **Exporter/opset:** exported with the dynamo exporter at opset ≥ 18 (the legacy exporter emits inconsistent shape metadata for the per-band mask heads, which onnxruntime rejects). `--opset` values below 18 are raised automatically.
+- **Interface:** inputs `spec_real`/`spec_imag` `[B, C, F, T]` only — there is no `audio` input and no `out_wave` output (RoFormers are pure spectrogram maskers; skip the time-branch combine step entirely). Outputs `out_spec_real`/`out_spec_imag` are `[B, S, C, F, T]`.
+- **STFT parameters come from the embedded metadata** (`stft_n_fft`, `stft_hop_length`, `stft_win_length`, `stft_normalized` — typically 2048/512/2048/false) rather than being fixed constants. `stft_normalized` is `false` for the shipped checkpoints, so the `sqrt(n_fft)` normalization caveat above does **not** apply: run a plain centered Hann STFT/iSTFT with no extra scaling and no Demucs-style pre-padding/trimming.
+- **Feed exactly `segment_samples` per call** (from metadata; e.g. 588800 ≈ 13.35 s for `bs_roformer_sw`). Only the batch axis is dynamic.
+- **Single-mask checkpoints** (metadata `output_complement: "true"`, e.g. `melband_roformer_kim`) emit one stem; compute the second client-side as `mixture - stem` after the iSTFT.
+- Extra metadata keys: `model_family` (`"roformer"`), `architecture` (`bs_roformer` / `mel_band_roformer`), `num_stems`, `output_complement`, `segment_samples`, the four `stft_*` keys, and `license` (the shipped RoFormer checkpoints are CC-BY-NC-SA-4.0 — non-commercial).

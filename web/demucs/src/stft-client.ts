@@ -1,4 +1,4 @@
-import type { STFTResult } from './constants.js';
+import type { DSPConfig, STFTResult } from './constants.js';
 
 export class STFTClient {
     private worker: Worker;
@@ -40,6 +40,21 @@ export class STFTClient {
             console.error('[stft-worker] message error:', event);
             this.failPending('STFT worker message deserialization failed');
         };
+    }
+
+    /**
+     * Install the model's DSP geometry in the worker. Must resolve before the
+     * first process() call; unconfigured workers assume HTDemucs defaults.
+     */
+    configure(config: DSPConfig): Promise<void> {
+        this.failPending('Superseded by an STFT configure request');
+        const requestId = ++this.requestCounter;
+        this.pendingId = requestId;
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = () => resolve();
+            this.pendingReject = reject;
+            this.worker.postMessage({ type: 'configure', requestId, config });
+        });
     }
 
     process(segmentInterleaved: Float32Array): Promise<STFTResult> {

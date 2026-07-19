@@ -1,16 +1,17 @@
-"""Unit tests for ``demucs.apply`` (chunk views, routing, shifts, progress)."""
+"""Unit tests for ``unblend.apply`` (chunk views, routing, shifts, progress)."""
 
 import pytest
 import torch
 from torch import nn
 
-from demucs.apply import (
+from unblend.apply import (
     TensorChunk,
     _should_restore_submodel_device,
     apply_model,
+    apply_model_multi,
     tensor_chunk,
 )
-from demucs.exceptions import ValidationError
+from unblend.exceptions import ValidationError
 
 
 def test_should_restore_submodel_device_same_device_is_noop() -> None:
@@ -43,14 +44,18 @@ def test_should_restore_submodel_device_uncompiled_returns_true() -> None:
     )
 
 
-def test_should_restore_submodel_device_compiled_skips_restore() -> None:
+@pytest.mark.parametrize(
+    "marker", ["_uncompiled_forward_core", "_uncompiled_run_transformers"]
+)
+def test_should_restore_submodel_device_compiled_skips_restore(marker: str) -> None:
     """
-    Compiled sub-models stay on the inference device — bouncing them off
-    invalidates the CUDAGraphs capture and forces a re-compile.
+    Compiled HTDemucs and RoFormer sub-models stay on the inference device —
+    bouncing them off invalidates the CUDAGraphs capture.
+
+    :param marker: Family-specific attribute recording the eager callable.
     """
     sub = nn.Linear(1, 1)
-    # Marker attribute set by Separator._compile_htdemucs_forward_core.
-    sub._uncompiled_forward_core = lambda *_a, **_kw: None
+    setattr(sub, marker, lambda *_args, **_kwargs: None)
     assert (
         _should_restore_submodel_device(sub, torch.device("cpu"), torch.device("cuda"))
         is False
@@ -203,6 +208,49 @@ def test_apply_model_shifts_progress_single_monotonic_span() -> None:
     assert [d["completed_chunks"] for d in chunks] == list(range(1, total + 1))
 
 
+def test_apply_model_multi_reports_aggregate_and_per_input_progress() -> None:
+    """
+    List-input chunk pooling emits one monotonic aggregate span plus enough
+    input metadata for independent per-file progress displays.
+    """
+    model = _DoublingModel()
+    mixes = [torch.randn(1, 1, 250), torch.randn(1, 1, 170)]
+    events: list[tuple[str, dict]] = []
+
+    outputs = apply_model_multi(
+        model,
+        mixes,
+        shifts=2,
+        chunk_batch_size=2,
+        progress_callback=lambda event, data: events.append((event, dict(data))),
+    )
+    assert len(outputs) == 2
+
+    starts = [data for event, data in events if event == "processing_start"]
+    completes = [data for event, data in events if event == "processing_complete"]
+    chunks = [data for event, data in events if event == "chunk_complete"]
+    assert len(starts) == 1
+    assert len(completes) == 1
+    assert starts[0]["total_inputs"] == 2
+    assert completes[0] == starts[0]
+
+    total = starts[0]["total_chunks"]
+    assert [data["completed_chunks"] for data in chunks] == list(
+        range(1, total + 1)
+    )
+    assert sum(starts[0]["input_total_chunks"]) == total
+    for input_index, input_total in enumerate(starts[0]["input_total_chunks"]):
+        input_events = [
+            data for data in chunks if data["input_index"] == input_index
+        ]
+        assert [data["input_completed_chunks"] for data in input_events] == list(
+            range(1, input_total + 1)
+        )
+        assert {data["input_total_chunks"] for data in input_events} == {
+            input_total
+        }
+
+
 def test_apply_model_rejects_out_of_range_overlap() -> None:
     """
     ``overlap`` outside ``[0, 1)`` is rejected up front — a negative overlap
@@ -222,7 +270,7 @@ def test_htdemucs_forward_rejects_overlength_input() -> None:
     time-branch ``view`` reinterpreted samples as channels. ``apply_model``
     is the supported path for full-length audio.
     """
-    from demucs.htdemucs import HTDemucs
+    from unblend.htdemucs import HTDemucs
 
     model = HTDemucs(
         sources=["a", "b"],
@@ -244,7 +292,7 @@ def test_htdemucs_freq_emb_cache_invalidated_on_weight_reload() -> None:
     Reloading weights into an already-used ``HTDemucs`` must not keep serving
     the previous weights' memoised frequency embedding.
     """
-    from demucs.htdemucs import HTDemucs
+    from unblend.htdemucs import HTDemucs
 
     kwargs = dict(
         sources=["a", "b"],
@@ -267,3 +315,183 @@ def test_htdemucs_freq_emb_cache_invalidated_on_weight_reload() -> None:
         used(x)  # populate the freq-emb cache with `used`'s weights
         used.load_state_dict(fresh.state_dict())
         assert torch.allclose(used(x), fresh(x), atol=1e-6)
+
+
+class _FlakyOOMModel(_DoublingModel):
+    """
+    ``_DoublingModel`` that raises a CUDA-OOM-shaped RuntimeError whenever
+    the batch is larger than ``fits`` — a GPU with room for ``fits`` chunks.
+    """
+
+    def __init__(self, fits: int) -> None:
+        """
+        :param fits: Largest batch dimension that "fits in memory".
+        """
+        super().__init__()
+        self.fits = fits
+        self.oom_count = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Raise fake OOM above ``fits``, else behave like ``_DoublingModel``.
+
+        :param x: Input of shape ``[batch, channels, samples]``.
+        :return: Output of shape ``[batch, 2, channels, samples]``.
+        """
+        if x.shape[0] > self.fits:
+            self.oom_count += 1
+            raise RuntimeError("CUDA out of memory. (fake, for backoff test)")
+        return super().forward(x)
+
+
+def test_oom_backoff_halves_until_fit_and_output_is_exact() -> None:
+    """
+    Auto-sized runs degrade to a fitting batch size: 8 -> 4 -> 2 here, with
+    the halvings recorded in the state dict and the output exact (the model
+    is pointwise, so any dropped/duplicated chunk would show).
+    """
+    model = _FlakyOOMModel(fits=2)
+    mix = torch.randn(1, 1, 250)
+    state = {"chunk_batch_size": 8}
+
+    out = apply_model(model, mix, chunk_batch_size=8, oom_backoff_state=state)
+
+    assert state["chunk_batch_size"] == 2
+    assert model.oom_count == 2
+    assert torch.allclose(out[:, 0], mix, atol=1e-5)
+    assert torch.allclose(out[:, 1], 2 * mix, atol=1e-5)
+
+
+def test_oom_without_backoff_state_propagates() -> None:
+    """
+    No state dict (explicit sizing) means OOM raises untouched.
+    """
+    model = _FlakyOOMModel(fits=1)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        apply_model(model, torch.randn(1, 1, 250), chunk_batch_size=4)
+
+
+def test_oom_at_batch_one_raises_with_state_floored() -> None:
+    """
+    When even batch size 1 doesn't fit, the OOM propagates (the model
+    genuinely doesn't fit) with the state floored at 1.
+    """
+    model = _FlakyOOMModel(fits=0)
+    state = {"chunk_batch_size": 4}
+    with pytest.raises(RuntimeError, match="out of memory"):
+        apply_model(
+            model, torch.randn(1, 1, 250), chunk_batch_size=4, oom_backoff_state=state
+        )
+    assert state["chunk_batch_size"] == 1
+
+
+def test_non_oom_runtime_error_propagates_despite_backoff() -> None:
+    """
+    Backoff only rescues OOM-shaped failures; other RuntimeErrors raise
+    with the state untouched.
+    """
+
+    class _Broken(_DoublingModel):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """
+            Always raise a non-OOM runtime error.
+
+            :param x: Ignored.
+            :return: Never returns.
+            """
+            raise RuntimeError("cuDNN launch failure (not memory)")
+
+    state = {"chunk_batch_size": 4}
+    with pytest.raises(RuntimeError, match="cuDNN"):
+        apply_model(
+            _Broken(),
+            torch.randn(1, 1, 250),
+            chunk_batch_size=4,
+            oom_backoff_state=state,
+        )
+    assert state["chunk_batch_size"] == 4
+
+
+def test_fixed_batch_shape_blocks_in_apply_backoff() -> None:
+    """
+    Compiled models (``_fixed_batch_shape``) can't change shape here — the
+    OOM propagates so the Separator can recapture instead.
+    """
+    model = _FlakyOOMModel(fits=1)
+    model._fixed_batch_shape = True
+    state = {"chunk_batch_size": 4}
+    with pytest.raises(RuntimeError, match="out of memory"):
+        apply_model(
+            model, torch.randn(1, 1, 250), chunk_batch_size=4, oom_backoff_state=state
+        )
+    assert state["chunk_batch_size"] == 4
+
+
+def test_oom_during_accumulation_phase_is_retry_safe(monkeypatch) -> None:
+    """
+    An OOM raised after the forward but during the (allocating) contribution
+    phase must not double-count already-processed chunks on retry: output
+    stays exactly equal to a clean run and progress never overshoots. Uses a
+    non-pointwise model — overlap contributions differ chunk to chunk, so
+    any double accumulation breaks equality (a pointwise model would hide
+    it: consistent out/sum_weight doubling cancels in the division).
+    """
+    import unblend.apply as apply_mod
+
+    class _PositionalModel(torch.nn.Module):
+        """
+        Non-pointwise stand-in: output depends on position within the chunk.
+        """
+
+        sources = ["one", "two"]
+        samplerate = 100
+        audio_channels = 1
+        max_allowed_segment = 1.0
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """
+            Stack ``x`` and its running cumsum along a sources dimension.
+
+            :param x: Input of shape ``[batch, channels, samples]``.
+            :return: Output of shape ``[batch, 2, channels, samples]``.
+            """
+            return torch.stack([x, x.cumsum(-1)], dim=1)
+
+    model = _PositionalModel()
+    mix = torch.randn(1, 1, 250)
+    clean = apply_model(model, mix, chunk_batch_size=4)
+
+    real_center_trim = apply_mod.center_trim
+    calls = {"n": 0}
+
+    def flaky_trim(tensor: torch.Tensor, reference) -> torch.Tensor:
+        """
+        Raise a fake OOM on the third contribution of the first attempt.
+
+        :param tensor: Tensor to trim.
+        :param reference: Trim reference.
+        :return: The trimmed tensor.
+        """
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("CUDA out of memory (fake, contribution phase)")
+        return real_center_trim(tensor, reference)
+
+    monkeypatch.setattr(apply_mod, "center_trim", flaky_trim)
+
+    events: list[tuple[str, dict]] = []
+    state = {"chunk_batch_size": 4}
+    out = apply_model(
+        model,
+        mix,
+        chunk_batch_size=4,
+        oom_backoff_state=state,
+        progress_callback=lambda e, d: events.append((e, dict(d))),
+    )
+
+    assert torch.allclose(out, clean, atol=1e-6)
+    assert state["chunk_batch_size"] == 2
+    chunk_events = [d for e, d in events if e == "chunk_complete"]
+    total = chunk_events[-1]["total_chunks"]
+    assert chunk_events[-1]["completed_chunks"] == total
+    assert all(d["completed_chunks"] <= total for d in chunk_events)

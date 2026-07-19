@@ -1,10 +1,10 @@
-"""Unit tests for the pure tensor helpers in ``demucs.audio``."""
+"""Unit tests for the pure tensor helpers in ``unblend.audio``."""
 
 import pytest
 import torch
 
-from demucs.audio import convert_audio_channels, prevent_clip
-from demucs.exceptions import ValidationError
+from unblend.audio import convert_audio_channels, prevent_clip
+from unblend.exceptions import ValidationError
 
 
 def test_convert_channels_stereo_passthrough() -> None:

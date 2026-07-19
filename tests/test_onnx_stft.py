@@ -14,8 +14,8 @@ from types import SimpleNamespace
 
 import torch
 
-from demucs.htdemucs import HTDemucs
-from demucs.onnx import HTDemucsONNXWrapper, compute_stft_for_export
+from unblend.htdemucs import HTDemucs
+from unblend.onnx import HTDemucsONNXWrapper, compute_stft_for_export
 
 
 def test_export_stft_matches_model_spec() -> None:

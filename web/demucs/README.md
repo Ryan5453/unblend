@@ -1,8 +1,8 @@
 # demucs-next
 
-Browser-side audio source separation using ONNX [Demucs](https://github.com/adefossez/demucs) models. Runs HTDemucs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
+Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
 
-For backend/server-side workflows, use the `demucs-next` Python package — it is significantly faster than the in-browser ONNX path.
+For backend/server-side workflows, use the `unblend` Python package — it is significantly faster than the in-browser ONNX path.
 
 ## Install
 
@@ -42,14 +42,27 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Output is always 2 channels per stem regardless of input channel count.
 
+## Models
+
+| Model | Stems | Family | Weights license |
+|---|---|---|---|
+| `htdemucs` | drums, bass, other, vocals | HTDemucs | unlicensed¹ |
+| `htdemucs_6s` | + guitar, piano | HTDemucs | unlicensed¹ |
+| `bs_roformer_sw` | bass, drums, other, vocals, guitar, piano | BS-RoFormer | CC-BY-NC-SA-4.0² |
+| `melband_roformer_kim` | vocals, other³ | Mel-Band RoFormer | CC-BY-NC-SA-4.0² |
+
+¹ The HTDemucs *code* is MIT (Meta), but the released weights carry no license grant.
+² **Non-commercial.** The RoFormer checkpoints are community-trained; surface `separator.license` in your app where appropriate.
+³ `other` is computed client-side as `mixture - vocals` (the checkpoint has a single vocal mask head).
+
+The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-460 MB fp16) and slower per segment.
+
 ## Constants
 
 - `SAMPLE_RATE` — `44100`. The only valid input sample rate.
-- `SEGMENT_SAMPLES` — `343980`. ~7.8s at 44.1 kHz; the training segment length the ONNX graph is traced at.
-- `SEGMENT_SECONDS` — `SEGMENT_SAMPLES / SAMPLE_RATE` (~7.8s).
+- `MODEL_CONFIGS` — per-model DSP geometry and metadata (`nfft`, `hopLength`, `segmentSamples`, `sources`, `license`, …). Use `specDims(config)` for a model's spectrogram dims.
+- `SEGMENT_SAMPLES` / `SEGMENT_SECONDS` / `NFFT` / `HOP_LENGTH` — the HTDemucs values (`343980` / ~7.8s / `4096` / `1024`), kept for back-compat; prefer `MODEL_CONFIGS[model]`.
 - `SEGMENT_OVERLAP` — `0.25`. Overlap fraction between consecutive segments.
-- `NFFT` — `4096`. STFT FFT size.
-- `HOP_LENGTH` — `1024`. STFT hop length.
 
 ## Usage
 
@@ -73,9 +86,9 @@ await separator.unload();
 
 ### `Separator.load(model, options)`
 
-Loads a model and returns a ready-to-use `Separator`. The model is fetched from HuggingFace (`Ryan5453/demucs-next`) when loaded.
+Loads a model and returns a ready-to-use `Separator`. Model URLs are resolved from the package's registry when loaded.
 
-- `model`: `'htdemucs'` (4 stems: drums, bass, other, vocals) | `'htdemucs_6s'` (6 stems: drums, bass, other, vocals, guitar, piano)
+- `model`: `'htdemucs'` | `'htdemucs_6s'` | `'bs_roformer_sw'` | `'melband_roformer_kim'` (see the Models table)
 - `options.backend`: `'webgpu'` (default) | `'wasm'`. WebGPU falls back to WASM automatically if unavailable or if session creation fails.
 - `options.precision`: `'fp32'` (default) | `'fp16'`. `'fp16'` is a weight-only-fp16 variant — roughly half the download with near-identical (not bit-exact) output: the weights are rounded to fp16, but compute still runs in fp32, so the difference is well below the audible floor.
 - `options.wasmPaths`: override the ORT `.wasm` asset URL prefix
@@ -87,6 +100,7 @@ Each `Separator` instance owns its own three workers (STFT, ONNX, iSTFT). Multip
 
 - `separator.model` — the loaded `ModelType`.
 - `separator.sources` — stem names produced by the model.
+- `separator.license` — license of the model weights (`'unlicensed'` for HTDemucs; `'CC-BY-NC-SA-4.0'` for the RoFormer checkpoints).
 - `separator.backend` — `'webgpu'` | `'wasm'` actually in use after fallback.
 - `separator.precision` — `'fp32'` | `'fp16'`.
 - `separator.separate(audioBuffer, options?)` — separates one `AudioBuffer`; safe to call repeatedly.
@@ -121,7 +135,7 @@ interface SeparationResult {
 
 Each stem `Float32Array` has length `numSamples * 2` and is interleaved: `[L0, R0, L1, R1, ...]`. To produce a WAV blob for download or playback, encode it yourself — see `web/app/src/utils/wav-utils.ts` in the demo app.
 
-The pipeline processes the audio in overlapping ~7.8s segments with crossfaded boundaries, pipelined across the STFT, ONNX, and iSTFT workers so STFT for segment N+1 runs while segment N is in inference.
+The pipeline processes the audio in overlapping segments (~7.8s for HTDemucs; the RoFormer models use their own traced chunk lengths, e.g. ~13.4s for `bs_roformer_sw`) with crossfaded boundaries, pipelined across the STFT, ONNX, and iSTFT workers so STFT for segment N+1 runs while segment N is in inference.
 
 ## Decoding Audio
 
