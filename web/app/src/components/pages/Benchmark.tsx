@@ -17,7 +17,7 @@ import {
     SAMPLE_RATE,
     type ModelType,
     type ModelPrecision,
-} from 'demucs-next';
+} from 'unblend';
 import { computeSDRAsync, meanFiniteSDR, type StemSDR } from '../../utils/sdr';
 import { ORT_WASM_PATHS } from '../../onnx-config';
 

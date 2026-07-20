@@ -240,9 +240,7 @@ def _get_kernel(name: str, dtype: torch.dtype) -> Any:
     return fn
 
 
-def metal_rms_norm(
-    x: torch.Tensor, gamma: torch.Tensor, scale: float
-) -> torch.Tensor:
+def metal_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
     """
     Apply RoFormer's last-dimension RMSNorm with one fused MPS kernel.
 

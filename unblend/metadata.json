@@ -12,11 +12,76 @@
       ],
       "models": [
         {
-          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs-0.th",
-          "checksum": "3e28d2b1",
-          "sha256": "3e28d2b17b930a176c8e10c0d0598c01a87424f5220344c25c9f4bb6c003d40a"
+          "format": "safetensors",
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs.safetensors",
+          "checksum": "d3cb2f212d065294",
+          "sha256": "d3cb2f212d0652945fd033c26e1fbfdf9b6fbb9087aa6104def87f08b1016a81",
+          "size_bytes": 84023856
         }
-      ]
+      ],
+      "architecture": "htdemucs",
+      "config": {
+        "sources": [
+          "drums",
+          "bass",
+          "other",
+          "vocals"
+        ],
+        "audio_channels": 2,
+        "samplerate": 44100,
+        "segment": 7.8,
+        "channels": 48,
+        "channels_time": null,
+        "growth": 2,
+        "nfft": 4096,
+        "cac": true,
+        "depth": 4,
+        "rewrite": true,
+        "multi_freqs": [],
+        "multi_freqs_depth": 3,
+        "freq_emb": 0.2,
+        "emb_scale": 10,
+        "emb_smooth": true,
+        "kernel_size": 8,
+        "stride": 4,
+        "time_stride": 2,
+        "context": 1,
+        "context_enc": 0,
+        "norm_starts": 4,
+        "norm_groups": 4,
+        "dconv_mode": 3,
+        "dconv_depth": 2,
+        "dconv_comp": 8,
+        "dconv_init": 0.001,
+        "bottom_channels": 512,
+        "t_layers": 5,
+        "t_hidden_scale": 4.0,
+        "t_heads": 8,
+        "t_dropout": 0.02,
+        "t_layer_scale": true,
+        "t_gelu": true,
+        "t_emb": "sin",
+        "t_max_positions": 10000,
+        "t_max_period": 10000.0,
+        "t_weight_pos_embed": 1.0,
+        "t_cape_mean_normalize": true,
+        "t_cape_augment": true,
+        "t_cape_glob_loc_scale": [
+          5000.0,
+          1.0,
+          1.4
+        ],
+        "t_sin_random_shift": 0,
+        "t_norm_in": true,
+        "t_norm_in_group": false,
+        "t_group_norm": false,
+        "t_norm_first": true,
+        "t_norm_out": true,
+        "t_weight_decay": 0.0,
+        "t_lr": null,
+        "t_cross_first": false,
+        "rescale": 0.1
+      }
     },
     "htdemucs_ft": {
       "backend": "demucs",
@@ -30,24 +95,32 @@
       ],
       "models": [
         {
-          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-0.th",
-          "checksum": "c40a6577",
-          "sha256": "c40a65774abc835ea93aa619a08ac7008e127535d2cd23dbe1a2a4dcd5c86e2f"
+          "format": "safetensors",
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-0.safetensors",
+          "checksum": "c971eb902178a60d",
+          "sha256": "c971eb902178a60d1729f665254030497c1ce0e170726b6f957828b9db97d942",
+          "size_bytes": 84023856
         },
         {
-          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-1.th",
-          "checksum": "db977ae6",
-          "sha256": "db977ae63b142c23e78a15bb5aa4d065a0bb6305804d7dbb6ba82f78e09514fa"
+          "format": "safetensors",
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-1.safetensors",
+          "checksum": "0bc9bc7b6d78ba66",
+          "sha256": "0bc9bc7b6d78ba666ef55e16b7c61236c1651139bd62aea507f07a883b96ea40",
+          "size_bytes": 84023856
         },
         {
-          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-2.th",
-          "checksum": "4b123cec",
-          "sha256": "4b123cec9ea944b13a0526bddf707cdf123f1c1d600323072712dd526976ab10"
+          "format": "safetensors",
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-2.safetensors",
+          "checksum": "08f6c794334b0e86",
+          "sha256": "08f6c794334b0e8643ec0e2b0fc2d1a25d61d6ac69027aa3842e004b8a165b8d",
+          "size_bytes": 84023856
         },
         {
-          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-3.th",
-          "checksum": "29903873",
-          "sha256": "299038731f0a6107cd1cd16e2dcf631874fc660e926878a1036ec328a424e591"
+          "format": "safetensors",
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_ft-3.safetensors",
+          "checksum": "24403c0ea6cec194",
+          "sha256": "24403c0ea6cec19432eb41334f506c94c15b611074c24e3be96861f2c6534da1",
+          "size_bytes": 84023856
         }
       ],
       "weights": [
@@ -75,7 +148,70 @@
           0.0,
           1.0
         ]
-      ]
+      ],
+      "architecture": "htdemucs",
+      "config": {
+        "sources": [
+          "drums",
+          "bass",
+          "other",
+          "vocals"
+        ],
+        "audio_channels": 2,
+        "samplerate": 44100,
+        "segment": 7.8,
+        "channels": 48,
+        "channels_time": null,
+        "growth": 2,
+        "nfft": 4096,
+        "cac": true,
+        "depth": 4,
+        "rewrite": true,
+        "multi_freqs": [],
+        "multi_freqs_depth": 3,
+        "freq_emb": 0.2,
+        "emb_scale": 10,
+        "emb_smooth": true,
+        "kernel_size": 8,
+        "stride": 4,
+        "time_stride": 2,
+        "context": 1,
+        "context_enc": 0,
+        "norm_starts": 4,
+        "norm_groups": 4,
+        "dconv_mode": 3,
+        "dconv_depth": 2,
+        "dconv_comp": 8,
+        "dconv_init": 0.001,
+        "bottom_channels": 512,
+        "t_layers": 5,
+        "t_hidden_scale": 4.0,
+        "t_heads": 8,
+        "t_dropout": 0.02,
+        "t_layer_scale": true,
+        "t_gelu": true,
+        "t_emb": "sin",
+        "t_max_positions": 10000,
+        "t_max_period": 10000.0,
+        "t_weight_pos_embed": 1.0,
+        "t_cape_mean_normalize": true,
+        "t_cape_augment": true,
+        "t_cape_glob_loc_scale": [
+          5000.0,
+          1.0,
+          1.4
+        ],
+        "t_sin_random_shift": 0,
+        "t_norm_in": true,
+        "t_norm_in_group": false,
+        "t_group_norm": false,
+        "t_norm_first": true,
+        "t_norm_out": true,
+        "t_weight_decay": 0.05,
+        "t_lr": null,
+        "t_cross_first": false,
+        "rescale": 0.1
+      }
     },
     "htdemucs_6s": {
       "backend": "demucs",
@@ -91,11 +227,78 @@
       ],
       "models": [
         {
-          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_6s-0.th",
-          "checksum": "1aa7b223",
-          "sha256": "1aa7b2234a1c2ba8a8c3a6e7caaa3b8f6741a98d567296aea64e7d0ae844786a"
+          "format": "safetensors",
+          "remote": "https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs_6s.safetensors",
+          "checksum": "0946dc1dbcbcc3c3",
+          "sha256": "0946dc1dbcbcc3c34976a46171fbeba8f02d89fbf939bccea3a0273b17b5faf3",
+          "size_bytes": 109714488
         }
-      ]
+      ],
+      "architecture": "htdemucs",
+      "config": {
+        "sources": [
+          "drums",
+          "bass",
+          "other",
+          "vocals",
+          "guitar",
+          "piano"
+        ],
+        "audio_channels": 2,
+        "samplerate": 44100,
+        "segment": 7.8,
+        "channels": 48,
+        "channels_time": null,
+        "growth": 2,
+        "nfft": 4096,
+        "cac": true,
+        "depth": 4,
+        "rewrite": true,
+        "multi_freqs": [],
+        "multi_freqs_depth": 3,
+        "freq_emb": 0.2,
+        "emb_scale": 10,
+        "emb_smooth": true,
+        "kernel_size": 8,
+        "stride": 4,
+        "time_stride": 2,
+        "context": 1,
+        "context_enc": 0,
+        "norm_starts": 4,
+        "norm_groups": 4,
+        "dconv_mode": 3,
+        "dconv_depth": 2,
+        "dconv_comp": 8,
+        "dconv_init": 0.001,
+        "bottom_channels": 0,
+        "t_layers": 5,
+        "t_hidden_scale": 4.0,
+        "t_heads": 8,
+        "t_dropout": 0.02,
+        "t_layer_scale": true,
+        "t_gelu": true,
+        "t_emb": "sin",
+        "t_max_positions": 10000,
+        "t_max_period": 10000.0,
+        "t_weight_pos_embed": 1.0,
+        "t_cape_mean_normalize": true,
+        "t_cape_augment": true,
+        "t_cape_glob_loc_scale": [
+          5000.0,
+          1.0,
+          1.4
+        ],
+        "t_sin_random_shift": 0,
+        "t_norm_in": true,
+        "t_norm_in_group": false,
+        "t_group_norm": false,
+        "t_norm_first": true,
+        "t_norm_out": true,
+        "t_weight_decay": 0.0,
+        "t_lr": null,
+        "t_cross_first": false,
+        "rescale": 0.1
+      }
     },
     "bs_roformer_sw": {
       "backend": "roformer",
@@ -131,8 +334,10 @@
         "mlp_expansion_factor": 4
       },
       "checkpoint": {
-        "url": "https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/resolve/main/BS-Rofo-SW-Fixed.ckpt",
-        "sha256": "24e7d35ee9c64415673d3fd33e06a67cac2c103c5df6267ba1576459c775916e"
+        "format": "safetensors",
+        "url": "https://huggingface.co/Ryan5453/unblend/resolve/main/bs_roformer_sw.safetensors",
+        "sha256": "56c131428745d83d63f72293d237fdbb56f40d8e4b6980cbcde70e28a9f7330f",
+        "size_bytes": 698840448
       }
     },
     "melband_roformer_kim": {
@@ -165,8 +370,10 @@
         "mlp_expansion_factor": 4
       },
       "checkpoint": {
-        "url": "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
-        "sha256": "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e"
+        "format": "safetensors",
+        "url": "https://huggingface.co/Ryan5453/unblend/resolve/main/melband_roformer_kim.safetensors",
+        "sha256": "03bfc70b43df1f3e92ed1e582e8b18983f8d4adcd1a7d2133ada3b2f371b3095",
+        "size_bytes": 912885624
       }
     }
   }

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import math
 import os
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -48,14 +49,14 @@ class Predictor(BasePredictor):
 
     Architecture:
 
-    * ``setup()`` loads every available Demucs model into its own ``Separator``
-      and spawns a per-model coalescer task on the same asyncio event loop.
-      Cog's Rust orchestrator runs every async ``predict()`` on the same
+    * ``setup()`` loads each served model and initializes the coalescer
+      registry. ``predict()`` lazily starts one finite-lived worker per active
+      parameter partition on the same asyncio event loop. Cog's Rust
+      orchestrator runs every async ``predict()`` on that loop (verified at
       event loop initialised in ``setup()`` (verified at
       ``crates/coglet-python/src/worker_bridge.rs:138-176`` in the cog
       source — ``new_event_loop`` + ``run_forever`` on a dedicated thread),
-      so a coalescer task created here is visible to every concurrent
-      ``predict()``.
+      so each partition worker is visible to every concurrent ``predict()``.
 
     * Each ``predict()`` writes its input + result future into the queue for
       its requested model and awaits the future. The coalescer drains the
@@ -90,7 +91,7 @@ class Predictor(BasePredictor):
 
     async def setup(self) -> None:
         """
-        Load the Demucs model and start the per-model coalescer machinery.
+        Load the served model and initialize lazy coalescer state.
         """
         self.separators: dict[str, Separator] = {}
         use_cuda = torch.cuda.is_available()
@@ -158,6 +159,8 @@ class Predictor(BasePredictor):
                 )
                 / 1000.0
             )
+            if not math.isfinite(self._batch_window_s) or self._batch_window_s < 0:
+                raise ValueError
         except ValueError:
             self._batch_window_s = _BATCH_WINDOW_MS_DEFAULT / 1000.0
 
@@ -171,15 +174,11 @@ class Predictor(BasePredictor):
         """
         Build the partition key for the coalescer queue.
 
-        ``split_overlap`` is a client-supplied float and is the only key
-        component with an unbounded value space. Each distinct key lazily
-        spawns a permanent coalescer task + queue (see ``_get_queue``), so
-        keying on the raw float would let a client minting near-identical
-        overlaps (0.25, 0.250001, ...) grow tasks/queues without bound. We
-        quantise to 3 decimals: the requests in a batch are all separated at
-        this rounded overlap anyway (``separate`` takes a single value), the
-        ≤0.0005 deviation from the request is numerically irrelevant to
-        separation quality, and it caps the key space at ~1000 buckets.
+        ``split_overlap`` is a client-supplied float and would otherwise make
+        near-identical requests incompatible for batching. We quantise to 3
+        decimals: requests in one batch are separated at this rounded overlap,
+        the ≤0.0005 deviation is numerically irrelevant to quality, and workers
+        now retire immediately when their queue drains.
 
         :param model: model name to separate with
         :param shifts: number of random shifts
@@ -189,112 +188,171 @@ class Predictor(BasePredictor):
         """
         return (model, shifts, round(split_overlap, 3), isolate_stem)
 
-    def _get_queue(self, key: tuple) -> asyncio.Queue:
+    def _enqueue_request(self, key: tuple, request: _Request) -> None:
         """
-        Return (or lazily create) the queue + coalescer task for ``key``.
+        Atomically enqueue a request, creating a finite-lived worker if needed.
 
-        :param key: the partition key
-        :return: the asyncio queue for this key
+        There is no ``await`` between registry lookup, worker creation, and
+        ``put_nowait``. A drained worker can therefore retire with an atomic
+        empty-check without racing a request onto an orphaned queue.
+
+        :param key: Partition key for compatible inference parameters.
+        :param request: Request to enqueue.
         """
         queue = self._queues.get(key)
-        if queue is None:
+        task = self._coalescers.get(key)
+        if queue is None or task is None or task.done():
             queue = asyncio.Queue()
             self._queues[key] = queue
-            self._coalescers[key] = asyncio.create_task(
+            task = asyncio.create_task(
                 self._coalesce(key, queue),
                 name=f"demucs-coalescer-{'|'.join(map(str, key))}",
             )
-        return queue
+            self._coalescers[key] = task
+        queue.put_nowait(request)
+
+    def _process_batch(
+        self,
+        separator: Separator,
+        batch: list[_Request],
+        *,
+        shifts: int,
+        split_overlap: float,
+        isolate_stem: str,
+    ) -> None:
+        """
+        Resolve one batch, falling back per request when the batch fails.
+
+        Keeping result tensors in this synchronous helper ensures its frame is
+        gone before the worker yields and starts another memory-heavy batch.
+
+        :param separator: Loaded model separator.
+        :param batch: Compatible live requests.
+        :param shifts: Number of shift rounds.
+        :param split_overlap: Segment overlap.
+        :param isolate_stem: Stem specialization name or ``"none"``.
+        """
+        audio_paths = [request.audio_path for request in batch]
+        stem_kwarg = isolate_stem if isolate_stem and isolate_stem != "none" else None
+        try:
+            results = separator.separate(
+                audio_paths,
+                shifts=shifts,
+                split_overlap=split_overlap,
+                use_only_stem=stem_kwarg,
+            )
+            if not isinstance(results, list) or len(results) != len(batch):
+                raise RuntimeError(
+                    "Batched separation returned an unexpected number of results."
+                )
+        except Exception:
+            for request in batch:
+                if request.future.done():
+                    continue
+                try:
+                    single = separator.separate(
+                        request.audio_path,
+                        shifts=shifts,
+                        split_overlap=split_overlap,
+                        use_only_stem=stem_kwarg,
+                    )
+                except Exception as single_exc:
+                    request.future.set_exception(single_exc)
+                else:
+                    request.future.set_result(single)
+        else:
+            for request, separated in zip(batch, results):
+                if not request.future.done():
+                    request.future.set_result(separated)
 
     async def _coalesce(self, key: tuple, queue: asyncio.Queue) -> None:
         """
-        Drain ``queue`` into full-batch ``Separator.separate`` calls.
+        Drain one parameter partition into full-batch separation calls.
 
-        Pulls the first request, then collects up to ``chunk_batch_size``
-        additional requests within the configured window. Runs the actual
-        separation synchronously on the event loop's thread (NOT via
-        ``asyncio.to_thread``) — see the class docstring for why the
-        CUDAGraph TLS binding forces this.
+        The worker retires as soon as its queue drains instead of waiting
+        forever, so client-controlled parameter combinations do not accumulate
+        permanent tasks and queues. Inference remains synchronous on the event
+        loop thread to preserve the compiled CUDAGraph TLS contract.
 
-        :param key: the partition key for this coalescer
-        :param queue: the request queue to drain
+        :param key: Partition key for compatible inference parameters.
+        :param queue: Queue owned by this worker.
         """
-        model_name, shifts, split_overlap, isolate_stem = key
-        separator = self.separators[model_name]
-        max_batch = separator.chunk_batch_size
+        active_batch: list[_Request] = []
 
-        while True:
-            try:
-                first = await queue.get()
-            except asyncio.CancelledError:
-                return
-
-            batch: list[_Request] = [first]
-            deadline = asyncio.get_event_loop().time() + self._batch_window_s
-            while len(batch) < max_batch:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    break
+        try:
+            model_name, shifts, split_overlap, isolate_stem = key
+            separator = self.separators[model_name]
+            max_batch = separator.chunk_batch_size
+            while True:
                 try:
-                    nxt = await asyncio.wait_for(queue.get(), remaining)
-                except asyncio.TimeoutError:
-                    break
-                batch.append(nxt)
+                    first = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
 
-            # Drop requests cancelled while they sat in the queue. Cog unlinks
-            # a request's temp input file the moment its predict() unwinds —
-            # including on cancellation (verified: the Rust orchestrator drops
-            # the request's PreparedInput, which calls path.unlink, in
-            # crates/coglet-python/src/input.rs). Feeding a cancelled request's
-            # now-deleted path into the batched separate() would raise
-            # FileNotFoundError and drag the whole batch down the slow
-            # per-request fallback below. ``future.done()`` is True for a
-            # request whose predict() already cancelled. (A request that
-            # cancels in the ~ms between here and separate()'s up-front file
-            # read is still caught by the except handler.)
-            batch = [r for r in batch if not r.future.done()]
-            if not batch:
-                continue
-
-            audio_paths = [r.audio_path for r in batch]
-            stem_kwarg = (
-                isolate_stem if isolate_stem and isolate_stem != "none" else None
-            )
-
-            try:
-                results = separator.separate(
-                    audio_paths,
-                    shifts=shifts,
-                    split_overlap=split_overlap,
-                    use_only_stem=stem_kwarg,
-                )
-            except Exception:
-                # A single bad input shouldn't kill its neighbours. Re-run
-                # each surviving request individually so the bad one gets
-                # its own exception and the rest get real results.
-                for req in batch:
-                    if req.future.done():
-                        continue
+                batch: list[_Request] = [first]
+                active_batch = batch
+                next_request: _Request | None = None
+                deadline = asyncio.get_running_loop().time() + self._batch_window_s
+                while len(batch) < max_batch:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
                     try:
-                        single = separator.separate(
-                            req.audio_path,
-                            shifts=shifts,
-                            split_overlap=split_overlap,
-                            use_only_stem=stem_kwarg,
-                        )
-                    except Exception as single_exc:
-                        req.future.set_exception(single_exc)
-                    else:
-                        req.future.set_result(single)
-                continue
+                        next_request = await asyncio.wait_for(queue.get(), remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    batch.append(next_request)
 
-            for req, separated in zip(batch, results):
-                if req.future.done():
-                    # The caller was cancelled before we got here; drop the
-                    # result silently rather than triggering "future result
-                    # not retrieved" warnings.
-                    continue
-                req.future.set_result(separated)
+                # Cog unlinks a cancelled request's temporary input path, so
+                # discard cancelled futures before touching their paths.
+                batch = [request for request in batch if not request.future.done()]
+                active_batch = batch
+                if batch:
+                    self._process_batch(
+                        separator,
+                        batch,
+                        shifts=shifts,
+                        split_overlap=split_overlap,
+                        isolate_stem=isolate_stem,
+                    )
+
+                active_batch = []
+                batch.clear()
+                first = None
+                next_request = None
+                # Let completed predict() calls encode and release their stem
+                # tensors before starting another memory-heavy batch.
+                await asyncio.sleep(0)
+                if queue.empty():
+                    return
+        except asyncio.CancelledError:
+            for request in active_batch:
+                if not request.future.done():
+                    request.future.cancel()
+            while True:
+                try:
+                    request = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not request.future.done():
+                    request.future.cancel()
+            raise
+        except Exception as exc:
+            for request in active_batch:
+                if not request.future.done():
+                    request.future.set_exception(exc)
+            while True:
+                try:
+                    request = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not request.future.done():
+                    request.future.set_exception(exc)
+        finally:
+            current = asyncio.current_task()
+            if self._queues.get(key) is queue and self._coalescers.get(key) is current:
+                self._queues.pop(key, None)
+                self._coalescers.pop(key, None)
 
     async def predict(
         self,
@@ -344,9 +402,8 @@ class Predictor(BasePredictor):
         ),
     ) -> Output:
         """
-        Run separation on a single audio file. Concurrent requests with
-        identical inference parameters share a forward pass via the per-model
-        coalescer started in :meth:`setup`.
+        Run separation on one file. Compatible concurrent requests share a
+        lazily-created forward batch; its worker retires when the queue drains.
 
         :param audio: the audio file to separate
         :param model: model to use for separation
@@ -358,8 +415,6 @@ class Predictor(BasePredictor):
         :return: the separated stems as output files
         """
         key = self._queue_key(model, shifts, split_overlap, isolate_stem)
-        queue = self._get_queue(key)
-
         request = _Request(
             audio_path=PathlibPath(str(audio)),
             model_name=model,
@@ -367,7 +422,7 @@ class Predictor(BasePredictor):
             format=format,
             clip_mode=clip_mode,
         )
-        await queue.put(request)
+        self._enqueue_request(key, request)
 
         try:
             separated = await request.future

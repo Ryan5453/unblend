@@ -53,7 +53,11 @@ def _compile_profile_key(separator: Separator) -> tuple[str, str] | None:
     :param separator: Initialized eager separator.
     :return: ``(architecture, precision)`` or ``None`` when unsupported.
     """
-    model = separator.model.models[0] if isinstance(separator.model, ModelEnsemble) else separator.model
+    model = (
+        separator.model.models[0]
+        if isinstance(separator.model, ModelEnsemble)
+        else separator.model
+    )
     if isinstance(model, HTDemucs):
         architecture = "htdemucs"
     elif isinstance(model, BSRoformer):
@@ -110,14 +114,10 @@ def _estimate_compile_chunks(
     :return: ``(estimated_chunks, known_duration_seconds, unknown_file_count)``.
     """
     sample_rate = separator.model.samplerate
-    segment_samples = int(
-        round(separator.model.max_allowed_segment * sample_rate)
-    )
+    segment_samples = int(round(separator.model.max_allowed_segment * sample_rate))
     stride = int((1 - split_overlap) * segment_samples)
     model_count = (
-        len(separator.model.models)
-        if isinstance(separator.model, ModelEnsemble)
-        else 1
+        len(separator.model.models) if isinstance(separator.model, ModelEnsemble) else 1
     )
     total_chunks = 0
     total_duration = 0.0
@@ -130,9 +130,7 @@ def _estimate_compile_chunks(
             continue
         total_duration += duration
         samples = int(math.ceil(duration * sample_rate))
-        chunks_per_shift = math.ceil(
-            (samples + expected_shift_padding) / stride
-        )
+        chunks_per_shift = math.ceil((samples + expected_shift_padding) / stride)
         total_chunks += shifts * chunks_per_shift
     return total_chunks * model_count, total_duration, unknown_files
 
@@ -184,14 +182,10 @@ def _maybe_enable_auto_compile(
         suffix = "s" if unknown_files != 1 else ""
         detail += f", {unknown_files} duration{suffix} unavailable"
     if estimated_eager_seconds < threshold:
-        console.print(
-            f"[cyan]Auto compile:[/cyan] keeping eager execution — {detail}"
-        )
+        console.print(f"[cyan]Auto compile:[/cyan] keeping eager execution — {detail}")
         return False
 
-    console.print(
-        f"[cyan]Auto compile:[/cyan] enabling CUDA compilation — {detail}"
-    )
+    console.print(f"[cyan]Auto compile:[/cyan] enabling CUDA compilation — {detail}")
     try:
         separator.enable_compile()
     except Exception as error:

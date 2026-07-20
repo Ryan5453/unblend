@@ -1,6 +1,6 @@
 # unblend
 
-`unblend` is a music source separation library with one `Separator` API over multiple model families: an optimized fork of [Demucs](https://github.com/adefossez/demucs), plus BS-RoFormer and Mel-Band RoFormer community checkpoints (`bs_roformer_sw`, `melband_roformer_kim`). The Demucs backend runs ~2.5× faster than upstream like-for-like (FP32), up to ~6× with FP16 + `torch.compile`; single-stem specialist loading reaches 19–23× by skipping unused models. Run `unblend models list` for stems and weight licenses (RoFormer weights are CC-BY-NC-SA-4.0, non-commercial; Demucs weights carry no license grant).
+`unblend` is a music source separation library with one `Separator` API over multiple model families: an optimized fork of [Demucs](https://github.com/adefossez/demucs), plus BS-RoFormer and Mel-Band RoFormer community checkpoints (`bs_roformer_sw`, `melband_roformer_kim`). The Demucs backend runs ~2.5× faster than upstream like-for-like (FP32), up to ~6× with FP16 + `torch.compile`; single-stem specialist loading reaches 19–23× by skipping unused models. Registered model weights are pickle-free Safetensors; architecture/configuration is allowlisted in `metadata.json`, and exact size plus SHA-256 are checked before loading. Run `unblend models list` for stems and weight licenses (RoFormer weights are CC-BY-NC-SA-4.0, non-commercial; Demucs weights carry no license grant).
 
 
 <details>
@@ -141,7 +141,7 @@ unblend provides a Python API for separating audio files. Please refer to the [A
 
 ## ONNX & Browser Usage
 
-unblend can also run in the browser via ONNX. See the [ONNX export notes](https://github.com/Ryan5453/unblend/blob/main/onnx.md) and the [`demucs-next` npm package docs](https://github.com/Ryan5453/unblend/blob/main/web/demucs/README.md) for details.
+unblend can also run in the browser via ONNX. See the [ONNX export notes](https://github.com/Ryan5453/unblend/blob/main/onnx.md) and the [`unblend` npm package docs](https://github.com/Ryan5453/unblend/blob/main/web/demucs/README.md) for details.
 
 ## Cog Usage
 

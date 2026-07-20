@@ -422,9 +422,7 @@ class Separator:
             return None
         supported = (HTDemucs, _RoformerBase)
         if isinstance(self.model, ModelEnsemble):
-            ref = next(
-                (m for m in self.model.models if isinstance(m, supported)), None
-            )
+            ref = next((m for m in self.model.models if isinstance(m, supported)), None)
         elif isinstance(self.model, supported):
             ref = self.model
         else:
@@ -583,12 +581,8 @@ class Separator:
                 model.forward_core = original_forward
                 del model._uncompiled_forward_core
 
-            original_transformers = getattr(
-                model, "_uncompiled_run_transformers", None
-            )
-            if original_transformers is not None and isinstance(
-                model, _RoformerBase
-            ):
+            original_transformers = getattr(model, "_uncompiled_run_transformers", None)
+            if original_transformers is not None and isinstance(model, _RoformerBase):
                 model._run_transformers = original_transformers
                 del model._uncompiled_run_transformers
             model._fixed_batch_shape = False
@@ -704,9 +698,7 @@ class Separator:
         # samplerate, channels, and effective segment length.
         supported = (HTDemucs, _RoformerBase)
         if isinstance(self.model, ModelEnsemble):
-            ref = next(
-                (m for m in self.model.models if isinstance(m, supported)), None
-            )
+            ref = next((m for m in self.model.models if isinstance(m, supported)), None)
         elif isinstance(self.model, supported):
             ref = self.model
         else:
@@ -1357,11 +1349,27 @@ class Separator:
                 f"progress_callback must be callable if provided, got {type(progress_callback)}"
             )
 
-        if isinstance(audio, list):
-            if not audio:
-                return []
-            batch_results = self._run_with_oom_backoff(
-                lambda cbs, state: self._separate_batch(
+        try:
+            if isinstance(audio, list):
+                if not audio:
+                    return []
+                return self._run_with_oom_backoff(
+                    lambda cbs, state: self._separate_batch(
+                        audio,
+                        shifts=shifts,
+                        split_overlap=split_overlap,
+                        seed=seed,
+                        progress_callback=progress_callback,
+                        use_only_stem=use_only_stem,
+                        chunk_batch_size=cbs,
+                        oom_backoff_state=state,
+                    ),
+                    chunk_batch_size=chunk_batch_size,
+                    allow=allow_oom_backoff,
+                )
+
+            return self._run_with_oom_backoff(
+                lambda cbs, state: self._separate_one(
                     audio,
                     shifts=shifts,
                     split_overlap=split_overlap,
@@ -1374,25 +1382,8 @@ class Separator:
                 chunk_batch_size=chunk_batch_size,
                 allow=allow_oom_backoff,
             )
+        finally:
             self._release_mps_cache()
-            return batch_results
-
-        result = self._run_with_oom_backoff(
-            lambda cbs, state: self._separate_one(
-                audio,
-                shifts=shifts,
-                split_overlap=split_overlap,
-                seed=seed,
-                progress_callback=progress_callback,
-                use_only_stem=use_only_stem,
-                chunk_batch_size=cbs,
-                oom_backoff_state=state,
-            ),
-            chunk_batch_size=chunk_batch_size,
-            allow=allow_oom_backoff,
-        )
-        self._release_mps_cache()
-        return result
 
     def _release_mps_cache(self) -> None:
         """
@@ -1579,7 +1570,9 @@ class Separator:
         """
         ref = wav.mean(0)
         mean = ref.mean()
-        std = ref.std()
+        # Preserve the training-time sample standard deviation for normal
+        # audio, but avoid the undefined one-sample Bessel correction.
+        std = ref.std(correction=1 if ref.numel() > 1 else 0)
         return (wav - mean) / (1e-5 + std), mean, std
 
     @staticmethod

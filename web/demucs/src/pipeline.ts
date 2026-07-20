@@ -15,6 +15,7 @@ import {
 import type { OnnxClient } from './onnx-client.js';
 import type { STFTClient } from './stft-client.js';
 import type { ISTFTClient, ISTFTResult } from './istft-client.js';
+import { StreamingOverlapAccumulator } from './overlap-accumulator.js';
 
 /** Maximum random shift in samples (Python: int(0.5 * model.samplerate)). */
 const MAX_SHIFT = Math.floor(0.5 * SAMPLE_RATE);
@@ -177,11 +178,21 @@ export async function runPipeline(
         outputs[source] = new Float32Array(numSamples * numChannels);
     }
 
-    // Per-round buffers, sized for the longest possible view (offset = 0)
-    // and reused across rounds.
-    const maxViewLength = numSamples + MAX_SHIFT;
-    const roundOut = modelSources.map(() => new Float32Array(maxViewLength * numChannels));
-    const sumWeight = new Float32Array(maxViewLength);
+    // Keep at most one segment of unfinished overlap-add data per source (and
+    // only the shifted-view length for shorter clips). Samples are normalized
+    // into final outputs as soon as no future segment can touch them, avoiding
+    // a second set of full-track source buffers.
+    const overlapBufferSamples = Math.min(
+        SEGMENT_SAMPLES,
+        numSamples + MAX_SHIFT,
+    );
+    const roundAccumulator = new StreamingOverlapAccumulator(
+        outputs,
+        modelSources,
+        overlapBufferSamples,
+        numChannels,
+        STEP,
+    );
 
     // Draw all offsets up front so totalSegs is known for progress reporting.
     // Python: random.randint(0, max_shift) — inclusive on both ends.
@@ -211,9 +222,8 @@ export async function runPipeline(
         const viewOffset = offsets[r];
         const viewLength = numSamples + MAX_SHIFT - viewOffset;
         const numSegments = Math.ceil(viewLength / STEP);
-
-        for (const buf of roundOut) buf.fill(0);
-        sumWeight.fill(0);
+        const trimStart = MAX_SHIFT - viewOffset;
+        roundAccumulator.startRound(trimStart, viewLength);
 
         function segmentWindow(seg: number) {
             const segStart = seg * STEP;
@@ -224,20 +234,9 @@ export async function runPipeline(
 
         function accumulate(result: ISTFTResult) {
             const { chunks, segStart, segLength } = result;
-            for (let s = 0; s < modelSources.length; s++) {
-                const chunk = chunks[s];
-                const out = roundOut[s];
-                for (let i = 0; i < segLength; i++) {
-                    const outIdx = (segStart + i) * numChannels;
-                    out[outIdx] += chunk[i * numChannels];
-                    out[outIdx + 1] += chunk[i * numChannels + 1];
-                }
-            }
-            // Chunks arrive pre-weighted from the iSTFT worker; track the matching
-            // weight sum so the final normalization divides it back out.
-            for (let i = 0; i < segLength; i++) {
-                sumWeight[segStart + i] += weight[i];
-            }
+            // Chunks arrive preweighted from the iSTFT worker. The streaming
+            // accumulator preserves the old add-then-divide order exactly.
+            roundAccumulator.add(chunks, segStart, segLength, weight);
         }
 
         // ``windowStart`` is view-relative; reads index the underlying padded
@@ -360,23 +359,7 @@ export async function runPipeline(
         if (prevIstftPromise) {
             accumulate(await prevIstftPromise);
         }
-
-        // Normalize by the accumulated weight sum (Python: out / sum_weight),
-        // then trim the shift back out: drop the first MAX_SHIFT - offset
-        // samples and keep numSamples (Python: partial[..., max_shift - offset:]
-        // [..., :length]). Every retained sample is covered by at least one
-        // chunk, so sumWeight > 0.
-        const trimStart = MAX_SHIFT - viewOffset;
-        for (let s = 0; s < modelSources.length; s++) {
-            const out = outputs[modelSources[s]];
-            const round = roundOut[s];
-            for (let i = 0; i < numSamples; i++) {
-                const w = sumWeight[trimStart + i];
-                const srcIdx = (trimStart + i) * 2;
-                out[i * 2] += round[srcIdx] / w;
-                out[i * 2 + 1] += round[srcIdx + 1] / w;
-            }
-        }
+        roundAccumulator.finishRound();
     }
 
     // Average the shift rounds and denormalize (Python: out * (1e-5 + std) + mean).

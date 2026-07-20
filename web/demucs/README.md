@@ -1,4 +1,4 @@
-# demucs-next
+# unblend
 
 Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
 
@@ -7,19 +7,19 @@ For backend/server-side workflows, use the `unblend` Python package — it is si
 ## Install
 
 ```bash
-npm install demucs-next
+npm install unblend
 ```
 
 `onnxruntime-web` is a regular dependency and is bundled for you; there is no separate peer install and no `<script>` tag. The package ships compiled ES modules plus type declarations from `./dist`. The three workers are referenced via `new Worker(new URL('./workers/*.js', import.meta.url))`, so you need a bundler that understands that pattern (Vite, Webpack 5). ORT's `.wasm` assets are emitted into your bundle by default; pass `wasmPaths` to load them from a URL at runtime instead.
 
 ### Vite consumers
 
-Add `demucs-next` to `optimizeDeps.exclude` so Vite processes the workers (and resolves ORT) instead of pre-bundling them with esbuild, which mangles the worker URLs:
+Add `unblend` to `optimizeDeps.exclude` so Vite processes the workers (and resolves ORT) instead of pre-bundling them with esbuild, which mangles the worker URLs:
 
 ```ts
 // vite.config.ts
 export default defineConfig({
-  optimizeDeps: { exclude: ['demucs-next'] },
+  optimizeDeps: { exclude: ['unblend'] },
 });
 ```
 
@@ -67,7 +67,7 @@ The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HT
 ## Usage
 
 ```ts
-import { Separator } from 'demucs-next';
+import { Separator } from 'unblend';
 
 const separator = await Separator.load('htdemucs', {
   backend: 'webgpu',   // falls back to 'wasm' automatically
@@ -139,7 +139,7 @@ The pipeline processes the audio in overlapping segments (~7.8s for HTDemucs; th
 
 ## Decoding Audio
 
-`demucs-next` does not handle audio decoding — you bring the `AudioBuffer`. In the browser, the easiest route is `AudioContext.decodeAudioData`, which handles MP3, AAC, FLAC, WAV, and Ogg using the browser's built-in decoders:
+`unblend` does not handle audio decoding — you bring the `AudioBuffer`. In the browser, the easiest route is `AudioContext.decodeAudioData`, which handles MP3, AAC, FLAC, WAV, and Ogg using the browser's built-in decoders:
 
 ```ts
 const ctx = new AudioContext({ sampleRate: 44100 });
@@ -154,4 +154,4 @@ For broader format support (ALAC, WMA, exotic containers), use `mediabunny` or `
 
 - **Browser only.** WebGPU, Web Workers, and `onnxruntime-web` together are not portable to Node or Deno without significant adaptation.
 - **Speed.** ONNX in the browser is ~3× slower than the Python package on equivalent hardware. A 4-minute song takes 30–90 seconds depending on backend and device.
-- **Memory.** Each loaded model occupies ~300 MB of GPU/heap memory. Unload instances you no longer need.
+- **Memory.** Model weights and inference workspaces are large, and returned stems require one full-track Float32 buffer per source. The overlap-add stage uses segment-sized circular buffers rather than a second full-track copy, but long tracks and six-stem models can still require substantial memory. Unload instances you no longer need.

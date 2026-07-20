@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { DemucsState } from '../types';
-import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'demucs-next';
+import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'unblend';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
 import { peaksFromInterleaved } from '../utils/peaks';
@@ -22,6 +22,7 @@ export function useDemucs() {
     const [audioError, setAudioError] = useState<string | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const separatorRef = useRef<Separator | null>(null);
+    const mountedRef = useRef(true);
     const modelLoadInFlightRef = useRef(false);
     const separateInFlightRef = useRef(false);
     const loadAudioInFlightRef = useRef(false);
@@ -33,7 +34,8 @@ export function useDemucs() {
 
     // Terminal-style log lines surfaced to the processing view.
     const [logs, setLogs] = useState<string[]>([]);
-    // Store pre-created blob URLs
+    // Store pre-created blob URLs.
+    const [originalUrl, setOriginalUrl] = useState<string | null>(null);
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
     // Precomputed waveform peaks per stem (0..1), for the studio lanes.
     const [stemPeaks, setStemPeaks] = useState<Record<string, number[]>>({});
@@ -41,6 +43,7 @@ export function useDemucs() {
     const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
     // Mirror the latest object URLs into refs so the unmount cleanup can
     // revoke them without reading stale state from its empty-deps closure.
+    const originalUrlRef = useRef<string | null>(null);
     const stemUrlsRef = useRef<Record<string, string>>({});
     const artworkUrlRef = useRef<string | null>(null);
     // Store track metadata from audio file
@@ -51,9 +54,9 @@ export function useDemucs() {
     // unbounded state array that no component ever rendered.
     const addLog = useCallback((message: string, type: 'info' | 'success' | 'error' = 'info') => {
         if (type === 'error') {
-            console.error(`[demucs] ${message}`);
+            console.error(`[unblend] ${message}`);
         } else {
-            console.log(`[demucs] ${message}`);
+            console.log(`[unblend] ${message}`);
         }
         setLogs(prev => {
             const next = [...prev, message];
@@ -86,16 +89,21 @@ export function useDemucs() {
         // Reject concurrent loads: a second call racing the first would tear
         // down or leak the separator the first one is still creating.
         if (modelLoadInFlightRef.current) {
-            addLog('A model load is already in progress', 'error');
+            const message = 'A model load is already in progress';
+            addLog(message, 'error');
+            setAudioError(message);
             return false;
         }
         // Swapping models mid-separation would unload the live separator and
         // destroy the run.
         if (separateInFlightRef.current) {
-            addLog('Cannot switch models while separation is in progress', 'error');
+            const message = 'Cannot switch models while separation is in progress';
+            addLog(message, 'error');
+            setAudioError(message);
             return false;
         }
         modelLoadInFlightRef.current = true;
+        setAudioError(null);
 
         try {
             // If a model is already loaded, tear it down before loading another.
@@ -103,6 +111,7 @@ export function useDemucs() {
                 await separatorRef.current.unload();
                 separatorRef.current = null;
             }
+            if (!mountedRef.current) return false;
 
             setState(prev => ({ ...prev, modelLoading: true, modelLoaded: false }));
             addLog(`Loading ${model} (${precision})...`, 'info');
@@ -113,6 +122,10 @@ export function useDemucs() {
                 precision,
                 wasmPaths: ORT_WASM_PATHS,
             });
+            if (!mountedRef.current) {
+                await separator.unload();
+                return false;
+            }
             separatorRef.current = separator;
 
             const elapsed = ((performance.now() - start) / 1000).toFixed(2);
@@ -127,7 +140,10 @@ export function useDemucs() {
             setState(prev => ({ ...prev, modelLoading: false, modelLoaded: true }));
             return true;
         } catch (err) {
-            addLog(`Failed to load ${model}: ${(err as Error).message}`, 'error');
+            if (!mountedRef.current) return false;
+            const message = `Failed to load ${model}: ${(err as Error).message}`;
+            addLog(message, 'error');
+            setAudioError(message);
             setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
             return false;
         } finally {
@@ -160,17 +176,30 @@ export function useDemucs() {
         setLogs([]);
         try {
             // Revoke object URLs from the previous track before it is replaced.
-            setStemUrls(prev => {
-                Object.values(prev).forEach(url => URL.revokeObjectURL(url));
-                return {};
-            });
+            if (originalUrlRef.current) {
+                URL.revokeObjectURL(originalUrlRef.current);
+            }
+            originalUrlRef.current = null;
+            setOriginalUrl(null);
+            Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
+            stemUrlsRef.current = {};
+            setStemUrls({});
             setStemPeaks({});
-            setArtworkUrl(prev => {
-                if (prev) URL.revokeObjectURL(prev);
-                return null;
-            });
-            // Clear previous track metadata up front so an untagged track
-            // does not keep showing the previous track's title/artist.
+            if (artworkUrlRef.current) {
+                URL.revokeObjectURL(artworkUrlRef.current);
+            }
+            artworkUrlRef.current = null;
+            setArtworkUrl(null);
+            // Clear every previous-track reference up front. If the replacement
+            // fails, the hook consistently reports no loaded audio rather than
+            // exposing old audio under the new operation's error.
+            audioBufferRef.current = null;
+            setState(prev => ({
+                ...prev,
+                audioLoaded: false,
+                audioBuffer: null,
+                audioFile: null,
+            }));
             setTrackTitle(null);
             setTrackArtist(null);
 
@@ -179,6 +208,10 @@ export function useDemucs() {
             const ctx = getAudioContext();
 
             const { buffer: audioBuffer, artwork, title, artist, usedFallback } = await decodeAudioFile(file, ctx);
+            if (!mountedRef.current) {
+                if (artwork) URL.revokeObjectURL(artwork);
+                return false;
+            }
 
             if (usedFallback === 'ffmpeg') {
                 addLog('Audio decoded using fallback decoder (ffmpeg.wasm)', 'info');
@@ -188,6 +221,7 @@ export function useDemucs() {
 
             // Store artwork if present
             if (artwork) {
+                artworkUrlRef.current = artwork;
                 setArtworkUrl(artwork);
                 addLog('Album artwork extracted', 'info');
             }
@@ -204,6 +238,9 @@ export function useDemucs() {
 
             addLog('Audio loaded successfully.', 'success');
 
+            const sourceUrl = URL.createObjectURL(file);
+            originalUrlRef.current = sourceUrl;
+            setOriginalUrl(sourceUrl);
             audioBufferRef.current = audioBuffer;
             setState(prev => ({
                 ...prev,
@@ -213,6 +250,7 @@ export function useDemucs() {
             }));
             return true;
         } catch (error) {
+            if (!mountedRef.current) return false;
             const errorMessage = (error as Error).message;
             addLog(`Failed to load audio: ${errorMessage}`, 'error');
             setAudioError(errorMessage);
@@ -222,43 +260,54 @@ export function useDemucs() {
         }
     }, [addLog, getAudioContext]);
 
-    const separateAudio = useCallback(async () => {
+    const separateAudio = useCallback(async (): Promise<boolean> => {
         const separator = separatorRef.current;
         if (!separator) {
-            addLog('Model not loaded', 'error');
-            return;
+            const message = 'Model not loaded';
+            addLog(message, 'error');
+            setAudioError(message);
+            return false;
         }
         const audioBuffer = audioBufferRef.current;
         if (!audioBuffer) {
-            addLog('Audio not loaded', 'error');
-            return;
+            const message = 'Audio not loaded';
+            addLog(message, 'error');
+            setAudioError(message);
+            return false;
         }
         // The library documents concurrent separate() calls on one instance
         // as unsafe; guard like loadModel does.
         if (separateInFlightRef.current) {
-            addLog('Separation already in progress', 'error');
-            return;
+            const message = 'Separation already in progress';
+            addLog(message, 'error');
+            setAudioError(message);
+            return false;
         }
         // Separating while a new track decodes would publish the old track's
         // stems under the new track's metadata when the decode resolves.
         if (loadAudioInFlightRef.current) {
-            addLog('Cannot separate while a track is still loading', 'error');
-            return;
+            const message = 'Cannot separate while a track is still loading';
+            addLog(message, 'error');
+            setAudioError(message);
+            return false;
         }
         // And mid-model-swap the current separator is being torn down.
         if (modelLoadInFlightRef.current) {
-            addLog('Cannot separate while a model is loading', 'error');
-            return;
+            const message = 'Cannot separate while a model is loading';
+            addLog(message, 'error');
+            setAudioError(message);
+            return false;
         }
         separateInFlightRef.current = true;
+        setAudioError(null);
+        let localUrls: string[] = [];
 
         try {
             setState(prev => ({ ...prev, separating: true }));
             // Revoke the previous run's object URLs before dropping them.
-            setStemUrls(prev => {
-                Object.values(prev).forEach(url => URL.revokeObjectURL(url));
-                return {};
-            });
+            Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
+            stemUrlsRef.current = {};
+            setStemUrls({});
             setStatus('Preparing audio...');
             setProgress(0);
 
@@ -269,10 +318,12 @@ export function useDemucs() {
 
             const result = await separator.separate(audioBuffer, {
                 onProgress: ({ segIdx, totalSegs, fraction }) => {
+                    if (!mountedRef.current) return;
                     setStatus(`Separating segment ${segIdx} of ${totalSegs}...`);
                     setProgress(fraction * 95);
                 },
             });
+            if (!mountedRef.current) return false;
 
             // Build blob URLs for the player UI.
             setStatus('Finalizing...');
@@ -284,21 +335,32 @@ export function useDemucs() {
             for (const [source, samples] of Object.entries(result.stems)) {
                 const blob = createWavBlob(samples, 2, SAMPLE_RATE);
                 urls[source] = URL.createObjectURL(blob);
+                localUrls.push(urls[source]);
                 peaks[source] = peaksFromInterleaved(samples, 2);
             }
 
+            // Transfer URL ownership to the cleanup ref synchronously before
+            // publishing React state; an unmount cannot fall into an effect gap.
+            stemUrlsRef.current = urls;
             setStemUrls(urls);
             setStemPeaks(peaks);
+            localUrls = [];
 
             setStatus('Complete!');
             setProgress(100);
             addLog(`Finished separation in ${(result.wallMs / 1000).toFixed(2)}s.`, 'success');
             setState(prev => ({ ...prev, separating: false }));
+            return true;
         } catch (error) {
-            addLog(`Separation failed: ${(error as Error).message}`, 'error');
+            localUrls.forEach(url => URL.revokeObjectURL(url));
+            if (!mountedRef.current) return false;
+            const message = `Separation failed: ${(error as Error).message}`;
+            addLog(message, 'error');
+            setAudioError(message);
             setStatus('Error during separation');
             setProgress(0);
             setState(prev => ({ ...prev, separating: false }));
+            return false;
         } finally {
             separateInFlightRef.current = false;
         }
@@ -315,7 +377,9 @@ export function useDemucs() {
     // Terminate the separator's workers, close the AudioContext, and revoke
     // outstanding object URLs when the hook unmounts to free audio resources.
     useEffect(() => {
+        mountedRef.current = true;
         return () => {
+            mountedRef.current = false;
             if (separatorRef.current) {
                 void separatorRef.current.unload();
                 separatorRef.current = null;
@@ -324,6 +388,7 @@ export function useDemucs() {
                 void audioContextRef.current.close();
                 audioContextRef.current = null;
             }
+            if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current);
             Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
             if (artworkUrlRef.current) URL.revokeObjectURL(artworkUrlRef.current);
         };
@@ -332,6 +397,7 @@ export function useDemucs() {
     return {
         ...state,
         logs,
+        originalUrl,
         stemUrls,
         stemPeaks,
         artworkUrl,

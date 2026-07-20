@@ -84,9 +84,12 @@ def test_cog_model_url_matches_metadata() -> None:
     the canonical entry that unblend.repo downloads from.
     """
     cog = (ROOT / "cog.yaml").read_text()
-    match = re.search(r"curl -L -o /root/\.unblend/models/(\S+)\.th (\S+)", cog)
-    assert match, "cog.yaml no longer bakes the htdemucs layer via curl"
-    baked_checksum, baked_url = match.groups()
+    match = re.search(
+        r"curl .*--output /root/\.unblend/models/(\S+\.safetensors) (https://\S+)",
+        cog,
+    )
+    assert match, "cog.yaml no longer bakes the htdemucs Safetensors layer"
+    baked_filename, baked_url = match.groups()
 
     with open(ROOT / "unblend" / "metadata.json") as f:
         layers = json.load(f)["models"]["htdemucs"]["models"]
@@ -107,4 +110,6 @@ def test_cog_model_url_matches_metadata() -> None:
         expected_url = f"{base.group(1)}/{remote}"
 
     assert baked_url == expected_url
-    assert baked_checksum == layers[0]["checksum"]
+    assert baked_filename == f"{layers[0]['checksum']}.safetensors"
+    assert f"--max-filesize {layers[0]['size_bytes']}" in cog
+    assert layers[0]["sha256"] in cog

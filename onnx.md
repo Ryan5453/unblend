@@ -1,7 +1,7 @@
 # ONNX Export
 
 `unblend` includes the ability to export its models (HTDemucs and the RoFormer family) to the ONNX format for deployment in browsers, mobile, or other runtimes.
-This is how [demucs.app](https://demucs.app) runs Demucs in-browser. HTDemucs specifics are below; RoFormer differences are in [RoFormer models](#roformer-models) at the end.
+This is how the [un/blend web app](https://demucs.app) runs source separation in-browser. HTDemucs specifics are below; RoFormer differences are in [RoFormer models](#roformer-models) at the end.
 
 ## Export
 

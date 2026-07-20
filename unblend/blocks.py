@@ -141,12 +141,24 @@ def _istft_fold(
         .squeeze(-1)
         .squeeze(1)
     )
-    out = out / norm
-
+    # Center-crop before division. The full folded Hann envelope has exact
+    # zeros at discarded endpoints; dividing first gives finite visible output
+    # but poisons backward with hidden 0/0 gradients.
+    start = n_fft // 2
     if length is None:
-        out = out[..., n_fft // 2 : -(n_fft // 2)]
+        stop = max(start, output_length - n_fft // 2)
+        requested_length = stop - start
     else:
-        out = out[..., n_fft // 2 : n_fft // 2 + length]
+        requested_length = length
+        stop = min(output_length, start + length)
+    out = out[..., start:stop]
+    norm = norm[..., start:stop]
+
+    covered = norm != 0
+    safe_norm = torch.where(covered, norm, torch.ones_like(norm))
+    out = torch.where(covered, out / safe_norm, torch.zeros_like(out))
+    if out.shape[-1] < requested_length:
+        out = functional.pad(out, (0, requested_length - out.shape[-1]))
     return out * (n_fft**0.5)
 
 
@@ -164,7 +176,7 @@ def ispectro(
     """
     *other, freqs, frames = z.shape
     n_fft = 2 * freqs - 2
-    z = z.view(-1, freqs, frames)
+    z = z.reshape(-1, freqs, frames)
     win_length = n_fft // (1 + pad)
 
     if z.device.type == "mps":

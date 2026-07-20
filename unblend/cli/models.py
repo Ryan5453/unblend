@@ -20,7 +20,7 @@ from rich.table import Table
 
 from ..apply import Model, ModelEnsemble
 from ..exceptions import ModelLoadingError
-from ..repo import ModelRepository, get_cache_dir
+from ..repo import ModelRepository
 from .progress import create_model_progress_bar, create_progress_callback
 from .utils import console, format_file_size, get_models
 
@@ -123,7 +123,9 @@ def download_models_command(
         console.print("Please either:")
         console.print("  1. Specify one or more model names to download")
         console.print("  2. Use [bold]--all[/bold] to download all available models")
-        console.print("\nTo see available models, run: [bold]unblend models list[/bold]")
+        console.print(
+            "\nTo see available models, run: [bold]unblend models list[/bold]"
+        )
         raise typer.Exit(1)
 
     if all_models:
@@ -381,8 +383,8 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
         console.print(f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}")
         return False
 
-    cache_dir = get_cache_dir()
-    if all((cache_dir / f"{checksum}.th").exists() for checksum in required):
+    cached_layers = model_repo.get_cache_info().get(name, {}).get("layers", {})
+    if all(checksum in cached_layers for checksum in required):
         # Existence-only — the download path sha256-verifies before moving into
         # cache, and ``get_model`` re-verifies on load. Re-hashing the whole
         # cache here would add ~1–3 s to every ``unblend separate`` invocation

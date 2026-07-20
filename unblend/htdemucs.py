@@ -23,7 +23,7 @@ from .blocks import (
     spectro,
 )
 from .exceptions import ValidationError
-from .states import capture_init
+from .model_utils import capture_init
 from .transformer import CrossTransformerEncoder
 
 
@@ -436,12 +436,16 @@ class HTDemucs(nn.Module):
         :param m: Mask or full spectrogram in CaC format
         :return: Complex spectrogram tensor
         """
-        # Convert CaC format back to complex.
-        # With CaC, `m` is actually a full spectrogram and `z` is ignored.
-        B, S, C, Fr, T = m.shape
+        if not self.cac:
+            # The decoder predicts a real magnitude mask. Preserve the
+            # mixture phase by applying it to the original complex STFT.
+            return z[:, None] * m
+
+        # With CaC, ``m`` is the complete source spectrogram encoded as
+        # adjacent real/imaginary feature channels and ``z`` is unused.
+        B, S, _C, Fr, T = m.shape
         out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
-        out = torch.view_as_complex(out.contiguous())
-        return out
+        return torch.view_as_complex(out.contiguous())
 
     def valid_length(self, length: int) -> int:
         """

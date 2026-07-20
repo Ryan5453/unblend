@@ -162,6 +162,36 @@ def test_normalize_denormalize_roundtrip() -> None:
     assert torch.allclose(restored, wav, atol=1e-6)
 
 
+def test_normalize_one_sample_is_finite_and_reversible() -> None:
+    """One-sample input avoids undefined sample-standard-deviation NaNs."""
+    wav = torch.tensor([[1.0], [3.0]])
+    normed, mean, std = Separator._normalize(wav)
+    restored = normed * (1e-5 + std) + mean
+
+    assert torch.isfinite(normed).all()
+    assert torch.isfinite(mean)
+    assert std.item() == 0.0
+    assert torch.equal(restored, wav)
+
+
+def test_separate_releases_mps_cache_when_dispatch_fails(monkeypatch) -> None:
+    """MPS cache cleanup runs once even when separation raises."""
+    separator = _stub_separator()
+    separator.device = "mps"
+    released = []
+
+    def fail_dispatch(*_args: object, **_kwargs: object) -> None:
+        """Raise a representative inference failure."""
+        raise RuntimeError("inference failed")
+
+    monkeypatch.setattr(separator, "_run_with_oom_backoff", fail_dispatch)
+    monkeypatch.setattr(separator, "_release_mps_cache", lambda: released.append(True))
+
+    with pytest.raises(RuntimeError, match="inference failed"):
+        separator.separate(b"audio")
+    assert released == [True]
+
+
 def test_separate_rejects_chunk_batch_size_too_large() -> None:
     """
     ``chunk_batch_size`` over the sanity cap (1024) is rejected before any
@@ -207,7 +237,9 @@ def test_separate_list_input_forwards_progress_callback() -> None:
     assert events[0][0] == "processing_start"
     assert events[-1][0] == "processing_complete"
     assert events[0][1]["total_inputs"] == 2
-    assert {data["input_index"] for event, data in events if event == "chunk_complete"} == {0, 1}
+    assert {
+        data["input_index"] for event, data in events if event == "chunk_complete"
+    } == {0, 1}
 
 
 def test_separate_rejects_unknown_use_only_stem() -> None:
@@ -353,9 +385,7 @@ def test_enable_compile_promotes_eager_cuda_separator(
     separator.chunk_batch_size = 2
     separator._compile_enabled = False
     separator._calibration_attempts = []
-    monkeypatch.setattr(
-        separator, "_initial_chunk_batch_size_estimate", lambda: 4
-    )
+    monkeypatch.setattr(separator, "_initial_chunk_batch_size_estimate", lambda: 4)
     monkeypatch.setattr(
         separator,
         "_calibrate_chunk_batch_size",
@@ -382,9 +412,7 @@ def test_compile_roformer_targets_transformer_core_without_state_drift(
     """
     compile_modes: list[str] = []
 
-    def fake_compile(
-        function: Callable[..., Any], *, mode: str
-    ) -> Callable[..., Any]:
+    def fake_compile(function: Callable[..., Any], *, mode: str) -> Callable[..., Any]:
         """
         Record the compile mode and return the eager callable.
 

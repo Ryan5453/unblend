@@ -1,5 +1,5 @@
 {
-  "name": "demucs-next",
+  "name": "unblend",
   "version": "1.0.0",
   "description": "Browser-side audio source separation using ONNX Demucs and RoFormer models. Designed to be embedded in a web app.",
   "license": "MIT",
@@ -45,6 +45,7 @@
   ],
   "scripts": {
     "build": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "test": "npm run build && node --test test/*.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

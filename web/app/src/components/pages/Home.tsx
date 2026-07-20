@@ -48,6 +48,7 @@ export function Home() {
         status,
         audioBuffer,
         audioFile,
+        originalUrl,
         stemUrls,
         stemPeaks,
         trackTitle,
@@ -79,17 +80,6 @@ export function Home() {
     // The displayPct value captured when separation begins, so the separation
     // phase can continue upward from the model-load crawl without jumping.
     const sepBaseRef = useRef<number | null>(null);
-    // Object URL for the original file (used for the ORIGINAL reference lane).
-    const originalUrl = useMemo(
-        () => (audioFile ? URL.createObjectURL(audioFile) : null),
-        [audioFile]
-    );
-    useEffect(() => {
-        return () => {
-            if (originalUrl) URL.revokeObjectURL(originalUrl);
-        };
-    }, [originalUrl]);
-
     const duration = audioBuffer?.duration ?? 0;
     const progressFrac = duration > 0 ? Math.min(1, currentTime / duration) : 0;
 
@@ -283,6 +273,7 @@ export function Home() {
     // ---- pipeline -----------------------------------------------------
     const runFile = useCallback(
         async (file: File) => {
+            clearAudioError();
             setPhase('processing');
             setDisplayPct(0);
             sepBaseRef.current = null;
@@ -298,9 +289,10 @@ export function Home() {
                     return;
                 }
             }
-            await separateAudio();
+            const separated = await separateAudio();
+            if (!separated) setPhase('drop');
         },
-        [loadAudio, loadModel, modelLoaded, separateAudio]
+        [clearAudioError, loadAudio, loadModel, modelLoaded, separateAudio]
     );
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -458,7 +450,6 @@ export function Home() {
                         <Braid active={isDragging} />
                         <div className="drop-caption">
                             <div className="t">Drop a song anywhere</div>
-                            <div className="s">MP3 · WAV · FLAC · OGG</div>
                             <div className="or">
                                 or{' '}
                                 <button
@@ -644,7 +635,7 @@ export function Home() {
             {audioError && (
                 <div className="modal-backdrop" onClick={clearAudioError}>
                     <div className="modal-content" onClick={e => e.stopPropagation()}>
-                        <div className="modal-title">Error</div>
+                        <div className="modal-title">Operation failed</div>
                         <div className="modal-msg">{audioError}</div>
                         <button className="modal-dismiss" onClick={clearAudioError}>
                             Dismiss

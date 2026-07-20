@@ -64,6 +64,23 @@ def _mel(**overrides):
     return MelBandRoformer(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "samplerate,segment_samples",
+    [(0, SR), (SR, 0), (True, SR), (SR, 1.5)],
+)
+def test_configure_inference_rejects_invalid_geometry(
+    samplerate: object, segment_samples: object
+) -> None:
+    """Sample rate and training segment must be positive integer counts."""
+    model = _bs()
+    with pytest.raises(ValidationError):
+        model.configure_inference(
+            sources=["vocals", "other"],
+            samplerate=samplerate,  # type: ignore[arg-type]
+            segment_samples=segment_samples,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize("builder", [_bs, _mel], ids=["bs", "mel"])
 def test_state_dict_roundtrip_is_strict(builder) -> None:
     """
@@ -135,7 +152,9 @@ def test_flows_through_apply_model(builder) -> None:
     )
     # Longer than one segment so tiling + overlap-add engage.
     mix = torch.randn(1, 2, int(SR * 5.0))
-    out = apply_model(model, mix, device="cpu", shifts=1, overlap=0.25, chunk_batch_size=2)
+    out = apply_model(
+        model, mix, device="cpu", shifts=1, overlap=0.25, chunk_batch_size=2
+    )
     assert out.shape == (1, 2, 2, mix.shape[-1])
     assert torch.isfinite(out).all()
 
@@ -239,15 +258,20 @@ def test_repository_loads_roformer_from_cache(tmp_path, monkeypatch) -> None:
         heads=2,
     )
     model = BSRoformer(**config)
-    ckpt_bytes_path = tmp_path / "weights.ckpt"
-    torch.save(model.state_dict(), ckpt_bytes_path)
+    from safetensors.torch import save_file
+
+    ckpt_bytes_path = tmp_path / "weights.safetensors"
+    save_file(
+        {key: value.clone() for key, value in model.state_dict().items()},
+        ckpt_bytes_path,
+    )
     raw = ckpt_bytes_path.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     # Content-addressed cache filename the loader looks up (sha256[:16]).
-    (cache_dir / f"{digest[:16]}.ckpt").write_bytes(raw)
+    (cache_dir / f"{digest[:16]}.safetensors").write_bytes(raw)
     monkeypatch.setattr(repo_module, "get_cache_dir", lambda: cache_dir)
 
     metadata = {
@@ -261,8 +285,10 @@ def test_repository_loads_roformer_from_cache(tmp_path, monkeypatch) -> None:
                 "segment_samples": SR * 4,
                 "config": config,
                 "checkpoint": {
-                    "url": "https://example.invalid/weights.ckpt",
+                    "format": "safetensors",
+                    "url": "https://example.invalid/weights.safetensors",
                     "sha256": digest,
+                    "size_bytes": len(raw),
                 },
             }
         }

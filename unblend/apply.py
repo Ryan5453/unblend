@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
+from numbers import Real
 from typing import (
     Any,
     Callable,
@@ -78,31 +80,89 @@ class ModelEnsemble(nn.Module):
             (performed in-place, be careful if you reuse the models passed).
         """
         super().__init__()
-        assert len(models) > 0
+        if not models:
+            raise ValidationError("ModelEnsemble requires at least one model.")
+        if segment is not None and (
+            isinstance(segment, bool)
+            or not isinstance(segment, Real)
+            or not math.isfinite(float(segment))
+            or segment <= 0
+        ):
+            raise ValidationError(
+                f"segment must be a finite positive number, got {segment}"
+            )
+
         first = models[0]
-        for other in models:
-            assert other.sources == first.sources
-            assert other.samplerate == first.samplerate
-            assert other.audio_channels == first.audio_channels
+        normalization = getattr(first, "external_normalization", True)
+        for index, other in enumerate(models):
+            if other.sources != first.sources:
+                raise ValidationError(
+                    f"Ensemble model {index} has sources {other.sources}, "
+                    f"expected {first.sources}."
+                )
+            if other.samplerate != first.samplerate:
+                raise ValidationError(
+                    f"Ensemble model {index} has samplerate {other.samplerate}, "
+                    f"expected {first.samplerate}."
+                )
+            if other.audio_channels != first.audio_channels:
+                raise ValidationError(
+                    f"Ensemble model {index} has {other.audio_channels} channels, "
+                    f"expected {first.audio_channels}."
+                )
+            if getattr(other, "external_normalization", True) != normalization:
+                raise ValidationError(
+                    "Ensemble members must share the same external_normalization "
+                    "contract."
+                )
+            maximum = float(other.max_allowed_segment)
+            if not math.isfinite(maximum) or maximum <= 0:
+                raise ValidationError(
+                    f"Ensemble model {index} has invalid max_allowed_segment "
+                    f"{other.max_allowed_segment}."
+                )
             if segment is not None:
-                if (
-                    not isinstance(other, HTDemucs)
-                    or segment <= other.max_allowed_segment
-                ):
-                    other.max_allowed_segment = segment
+                other.max_allowed_segment = min(float(segment), maximum)
 
         self.audio_channels = first.audio_channels
         self.samplerate = first.samplerate
         self.sources = first.sources
+        self.external_normalization = normalization
         self.models = nn.ModuleList(models)
 
         if weights is None:
-            weights = [[1.0 for _ in first.sources] for _ in models]
+            normalized_weights = [[1.0 for _ in first.sources] for _ in models]
         else:
-            assert len(weights) == len(models)
-            for weight in weights:
-                assert len(weight) == len(first.sources)
-        self.weights = weights
+            if len(weights) != len(models):
+                raise ValidationError(
+                    f"weights must have one row per model ({len(models)}), "
+                    f"got {len(weights)}."
+                )
+            normalized_weights = []
+            for model_index, row in enumerate(weights):
+                if len(row) != len(first.sources):
+                    raise ValidationError(
+                        f"weights row {model_index} must contain "
+                        f"{len(first.sources)} source weights, got {len(row)}."
+                    )
+                converted = []
+                for source_index, value in enumerate(row):
+                    if isinstance(value, bool) or not isinstance(value, Real):
+                        raise ValidationError(
+                            f"weights[{model_index}][{source_index}] must be numeric."
+                        )
+                    value = float(value)
+                    if not math.isfinite(value):
+                        raise ValidationError(
+                            f"weights[{model_index}][{source_index}] must be finite."
+                        )
+                    converted.append(value)
+                normalized_weights.append(converted)
+
+        # Copy caller-owned lists and validate through the same defensive path
+        # used before every inference (the public attribute remains mutable).
+        self.weights = [list(row) for row in normalized_weights]
+        self.validated_weight_totals()
 
     @property
     def max_allowed_segment(self) -> float:
@@ -111,13 +171,53 @@ class ModelEnsemble(nn.Module):
 
         :return: Maximum allowed segment length in seconds.
         """
-        max_allowed_segment = float("inf")
-        for model in self.models:
-            if isinstance(model, HTDemucs):
-                max_allowed_segment = min(
-                    max_allowed_segment, float(model.max_allowed_segment)
+        values = [float(model.max_allowed_segment) for model in self.models]
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            raise ValidationError(
+                "Every ensemble member must have a finite, positive "
+                "max_allowed_segment."
+            )
+        return min(values)
+
+    def validated_weight_totals(self) -> list[float]:
+        """
+        Validate the mutable weight matrix and return per-source totals.
+
+        :return: Finite, non-zero total weight for every source.
+        :raises ValidationError: If dimensions or values are invalid.
+        """
+        if len(self.weights) != len(self.models):
+            raise ValidationError(
+                f"weights must have one row per model ({len(self.models)}), "
+                f"got {len(self.weights)}."
+            )
+        for model_index, row in enumerate(self.weights):
+            if len(row) != len(self.sources):
+                raise ValidationError(
+                    f"weights row {model_index} must contain {len(self.sources)} "
+                    f"source weights, got {len(row)}."
                 )
-        return max_allowed_segment
+            for source_index, value in enumerate(row):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Real)
+                    or not math.isfinite(float(value))
+                ):
+                    raise ValidationError(
+                        f"weights[{model_index}][{source_index}] must be a "
+                        "finite number."
+                    )
+        totals = [
+            sum(float(row[source]) for row in self.weights)
+            for source in range(len(self.sources))
+        ]
+        for source, total in zip(self.sources, totals):
+            if not math.isfinite(total) or total == 0:
+                raise ValidationError(
+                    f"Ensemble weights for source '{source}' must have a finite, "
+                    "non-zero total."
+                )
+        return totals
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -578,6 +678,7 @@ def apply_model_multi(
         return results
 
     if isinstance(model, ModelEnsemble):
+        totals = model.validated_weight_totals()
         # Same specialisation shortcut as apply_model: when use_only_stem points
         # at a model that has a 1.0 weight for that stem (and zeros elsewhere),
         # we can run that sub-model alone.
@@ -596,6 +697,10 @@ def apply_model_multi(
                             abs(w) < 1e-6
                             for j, w in enumerate(weights)
                             if j != stem_index
+                        )
+                        and all(
+                            other_index == i or abs(other_weights[stem_index]) < 1e-6
+                            for other_index, other_weights in enumerate(model.weights)
                         )
                     ):
                         model_index = i
@@ -686,7 +791,6 @@ def apply_model_multi(
         sub_callback = ensemble_progress if progress_callback else None
 
         results: list[Tensor] | None = None
-        totals = [0.0] * len(model.sources)
         for sub_model, model_weights in zip(model.models, model.weights):
             sub_param = next(sub_model.parameters(), None)
             sub_device = sub_param.device if sub_param is not None else None
@@ -705,7 +809,6 @@ def apply_model_multi(
             if _should_restore_submodel_device(sub_model, sub_device, device):
                 sub_model.to(sub_device)
             for k, inst_weight in enumerate(model_weights):
-                totals[k] += inst_weight
                 for sub_out in sub_outs:
                     sub_out[:, k, :, :] *= inst_weight
             if results is None:
@@ -768,9 +871,7 @@ def apply_model_multi(
             input_total_chunks = [0] * len(mixes)
             # Mirrors ``range(0, length, stride)`` in the unshifted helper.
             for offsets_per_mix in all_offsets:
-                for mix_index, (mix, offset) in enumerate(
-                    zip(mixes, offsets_per_mix)
-                ):
+                for mix_index, (mix, offset) in enumerate(zip(mixes, offsets_per_mix)):
                     shifted_length = mix.shape[-1] + max_shift - offset
                     input_total_chunks[mix_index] += -(-shifted_length // stride)
             total_chunks = sum(input_total_chunks)
@@ -799,9 +900,7 @@ def apply_model_multi(
                             "completed_chunks": completed_total,
                             "total_chunks": total_chunks,
                             "input_index": mix_index,
-                            "input_completed_chunks": input_completed_chunks[
-                                mix_index
-                            ],
+                            "input_completed_chunks": input_completed_chunks[mix_index],
                             "input_total_chunks": input_total_chunks[mix_index],
                         },
                     )

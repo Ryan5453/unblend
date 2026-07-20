@@ -203,7 +203,12 @@ class LayerScale(nn.Module):
     """
 
     def __init__(
-        self, channels: int, init: float = 0, channel_last: bool = False
+        self,
+        channels: int,
+        init: float = 0,
+        channel_last: bool = False,
+        device: Any = None,
+        dtype: Any = None,
     ) -> None:
         """
         Initialize learnable diagonal rescaling for residual outputs.
@@ -211,11 +216,14 @@ class LayerScale(nn.Module):
         :param channels: Number of channels to scale
         :param init: Initial value for scale parameters
         :param channel_last: If False, expects (B, C, T) tensors; if True, expects (B, T, C)
+        :param device: Device for the learnable scale.
+        :param dtype: Data type for the learnable scale.
         """
         super().__init__()
         self.channel_last = channel_last
-        self.scale = nn.Parameter(torch.zeros(channels, requires_grad=True))
-        self.scale.data[:] = init
+        self.scale = nn.Parameter(
+            torch.full((channels,), init, device=device, dtype=dtype)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -301,12 +309,20 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
 
         self.norm_out = None
         if self.norm_first and norm_out:
-            self.norm_out = MyGroupNorm(num_groups=int(norm_out), num_channels=d_model)
+            self.norm_out = MyGroupNorm(
+                num_groups=int(norm_out),
+                num_channels=d_model,
+                **factory_kwargs,
+            )
         self.gamma_1 = (
-            LayerScale(d_model, init_values, True) if layer_scale else nn.Identity()
+            LayerScale(d_model, init_values, True, **factory_kwargs)
+            if layer_scale
+            else nn.Identity()
         )
         self.gamma_2 = (
-            LayerScale(d_model, init_values, True) if layer_scale else nn.Identity()
+            LayerScale(d_model, init_values, True, **factory_kwargs)
+            if layer_scale
+            else nn.Identity()
         )
 
     def forward(
@@ -384,7 +400,11 @@ class CrossTransformerEncoderLayer(nn.Module):
 
         self.cross_attn: nn.Module
         self.cross_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=batch_first
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=batch_first,
+            **factory_kwargs,
         )
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
@@ -412,13 +432,21 @@ class CrossTransformerEncoderLayer(nn.Module):
 
         self.norm_out = None
         if self.norm_first and norm_out:
-            self.norm_out = MyGroupNorm(num_groups=int(norm_out), num_channels=d_model)
+            self.norm_out = MyGroupNorm(
+                num_groups=int(norm_out),
+                num_channels=d_model,
+                **factory_kwargs,
+            )
 
         self.gamma_1 = (
-            LayerScale(d_model, init_values, True) if layer_scale else nn.Identity()
+            LayerScale(d_model, init_values, True, **factory_kwargs)
+            if layer_scale
+            else nn.Identity()
         )
         self.gamma_2 = (
-            LayerScale(d_model, init_values, True) if layer_scale else nn.Identity()
+            LayerScale(d_model, init_values, True, **factory_kwargs)
+            if layer_scale
+            else nn.Identity()
         )
 
         self.dropout1 = nn.Dropout(dropout)
@@ -576,15 +604,15 @@ class CrossTransformerEncoder(nn.Module):
 
         self.norm_in: nn.Module
         self.norm_in_t: nn.Module
-        if norm_in:
-            self.norm_in = nn.LayerNorm(dim)
-            self.norm_in_t = nn.LayerNorm(dim)
-        elif norm_in_group:
-            self.norm_in = MyGroupNorm(int(norm_in_group), dim)
-            self.norm_in_t = MyGroupNorm(int(norm_in_group), dim)
-        else:
+        if not norm_in:
             self.norm_in = nn.Identity()
             self.norm_in_t = nn.Identity()
+        elif norm_in_group:
+            self.norm_in = MyGroupNorm(1, dim)
+            self.norm_in_t = MyGroupNorm(1, dim)
+        else:
+            self.norm_in = nn.LayerNorm(dim)
+            self.norm_in_t = nn.LayerNorm(dim)
 
         # spectrogram layers
         self.layers = nn.ModuleList()

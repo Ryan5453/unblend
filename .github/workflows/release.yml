@@ -7,14 +7,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  test:
+  preflight:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Guard against tagging without bumping versions: the publish jobs skip
-      # already-published versions, so a stale version would otherwise
-      # silently release nothing.
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # Guard against tagging without bumping versions: publish is idempotent,
+      # so a stale version would otherwise silently release nothing.
       - name: Check tag matches package versions
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -22,30 +37,17 @@ jobs:
           js=$(node -p "require('./web/demucs/package.json').version")
           test "$py" = "$version" || { echo "pyproject.toml has $py, tag is $version"; exit 1; }
           test "$js" = "$version" || { echo "web/demucs/package.json has $js, tag is $version"; exit 1; }
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-      - name: Sync dependencies
-        run: uv sync --extra dev
-      - name: Run fast tests
+      - name: Sync Python dependencies
+        run: |
+          uv sync --extra dev --extra onnx
+          uv pip install onnxruntime
+      - name: Check Python style
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Run Python tests
         run: uv run pytest -m "not slow" -q
-
-  pypi:
-    needs: test
-    runs-on: ubuntu-latest
-    # Trusted publishing (OIDC): register this repo + workflow + environment as
-    # a trusted publisher for unblend on pypi.org; no token needed.
-    environment: release
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-      - name: Build distributions
+      - name: Build Python distributions
         run: uv build
       - name: Verify wheel contents
         run: |
@@ -55,49 +57,88 @@ jobs:
           for kernel in unblend/metal/*.metal; do
             echo "$listing" | grep -q "$kernel"
           done
-      - name: Publish to PyPI
-        # --check-url makes reruns idempotent: files already on PyPI are
-        # skipped instead of erroring.
-        run: uv publish --check-url https://pypi.org/simple/
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Test and build web packages
+        working-directory: web
+        run: |
+          npm test
+          npm run build
+          npm run lint -w demucs-app
+          npm audit --omit=dev --audit-level=high
+      - name: Pack npm package
+        run: |
+          mkdir -p release-artifacts
+          cd web
+          npm pack -w unblend --pack-destination ../release-artifacts
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload npm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: release-artifacts/*.tgz
+          if-no-files-found: error
 
-  npm:
-    needs: test
+  publish:
+    needs: preflight
     runs-on: ubuntu-latest
-    # Trusted publishing with provenance: configure this repo + workflow +
-    # environment as a trusted publisher for demucs-next on npmjs.com. The
-    # package must already exist there, so the very first publish is manual.
+    # Configure trusted publishers for package "unblend", this workflow, and
+    # environment "release" on both npm and PyPI. npm's first package version
+    # must still be published manually before trusted publishing can be enabled.
     environment: release
     permissions:
+      contents: read
       id-token: write
-    defaults:
-      run:
-        working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           # npm >= 11.5 is required for OIDC trusted publishing.
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Install dependencies
-        run: npm ci
+      - name: Download Python distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist
+      - name: Download npm package
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: release-artifacts
       - name: Publish to npm
-        # Skip if this version is already on the registry (the manual first
-        # publish, or a rerun after a partial failure). npm refuses to publish
-        # over an existing version, so this keeps the job green.
+        shell: bash
         run: |
-          version=$(node -p "require('./demucs/package.json').version")
-          if npm view "demucs-next@$version" version >/dev/null 2>&1; then
-            echo "demucs-next@$version already published; skipping."
+          version="${GITHUB_REF_NAME#v}"
+          set +e
+          published=$(npm view "unblend@$version" version --json 2>npm-view.err)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "unblend@$version already published ($published); skipping."
+          elif grep -q "E404" npm-view.err; then
+            npm publish "release-artifacts/unblend-$version.tgz" --provenance --access public
           else
-            npm publish -w demucs-next --provenance --access public
+            cat npm-view.err >&2
+            exit "$status"
           fi
+      - name: Publish to PyPI
+        # --check-url makes reruns idempotent: files already on PyPI are
+        # skipped instead of erroring.
+        run: uv publish --check-url https://pypi.org/simple/ dist/*
 
   github-release:
-    needs: [pypi, npm]
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -5,28 +5,50 @@
 # LICENSE file in the root directory of this source tree.
 
 
-import functools
 import inspect
 import sys
+import threading
 import warnings
-from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Iterator
 
 import torch
 
 from . import htdemucs as _htdemucs
 
-# The Demucs ``.th`` checkpoints pickle the model *class by reference*
-# (``demucs.htdemucs.HTDemucs`` — the upstream module path they were saved
-# under), so unpickling imports that path. Alias it to this package so the
-# checkpoints keep loading after the demucs → unblend rename. ``setdefault``
-# leaves a genuinely-installed upstream ``demucs`` untouched — but note that
-# unpickling through a real upstream demucs would produce upstream class
-# instances, so unblend still cannot share a process with an imported
-# upstream demucs.
-sys.modules.setdefault("demucs", sys.modules[__package__])
-sys.modules.setdefault("demucs.htdemucs", _htdemucs)
+_LEGACY_ALIAS_LOCK = threading.RLock()
+
+
+@contextmanager
+def _legacy_demucs_aliases() -> Iterator[None]:
+    """
+    Temporarily expose historical module names while loading a legacy pickle.
+
+    Normal ``import unblend`` never modifies ``sys.modules['demucs']``. The
+    aliases exist only inside this explicit compatibility boundary and are
+    restored even when unpickling fails.
+
+    :return: Context manager yielding while aliases are installed.
+    """
+    with _LEGACY_ALIAS_LOCK:
+        missing = object()
+        previous_demucs = sys.modules.get("demucs", missing)
+        previous_htdemucs = sys.modules.get("demucs.htdemucs", missing)
+        sys.modules["demucs"] = sys.modules[__package__]
+        sys.modules["demucs.htdemucs"] = _htdemucs
+        try:
+            yield
+        finally:
+            if previous_demucs is missing:
+                sys.modules.pop("demucs", None)
+            else:
+                sys.modules["demucs"] = previous_demucs
+            if previous_htdemucs is missing:
+                sys.modules.pop("demucs.htdemucs", None)
+            else:
+                sys.modules["demucs.htdemucs"] = previous_htdemucs
+
 
 # Known deprecated parameters that are present in older model checkpoints
 # but are no longer used in the current model classes. These are silently ignored.
@@ -88,16 +110,17 @@ def load_model(
             # package["klass"]/["args"]/["kwargs"]), which weights_only=True
             # refuses to unpickle. This means loading can execute arbitrary
             # code, so callers must only pass files whose integrity has been
-            # verified — ModelRepository checks every layer against the full
-            # SHA-256 digest in the shipped metadata before handing the
-            # path/bytes here.
-            package = torch.load(path, "cpu", weights_only=False)
+            # verified independently. Registered models never use this legacy
+            # path; ModelRepository accepts Safetensors only.
+            with _legacy_demucs_aliases():
+                package = torch.load(path, "cpu", weights_only=False)
     else:
         raise ValueError(f"Invalid type for {path_or_package}.")
 
     klass = package["klass"]
     args = package["args"]
-    kwargs = package["kwargs"]
+    # Filtering deprecated keys must not mutate a caller-owned package.
+    kwargs = dict(package["kwargs"])
 
     if strict:
         model = klass(*args, **kwargs)
@@ -131,25 +154,3 @@ def set_state(model: torch.nn.Module, state: dict, strict: bool = True) -> None:
         keys are tolerated rather than raising.
     """
     model.load_state_dict(state, strict=strict)
-
-
-def capture_init(init: Callable) -> Callable:
-    """
-    Decorator that captures the args and kwargs passed to __init__.
-
-    :param init: The __init__ method to wrap
-    :return: Wrapped __init__ that stores args/kwargs on the instance
-    """
-
-    @functools.wraps(init)
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """
-        Store the init args/kwargs on the instance, then call the wrapped init.
-
-        :param args: Positional arguments forwarded to the wrapped ``__init__``
-        :param kwargs: Keyword arguments forwarded to the wrapped ``__init__``
-        """
-        self._init_args_kwargs = (args, kwargs)
-        init(self, *args, **kwargs)
-
-    return __init__

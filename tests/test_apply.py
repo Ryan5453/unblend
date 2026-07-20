@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from unblend.apply import (
+    ModelEnsemble,
     TensorChunk,
     _should_restore_submodel_device,
     apply_model,
@@ -151,6 +152,110 @@ class _DoublingModel(torch.nn.Module):
         return torch.stack([x, 2 * x], dim=1)
 
 
+def test_model_ensemble_rejects_zero_weight_total() -> None:
+    """A per-source zero weight total is rejected before inference."""
+    with pytest.raises(ValidationError, match="non-zero total"):
+        ModelEnsemble(
+            [_DoublingModel(), _DoublingModel()],
+            weights=[[1.0, 1.0], [-1.0, 1.0]],
+        )
+
+
+def test_model_ensemble_revalidates_mutated_weights() -> None:
+    """Post-construction weight mutation cannot cause silent NaN output."""
+    ensemble = ModelEnsemble([_DoublingModel()])
+    ensemble.weights[0][0] = 0.0
+    with pytest.raises(ValidationError, match="non-zero total"):
+        apply_model(ensemble, torch.randn(1, 100))
+
+    ensemble.weights[0] = [1.0, 0.0]
+    with pytest.raises(ValidationError, match="non-zero total"):
+        apply_model(
+            ensemble,
+            torch.randn(1, 100),
+            use_only_stem="one",
+        )
+
+
+def test_specialist_shortcut_requires_exclusive_stem_weight() -> None:
+    """A one-hot row cannot bypass another model contributing to that stem."""
+
+    class DifferentModel(_DoublingModel):
+        """Return distinguishable values for both sources."""
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Return ``3x`` and ``4x`` as the two sources."""
+            return torch.stack([3 * x, 4 * x], dim=1)
+
+    ensemble = ModelEnsemble(
+        [_DoublingModel(), DifferentModel()],
+        weights=[[1.0, 0.0], [1.0, 1.0]],
+    )
+    mix = torch.randn(1, 100)
+
+    expected = apply_model(ensemble, mix)
+    actual = apply_model(ensemble, mix, use_only_stem="one")
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual[:, 0], 2 * mix[None])
+
+
+def test_model_ensemble_propagates_contract_and_segment_cap() -> None:
+    """Raw-audio ensembles preserve normalization and finite segment limits."""
+    first = _DoublingModel()
+    second = _DoublingModel()
+    first.external_normalization = False
+    second.external_normalization = False
+    first.max_allowed_segment = 2.5
+    second.max_allowed_segment = 3.0
+
+    ensemble = ModelEnsemble([first, second], segment=4.0)
+
+    assert ensemble.external_normalization is False
+    assert ensemble.max_allowed_segment == 2.5
+    assert first.max_allowed_segment == 2.5
+    assert second.max_allowed_segment == 3.0
+
+
+def test_model_ensemble_rejects_mixed_normalization_contracts() -> None:
+    """Members requiring raw and externally-normalized audio cannot mix."""
+    raw = _DoublingModel()
+    raw.external_normalization = False
+    with pytest.raises(ValidationError, match="external_normalization"):
+        ModelEnsemble([_DoublingModel(), raw])
+
+
+def test_htdemucs_mask_without_cac_applies_real_mask() -> None:
+    """Non-CaC decoding applies a real mask while preserving mixture phase."""
+    from unblend.htdemucs import HTDemucs
+
+    model = object.__new__(HTDemucs)
+    model.cac = False
+    mixture = torch.randn(2, 2, 3, 4, dtype=torch.complex64)
+    mask = torch.randn(2, 5, 2, 3, 4)
+
+    actual = model._mask(mixture, mask)
+
+    assert actual.shape == (2, 5, 2, 3, 4)
+    assert torch.equal(actual, mixture[:, None] * mask)
+
+
+def test_htdemucs_mask_with_cac_decodes_complex_channels() -> None:
+    """CaC decoding still reconstructs adjacent real/imaginary channels."""
+    from unblend.htdemucs import HTDemucs
+
+    model = object.__new__(HTDemucs)
+    model.cac = True
+    target = torch.randn(2, 3, 2, 4, 5, dtype=torch.complex64)
+    encoded = (
+        torch.view_as_real(target).permute(0, 1, 2, 5, 3, 4).reshape(2, 3, 4, 4, 5)
+    )
+
+    actual = model._mask(torch.empty(0), encoded)
+
+    assert torch.equal(actual, target)
+
+
 def test_apply_model_batched_mix_routes_rows_independently() -> None:
     """
     A mix with batch dim > 1 separates each row independently (this used
@@ -235,20 +340,14 @@ def test_apply_model_multi_reports_aggregate_and_per_input_progress() -> None:
     assert completes[0] == starts[0]
 
     total = starts[0]["total_chunks"]
-    assert [data["completed_chunks"] for data in chunks] == list(
-        range(1, total + 1)
-    )
+    assert [data["completed_chunks"] for data in chunks] == list(range(1, total + 1))
     assert sum(starts[0]["input_total_chunks"]) == total
     for input_index, input_total in enumerate(starts[0]["input_total_chunks"]):
-        input_events = [
-            data for data in chunks if data["input_index"] == input_index
-        ]
+        input_events = [data for data in chunks if data["input_index"] == input_index]
         assert [data["input_completed_chunks"] for data in input_events] == list(
             range(1, input_total + 1)
         )
-        assert {data["input_total_chunks"] for data in input_events} == {
-            input_total
-        }
+        assert {data["input_total_chunks"] for data in input_events} == {input_total}
 
 
 def test_apply_model_rejects_out_of_range_overlap() -> None:

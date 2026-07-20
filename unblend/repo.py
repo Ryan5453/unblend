@@ -8,20 +8,21 @@
 import copy
 import json
 import os
-import pickle
 import shutil
 import tempfile
+import time
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-import torch
+from safetensors import SafetensorError
+from safetensors.torch import load_file
 
 from .apply import Model, ModelEnsemble
 from .exceptions import ModelLoadingError
-from .roformer import build_roformer, extract_state_dict
-from .states import load_model, load_tensor_package
+from .htdemucs import HTDemucs
+from .roformer import build_roformer
 
 BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 
@@ -29,6 +30,7 @@ BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 # (``_download_and_load_layer``) and the sweeper (``sweep_stale_downloads``)
 # so the two can't silently drift apart.
 STAGING_PREFIX = "tmp"
+DOWNLOAD_DEADLINE_SECONDS = 2 * 60 * 60
 
 
 def check_checksum(path: Path, checksum: str) -> None:
@@ -60,27 +62,48 @@ def check_checksum(path: Path, checksum: str) -> None:
         )
 
 
-def _load_demucs_layer(path: Path) -> "Model | ModelEnsemble":
+def check_size(path: Path, expected_size: int) -> None:
     """
-    Load one Demucs layer file, preferring the unblend tensor-package format.
+    Verify an artifact has the exact byte length declared in metadata.
 
-    Tensor packages (``{"format": "unblend-htdemucs-v1", "config", "state"}``)
-    load with ``weights_only=True`` — pure tensors and primitives, no code
-    execution. Anything else falls back to the legacy upstream pickle format,
-    which reconstructs the pickled class and therefore requires
-    ``weights_only=False``; callers must only pass files whose SHA-256 has
-    already been verified against the shipped metadata.
-
-    :param path: Path to the verified layer file.
-    :return: The loaded model.
+    :param path: Artifact path.
+    :param expected_size: Required byte count.
+    :raises ModelLoadingError: If the file cannot be read or has the wrong size.
     """
     try:
-        package = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception:
-        package = None
-    if isinstance(package, dict) and package.get("format") == "unblend-htdemucs-v1":
-        return load_tensor_package(package)
-    return load_model(torch.load(path, map_location="cpu", weights_only=False))
+        actual_size = path.stat().st_size
+    except OSError as exc:
+        raise ModelLoadingError(f"Could not stat {path}: {exc}") from exc
+    if actual_size != expected_size:
+        raise ModelLoadingError(
+            f"Invalid size for {path}, expected {expected_size} bytes but got "
+            f"{actual_size}."
+        )
+
+
+def _load_demucs_layer(path: Path, model_info: dict) -> HTDemucs:
+    """
+    Build one allowlisted HTDemucs architecture from pickle-free weights.
+
+    Constructor configuration lives in trusted registry metadata; the artifact
+    contains tensors only. A malformed Safetensors file fails closed and never
+    falls back to a pickle loader.
+
+    :param path: Path to the verified Safetensors artifact.
+    :param model_info: Registry entry containing architecture and config.
+    :return: Strictly weight-loaded HTDemucs model.
+    :raises ModelLoadingError: If construction or strict loading fails.
+    """
+    if model_info.get("architecture") != "htdemucs":
+        raise ModelLoadingError(
+            f"Unsupported Demucs architecture {model_info.get('architecture')!r}."
+        )
+    try:
+        model = HTDemucs(**dict(model_info["config"]))
+        model.load_state_dict(load_file(path, device="cpu"), strict=True)
+        return model
+    except (KeyError, TypeError, RuntimeError, SafetensorError, ValueError) as exc:
+        raise ModelLoadingError(f"Failed to build HTDemucs from {path}: {exc}") from exc
 
 
 def get_cache_dir() -> Path:
@@ -115,72 +138,120 @@ class ModelRepository:
             metadata_path = Path(__file__).parent / "metadata.json"
         self.metadata_path = metadata_path
 
-        # Load metadata
-        with open(self.metadata_path, "r") as f:
-            self.metadata = json.load(f)
-
-        if "models" in self.metadata:
-            self._models = self.metadata["models"]
-        else:
+        try:
+            with open(self.metadata_path, "r") as f:
+                self.metadata = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
             raise ModelLoadingError(
-                "Invalid metadata structure: 'models' key not found in metadata.json. "
-                "The expected format is a top-level 'models' dictionary."
-            )
+                f"Could not read model metadata {self.metadata_path}: {exc}"
+            ) from exc
 
-        # Generate layer URLs from model remote paths. The short checksum is
-        # the cache filename / URL key; the full sha256 is what downloads and
-        # cache hits are verified against.
-        self._layer_urls = {}
-        self._layer_sha256 = {}
+        if not isinstance(self.metadata, dict) or not isinstance(
+            self.metadata.get("models"), dict
+        ):
+            raise ModelLoadingError(
+                "Invalid metadata structure: expected a top-level 'models' dictionary."
+            )
+        self._models = self.metadata["models"]
+        if not self._models:
+            raise ModelLoadingError("Model metadata must contain at least one model.")
         for model_name, model_info in self._models.items():
-            if "models" not in model_info:
-                continue
-            # ``sources`` is required so the only_load specialist optimisation
-            # can resolve stem names without downloading a layer just to peek
-            # at them.
+            if not isinstance(model_name, str) or not model_name:
+                raise ModelLoadingError("Every model name must be a non-empty string.")
+            if not isinstance(model_info, dict):
+                raise ModelLoadingError(
+                    f"Model {model_name} metadata must be a dictionary."
+                )
+            if model_info.get("backend") not in {"demucs", "roformer"}:
+                raise ModelLoadingError(
+                    f"Model {model_name} has unknown backend "
+                    f"{model_info.get('backend')!r}."
+                )
             sources = model_info.get("sources")
             if not (
-                isinstance(sources, list) and all(isinstance(s, str) for s in sources)
+                isinstance(sources, list)
+                and sources
+                and all(isinstance(source, str) and source for source in sources)
+                and len(set(sources)) == len(sources)
             ):
                 raise ModelLoadingError(
-                    f"Model {model_name} is missing a 'sources' list in metadata."
+                    f"Model {model_name} must declare unique, non-empty sources."
                 )
-            for model_entry in model_info["models"]:
-                checksum = model_entry["checksum"]
-                remote_path = model_entry["remote"]
-                # Absolute remotes (the re-hosted tensor packages) are used
-                # verbatim; bare paths resolve against the Meta CDN.
-                if "://" in remote_path:
-                    url = remote_path
-                else:
-                    url = f"{BASE_CDN_URL}/{remote_path}"
-                # Short checksums key the shared cache/URL registries across
-                # all models — two entries disagreeing under one key would
-                # silently take the last writer.
-                if checksum in self._layer_urls and self._layer_urls[checksum] != url:
+
+        # Generate layer URLs from model remote paths. The digest prefix is
+        # the cache filename / URL key; the full sha256 is what downloads and
+        # cache hits are verified against.
+        self._layer_urls: dict[str, str] = {}
+        self._layer_sha256: dict[str, str] = {}
+        self._layer_sizes: dict[str, int] = {}
+        for model_name, model_info in self._models.items():
+            if model_info["backend"] != "demucs":
+                continue
+            sources = model_info["sources"]
+            layers = model_info.get("models")
+            if not (
+                isinstance(layers, list)
+                and layers
+                and all(isinstance(layer, dict) for layer in layers)
+            ):
+                raise ModelLoadingError(
+                    f"Demucs model {model_name} must contain a non-empty layer list."
+                )
+            if model_info.get("architecture") != "htdemucs":
+                raise ModelLoadingError(
+                    f"Demucs model {model_name} must declare architecture 'htdemucs'."
+                )
+            config = model_info.get("config")
+            if not isinstance(config, dict) or config.get("sources") != sources:
+                raise ModelLoadingError(
+                    f"Demucs model {model_name} must declare a config whose "
+                    "sources match metadata."
+                )
+            for model_entry in layers:
+                if model_entry.get("format") != "safetensors":
                     raise ModelLoadingError(
-                        f"Layer checksum {checksum} is registered with two "
-                        "different remotes in metadata."
+                        f"Layer of model {model_name} must use Safetensors."
                     )
-                self._layer_urls[checksum] = url
-                # Loading runs ``torch.load(weights_only=False)``, which can
-                # execute arbitrary pickle code, so a full 64-char SHA-256 is
-                # the integrity gate.
+                checksum = model_entry.get("checksum")
                 sha = model_entry.get("sha256")
-                if not isinstance(sha, str) or len(sha) != 64:
-                    raise ModelLoadingError(
-                        f"Layer {checksum} of model {model_name} is missing a "
-                        "full 64-character sha256 in metadata; refusing to load."
-                    )
                 if (
-                    checksum in self._layer_sha256
-                    and self._layer_sha256[checksum] != sha
+                    not isinstance(sha, str)
+                    or len(sha) != 64
+                    or any(char not in "0123456789abcdef" for char in sha)
+                    or not isinstance(checksum, str)
+                    or len(checksum) < 8
+                    or not sha.startswith(checksum)
                 ):
                     raise ModelLoadingError(
-                        f"Layer checksum {checksum} is registered with two "
-                        "different sha256 digests in metadata."
+                        f"Layer of model {model_name} has an invalid checksum/sha256."
                     )
+                size = model_entry.get("size_bytes")
+                if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                    raise ModelLoadingError(
+                        f"Layer {checksum} of model {model_name} is missing a "
+                        "positive size_bytes value."
+                    )
+                remote_path = model_entry.get("remote")
+                if not isinstance(remote_path, str) or not remote_path:
+                    raise ModelLoadingError(
+                        f"Layer {checksum} of model {model_name} has no remote URL."
+                    )
+                url = (
+                    remote_path
+                    if "://" in remote_path
+                    else f"{BASE_CDN_URL}/{remote_path}"
+                )
+                if checksum in self._layer_urls and (
+                    self._layer_urls[checksum] != url
+                    or self._layer_sha256[checksum] != sha
+                    or self._layer_sizes[checksum] != size
+                ):
+                    raise ModelLoadingError(
+                        f"Layer checksum {checksum} has conflicting metadata."
+                    )
+                self._layer_urls[checksum] = url
                 self._layer_sha256[checksum] = sha
+                self._layer_sizes[checksum] = size
 
         # RoFormer entries are a single checkpoint artifact + an inline config,
         # loaded via build_roformer rather than the Demucs layer/CDN path
@@ -190,29 +261,50 @@ class ModelRepository:
         for model_name, model_info in self._models.items():
             if model_info.get("backend") != "roformer":
                 continue
-            for field in (
-                "architecture",
-                "config",
-                "sources",
-                "samplerate",
-                "segment_samples",
+            architecture = model_info.get("architecture")
+            if not isinstance(architecture, str) or architecture not in {
+                "bs_roformer",
+                "mel_band_roformer",
+            }:
+                raise ModelLoadingError(
+                    f"RoFormer model {model_name} has an unknown architecture."
+                )
+            if (
+                not isinstance(model_info.get("config"), dict)
+                or not model_info["config"]
             ):
-                if field not in model_info:
+                raise ModelLoadingError(
+                    f"RoFormer model {model_name} must declare a non-empty config."
+                )
+            for field in ("samplerate", "segment_samples"):
+                value = model_info[field]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                     raise ModelLoadingError(
-                        f"RoFormer model {model_name} is missing '{field}' in metadata."
+                        f"RoFormer model {model_name} has invalid {field}: {value}."
                     )
             checkpoint = model_info.get("checkpoint")
-            if not isinstance(checkpoint, dict) or not str(
-                checkpoint.get("url", "")
-            ).startswith("https://"):
+            if (
+                not isinstance(checkpoint, dict)
+                or checkpoint.get("format") != "safetensors"
+                or not str(checkpoint.get("url", "")).startswith("https://")
+            ):
                 raise ModelLoadingError(
-                    f"RoFormer model {model_name} is missing a valid https "
-                    "checkpoint URL."
+                    f"RoFormer model {model_name} must declare a valid https "
+                    "Safetensors checkpoint."
                 )
             digest = checkpoint.get("sha256")
-            if not isinstance(digest, str) or len(digest) != 64:
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
                 raise ModelLoadingError(
-                    f"RoFormer model {model_name} is missing a 64-character sha256."
+                    f"RoFormer model {model_name} is missing a valid sha256."
+                )
+            size = checkpoint.get("size_bytes")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ModelLoadingError(
+                    f"RoFormer model {model_name} is missing positive size_bytes."
                 )
 
     def _roformer_cache_path(self, model_info: dict) -> Path:
@@ -220,10 +312,19 @@ class ModelRepository:
         Content-addressed cache path for a RoFormer checkpoint.
 
         :param model_info: The model's registry entry.
-        :return: ``<cache dir>/<sha256[:16]>.ckpt``.
+        :return: ``<cache dir>/<sha256[:16]>.safetensors``.
         """
         digest = model_info["checkpoint"]["sha256"]
-        return get_cache_dir() / f"{digest[:16]}.ckpt"
+        return get_cache_dir() / f"{digest[:16]}.safetensors"
+
+    def _layer_cache_path(self, checksum: str) -> Path:
+        """
+        Return the content-addressed cache path for a Demucs layer.
+
+        :param checksum: Registered digest prefix.
+        :return: ``<cache dir>/<checksum>.safetensors``.
+        """
+        return get_cache_dir() / f"{checksum}.safetensors"
 
     def get_cache_info(self) -> dict[str, dict]:
         """
@@ -233,14 +334,13 @@ class ModelRepository:
         :return: Dictionary mapping each model name with at least one cached
             layer to ``{"layers", "size_bytes", "total_layers", "complete"}``
         """
-        cache_dir = get_cache_dir()
         cached_models = {}
 
         # Check which layer files are downloaded. Single stat per file — an
         # exists()-then-stat() pair would race a concurrent removal.
         cached_layers = {}
         for checksum in self._layer_urls:
-            layer_path = cache_dir / f"{checksum}.th"
+            layer_path = self._layer_cache_path(checksum)
             try:
                 size_bytes = layer_path.stat().st_size
             except OSError:
@@ -294,7 +394,7 @@ class ModelRepository:
         :return: Number of files removed
         """
         removed = 0
-        for tmp_path in get_cache_dir().glob(f"{STAGING_PREFIX}*.th"):
+        for tmp_path in get_cache_dir().glob(f"{STAGING_PREFIX}*"):
             try:
                 tmp_path.unlink()
             except OSError:
@@ -307,6 +407,8 @@ class ModelRepository:
         url: str,
         cache_path: Path,
         expected_checksum: str,
+        expected_size: int,
+        model_info: dict,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
         model_name: str = "",
         layer_index: int = 1,
@@ -318,6 +420,8 @@ class ModelRepository:
         :param url: URL to download the layer from
         :param cache_path: Local path to cache the downloaded layer
         :param expected_checksum: Expected full 64-character SHA-256 digest for verification
+        :param expected_size: Exact artifact size from trusted metadata.
+        :param model_info: Architecture/config registry entry for construction.
         :param progress_callback: Optional callback for download progress updates
         :param model_name: Name of the model being downloaded
         :param layer_index: Index of the current layer (1-based)
@@ -329,12 +433,18 @@ class ModelRepository:
         # verify it, then move it into the cache. A partial or corrupt
         # download can never land at ``cache_path``.
         tmp_path: Path | None = None
+        started = time.monotonic()
         try:
             with httpx.stream(
                 "GET", url, follow_redirects=True, timeout=30.0
             ) as response:
                 response.raise_for_status()
                 total_size = int(response.headers.get("content-length", 0))
+                if total_size and total_size != expected_size:
+                    raise ModelLoadingError(
+                        f"Download size for {url} is {total_size} bytes; "
+                        f"expected {expected_size}."
+                    )
                 downloaded_size = 0
 
                 # Notify callback about layer start
@@ -357,14 +467,24 @@ class ModelRepository:
                 with tempfile.NamedTemporaryFile(
                     delete=False,
                     prefix=STAGING_PREFIX,
-                    suffix=".th",
+                    suffix=cache_path.suffix,
                     dir=cache_path.parent,
                 ) as tmp_file:
                     tmp_path = Path(tmp_file.name)
                     chunk_counter = 0
                     for chunk in response.iter_bytes(chunk_size=8192):
-                        tmp_file.write(chunk)
                         downloaded_size += len(chunk)
+                        if downloaded_size > expected_size:
+                            raise ModelLoadingError(
+                                f"Download from {url} exceeded the expected "
+                                f"{expected_size} bytes."
+                            )
+                        if time.monotonic() - started > DOWNLOAD_DEADLINE_SECONDS:
+                            raise ModelLoadingError(
+                                f"Download from {url} exceeded the "
+                                f"{DOWNLOAD_DEADLINE_SECONDS}-second deadline."
+                            )
+                        tmp_file.write(chunk)
                         chunk_counter += 1
 
                         # Update progress every few chunks to avoid too frequent updates
@@ -390,15 +510,14 @@ class ModelRepository:
                                 },
                             )
 
-            # Verify integrity BEFORE unpickling. ``load_model`` /
-            # ``torch.load`` use ``weights_only=False`` because the
-            # checkpoint format pickles the model class and its init
-            # args (``weights_only=True`` refuses to reconstruct those),
-            # which means loading can execute arbitrary code. The full
-            # SHA-256 from the shipped metadata is the integrity gate, so
-            # it must pass before the bytes reach the unpickler. The
-            # cache-load paths in ``get_model`` already check_checksum
-            # before torch.load.
+            if downloaded_size != expected_size:
+                raise ModelLoadingError(
+                    f"Download from {url} ended at {downloaded_size} bytes; "
+                    f"expected {expected_size}."
+                )
+
+            # Verify integrity before making the tensor-only artifact visible
+            # in the cache or constructing the allowlisted architecture.
             if progress_callback:
                 progress_callback(
                     "layer_progress",
@@ -412,10 +531,11 @@ class ModelRepository:
                         "phase": "verifying",
                     },
                 )
+            check_size(tmp_path, expected_size)
             check_checksum(tmp_path, expected_checksum)
 
             # Bytes are verified — now load and move into the cache.
-            layer = _load_demucs_layer(tmp_path)
+            layer = _load_demucs_layer(tmp_path, model_info)
             shutil.move(str(tmp_path), str(cache_path))
             tmp_path = None
 
@@ -447,30 +567,36 @@ class ModelRepository:
         url: str,
         cache_path: Path,
         expected_sha256: str,
+        expected_size: int,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
         model_name: str = "",
     ) -> None:
         """
         Stream a single file to the cache, verifying its SHA-256 before it
-        lands. Used for RoFormer ``.ckpt`` checkpoints (one file per model,
-        arbitrary host) — the Demucs layer path stays on
-        ``_download_and_load_layer``.
+        lands. Used for RoFormer Safetensors artifacts (one file per model).
 
         :param url: Source URL.
         :param cache_path: Destination path in the cache.
         :param expected_sha256: Full 64-character digest to verify against.
+        :param expected_size: Exact artifact size from trusted metadata.
         :param progress_callback: Optional callback (``layer_start`` /
             ``layer_progress`` / ``layer_complete`` events, ``total_layers=1``).
         :param model_name: Model name for progress payloads.
         :raises ModelLoadingError: On download or verification failure.
         """
         tmp_path: Path | None = None
+        started = time.monotonic()
         try:
             with httpx.stream(
                 "GET", url, follow_redirects=True, timeout=30.0
             ) as response:
                 response.raise_for_status()
                 total_size = int(response.headers.get("content-length", 0))
+                if total_size and total_size != expected_size:
+                    raise ModelLoadingError(
+                        f"Download size for {url} is {total_size} bytes; "
+                        f"expected {expected_size}."
+                    )
                 downloaded = 0
                 if progress_callback:
                     progress_callback(
@@ -486,14 +612,24 @@ class ModelRepository:
                 with tempfile.NamedTemporaryFile(
                     delete=False,
                     prefix=STAGING_PREFIX,
-                    suffix=".ckpt",
+                    suffix=cache_path.suffix,
                     dir=cache_path.parent,
                 ) as tmp_file:
                     tmp_path = Path(tmp_file.name)
                     counter = 0
                     for chunk in response.iter_bytes(chunk_size=8192):
-                        tmp_file.write(chunk)
                         downloaded += len(chunk)
+                        if downloaded > expected_size:
+                            raise ModelLoadingError(
+                                f"Download from {url} exceeded the expected "
+                                f"{expected_size} bytes."
+                            )
+                        if time.monotonic() - started > DOWNLOAD_DEADLINE_SECONDS:
+                            raise ModelLoadingError(
+                                f"Download from {url} exceeded the "
+                                f"{DOWNLOAD_DEADLINE_SECONDS}-second deadline."
+                            )
+                        tmp_file.write(chunk)
                         counter += 1
                         if progress_callback and counter % 40 == 0 and total_size > 0:
                             progress_callback(
@@ -507,7 +643,13 @@ class ModelRepository:
                                     "total_bytes": total_size,
                                 },
                             )
+            if downloaded != expected_size:
+                raise ModelLoadingError(
+                    f"Download from {url} ended at {downloaded} bytes; "
+                    f"expected {expected_size}."
+                )
             # Integrity gate before the file is visible in the cache.
+            check_size(tmp_path, expected_size)
             check_checksum(tmp_path, expected_sha256)
             shutil.move(str(tmp_path), str(cache_path))
             tmp_path = None
@@ -536,10 +678,9 @@ class ModelRepository:
         Build a RoFormer model, downloading and caching its checkpoint if a
         verified copy isn't already present.
 
-        The checkpoint's SHA-256 is verified before the bytes are unpickled,
-        so the ``weights_only=False`` fallback (needed for some Lightning
-        checkpoints that pickle non-tensor hyperparameters) never loads
-        unverified data.
+        The checkpoint is a tensor-only Safetensors artifact. Its exact size
+        and SHA-256 are verified before strict loading into the allowlisted
+        architecture declared in metadata.
 
         :param name: Model name.
         :param model_info: The model's registry entry.
@@ -557,10 +698,19 @@ class ModelRepository:
         cached = False
         if cache_path.exists():
             try:
+                check_size(cache_path, checkpoint["size_bytes"])
                 check_checksum(cache_path, expected)
                 cached = True
-            except ModelLoadingError:
-                cache_path.unlink(missing_ok=True)
+            except ModelLoadingError as exc:
+                if isinstance(exc.__cause__, OSError):
+                    raise
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    raise ModelLoadingError(
+                        f"Cached checkpoint {cache_path} failed verification and "
+                        f"could not be removed: {cleanup_error}"
+                    ) from None
 
         if cached:
             if progress_callback:
@@ -575,7 +725,12 @@ class ModelRepository:
                 )
         else:
             self._download_verified_file(
-                checkpoint["url"], cache_path, expected, progress_callback, name
+                checkpoint["url"],
+                cache_path,
+                expected,
+                checkpoint["size_bytes"],
+                progress_callback,
+                name,
             )
 
         if progress_callback:
@@ -584,15 +739,7 @@ class ModelRepository:
             )
 
         try:
-            raw = torch.load(cache_path, map_location="cpu", weights_only=True)
-        except Exception:
-            # SHA-256 was verified above, so loading the verified bytes with
-            # weights_only=False is safe; some Lightning checkpoints pickle
-            # non-tensor hyperparameters that weights_only=True refuses.
-            raw = torch.load(cache_path, map_location="cpu", weights_only=False)
-
-        try:
-            state = extract_state_dict(raw)
+            state = load_file(cache_path, device="cpu")
             return build_roformer(
                 model_info["architecture"],
                 dict(model_info["config"]),
@@ -655,6 +802,10 @@ class ModelRepository:
                             for j, w in enumerate(weight_row)
                             if j != stem_index
                         )
+                        and all(
+                            other_index == i or abs(other_row[stem_index]) < 1e-6
+                            for other_index, other_row in enumerate(weights)
+                        )
                     ):
                         model_index = i
                         break
@@ -675,7 +826,7 @@ class ModelRepository:
 
         :param name: Model name
         :param only_load: Optional stem for the single-specialist optimisation
-        :return: List of layer checksums (cache filenames are ``{checksum}.th``)
+        :return: List of layer checksums (cache filenames use Safetensors)
         :raises ModelLoadingError: If the model is not found
         """
         layer_checksums, _ = self._select_layers(name, only_load)
@@ -686,7 +837,7 @@ class ModelRepository:
         Return the full 64-character SHA-256 the layer with the given short
         checksum is expected to hash to.
 
-        :param checksum: Short (8-char) checksum that names the cache file.
+        :param checksum: Digest prefix that names the cache file.
         :return: Full 64-character SHA-256 digest from metadata.
         :raises KeyError: If ``checksum`` is not a registered layer.
         """
@@ -715,7 +866,6 @@ class ModelRepository:
 
         # Download each layer
         layers = []
-        cache_dir = get_cache_dir()
         total_layers = len(layer_checksums)
 
         # Notify callback about download start
@@ -734,20 +884,18 @@ class ModelRepository:
 
             url = self._layer_urls[layer_checksum]
 
-            # Determine cache path
-            filename = f"{layer_checksum}.th"
-            cache_path = cache_dir / filename
-
+            cache_path = self._layer_cache_path(layer_checksum)
             expected = self._layer_sha256[layer_checksum]
+            expected_size = self._layer_sizes[layer_checksum]
 
             # Check if file exists and validate its integrity
             if cache_path.exists():
                 try:
-                    # Validate checksum
+                    check_size(cache_path, expected_size)
                     check_checksum(cache_path, expected)
 
-                    # Try to load the model
-                    layer = _load_demucs_layer(cache_path)
+                    # Safetensors parsing and strict architecture loading.
+                    layer = _load_demucs_layer(cache_path, model_info)
                     layers.append(layer)
 
                     # Notify callback about cached layer
@@ -763,29 +911,16 @@ class ModelRepository:
                         )
                     continue
                 except OSError as exc:
-                    # A direct read failure from torch.load (e.g. the file
-                    # racing a concurrent removal) is not corruption — keep
-                    # the cache and surface the documented error type.
+                    # A direct read failure racing a concurrent removal is not
+                    # corruption — keep the cache and surface the error.
                     raise ModelLoadingError(
                         f"Could not read cached layer {cache_path}: {exc}"
                     ) from exc
-                except (
-                    ModelLoadingError,
-                    RuntimeError,
-                    EOFError,
-                    pickle.UnpicklingError,
-                ) as exc:
+                except ModelLoadingError as exc:
                     if isinstance(exc.__cause__, OSError):
-                        # A read failure (file lock, EIO, permissions) is not
-                        # corruption — keep the cached file and surface the
-                        # error instead of destroying a possibly-valid cache.
-                        # Non-ModelLoadingError carriers (e.g. torch.load
-                        # failing mid-read) still leave as the documented type.
-                        if isinstance(exc, ModelLoadingError):
-                            raise
-                        raise ModelLoadingError(
-                            f"Could not read cached layer {cache_path}: {exc}"
-                        ) from exc
+                        # A file lock, EIO, or permissions failure is not
+                        # corruption; preserve the possibly-valid cache.
+                        raise
                     # The cached file is corrupt: discard and redownload.
                     # ``missing_ok`` covers a concurrent process unlinking it
                     # first.
@@ -805,6 +940,8 @@ class ModelRepository:
                 url=url,
                 cache_path=cache_path,
                 expected_checksum=expected,
+                expected_size=expected_size,
+                model_info=model_info,
                 progress_callback=progress_callback,
                 model_name=name,
                 layer_index=i + 1,
@@ -837,16 +974,12 @@ class ModelRepository:
                 # Return the raw model directly for better performance
                 model = layers[0]
 
-                # Apply segment override if needed
+                # A metadata override can shorten, never enlarge, the model's
+                # configured training segment.
                 if segment is not None:
-                    # Embedded import to avoid circular dependency: repo -> htdemucs -> repo
-                    from .htdemucs import HTDemucs
-
-                    if (
-                        not isinstance(model, HTDemucs)
-                        or segment <= model.max_allowed_segment
-                    ):
-                        model.max_allowed_segment = segment
+                    model.max_allowed_segment = min(
+                        float(segment), float(model.max_allowed_segment)
+                    )
 
                 return model
 
@@ -875,7 +1008,6 @@ class ModelRepository:
             return False
 
         info = self._models[name]
-        cache_dir = get_cache_dir()
         removed_any = False
 
         if info.get("backend") == "roformer":
@@ -893,8 +1025,7 @@ class ModelRepository:
         # Remove all layer files for this model
         for layer_info in self._models[name].get("models", []):
             layer_checksum = layer_info["checksum"]
-            filename = f"{layer_checksum}.th"
-            layer_path = cache_dir / filename
+            layer_path = self._layer_cache_path(layer_checksum)
             try:
                 layer_path.unlink()
             except FileNotFoundError:

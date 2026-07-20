@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .exceptions import ModelLoadingError, ValidationError
+from .exceptions import ValidationError
 
 # The standard 62-band split over the 1025 STFT bins of n_fft=2048, from the
 # BS-RoFormer reference implementation. Community checkpoints (including
@@ -88,9 +88,7 @@ class RotaryEmbedding(nn.Module):
         :param theta: Base for the inverse-frequency spectrum.
         """
         super().__init__()
-        freqs = 1.0 / (
-            theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim)
-        )
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
         self.freqs = nn.Parameter(freqs, requires_grad=False)
         # Phase table cache, keyed by (seq_len, device). Chunked inference
         # calls every attention block with the same one or two sequence
@@ -498,9 +496,7 @@ class MaskEstimator(nn.Module):
         return torch.cat(outs, dim=-1)
 
 
-def _slaney_mel_filter_bank(
-    sample_rate: int, n_fft: int, n_mels: int
-) -> Tensor:
+def _slaney_mel_filter_bank(sample_rate: int, n_fft: int, n_mels: int) -> Tensor:
     """
     Slaney-style mel filter bank, replicating ``librosa.filters.mel`` with
     default arguments (``htk=False``, ``norm="slaney"``, ``fmin=0``,
@@ -727,9 +723,24 @@ class _RoformerBase(nn.Module):
         :param segment_samples: Training chunk length in samples; becomes
             ``max_allowed_segment`` (seconds) for the tiling in
             ``apply_model``.
-        :raises ValidationError: If ``sources`` doesn't match the head count
-            (with or without the complement stem).
+        :raises ValidationError: If source count or numeric metadata is invalid.
         """
+        if (
+            isinstance(samplerate, bool)
+            or not isinstance(samplerate, int)
+            or samplerate <= 0
+        ):
+            raise ValidationError(
+                f"samplerate must be a positive integer, got {samplerate}"
+            )
+        if (
+            isinstance(segment_samples, bool)
+            or not isinstance(segment_samples, int)
+            or segment_samples <= 0
+        ):
+            raise ValidationError(
+                f"segment_samples must be a positive integer, got {segment_samples}"
+            )
         if len(sources) == self.num_stems:
             self.output_complement = False
         elif self.num_stems == 1 and len(sources) == 2:
@@ -1266,43 +1277,3 @@ def build_roformer(
     if state is not None:
         model.load_state_dict(state, strict=True)
     return model.eval()
-
-
-def extract_state_dict(obj: dict) -> dict[str, Tensor]:
-    """
-    Pull a plain ``{param_name: tensor}`` state dict out of a loaded RoFormer
-    checkpoint, tolerating the wrappers community checkpoints ship in.
-
-    Handles a bare state dict, a Lightning-style ``{"state_dict": {...}}``
-    wrapper, and a single uniform module prefix on every key (e.g. ``"model."``
-    from a wrapping ``LightningModule``). RoFormer ``.ckpt`` files hold only
-    tensors, so the caller loads them with ``weights_only=True`` — no
-    arbitrary-code execution on load, unlike the Demucs ``.th`` format.
-
-    :param obj: An object already loaded via ``torch.load``.
-    :return: The unwrapped state dict.
-    :raises ModelLoadingError: If no tensor state dict can be recovered.
-    """
-    state = obj
-    if (
-        isinstance(state, dict)
-        and "state_dict" in state
-        and isinstance(state["state_dict"], dict)
-    ):
-        state = state["state_dict"]
-    if not isinstance(state, dict) or not state:
-        raise ModelLoadingError("RoFormer checkpoint contains no state dict.")
-
-    # Strip a single wrapper prefix shared by every key (Lightning nests the
-    # model under an attribute). Our own top-level keys don't share one, so a
-    # genuinely-unwrapped checkpoint is left untouched.
-    for prefix in ("model.", "module.", "net."):
-        if all(key.startswith(prefix) for key in state):
-            state = {key[len(prefix) :]: value for key, value in state.items()}
-            break
-
-    if not all(isinstance(value, torch.Tensor) for value in state.values()):
-        raise ModelLoadingError(
-            "RoFormer checkpoint state dict holds non-tensor values."
-        )
-    return state

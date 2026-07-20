@@ -85,7 +85,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        from unblend.api import Separator
+        from demucs.api import Separator
     except Exception as exc:
         _emit({"event": "init_error", "error_type": type(exc).__name__,
                "error_message": "failed to import upstream demucs: " + str(exc)})

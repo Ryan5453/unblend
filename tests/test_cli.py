@@ -489,7 +489,6 @@ def test_models_remove_all_empty_cache_exits_zero(
     :param monkeypatch: pytest monkeypatch fixture
     """
     monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: tmp_path)
-    monkeypatch.setattr("unblend.cli.models.get_cache_dir", lambda: tmp_path)
 
     result = _invoke(["models", "remove", "--all"])
     assert result.exit_code == 0
@@ -535,8 +534,8 @@ def test_models_remove_all_sweeps_partial_and_temp_files(
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path))
     # One layer of the multi-layer ensemble = a genuinely partial cache.
     checksum = ModelRepository().list_models()["htdemucs_ft"]["models"][0]["checksum"]
-    partial_layer = tmp_path / f"{checksum}.th"
-    stale_tmp = tmp_path / "tmpq1w2e3.th"
+    partial_layer = tmp_path / f"{checksum}.safetensors"
+    stale_tmp = tmp_path / "tmpq1w2e3.safetensors"
     partial_layer.write_bytes(b"x")
     stale_tmp.write_bytes(b"y")
 

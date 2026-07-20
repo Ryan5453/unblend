@@ -13,7 +13,7 @@
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
-    "demucs-next": "*",
+    "unblend": "*",
     "mediabunny": "^1.26.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

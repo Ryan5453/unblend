@@ -5,6 +5,7 @@
 numpy>=2.0.0
 torch>=2.13.0
 torchcodec>=0.15.0
+safetensors>=0.8.0
 typer>=0.19.1,<0.26
 click>=8.1.0
 rich>=13.8.0

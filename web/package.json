@@ -1,5 +1,5 @@
 {
-  "name": "demucs-next-workspace",
+  "name": "unblend-workspace",
   "private": true,
   "license": "MIT",
   "workspaces": [
@@ -7,9 +7,10 @@
     "app"
   ],
   "scripts": {
-    "build:lib": "npm run build -w demucs-next",
+    "build:lib": "npm run build -w unblend",
     "build:app": "npm run build -w demucs-app",
     "build": "npm run build:lib && npm run build:app",
+    "test": "npm run test -w unblend",
     "dev": "npm run build:lib && npm run dev -w demucs-app"
   }
 }

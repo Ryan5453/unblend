@@ -20,18 +20,20 @@ def test_repository_lists_expected_models() -> None:
     assert EXPECTED_ROFORMER_MODELS.issubset(models.keys())
 
 
-def test_every_demucs_layer_has_remote_and_checksum() -> None:
-    """
-    Each Demucs model lists at least one layer with a remote path and checksum.
-    """
+def test_every_demucs_layer_has_safe_artifact_and_config() -> None:
+    """Demucs entries construct allowlisted models from Safetensors only."""
     for name, info in ModelRepository().list_models().items():
         if info.get("backend") == "roformer":
             continue
+        assert info["architecture"] == "htdemucs"
+        assert info["config"]["sources"] == info["sources"]
         layers = info.get("models")
         assert layers, f"{name} has no layers"
         for layer in layers:
-            assert layer.get("remote"), f"{name} layer missing remote"
-            assert layer.get("checksum"), f"{name} layer missing checksum"
+            assert layer["format"] == "safetensors"
+            assert layer["remote"].endswith(".safetensors")
+            assert layer["sha256"].startswith(layer["checksum"])
+            assert layer["size_bytes"] > 0
 
 
 def test_ensemble_weights_are_consistent() -> None:
@@ -62,8 +64,8 @@ def test_every_model_is_licence_labelled() -> None:
 def test_roformer_entries_are_well_formed() -> None:
     """
     Each RoFormer entry carries the fields ``build_roformer`` needs: a known
-    architecture, an inline config, sources, sample rate, segment length, and
-    a checkpoint with an https URL and a 64-char sha256.
+    architecture, inline config, sources, sample rate, segment length, and a
+    Safetensors checkpoint with an https URL, exact size, and full sha256.
     """
     for name, info in ModelRepository().list_models().items():
         if info.get("backend") != "roformer":
@@ -74,5 +76,8 @@ def test_roformer_entries_are_well_formed() -> None:
         assert isinstance(info["samplerate"], int)
         assert isinstance(info["segment_samples"], int)
         checkpoint = info["checkpoint"]
+        assert checkpoint["format"] == "safetensors"
         assert checkpoint["url"].startswith("https://")
+        assert checkpoint["url"].endswith(".safetensors")
         assert len(checkpoint["sha256"]) == 64
+        assert checkpoint["size_bytes"] > 0

@@ -78,11 +78,7 @@ def test_metal_rms_norm_matches_fp32_reference(
     ref = F.normalize(ref_x, dim=-1) * scale * ref_gamma
     out = metal_rms_norm(mps_x, mps_gamma, scale).cpu().float()
 
-    tolerance = (
-        dict(atol=2e-5, rtol=2e-5)
-        if dtype == torch.float32
-        else _tol(dtype)
-    )
+    tolerance = dict(atol=2e-5, rtol=2e-5) if dtype == torch.float32 else _tol(dtype)
     torch.testing.assert_close(out, ref, **tolerance)
 
 

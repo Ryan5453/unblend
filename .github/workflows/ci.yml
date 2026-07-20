@@ -106,6 +106,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: brew install ffmpeg
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -132,5 +134,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Test browser library
+        run: npm test
       - name: Build library and app
         run: npm run build
+      - name: Lint app
+        run: npm run lint -w demucs-app
