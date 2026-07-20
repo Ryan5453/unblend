@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback, type DragEvent } from 'react';
 import { useDemucs } from '../../hooks/useDemucs';
 import { WaveCanvas, RulerCanvas } from '../ui/WaveLane';
-import { SplitDiagram } from '../ui/SplitDiagram';
+import { Braid } from '../ui/Braid';
 import { peaksFromBuffer } from '../../utils/peaks';
 import { makeZip } from '../../utils/zip';
 
@@ -458,7 +458,7 @@ export function Home() {
                         onMouseEnter={() => setIsHovering(true)}
                         onMouseLeave={() => setIsHovering(false)}
                     >
-                        <SplitDiagram active={isDragging || isHovering} />
+                        <Braid active={isDragging || isHovering} />
                         <div className="drop-caption">
                             <div className="t">Drop a song anywhere</div>
                             <div className="s">MP3 · WAV · FLAC · OGG</div>
@@ -482,13 +482,18 @@ export function Home() {
             {/* ---------- PROCESSING ---------- */}
             {phase === 'processing' && (
                 <section className="view-proc animate-fade-in">
-                    <div className="proc">
-                        <div className="pct">{Math.round(displayPct)}</div>
-                        <div className="proc-log">
-                            {logs.slice(-13).map((line, i) => (
-                                <div key={i}>&gt; {line.toUpperCase()}</div>
-                            ))}
-                            <div className="cur">&gt; {(status || 'WORKING').toUpperCase()} </div>
+                    <div className="proc-stack">
+                        <div className="proc-braid">
+                            <Braid progress={displayPct} audioBuffer={audioBuffer} />
+                        </div>
+                        <div className="proc">
+                            <div className="pct">{Math.round(displayPct)}</div>
+                            <div className="proc-log">
+                                {logs.slice(-13).map((line, i) => (
+                                    <div key={i}>&gt; {line.toUpperCase()}</div>
+                                ))}
+                                <div className="cur">&gt; {(status || 'WORKING').toUpperCase()} </div>
+                            </div>
                         </div>
                     </div>
                 </section>
