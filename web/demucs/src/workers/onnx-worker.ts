@@ -1,9 +1,9 @@
 /**
  * ONNX Runtime worker. Handles both WebGPU and WASM backends — same code, the
- * caller picks via the ``backend`` field on the load message. Inputs and
- * outputs are always float32; for fp16 models the weights and activations are
- * fp16 internally but the converter inserts Cast nodes at the IO boundary so
- * the JS pipeline stays fp32 end-to-end.
+ * caller picks via the ``backend`` field on the load message. Inputs, outputs,
+ * activations, and compute are always float32. An "fp16" artifact uses fp16
+ * only for weight storage; the exporter inserts a Cast(fp16 -> fp32) after
+ * each converted weight, allowing ORT to fold the constant cast at load time.
  */
 
 import * as onnx from 'onnxruntime-web';

@@ -37,6 +37,11 @@ export interface SeparationOptions {
      */
     onProgress?: (progress: SeparationProgress) => void;
     /**
+     * Cancels the active run. Cancellation terminates the Separator's workers,
+     * so that Separator is permanently invalid and must be loaded again.
+     */
+    signal?: AbortSignal;
+    /**
      * Number of random sub-second shifts to average (the Demucs "shift
      * trick"). Each extra shift reruns the whole separation on a randomly
      * shifted copy of the input, so runtime scales linearly. Integer in
@@ -93,13 +98,7 @@ export interface Pipeline {
     istft: ISTFTClient;
 }
 
-export async function runPipeline(
-    pipeline: Pipeline,
-    audioBuffer: AudioBuffer,
-    config: ModelConfig,
-    options: SeparationOptions = {}
-): Promise<SeparationResult> {
-    const { onProgress } = options;
+export function validateSeparationOptions(options: SeparationOptions): void {
     const shifts = options.shifts ?? 1;
     if (!Number.isInteger(shifts) || shifts < 1 || shifts > 20) {
         throw new Error(
@@ -109,6 +108,30 @@ export async function runPipeline(
     if (options.seed !== undefined && !Number.isInteger(options.seed)) {
         throw new Error(`seed must be an integer if provided, got ${options.seed}`);
     }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return;
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
+}
+
+const ABORT_BLOCK_SAMPLES = 1 << 20;
+
+async function yieldAndCheckAbort(signal: AbortSignal): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    throwIfAborted(signal);
+}
+
+export async function runPipeline(
+    pipeline: Pipeline,
+    audioBuffer: AudioBuffer,
+    config: ModelConfig,
+    options: SeparationOptions = {}
+): Promise<SeparationResult> {
+    validateSeparationOptions(options);
+    throwIfAborted(options.signal);
+    const { onProgress, signal } = options;
+    const shifts = options.shifts ?? 1;
     const rand = options.seed !== undefined ? mulberry32(options.seed) : Math.random;
     const { onnx, stft, istft } = pipeline;
     const numChannels = 2;
@@ -136,14 +159,35 @@ export async function runPipeline(
     let denormStd = 0;
     if (config.normalizeInput) {
         let refSum = 0;
-        for (let i = 0; i < numSamples; i++) {
-            refSum += (left[i] + right[i]) / 2;
+        if (signal) {
+            for (let start = 0; start < numSamples; start += ABORT_BLOCK_SAMPLES) {
+                const end = Math.min(numSamples, start + ABORT_BLOCK_SAMPLES);
+                for (let i = start; i < end; i++) {
+                    refSum += (left[i] + right[i]) / 2;
+                }
+                if (end < numSamples) await yieldAndCheckAbort(signal);
+            }
+        } else {
+            for (let i = 0; i < numSamples; i++) {
+                refSum += (left[i] + right[i]) / 2;
+            }
         }
         mean = refSum / numSamples;
         let refVar = 0;
-        for (let i = 0; i < numSamples; i++) {
-            const d = (left[i] + right[i]) / 2 - mean;
-            refVar += d * d;
+        if (signal) {
+            for (let start = 0; start < numSamples; start += ABORT_BLOCK_SAMPLES) {
+                const end = Math.min(numSamples, start + ABORT_BLOCK_SAMPLES);
+                for (let i = start; i < end; i++) {
+                    const d = (left[i] + right[i]) / 2 - mean;
+                    refVar += d * d;
+                }
+                if (end < numSamples) await yieldAndCheckAbort(signal);
+            }
+        } else {
+            for (let i = 0; i < numSamples; i++) {
+                const d = (left[i] + right[i]) / 2 - mean;
+                refVar += d * d;
+            }
         }
         // Deliberate guard: the reference's unbiased std is NaN for 1-sample input.
         const std = numSamples > 1 ? Math.sqrt(refVar / (numSamples - 1)) : 0;
@@ -157,10 +201,22 @@ export async function runPipeline(
     // and the rounds are averaged.
     const paddedSamples = numSamples + 2 * MAX_SHIFT;
     const padded = new Float32Array(paddedSamples * numChannels);
-    for (let i = 0; i < numSamples; i++) {
-        const idx = (MAX_SHIFT + i) * 2;
-        padded[idx] = (left[i] - mean) * norm;
-        padded[idx + 1] = (right[i] - mean) * norm;
+    if (signal) {
+        for (let start = 0; start < numSamples; start += ABORT_BLOCK_SAMPLES) {
+            const end = Math.min(numSamples, start + ABORT_BLOCK_SAMPLES);
+            for (let i = start; i < end; i++) {
+                const idx = (MAX_SHIFT + i) * 2;
+                padded[idx] = (left[i] - mean) * norm;
+                padded[idx + 1] = (right[i] - mean) * norm;
+            }
+            if (end < numSamples) await yieldAndCheckAbort(signal);
+        }
+    } else {
+        for (let i = 0; i < numSamples; i++) {
+            const idx = (MAX_SHIFT + i) * 2;
+            padded[idx] = (left[i] - mean) * norm;
+            padded[idx + 1] = (right[i] - mean) * norm;
+        }
     }
 
     // Mirror the Python chunking exactly (unblend/apply.py): segments start at
@@ -287,9 +343,12 @@ export async function runPipeline(
             // hidden tabs, which would stall the pipeline.
             if (seg % 5 === 0) {
                 await new Promise(resolve => setTimeout(resolve, 0));
+                throwIfAborted(signal);
             }
 
+            throwIfAborted(signal);
             const stftResult = await pendingStft;
+            throwIfAborted(signal);
             const currentPlanar = pendingPlanar;
 
             const specShape = [1, numChannels, stftResult.numBins, stftResult.numFrames];
@@ -314,6 +373,7 @@ export async function runPipeline(
             }
 
             const results = await inferencePromise;
+            throwIfAborted(signal);
             totalInferenceMs += performance.now() - inferenceStart;
 
             // The iSTFT worker slices these buffers with subarray, which
@@ -332,6 +392,7 @@ export async function runPipeline(
 
             if (prevIstftPromise) {
                 accumulate(await prevIstftPromise);
+                throwIfAborted(signal);
             }
 
             // The result buffers were transferred from the ONNX worker and are
@@ -358,8 +419,10 @@ export async function runPipeline(
 
         if (prevIstftPromise) {
             accumulate(await prevIstftPromise);
+            throwIfAborted(signal);
         }
         roundAccumulator.finishRound();
+        throwIfAborted(signal);
     }
 
     // Average the shift rounds and denormalize (Python: out * (1e-5 + std) + mean).
@@ -369,8 +432,20 @@ export async function runPipeline(
         : 1 / shifts;
     for (const source of modelSources) {
         const out = outputs[source];
-        for (let i = 0; i < numSamples * numChannels; i++) {
-            out[i] = out[i] * denormScale + mean;
+        const length = numSamples * numChannels;
+        if (signal) {
+            for (let start = 0; start < length; start += ABORT_BLOCK_SAMPLES) {
+                const end = Math.min(length, start + ABORT_BLOCK_SAMPLES);
+                for (let i = start; i < end; i++) {
+                    out[i] = out[i] * denormScale + mean;
+                }
+                if (end < length) await yieldAndCheckAbort(signal);
+            }
+        } else {
+            // Keep the hot no-cancellation loop branch-free.
+            for (let i = 0; i < length; i++) {
+                out[i] = out[i] * denormScale + mean;
+            }
         }
     }
 
@@ -380,9 +455,20 @@ export async function runPipeline(
     if (config.complement) {
         const stem = outputs[config.complement.stem];
         const complement = new Float32Array(numSamples * numChannels);
-        for (let i = 0; i < numSamples; i++) {
-            complement[i * 2] = left[i] - stem[i * 2];
-            complement[i * 2 + 1] = right[i] - stem[i * 2 + 1];
+        if (signal) {
+            for (let start = 0; start < numSamples; start += ABORT_BLOCK_SAMPLES) {
+                const end = Math.min(numSamples, start + ABORT_BLOCK_SAMPLES);
+                for (let i = start; i < end; i++) {
+                    complement[i * 2] = left[i] - stem[i * 2];
+                    complement[i * 2 + 1] = right[i] - stem[i * 2 + 1];
+                }
+                if (end < numSamples) await yieldAndCheckAbort(signal);
+            }
+        } else {
+            for (let i = 0; i < numSamples; i++) {
+                complement[i * 2] = left[i] - stem[i * 2];
+                complement[i * 2 + 1] = right[i] - stem[i * 2 + 1];
+            }
         }
         outputs[config.complement.name] = complement;
     }

@@ -541,21 +541,33 @@ def separate_command(
             console.print(f"  [bold]{escape(path)}[/bold] ← {escape(', '.join(srcs))}")
         raise typer.Exit(1)
 
-    folded_groups: dict[str, set[str]] = {}
+    canonical_groups: dict[str, set[str]] = {}
     for planned in planned_paths:
-        key = unicodedata.normalize("NFC", planned).casefold()
-        folded_groups.setdefault(key, set()).add(planned)
+        # ``resolve(strict=False)`` collapses dot components and existing
+        # symlinked parents; NFC+casefold conservatively catches aliases on
+        # normalization/case-insensitive filesystems before inference starts.
+        try:
+            resolved = str(Path(planned).resolve(strict=False))
+        except (OSError, RuntimeError) as exc:
+            console.print(
+                "[red]✗[/red] Could not resolve planned output path "
+                f"'{escape(planned)}': {escape(str(exc))}"
+            )
+            raise typer.Exit(1) from exc
+        key = unicodedata.normalize("NFC", resolved).casefold()
+        canonical_groups.setdefault(key, set()).add(planned)
     aliasing_groups = [
-        sorted(aliases) for aliases in folded_groups.values() if len(aliases) > 1
+        sorted(aliases) for aliases in canonical_groups.values() if len(aliases) > 1
     ]
     if aliasing_groups:
         console.print(
-            "[yellow]![/yellow] Some output paths differ only by letter case or "
-            "Unicode form; on filesystems that treat those as the same file "
-            "(e.g. macOS/Windows) they may overwrite each other:"
+            "[red]✗[/red] Output paths resolve to case, Unicode, or filesystem "
+            "aliases and may overwrite each other. Choose a template that "
+            "produces distinct paths:"
         )
         for aliases in aliasing_groups:
             console.print(f"  {escape(', '.join(aliases))}")
+        raise typer.Exit(1)
 
     # Reuse format_output_path so the displayed template can never drift from the
     # paths actually written. Keep {stem} as a literal placeholder (and {track}

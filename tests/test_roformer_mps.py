@@ -159,6 +159,25 @@ def test_mps_manual_attention_matches_native_sdpa(
 
 
 @mps_only
+def test_mps_manual_attention_prescales_before_fp16_matmul() -> None:
+    """Large finite FP16 Q/K values do not overflow before attention scaling."""
+    query = torch.full((1, 1, 4, 16), 100.0, device="mps", dtype=torch.float16)
+    key = query.clone()
+    value = torch.randn_like(query)
+    expected = F.scaled_dot_product_attention(query, key, value)
+    actual = _scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        scale=16**-0.5,
+        dropout=0.0,
+        training=False,
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@mps_only
 @pytest.mark.parametrize("builder", [_tiny_bs, _tiny_mel], ids=["bs", "mel"])
 def test_mps_forward_matches_cpu(builder) -> None:
     """

@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import warnings
 from importlib import resources
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -165,7 +165,9 @@ def _is_metal_lp(t: torch.Tensor) -> bool:
     :param t: Tensor whose device and dtype are checked
     :return: ``True`` if ``t`` is on MPS and FP16/BF16, ``False`` otherwise
     """
-    return t.device.type == "mps" and t.dtype in _LP_DTYPES
+    return (
+        t.device.type == "mps" and t.dtype in _LP_DTYPES and not torch.is_grad_enabled()
+    )
 
 
 def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
@@ -254,7 +256,12 @@ def metal_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.
     :param scale: RoFormer's ``sqrt(dim)`` normalization scale.
     :return: Normalized tensor with the same shape and dtype as ``x``.
     """
-    if x.device.type != "mps" or x.dtype not in _RMS_DTYPES or x.numel() == 0:
+    if (
+        x.device.type != "mps"
+        or x.dtype not in _RMS_DTYPES
+        or x.numel() == 0
+        or torch.is_grad_enabled()
+    ):
         normalized = F.normalize(x.float(), dim=-1) * scale * gamma.float()
         return normalized.type(x.dtype)
 
@@ -430,6 +437,7 @@ class MetalGroupNorm(nn.Module):
         # Affine parameters live in FP32 storage; we cast lazily and cache.
         self.weight = nn.Parameter(gn.weight.detach().to(torch.float32).clone())
         self.bias = nn.Parameter(gn.bias.detach().to(torch.float32).clone())
+        self.train(gn.training)
 
     @classmethod
     def from_groupnorm(cls, gn: nn.GroupNorm) -> "MetalGroupNorm":
@@ -455,6 +463,15 @@ class MetalGroupNorm(nn.Module):
         if cache is None:
             cache = {}
             object.__setattr__(self, "_aff_cache", cache)
+        versions = (
+            id(self.weight),
+            self.weight._version,
+            id(self.bias),
+            self.bias._version,
+        )
+        if getattr(self, "_aff_versions", None) != versions:
+            cache.clear()
+            object.__setattr__(self, "_aff_versions", versions)
         key = (dtype, device)
         cached = cache.get(key)
         if cached is None:
@@ -463,6 +480,30 @@ class MetalGroupNorm(nn.Module):
             cache[key] = (w, b)
             return w, b
         return cached
+
+    def _clear_parameter_caches(self) -> None:
+        """Discard all derived low-precision parameter copies."""
+        for name in ("_aff_cache", "_ls_cache"):
+            cache = getattr(self, name, None)
+            if cache:
+                cache.clear()
+        for name in ("_aff_versions", "_ls_version"):
+            if hasattr(self, name):
+                object.__delattr__(self, name)
+
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> "MetalGroupNorm":
+        """
+        Apply a module transform and invalidate device/dtype-specific caches.
+
+        :param fn: Tensor transform supplied by ``nn.Module.to``/``half``.
+        :param recurse: Whether to transform child modules recursively.
+        :return: This module after the transform completes.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        self._clear_parameter_caches()
+        return result
 
     def _load_from_state_dict(self, *args: object, **kwargs: object) -> None:
         """
@@ -478,10 +519,7 @@ class MetalGroupNorm(nn.Module):
         :param kwargs: Keyword arguments forwarded to ``nn.Module._load_from_state_dict``.
         """
         super()._load_from_state_dict(*args, **kwargs)
-        for name in ("_aff_cache", "_ls_cache"):
-            cache = getattr(self, name, None)
-            if cache:
-                cache.clear()
+        self._clear_parameter_caches()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -783,6 +821,10 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         if cache is None:
             cache = {}
             object.__setattr__(self, "_ls_cache", cache)
+        version = (id(self.layer_scale), self.layer_scale._version)
+        if getattr(self, "_ls_version", None) != version:
+            cache.clear()
+            object.__setattr__(self, "_ls_version", version)
         key = (dtype, device)
         cached = cache.get(key)
         if cached is None:
@@ -1343,6 +1385,7 @@ class MetalMultiheadAttention(nn.Module):
         self.out_proj = mha.out_proj
         # Held for any path we don't optimise (masks, need_weights, etc.).
         self._fallback = mha
+        self.train(mha.training)
 
     @classmethod
     def from_mha(cls, mha: nn.MultiheadAttention) -> "MetalMultiheadAttention":
@@ -1387,7 +1430,8 @@ class MetalMultiheadAttention(nn.Module):
         # F.scaled_dot_product_attention's, and the wrapped module is the only
         # path that reproduces it exactly. Demucs itself never passes masks.
         if (
-            need_weights
+            self.training
+            or need_weights
             or key_padding_mask is not None
             or attn_mask is not None
             or is_causal
@@ -1569,6 +1613,7 @@ def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
                 params = list(child.parameters())
                 if params:
                     replacement.to(device=params[0].device)
+                replacement.train(child.training)
                 setattr(mod, name, replacement)
             else:
                 _walk_layers(child)
@@ -1608,6 +1653,7 @@ def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
                 params = list(child.parameters())
                 if params:
                     replacement.to(device=params[0].device)
+                replacement.train(child.training)
                 setattr(mod, name, replacement)
             else:
                 _walk_modules(child)

@@ -1,5 +1,7 @@
 """Unit tests for ``unblend.apply`` (chunk views, routing, shifts, progress)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -225,6 +227,14 @@ def test_model_ensemble_rejects_mixed_normalization_contracts() -> None:
         ModelEnsemble([_DoublingModel(), raw])
 
 
+def test_htdemucs_valid_length_matches_rounded_apply_segment() -> None:
+    """Fractional seconds use the same sample conversion in validation/chunking."""
+    from unblend.htdemucs import HTDemucs
+
+    model = SimpleNamespace(max_allowed_segment=1.0001, samplerate=8000)
+    assert HTDemucs.valid_length(model, 8001) == 8001
+
+
 def test_htdemucs_mask_without_cac_applies_real_mask() -> None:
     """Non-CaC decoding applies a real mask while preserving mixture phase."""
     from unblend.htdemucs import HTDemucs
@@ -311,6 +321,45 @@ def test_apply_model_shifts_progress_single_monotonic_span() -> None:
     total = starts[0]["total_chunks"]
     assert {d["total_chunks"] for d in chunks} == {total}
     assert [d["completed_chunks"] for d in chunks] == list(range(1, total + 1))
+
+
+def test_ensemble_shifts_share_offsets_and_report_exact_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different segment lengths still produce one exact, non-clamped span."""
+
+    class ShortSegmentModel(_DoublingModel):
+        max_allowed_segment = 0.6
+
+    ensemble = ModelEnsemble([_DoublingModel(), ShortSegmentModel()])
+    mix = torch.randn(1, 1, 260)
+    draws: list[int] = []
+    values = iter([0, 17, 49])
+
+    def fake_randint(_low: int, _high: int) -> int:
+        value = next(values)
+        draws.append(value)
+        return value
+
+    monkeypatch.setattr("unblend.apply.random.randint", fake_randint)
+    events: list[tuple[str, dict]] = []
+    apply_model(
+        ensemble,
+        mix,
+        shifts=3,
+        progress_callback=lambda event, data: events.append((event, dict(data))),
+    )
+
+    starts = [data for event, data in events if event == "processing_start"]
+    chunks = [data for event, data in events if event == "chunk_complete"]
+    completes = [data for event, data in events if event == "processing_complete"]
+    assert draws == [0, 17, 49]  # one plan, not one set per ensemble member
+    assert len(starts) == len(completes) == 1
+    total = starts[0]["total_chunks"]
+    assert completes[0] == starts[0]
+    assert len(chunks) == total
+    assert [event["completed_chunks"] for event in chunks] == list(range(1, total + 1))
+    assert chunks[-1]["input_completed_chunks"] == starts[0]["input_total_chunks"][0]
 
 
 def test_apply_model_multi_reports_aggregate_and_per_input_progress() -> None:
@@ -528,8 +577,8 @@ def test_fixed_batch_shape_blocks_in_apply_backoff() -> None:
 
 def test_oom_during_accumulation_phase_is_retry_safe(monkeypatch) -> None:
     """
-    An OOM raised after the forward but during the (allocating) contribution
-    phase must not double-count already-processed chunks on retry: output
+    An OOM raised after the forward but before the in-place-weighted views are
+    committed must not double-count already-processed chunks on retry: output
     stays exactly equal to a clean run and progress never overshoots. Uses a
     non-pointwise model — overlap contributions differ chunk to chunk, so
     any double accumulation breaks equality (a pointwise model would hide

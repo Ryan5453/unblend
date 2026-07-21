@@ -2,7 +2,8 @@ build:
   gpu: true
   cuda: "12.4"
   python_version: "3.12"
-  python_requirements: "requirements.txt"
+  # Generated from uv.lock; CI fails if this export drifts.
+  python_requirements: "requirements-cog.txt"
   system_packages:
     - "ffmpeg"
   run:
@@ -12,7 +13,7 @@ build:
     # start. The URL and checksum come from unblend/metadata.json; the cache
     # filename is the short checksum, matching unblend.repo's naming.
     # predictor.setup() would otherwise download htdemucs by name on first boot.
-    - curl --fail --location --max-time 7200 --max-filesize 84023856 --output /root/.unblend/models/d3cb2f212d065294.safetensors https://huggingface.co/Ryan5453/unblend/resolve/main/htdemucs.safetensors
+    - curl --fail --location --max-time 7200 --max-filesize 84023856 --output /root/.unblend/models/d3cb2f212d065294.safetensors https://huggingface.co/Ryan5453/unblend/resolve/9ba75778acf1b64fc40a9ea05137a2c6af9cd1d5/htdemucs.safetensors
     - echo 'd3cb2f212d0652945fd033c26e1fbfdf9b6fbb9087aa6104def87f08b1016a81  /root/.unblend/models/d3cb2f212d065294.safetensors' | sha256sum --check --strict
     - python -c "import site; open(site.getsitepackages()[0] + '/sitecustomize.py', 'w').write('import os\nos.environ.pop(\"LD_LIBRARY_PATH\", None)\n')"
 

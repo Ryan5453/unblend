@@ -6,16 +6,27 @@ legacy pickle compatibility is tested as a separate opt-in boundary.
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
+import time
+import warnings
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from unblend.exceptions import ModelLoadingError
-from unblend.repo import ModelRepository, check_checksum, check_size, get_cache_dir
+from unblend.repo import (
+    STAGING_PREFIX,
+    STAGING_STALE_SECONDS,
+    ModelRepository,
+    check_checksum,
+    check_size,
+    get_cache_dir,
+)
 
 
 def _good_metadata() -> dict:
@@ -257,6 +268,32 @@ def test_repository_rejects_malformed_roformer_fields(tmp_path: Path) -> None:
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
+@pytest.mark.parametrize("missing", ["samplerate", "segment_samples"])
+def test_repository_wraps_missing_roformer_geometry(
+    tmp_path: Path, missing: str
+) -> None:
+    """Missing required geometry raises ModelLoadingError, never raw KeyError."""
+    entry = {
+        "backend": "roformer",
+        "architecture": "bs_roformer",
+        "config": {"dim": 16},
+        "sources": ["vocals"],
+        "samplerate": 44100,
+        "segment_samples": 44100,
+        "checkpoint": {
+            "format": "safetensors",
+            "url": "https://example.invalid/model.safetensors",
+            "sha256": "a" * 64,
+            "size_bytes": 1,
+        },
+    }
+    entry.pop(missing)
+    with pytest.raises(ModelLoadingError, match=missing):
+        ModelRepository(
+            metadata_path=_write_metadata(tmp_path, {"models": {"bad": entry}})
+        )
+
+
 def test_repository_accepts_well_formed_metadata(tmp_path: Path) -> None:
     """
     A correctly-shaped metadata file constructs cleanly.
@@ -406,6 +443,58 @@ def test_get_model_redownloads_corrupt_cached_layer(
     assert download_calls[0]["expected_checksum"] == "abcd1234" + "a" * 56
 
 
+def test_repository_instances_coordinate_one_artifact_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two repository instances recheck under one cross-process file lock."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache)
+    monkeypatch.setattr("unblend.repo.check_checksum", lambda *_args: None)
+    model = SimpleNamespace(
+        sources=["drums", "bass", "other", "vocals"], max_allowed_segment=1.0
+    )
+    monkeypatch.setattr("unblend.repo._load_demucs_layer", lambda *_args: model)
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fake_download(self: ModelRepository, **kwargs: object):
+        """Populate the cache slowly enough for the other thread to wait."""
+        nonlocal calls
+        del self
+        with calls_lock:
+            calls += 1
+        time.sleep(0.1)
+        path = kwargs["cache_path"]
+        assert isinstance(path, Path)
+        path.write_bytes(b"x" * 1024)
+        return model
+
+    monkeypatch.setattr(ModelRepository, "_download_and_load_layer", fake_download)
+    metadata_path = _write_metadata(tmp_path, _good_metadata())
+    repos = [ModelRepository(metadata_path=metadata_path) for _ in range(2)]
+    barrier = threading.Barrier(3)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def load(repo: ModelRepository) -> None:
+        barrier.wait()
+        try:
+            results.append(repo.get_model("fakemodel"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=load, args=(repo,)) for repo in repos]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not errors
+    assert len(results) == 2
+    assert calls == 1
+
+
 def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
     """Repository cannot skip another layer that contributes to the stem."""
     metadata = _good_metadata()
@@ -429,6 +518,112 @@ def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("stem", ["", "not-a-stem"])
+def test_get_model_rejects_only_load_before_cache_or_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stem: str
+) -> None:
+    """Direct repository callers fail fast for invalid or empty stems."""
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
+    monkeypatch.setattr(
+        repo,
+        "_download_and_load_layer",
+        lambda **_kwargs: pytest.fail("invalid only_load touched the downloader"),
+    )
+    with pytest.raises(ModelLoadingError, match="not found"):
+        repo.get_model("fakemodel", only_load=stem)
+    with pytest.raises(ModelLoadingError, match="not found"):
+        repo.required_layers("fakemodel", only_load=stem)
+
+
+def test_artifact_lock_wraps_acquisition_filesystem_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock-path failures become stable repository-domain errors."""
+    from unblend import repo as repo_module
+
+    class BrokenLock:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def acquire(self, *, timeout: int) -> None:
+            raise PermissionError("read-only cache")
+
+    monkeypatch.setattr(repo_module, "FileLock", BrokenLock)
+    with pytest.raises(ModelLoadingError, match="Could not create/acquire") as caught:
+        with repo_module._artifact_lock(tmp_path / "cache" / "model.safetensors"):
+            pytest.fail("lock acquisition unexpectedly succeeded")
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_roformer_materializes_state_while_cache_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent remove cannot unlink a checkpoint during load_file."""
+    from contextlib import contextmanager
+
+    from unblend import repo as repo_module
+
+    checkpoint = tmp_path / "checkpoint.safetensors"
+    checkpoint.write_bytes(b"registered")
+    digest = sha256(checkpoint.read_bytes()).hexdigest()
+    metadata = {
+        "models": {
+            "tiny": {
+                "backend": "roformer",
+                "architecture": "bs_roformer",
+                "sources": ["vocals", "other"],
+                "samplerate": 8000,
+                "segment_samples": 8000,
+                "config": {"dim": 1},
+                "checkpoint": {
+                    "format": "safetensors",
+                    "url": "https://example.invalid/tiny.safetensors",
+                    "sha256": digest,
+                    "size_bytes": checkpoint.stat().st_size,
+                },
+            }
+        }
+    }
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
+    cache_path = repo._roformer_cache_path(repo.list_models()["tiny"])
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(checkpoint.read_bytes())
+
+    locked = False
+
+    @contextmanager
+    def tracked_lock(_path: Path):
+        nonlocal locked
+        locked = True
+        try:
+            yield
+        finally:
+            locked = False
+
+    def fake_load_file(path: Path, *, device: str) -> dict:
+        assert path == cache_path
+        assert device == "cpu"
+        assert locked
+        return {"weight": object()}
+
+    monkeypatch.setattr(repo_module, "_artifact_lock", tracked_lock)
+    monkeypatch.setattr(repo_module, "load_file", fake_load_file)
+    monkeypatch.setattr(
+        repo_module,
+        "build_roformer",
+        lambda *_args, state, **_kwargs: (assert_state_materialized(state, locked)),
+    )
+
+    def assert_state_materialized(state: dict, still_locked: bool) -> SimpleNamespace:
+        assert state == {"weight": state["weight"]}
+        assert not still_locked
+        return SimpleNamespace(sources=["vocals", "other"])
+
+    loaded = repo.get_model("tiny")
+    assert loaded.sources == ["vocals", "other"]
+
+
 def test_get_cache_dir_env_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -444,6 +639,24 @@ def test_get_cache_dir_env_override(
 
     monkeypatch.setenv("UNBLEND_CACHE_DIR", "~/some-demucs-cache")
     assert get_cache_dir() == Path.home() / "some-demucs-cache"
+
+
+def test_get_cache_dir_legacy_fallback_and_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The old variable warns, while the new name silently wins."""
+    legacy = tmp_path / "legacy"
+    current = tmp_path / "current"
+    monkeypatch.delenv("UNBLEND_CACHE_DIR", raising=False)
+    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(legacy))
+    with pytest.warns(DeprecationWarning, match="UNBLEND_CACHE_DIR"):
+        assert get_cache_dir() == legacy
+
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(current))
+    with warnings.catch_warnings(record=True) as warnings_seen:
+        warnings.simplefilter("always")
+        assert get_cache_dir() == current
+    assert not warnings_seen
 
 
 def test_get_cache_info_reports_partial_models(
@@ -489,21 +702,25 @@ def test_get_cache_info_reports_partial_models(
 def test_sweep_stale_downloads_removes_staging_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """
-    ``sweep_stale_downloads`` removes ``tmp*`` staging leftovers but not
-    cached layer files.
-    """
+    """Only expired staging files are swept; active files are preserved."""
     cache = tmp_path / "cache"
     cache.mkdir()
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(cache))
 
-    (cache / "tmpabc123.safetensors").write_bytes(b"partial download")
-    (cache / "abcd1234.safetensors").write_bytes(b"cached layer")
+    stale = cache / f"{STAGING_PREFIX}stale.tmp"
+    active = cache / f"{STAGING_PREFIX}active.tmp"
+    stale.write_bytes(b"abandoned")
+    active.write_bytes(b"active")
+    old = time.time() - STAGING_STALE_SECONDS - 1
+    os.utime(stale, (old, old))
+    cached = cache / "abcd1234.safetensors"
+    cached.write_bytes(b"cached layer")
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     assert repo.sweep_stale_downloads() == 1
-    assert not (cache / "tmpabc123.safetensors").exists()
-    assert (cache / "abcd1234.safetensors").exists()
+    assert not stale.exists()
+    assert active.exists()
+    assert cached.exists()
 
 
 def test_list_models_returns_copies() -> None:

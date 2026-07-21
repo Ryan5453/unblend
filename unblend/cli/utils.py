@@ -56,11 +56,13 @@ def format_output_path(
     """
     if now is None:
         now = datetime.now()
+    stripped_track = track.name.rsplit(".", 1)[0]
+    # Empty/dot components can collapse or escape a template directory after
+    # path normalization. Preserve the full legal filename in those cases.
+    safe_track = track.name if stripped_track in {"", ".", ".."} else stripped_track
     variables = {
         "model": model,
-        # ``or track.name`` keeps dotfiles like ".hidden" from resolving to ""
-        # (which could collapse "{track}/..." into an absolute path).
-        "track": track.name.rsplit(".", 1)[0] or track.name,
+        "track": safe_track,
         "stem": stem,
         "ext": ext,
         "date": now.strftime("%Y-%m-%d"),

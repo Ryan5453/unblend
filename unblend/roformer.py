@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -142,6 +142,21 @@ class RotaryEmbedding(nn.Module):
             self._rotation_cache[key] = cached
         return cached
 
+    def _apply(
+        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
+    ) -> "RotaryEmbedding":
+        """
+        Apply a dtype/device transform, then invalidate derived phase caches.
+
+        :param fn: Tensor transformation supplied by ``nn.Module.to``/``half``.
+        :param recurse: Whether child modules should also be transformed.
+        :return: This module after the successful transformation.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        self._phase_cache.clear()
+        self._rotation_cache.clear()
+        return result
+
     def _load_from_state_dict(self, *args: object, **kwargs: object) -> None:
         """
         Drop cached phases when weights (``freqs``) are replaced.
@@ -241,7 +256,9 @@ def _scaled_dot_product_attention(
     :return: Attention output with the same shape as ``query``.
     """
     if query.device.type == "mps" and not training:
-        weights = (query @ key.transpose(-1, -2)) * scale
+        # Pre-scale Q so large finite FP16 values cannot overflow in an
+        # unscaled intermediate before the mathematically-required reduction.
+        weights = (query * scale) @ key.transpose(-1, -2)
         return weights.softmax(dim=-1) @ value
     return F.scaled_dot_product_attention(
         query,

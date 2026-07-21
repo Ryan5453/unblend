@@ -361,6 +361,29 @@ def test_build_roformer_loads_state() -> None:
         assert torch.equal(reference(audio), built(audio)[:, :1])
 
 
+def test_rotary_cache_is_invalidated_by_dtype_transform() -> None:
+    """A warmed module converted to half matches a freshly converted module."""
+    from unblend.roformer import RotaryEmbedding
+
+    warmed = RotaryEmbedding(dim=16)
+    sample = torch.randn(1, 2, 8, 16)
+    warmed.rotate_queries_or_keys(sample)
+    assert warmed._phase_cache
+
+    warmed.half()
+    assert not warmed._phase_cache
+    assert not warmed._rotation_cache
+
+    half_sample = sample.half()
+    fresh = RotaryEmbedding(dim=16).half()
+    torch.testing.assert_close(
+        warmed.rotate_queries_or_keys(half_sample),
+        fresh.rotate_queries_or_keys(half_sample),
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_rotary_rotation_accepts_half_inputs() -> None:
     """
     Rotation must work on fp16 tensors from a model cast to half: the phase

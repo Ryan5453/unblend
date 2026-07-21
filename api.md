@@ -62,7 +62,7 @@ def separate(
 
 When separating audio, you have the ability to specify the following parameters:
 
-- `audio` - The audio to separate. **Polymorphic input**: a single `(Tensor, sample_rate)` tuple / file path / raw bytes returns a single `SeparatedSources`. Passing a `list` of those returns `list[SeparatedSources]` and pools tail chunks across inputs (so every forward pass runs at full `chunk_batch_size`, no wasted slots). Useful when serving many short clips concurrently — see `apply_model_multi` in `unblend/apply.py`.
+- `audio` - The audio to separate. **Polymorphic input**: a single `(Tensor, sample_rate)` tuple / file path / raw bytes returns a single `SeparatedSources`. Tuple tensors must be real floating-point audio already normalized to the expected amplitude range; integer PCM, boolean, and complex tensors are rejected rather than silently reinterpreted. Passing a `list` of inputs returns `list[SeparatedSources]` and pools tail chunks across inputs (so every forward pass runs at full `chunk_batch_size`, no wasted slots). Useful when serving many short clips concurrently — see `apply_model_multi` in `unblend/apply.py`.
 - `shifts` - The number of random shifts for equivariant stabilization. In simple terms, this is a technique to make the model more robust to small changes in the audio, such as small shifts in time or pitch. More shifts mean generally higher quality separation but also longer processing time. Must be an integer in `[1, 20]`.
 - `split_overlap` - The overlap between consecutive segments. Must be in the range `[0.0, 1.0)`. Higher values smooth segment boundaries at the cost of more compute per track.
 - `seed` - Optional random seed for reproducible shift-based inference. With list input, per-input shift offsets advance from this seed in sequence — outputs are reproducible across runs at the same seed, but a list call with `seed=N` does NOT produce bit-identical outputs to N separate single-file calls with `seed=N`. Setting this also reseeds the process-global `random` and `torch` RNGs as a side effect, affecting other code in the host process.
@@ -205,17 +205,34 @@ This will return either a `Model` or `ModelEnsemble` instance corresponding to t
 def list_models(self) -> dict[str, dict]:
 ```
 
-This will return a dictionary of all available models.
+This returns deep copies of the registered metadata as a tagged union. Inspect
+`backend` before reading backend-specific fields:
 
 ```python
 {
-    "model_name": {
-        "sources": list, # Stem names, in output order
-        "models": list,  # Layer entries, each {"checksum": str, "remote": str, "sha256": str}
-        "weights": list, # Bag-of-models only: per-source mixing weights
-    }
+    "htdemucs": {
+        "backend": "demucs",
+        "architecture": "htdemucs",
+        "sources": list,  # Stem names, in output order
+        "models": list,   # Safetensors layer entries: remote, checksum, sha256, size_bytes
+        "weights": list | None,  # Bag-of-models mixing weights when present
+        "config": dict,
+    },
+    "bs_roformer_sw": {
+        "backend": "roformer",
+        "architecture": "bs_roformer" | "mel_band_roformer",
+        "sources": list,
+        "checkpoint": {"url": str, "sha256": str, "size_bytes": int},
+        "config": dict,
+        "samplerate": int,
+        "segment_samples": int,
+    },
 }
 ```
+
+`get_cache_info()` uses the same common cache shape for both families. Demucs
+`layers` keys are registered checksum prefixes; a RoFormer has one layer keyed
+by the first 16 characters of its checkpoint SHA-256.
 
 ### remove_model
 
@@ -235,7 +252,14 @@ from unblend.repo import get_cache_dir
 def get_cache_dir() -> Path:
 ```
 
-This will return the directory where the models are cached (created on first download). Set the `UNBLEND_CACHE_DIR` environment variable to relocate it (default: `~/.unblend/models`); the value is tilde-expanded and resolved.
+This returns the model cache directory (created on first download).
+`UNBLEND_CACHE_DIR` relocates it and takes precedence. During the package rename,
+`DEMUCS_CACHE_DIR` remains a deprecated fallback and emits a deprecation warning;
+the default is `~/.unblend/models`. Values are tilde-expanded and resolved.
+
+Old `~/.demucs/models/*.th` pickle checkpoints are intentionally **not** reused:
+unblend downloads verified Safetensors artifacts into the new cache. After
+confirming unblend's models are cached, the old `.th` cache may be removed.
 
 ## Progress Callbacks
 

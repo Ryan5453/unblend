@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 import typer
+from filelock import FileLock
 
 from unblend.api import Separator, default_device
 from unblend.cli.models import ensure_model_available
@@ -51,7 +52,7 @@ UPSTREAM_REPO = "https://github.com/adefossez/demucs.git"
 # must NOT import anything from the unblend repo (different interpreter).
 _UPSTREAM_WORKER_TEMPLATE = r'''
 from __future__ import annotations
-import argparse, json, math, sys, time, traceback
+import argparse, json, math, random, sys, time, traceback
 from pathlib import Path
 import torch
 import torchaudio
@@ -116,7 +117,13 @@ def main() -> int:
 
     for track in tracks:
         track_name = track["name"]
+        track_seed = track.get("track_seed")
         stem_paths = track["stem_paths"]
+        if track_seed is not None:
+            random.seed(track_seed)
+            torch.manual_seed(track_seed)
+            if args.device == "cuda":
+                torch.cuda.manual_seed_all(track_seed)
         t0 = time.perf_counter()
         try:
             _, separated = separator.separate_audio_file(Path(track["mixture_path"]))
@@ -129,9 +136,11 @@ def main() -> int:
                     reference, _ = torchaudio.load(ref_path)
                     stem_scores[stem_name] = _compute_sdr(separated[stem_name], reference)
             _emit({"event": "track_complete", "track_name": track_name,
-                   "elapsed_sec": elapsed, "stem_scores": stem_scores})
+                   "track_seed": track_seed, "elapsed_sec": elapsed,
+                   "stem_scores": stem_scores})
         except Exception as exc:
             _emit({"event": "track_error", "track_name": track_name,
+                   "track_seed": track_seed,
                    "elapsed_sec": time.perf_counter() - t0,
                    "error_type": type(exc).__name__, "error_message": str(exc),
                    "traceback": traceback.format_exc(limit=3)})
@@ -377,50 +386,52 @@ def _build_configs(
     return configs
 
 
-def _ensure_upstream_venv(version: str, python_version: str) -> Path:
+def _upstream_venv_spec(version: str, python_version: str) -> tuple[Path, str]:
     """
-    Create (or reuse) an isolated venv with ``demucs==<version>`` installed.
+    Derive a contained cache path and identity marker for an upstream venv.
 
-    :param version: Git ref of upstream demucs to install.
-    :param python_version: Python interpreter version for the venv.
-    :return: Path to the prepared venv directory.
+    Git refs are untrusted path input (they may contain ``../`` or slashes), so
+    only a fixed-size digest is used as the directory name. The marker binds a
+    cached environment to both the exact raw ref and requested Python version.
+
+    :param version: Raw upstream Git ref.
+    :param python_version: Requested Python interpreter version.
+    :return: ``(venv_path, marker_json)``.
     """
-    venv_dir = (UPSTREAM_VENV_ROOT / version).resolve()
+    identity = {"version": version, "python_version": python_version}
+    marker_text = json.dumps(identity, sort_keys=True) + "\n"
+    digest = hashlib.blake2b(marker_text.encode("utf-8"), digest_size=16).hexdigest()
+    root = UPSTREAM_VENV_ROOT.resolve()
+    venv_dir = root / f"upstream-{digest}"
+    if not venv_dir.is_relative_to(root):  # defensive: digest names cannot escape
+        raise RuntimeError(f"Unsafe upstream venv path: {venv_dir}")
+    return venv_dir, marker_text
+
+
+def _upstream_venv_ready(venv_dir: Path, marker_text: str) -> bool:
+    """Return whether a cached upstream environment matches its full identity."""
+    try:
+        return (venv_dir / "bin" / "python").exists() and (
+            venv_dir / ".demucs-installed"
+        ).read_text() == marker_text
+    except OSError:
+        return False
+
+
+def _provision_upstream_venv(
+    venv_dir: Path, version: str, python_version: str, marker_text: str
+) -> None:
+    """Create and populate one upstream environment while its lock is held."""
     python_bin = venv_dir / "bin" / "python"
-    marker = venv_dir / ".demucs-installed"
-    if python_bin.exists() and marker.exists():
-        return venv_dir
-
-    venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    if venv_dir.exists() and not marker.exists():
-        shutil.rmtree(venv_dir)
-
     uv_bin = shutil.which("uv")
     # Install upstream from git rather than PyPI: PyPI's last release (4.0.1)
-    # predates upstream's `demucs.api.Separator`, which we depend on. The git
-    # `<2.2` torchaudio cap pulls torch 2.1.x, which was built against numpy 1
-    # — pinning numpy<2 avoids "Numpy is not available" at runtime. Modern
-    # setuptools no longer installs `pkg_resources` by default but several
-    # legacy deps (dora-search, lameenc) still import it, so we pull it in.
+    # predates upstream's `demucs.api.Separator`, which we depend on.
     install_targets = [
         f"demucs @ git+{UPSTREAM_REPO}@{version}",
-        # Pin torch/torchaudio explicitly. Upstream caps torchaudio<2.2, but
-        # an unconstrained resolve now grabs the latest torch (2.12+) first and
-        # then fails to find a matching old torchaudio ("No matching
-        # distribution for torchaudio<2.2"). 2.1.2 is the newest pair that
-        # satisfies upstream's cap and ships cp311 CUDA wheels. This is
-        # upstream's own dependency reality — the comparison is "upstream as it
-        # ships" vs "unblend as it ships".
         "torch==2.1.2",
         "torchaudio==2.1.2",
-        # torch 2.1.x was built against numpy 1 — pin to avoid "Numpy is not
-        # available" at runtime.
         "numpy<2",
-        # setuptools >=80 removed `pkg_resources`; legacy upstream deps still
-        # import it, so pin below the cutoff.
         "setuptools<80",
-        # The worker calls torchaudio.load() to read reference stems for SDR.
-        # torchaudio 2.1's bundled backends are gone; soundfile fills the gap.
         "soundfile",
     ]
     if uv_bin is not None:
@@ -447,26 +458,66 @@ def _ensure_upstream_venv(version: str, python_version: str) -> Path:
         )
     else:
         typer.echo(f"Creating upstream venv via python -m venv at {venv_dir}")
-        subprocess.run(
-            [sys.executable, "-m", "venv", str(venv_dir)],
-            check=True,
-        )
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
         typer.echo(
             f"Installing demucs=={version} into upstream venv (this can take a few minutes)"
         )
         subprocess.run(
-            [
-                str(python_bin),
-                "-m",
-                "pip",
-                "install",
-                *install_targets,
-            ],
+            [str(python_bin), "-m", "pip", "install", *install_targets],
             check=True,
         )
+    (venv_dir / ".demucs-installed").write_text(marker_text)
 
-    marker.write_text(f"demucs=={version}\n")
+
+def _ensure_upstream_venv(version: str, python_version: str) -> Path:
+    """
+    Create (or reuse) an isolated venv with ``demucs==<version>`` installed.
+
+    Marker validation, deletion, creation, installation, and publication are
+    serialized across processes. The lock is a sibling of the deletable venv,
+    so rebuilding the environment cannot remove the active lock itself.
+
+    :param version: Git ref of upstream demucs to install.
+    :param python_version: Python interpreter version for the venv.
+    :return: Path to the prepared venv directory.
+    """
+    venv_dir, marker_text = _upstream_venv_spec(version, python_version)
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(f"{venv_dir}.lock")
+    with FileLock(lock_path, timeout=2 * 60 * 60):
+        # Another process may have completed provisioning while this caller
+        # waited, so the identity check belongs inside the lock.
+        if _upstream_venv_ready(venv_dir, marker_text):
+            return venv_dir
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir)
+        _provision_upstream_venv(venv_dir, version, python_version, marker_text)
+        if not _upstream_venv_ready(venv_dir, marker_text):
+            raise RuntimeError(
+                f"Upstream venv provisioning did not complete: {venv_dir}"
+            )
     return venv_dir
+
+
+def _build_upstream_tracks_payload(
+    tracks: list[BenchmarkTrack], seed: int | None
+) -> list[dict[str, Any]]:
+    """Build the isolated worker payload with stable per-track seeds."""
+    return [
+        {
+            "name": track.name,
+            "track_seed": (
+                _build_track_seed(seed, track.name) if seed is not None else None
+            ),
+            "mixture_path": str(track.mixture_path),
+            "reference_stems": list(track.reference_stems),
+            "stem_paths": {
+                stem: str(track.directory / f"{stem}.wav")
+                for stem in track.reference_stems
+            },
+        }
+        for track in tracks
+    ]
 
 
 def _run_upstream_config(
@@ -496,18 +547,10 @@ def _run_upstream_config(
     venv_dir = _ensure_upstream_venv(config.upstream_version, upstream_python_version)
     venv_python = venv_dir / "bin" / "python"
 
-    tracks_payload = [
-        {
-            "name": track.name,
-            "mixture_path": str(track.mixture_path),
-            "reference_stems": list(track.reference_stems),
-            "stem_paths": {
-                stem: str(track.directory / f"{stem}.wav")
-                for stem in track.reference_stems
-            },
-        }
-        for track in tracks
-    ]
+    tracks_payload = _build_upstream_tracks_payload(tracks, seed)
+    track_seed_by_name = {
+        str(track["name"]): track.get("track_seed") for track in tracks_payload
+    }
     tracks_json_path = output_dir / f"_tmp_upstream_tracks_{config.config_id}.json"
     tracks_json_path.write_text(json.dumps(tracks_payload))
 
@@ -606,7 +649,9 @@ def _run_upstream_config(
                     **_detail_row_base(config, chunk_batch_size, seed, device),
                     "track_index": track_index,
                     "track_name": track_name,
-                    "track_seed": None,
+                    "track_seed": event.get(
+                        "track_seed", track_seed_by_name.get(track_name)
+                    ),
                     "elapsed_sec": float(event.get("elapsed_sec", 0.0)),
                 }
                 if kind == "track_complete":
@@ -665,7 +710,7 @@ def _run_upstream_config(
                 **_detail_row_base(config, chunk_batch_size, seed, device),
                 "track_index": track_index_by_name[track.name],
                 "track_name": track.name,
-                "track_seed": None,
+                "track_seed": track_seed_by_name[track.name],
                 "elapsed_sec": None,
                 "status": "error",
                 "error_type": init_error_type or "WorkerCrashed",

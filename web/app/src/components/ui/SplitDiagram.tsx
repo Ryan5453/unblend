@@ -1,53 +1,5 @@
 import { useEffect, useRef } from 'react';
-
-interface StemLine {
-    label: string;
-    amp: number;
-    lane: number;
-    wave: (x: number, t: number) => number;
-}
-
-// Each stem has its own waveform character; the mix line is literally their
-// sum, so the diagram is a true picture of what separation does.
-const STEMS: StemLine[] = [
-    {
-        label: 'VOCALS',
-        amp: 9,
-        lane: -1,
-        wave: (x, t) => 0.55 * Math.sin(x * 0.018 + t * 2.0) + 0.45 * Math.sin(x * 0.041 - t * 1.4),
-    },
-    {
-        label: 'DRUMS',
-        amp: 13,
-        lane: -1 / 3,
-        wave: (x, t) => {
-            const u = x - t * 150;
-            const s = u / 120 - Math.floor(u / 120);
-            const beat = Math.floor(u / 120);
-            return (beat % 2 === 0 ? 1 : -0.75) * Math.exp(-s * 9);
-        },
-    },
-    {
-        label: 'BASS',
-        amp: 14,
-        lane: 1 / 3,
-        wave: (x, t) => Math.sin(x * 0.0085 - t * 1.2),
-    },
-    {
-        label: 'OTHER',
-        amp: 7,
-        lane: 1,
-        wave: (x, t) => 0.5 * Math.sin(x * 0.07 + t * 3.1) + 0.5 * Math.sin(x * 0.033 - t * 2.3),
-    },
-];
-
-const INK = [25, 25, 22];
-const RED = [207, 59, 23];
-
-const AMP_SUM = STEMS.reduce((sum, s) => sum + s.amp, 0);
-
-const smooth = (u: number) => u * u * (3 - 2 * u);
-const lerp = (a: number, b: number, k: number) => a + (b - a) * k;
+import { STEMS, AMP_SUM, INK, RED, smooth, lerp } from './stems';
 
 export function SplitDiagram({ active }: { active: boolean }) {
     const wrapRef = useRef<HTMLDivElement>(null);

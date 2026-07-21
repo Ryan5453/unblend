@@ -830,12 +830,22 @@ class Separator:
         self.device = device
         self.dtype = dtype
 
-        # Handle both string model names and model instances
+        # Validate named-model stems from metadata before any cache/network
+        # work. Direct model instances are validated after assignment below.
         if isinstance(model, str):
             model_repo = ModelRepository()
+            model_info = model_repo.list_models().get(model)
+            if (
+                model_info is not None
+                and only_load is not None
+                and only_load not in model_info["sources"]
+            ):
+                raise ValidationError(
+                    f"Stem {only_load!r} not found in model. Available stems: "
+                    f"{', '.join(model_info['sources'])}"
+                )
             self.model = model_repo.get_model(name=model, only_load=only_load)
         else:
-            # model is already a Model instance
             self.model = model
 
         if self.model is None:
@@ -851,10 +861,10 @@ class Separator:
         # The forward keeps STFT/iSTFT, complex mask math, norm reductions,
         # and rotary phases in FP32 internally.
 
-        # Validate only_load stem exists in the loaded model
-        if only_load and only_load not in self.model.sources:
+        # Keep validation for caller-supplied model objects as well.
+        if only_load is not None and only_load not in self.model.sources:
             raise ValidationError(
-                f"Stem '{only_load}' not found in model. "
+                f"Stem {only_load!r} not found in model. "
                 f"Available stems: {', '.join(self.model.sources)}"
             )
 
@@ -869,13 +879,10 @@ class Separator:
         )
         try:
             if self.device == "cuda":
-                # cudnn autotune (``benchmark=True``) only for the compile path:
-                # there every forward has one fixed shape (tails are padded to the
-                # captured batch), so the exhaustive algorithm search is paid once.
-                # Eager runs see a different tail-batch shape on nearly every
-                # input; each new shape would re-trigger a multi-second search,
-                # while heuristic selection measures within ~1% of the tuned
-                # algorithms for these conv shapes — so eager leaves it off.
+                # Use cuDNN autotune during fixed-shape compile capture, but
+                # not eager setup where tail shapes vary. This process-global
+                # setting is restored before the constructor returns; callers
+                # retain ownership of the policy used by later eager forwards.
                 torch.backends.cudnn.benchmark = compile
                 torch.set_float32_matmul_precision("high")
 
@@ -966,14 +973,14 @@ class Separator:
                     )
                     for target in targets:
                         target._forward_reserve_bytes = reserve
-        except Exception:
-            # Don't leave global cuDNN / matmul precision state flipped if
-            # init failed.
+        finally:
+            # These are process-global settings. They are useful while CUDA
+            # setup/calibration selects kernels, but a library constructor must
+            # not change policy for unrelated host workloads.
             if prev_cudnn_benchmark is not None:
                 torch.backends.cudnn.benchmark = prev_cudnn_benchmark
             if prev_matmul_precision is not None:
                 torch.set_float32_matmul_precision(prev_matmul_precision)
-            raise
 
     def enable_compile(self) -> None:
         """
@@ -1023,8 +1030,9 @@ class Separator:
             self._teardown_compile_state()
             self._compile_enabled = False
             self.chunk_batch_size = previous_batch_size
-            torch.backends.cudnn.benchmark = previous_cudnn_benchmark
             raise
+        finally:
+            torch.backends.cudnn.benchmark = previous_cudnn_benchmark
 
         per_chunk = getattr(self, "_per_chunk_steady_bytes", None)
         if per_chunk is not None:
@@ -1133,6 +1141,12 @@ class Separator:
                 raise ValidationError(
                     f"Expected a 1-D or 2-D waveform tensor, got {wav.dim()} "
                     "dimensions."
+                )
+            if not wav.is_floating_point():
+                raise ValidationError(
+                    "Waveform tensor must use a floating-point dtype with "
+                    "samples already normalized to audio amplitude range; got "
+                    f"{wav.dtype}."
                 )
             if isinstance(input_sr, bool):
                 raise ValidationError("Sample rate must be an int, got bool.")

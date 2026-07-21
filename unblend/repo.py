@@ -8,14 +8,17 @@
 import copy
 import json
 import os
-import shutil
 import tempfile
 import time
+import warnings
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import httpx
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from safetensors import SafetensorError
 from safetensors.torch import load_file
 
@@ -29,8 +32,40 @@ BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 # Prefix for download staging files in the cache dir. Shared by the writer
 # (``_download_and_load_layer``) and the sweeper (``sweep_stale_downloads``)
 # so the two can't silently drift apart.
-STAGING_PREFIX = "tmp"
+STAGING_PREFIX = ".unblend-download-"
 DOWNLOAD_DEADLINE_SECONDS = 2 * 60 * 60
+STAGING_STALE_SECONDS = DOWNLOAD_DEADLINE_SECONDS + 5 * 60
+LOCK_TIMEOUT_SECONDS = DOWNLOAD_DEADLINE_SECONDS + 10 * 60
+
+
+@contextmanager
+def _artifact_lock(cache_path: Path) -> Iterator[None]:
+    """
+    Serialize validation, download, and promotion for one cache artifact.
+
+    :param cache_path: Final content-addressed cache path.
+    :return: Context manager yielding while this artifact's lock is held.
+    """
+    lock_path = cache_path.with_name(f".{cache_path.name}.lock")
+    lock = FileLock(lock_path)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock.acquire(timeout=LOCK_TIMEOUT_SECONDS)
+    except FileLockTimeout as exc:
+        raise ModelLoadingError(
+            f"Timed out waiting for model cache lock {lock_path}."
+        ) from exc
+    except OSError as exc:
+        raise ModelLoadingError(
+            f"Could not create/acquire model cache lock {lock_path}: {exc}"
+        ) from exc
+    try:
+        # Deliberately keep the caller's exception outside the acquisition
+        # handlers above: domain errors raised in the critical section must
+        # retain their original type and context.
+        yield
+    finally:
+        lock.release()
 
 
 def check_checksum(path: Path, checksum: str) -> None:
@@ -110,16 +145,25 @@ def get_cache_dir() -> Path:
     """
     Get the cache directory for downloaded models.
 
-    Honours the ``UNBLEND_CACHE_DIR`` environment variable (tilde-expanded and
-    resolved); defaults to ``~/.unblend/models``. The directory is not created
-    here — read paths work against a missing dir, and the download path
-    creates it (surfacing a clear error if it can't).
+    ``UNBLEND_CACHE_DIR`` takes precedence. The former
+    ``DEMUCS_CACHE_DIR`` name remains a deprecated fallback so renamed CLI
+    aliases do not silently download into a different filesystem. Without
+    either variable, the cache defaults to ``~/.unblend/models``.
 
     :return: Path to the cache directory
     """
     override = os.environ.get("UNBLEND_CACHE_DIR")
     if override:
         return Path(override).expanduser().resolve()
+    legacy_override = os.environ.get("DEMUCS_CACHE_DIR")
+    if legacy_override:
+        warnings.warn(
+            "DEMUCS_CACHE_DIR is deprecated; use UNBLEND_CACHE_DIR instead. "
+            "Legacy .th cache artifacts are not reused by unblend.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return Path(legacy_override).expanduser().resolve()
     return Path.home() / ".unblend" / "models"
 
 
@@ -277,7 +321,7 @@ class ModelRepository:
                     f"RoFormer model {model_name} must declare a non-empty config."
                 )
             for field in ("samplerate", "segment_samples"):
-                value = model_info[field]
+                value = model_info.get(field)
                 if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                     raise ModelLoadingError(
                         f"RoFormer model {model_name} has invalid {field}: {value}."
@@ -385,17 +429,20 @@ class ModelRepository:
 
     def sweep_stale_downloads(self) -> int:
         """
-        Remove leftover download staging files from interrupted downloads.
-        Files that vanish concurrently or can't be removed (e.g. held open by
-        an in-flight download on Windows) are skipped. On POSIX an in-flight
-        download's staging file *is* removed — that download then fails
-        cleanly at verification, consistent with the cache wipe requested.
+        Remove staging files older than the maximum download lifetime.
 
-        :return: Number of files removed
+        Active downloads continuously update their staging-file mtime and are
+        bounded by ``DOWNLOAD_DEADLINE_SECONDS``. The additional grace period
+        ensures a concurrent sweeper never unlinks an in-flight POSIX file.
+
+        :return: Number of stale files removed
         """
         removed = 0
+        cutoff = time.time() - STAGING_STALE_SECONDS
         for tmp_path in get_cache_dir().glob(f"{STAGING_PREFIX}*"):
             try:
+                if tmp_path.stat().st_mtime >= cutoff:
+                    continue
                 tmp_path.unlink()
             except OSError:
                 continue
@@ -459,15 +506,13 @@ class ModelRepository:
                         },
                     )
 
-                # Stage the temp file inside the cache dir so the final
-                # ``shutil.move`` is a same-filesystem atomic rename rather than
-                # a cross-device copy (which a concurrent reader could observe
-                # half-written).
+                # Stage inside the cache dir so final ``os.replace`` is a
+                # same-filesystem atomic promotion.
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
                     delete=False,
-                    prefix=STAGING_PREFIX,
-                    suffix=cache_path.suffix,
+                    prefix=f"{STAGING_PREFIX}{cache_path.name}.",
+                    suffix=".tmp",
                     dir=cache_path.parent,
                 ) as tmp_file:
                     tmp_path = Path(tmp_file.name)
@@ -536,7 +581,7 @@ class ModelRepository:
 
             # Bytes are verified — now load and move into the cache.
             layer = _load_demucs_layer(tmp_path, model_info)
-            shutil.move(str(tmp_path), str(cache_path))
+            os.replace(tmp_path, cache_path)
             tmp_path = None
 
             # Notify callback about layer completion
@@ -611,8 +656,8 @@ class ModelRepository:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
                     delete=False,
-                    prefix=STAGING_PREFIX,
-                    suffix=cache_path.suffix,
+                    prefix=f"{STAGING_PREFIX}{cache_path.name}.",
+                    suffix=".tmp",
                     dir=cache_path.parent,
                 ) as tmp_file:
                     tmp_path = Path(tmp_file.name)
@@ -651,7 +696,7 @@ class ModelRepository:
             # Integrity gate before the file is visible in the cache.
             check_size(tmp_path, expected_size)
             check_checksum(tmp_path, expected_sha256)
-            shutil.move(str(tmp_path), str(cache_path))
+            os.replace(tmp_path, cache_path)
             tmp_path = None
             if progress_callback:
                 progress_callback(
@@ -695,43 +740,54 @@ class ModelRepository:
         if progress_callback:
             progress_callback("download_start", {"model_name": name, "total_layers": 1})
 
-        cached = False
-        if cache_path.exists():
-            try:
-                check_size(cache_path, checkpoint["size_bytes"])
-                check_checksum(cache_path, expected)
-                cached = True
-            except ModelLoadingError as exc:
-                if isinstance(exc.__cause__, OSError):
-                    raise
+        with _artifact_lock(cache_path):
+            # Recheck only after taking the per-artifact lock: another process
+            # may have completed and promoted the checkpoint while we waited.
+            cached = False
+            if cache_path.exists():
                 try:
-                    cache_path.unlink(missing_ok=True)
-                except OSError as cleanup_error:
-                    raise ModelLoadingError(
-                        f"Cached checkpoint {cache_path} failed verification and "
-                        f"could not be removed: {cleanup_error}"
-                    ) from None
+                    check_size(cache_path, checkpoint["size_bytes"])
+                    check_checksum(cache_path, expected)
+                    cached = True
+                except ModelLoadingError as exc:
+                    if isinstance(exc.__cause__, OSError):
+                        raise
+                    try:
+                        cache_path.unlink(missing_ok=True)
+                    except OSError as cleanup_error:
+                        raise ModelLoadingError(
+                            f"Cached checkpoint {cache_path} failed verification and "
+                            f"could not be removed: {cleanup_error}"
+                        ) from None
 
-        if cached:
-            if progress_callback:
-                progress_callback(
-                    "layer_complete",
-                    {
-                        "model_name": name,
-                        "layer_index": 1,
-                        "total_layers": 1,
-                        "cached": True,
-                    },
+            if cached:
+                if progress_callback:
+                    progress_callback(
+                        "layer_complete",
+                        {
+                            "model_name": name,
+                            "layer_index": 1,
+                            "total_layers": 1,
+                            "cached": True,
+                        },
+                    )
+            else:
+                self._download_verified_file(
+                    checkpoint["url"],
+                    cache_path,
+                    expected,
+                    checkpoint["size_bytes"],
+                    progress_callback,
+                    name,
                 )
-        else:
-            self._download_verified_file(
-                checkpoint["url"],
-                cache_path,
-                expected,
-                checkpoint["size_bytes"],
-                progress_callback,
-                name,
-            )
+            # Keep remove_model excluded until Safetensors has materialized all
+            # tensors; the in-memory state no longer depends on cache_path.
+            try:
+                state = load_file(cache_path, device="cpu")
+            except (OSError, SafetensorError) as exc:
+                raise ModelLoadingError(
+                    f"Failed to read verified checkpoint {cache_path}: {exc}"
+                ) from exc
 
         if progress_callback:
             progress_callback(
@@ -739,7 +795,6 @@ class ModelRepository:
             )
 
         try:
-            state = load_file(cache_path, device="cpu")
             return build_roformer(
                 model_info["architecture"],
                 dict(model_info["config"]),
@@ -774,6 +829,11 @@ class ModelRepository:
             )
 
         model_info = self._models[name]
+        if only_load is not None and only_load not in model_info["sources"]:
+            raise ModelLoadingError(
+                f"Stem {only_load!r} not found in model {name}. Available "
+                f"stems: {', '.join(model_info['sources'])}"
+            )
         if "models" not in model_info:
             # __init__ skips (rather than rejects) metadata entries without a
             # layer list, so custom metadata can reach here.
@@ -859,6 +919,15 @@ class ModelRepository:
         :raises ModelLoadingError: If the model is not found or fails to load
         """
         info = self._models.get(name)
+        if (
+            info is not None
+            and only_load is not None
+            and only_load not in info["sources"]
+        ):
+            raise ModelLoadingError(
+                f"Stem {only_load!r} not found in model {name}. Available "
+                f"stems: {', '.join(info['sources'])}"
+            )
         if info is not None and info.get("backend") == "roformer":
             return self._get_roformer_model(name, info, progress_callback)
 
@@ -888,66 +957,53 @@ class ModelRepository:
             expected = self._layer_sha256[layer_checksum]
             expected_size = self._layer_sizes[layer_checksum]
 
-            # Check if file exists and validate its integrity
-            if cache_path.exists():
-                try:
-                    check_size(cache_path, expected_size)
-                    check_checksum(cache_path, expected)
-
-                    # Safetensors parsing and strict architecture loading.
-                    layer = _load_demucs_layer(cache_path, model_info)
-                    layers.append(layer)
-
-                    # Notify callback about cached layer
-                    if progress_callback:
-                        progress_callback(
-                            "layer_complete",
-                            {
-                                "model_name": name,
-                                "layer_index": i + 1,
-                                "total_layers": total_layers,
-                                "cached": True,
-                            },
-                        )
-                    continue
-                except OSError as exc:
-                    # A direct read failure racing a concurrent removal is not
-                    # corruption — keep the cache and surface the error.
-                    raise ModelLoadingError(
-                        f"Could not read cached layer {cache_path}: {exc}"
-                    ) from exc
-                except ModelLoadingError as exc:
-                    if isinstance(exc.__cause__, OSError):
-                        # A file lock, EIO, or permissions failure is not
-                        # corruption; preserve the possibly-valid cache.
-                        raise
-                    # The cached file is corrupt: discard and redownload.
-                    # ``missing_ok`` covers a concurrent process unlinking it
-                    # first.
+            with _artifact_lock(cache_path):
+                # Validate only after taking the lock: another repository
+                # instance may have populated this path while we waited.
+                if cache_path.exists():
                     try:
-                        cache_path.unlink(missing_ok=True)
-                    except OSError as e:
-                        # NOTE: deliberately not ``from e`` — an OSError cause
-                        # means "transient read failure" to the guard above,
-                        # and this is a failed *corruption* cleanup.
+                        check_size(cache_path, expected_size)
+                        check_checksum(cache_path, expected)
+                        layer = _load_demucs_layer(cache_path, model_info)
+                        layers.append(layer)
+                        if progress_callback:
+                            progress_callback(
+                                "layer_complete",
+                                {
+                                    "model_name": name,
+                                    "layer_index": i + 1,
+                                    "total_layers": total_layers,
+                                    "cached": True,
+                                },
+                            )
+                        continue
+                    except OSError as exc:
                         raise ModelLoadingError(
-                            f"Cached layer {cache_path} failed verification and "
-                            f"could not be removed: {e}"
-                        ) from None
+                            f"Could not read cached layer {cache_path}: {exc}"
+                        ) from exc
+                    except ModelLoadingError as exc:
+                        if isinstance(exc.__cause__, OSError):
+                            raise
+                        try:
+                            cache_path.unlink(missing_ok=True)
+                        except OSError as e:
+                            raise ModelLoadingError(
+                                f"Cached layer {cache_path} failed verification and "
+                                f"could not be removed: {e}"
+                            ) from None
 
-            # Download and load the layer
-            layer = self._download_and_load_layer(
-                url=url,
-                cache_path=cache_path,
-                expected_checksum=expected,
-                expected_size=expected_size,
-                model_info=model_info,
-                progress_callback=progress_callback,
-                model_name=name,
-                layer_index=i + 1,
-                total_layers=total_layers,
-            )
-            layers.append(layer)
+                layer = self._download_and_load_layer(
+                    url=url,
+                    cache_path=cache_path,
+                    expected_checksum=expected,
+                    expected_size=expected_size,
+                    model_info=model_info,
+                    progress_callback=progress_callback,
+                    model_name=name,
+                    layer_index=i + 1,
+                    total_layers=total_layers,
+                )
+                layers.append(layer)
         # Notify callback about download completion
         if progress_callback:
             progress_callback(
@@ -1012,28 +1068,30 @@ class ModelRepository:
 
         if info.get("backend") == "roformer":
             path = self._roformer_cache_path(info)
-            try:
-                path.unlink()
-                return True
-            except FileNotFoundError:
-                return False
-            except OSError as e:
-                raise ModelLoadingError(
-                    f"Could not remove cached checkpoint {path}: {e}"
-                ) from e
+            with _artifact_lock(path):
+                try:
+                    path.unlink()
+                    return True
+                except FileNotFoundError:
+                    return False
+                except OSError as e:
+                    raise ModelLoadingError(
+                        f"Could not remove cached checkpoint {path}: {e}"
+                    ) from e
 
         # Remove all layer files for this model
         for layer_info in self._models[name].get("models", []):
             layer_checksum = layer_info["checksum"]
             layer_path = self._layer_cache_path(layer_checksum)
-            try:
-                layer_path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as e:
-                raise ModelLoadingError(
-                    f"Could not remove cached layer {layer_path}: {e}"
-                ) from e
-            removed_any = True
+            with _artifact_lock(layer_path):
+                try:
+                    layer_path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    raise ModelLoadingError(
+                        f"Could not remove cached layer {layer_path}: {e}"
+                    ) from e
+                removed_any = True
 
         return removed_any

@@ -6,7 +6,12 @@
 
 import json
 import math
-from typing import TYPE_CHECKING
+import os
+import shutil
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 import torch.nn as nn
@@ -338,6 +343,65 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
     onnx_model.graph.node.extend(new_cast_nodes + original_nodes)
 
 
+@contextmanager
+def _atomic_onnx_path(output_path: str) -> Iterator[str]:
+    """
+    Yield a sibling staging path and atomically publish it on success.
+
+    :param output_path: Caller-requested final ONNX path.
+    :return: Context manager yielding a temporary sibling filename.
+    """
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp.onnx", dir=destination.parent
+    )
+    os.close(fd)
+    staging = Path(raw_path)
+
+    def sidecars() -> list[Path]:
+        """
+        Find external-data paths private to this random staging prefix.
+
+        :return: Sibling sidecar files/directories created by the exporter.
+        """
+        # Dynamo/ONNX exporters commonly use either ``model.onnx.data`` or a
+        # suffix-replaced ``model.data``. The staging basename is random, so
+        # this prefix is private to the current export and safe to clean.
+        # Do not feed the caller-derived destination name to glob(): legal
+        # filenames can contain ``[]``, ``?``, or ``*`` and would turn into a
+        # pattern, allowing sidecars to evade detection. Compare names
+        # literally instead.
+        return [
+            candidate
+            for candidate in staging.parent.iterdir()
+            if candidate != staging and candidate.name.startswith(staging.stem)
+        ]
+
+    try:
+        yield str(staging)
+        external_files = sidecars()
+        if external_files:
+            names = ", ".join(path.name for path in external_files)
+            raise RuntimeError(
+                "External-data ONNX exports are not supported by this "
+                f"single-file publisher; exporter created: {names}"
+            )
+        # Windows requires a write-capable descriptor for fsync/FlushFileBuffers.
+        with open(staging, "rb+") as file:
+            file.flush()
+            os.fsync(file.fileno())
+        # Replaces a destination symlink entry rather than following it.
+        os.replace(staging, destination)
+    finally:
+        staging.unlink(missing_ok=True)
+        for candidate in sidecars():
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate, ignore_errors=True)
+            else:
+                candidate.unlink(missing_ok=True)
+
+
 def _add_metadata(onnx_model: "onnx.ModelProto", metadata: dict[str, str]) -> None:
     """
     Attach key/value pairs to an ONNX model's ``metadata_props``.
@@ -401,49 +465,53 @@ def _export_roformer_to_onnx(
         normalized=stft["normalized"],
     )
 
-    batch = torch.export.Dim("batch")
-    program = torch.onnx.export(
-        wrapper,
-        (dummy_real, dummy_imag),
-        input_names=["spec_real", "spec_imag"],
-        output_names=["out_spec_real", "out_spec_imag"],
-        # Like HTDemucs: only batch is dynamic. RoFormer checkpoints are
-        # trained at a fixed chunk length, so the frequency/time axes are
-        # fixed at the traced shape.
-        dynamic_shapes={"spec_real": {0: batch}, "spec_imag": {0: batch}},
-        opset_version=max(opset_version, 18),
-        dynamo=True,
-    )
-    program.save(output_path)
+    with _atomic_onnx_path(output_path) as staging_path:
+        batch = torch.export.Dim("batch")
+        program = torch.onnx.export(
+            wrapper,
+            (dummy_real, dummy_imag),
+            input_names=["spec_real", "spec_imag"],
+            output_names=["out_spec_real", "out_spec_imag"],
+            # Like HTDemucs: only batch is dynamic. RoFormer checkpoints are
+            # trained at a fixed chunk length, so the frequency/time axes are
+            # fixed at the traced shape.
+            dynamic_shapes={"spec_real": {0: batch}, "spec_imag": {0: batch}},
+            opset_version=max(opset_version, 18),
+            dynamo=True,
+        )
+        program.save(staging_path)
 
-    onnx_model = onnx.load(output_path)
-    if fp16:
-        _convert_weights_to_fp16(onnx_model)
+        onnx_model = onnx.load(staging_path)
+        if fp16:
+            _convert_weights_to_fp16(onnx_model)
 
-    architecture = (
-        "mel_band_roformer" if isinstance(model, MelBandRoformer) else "bs_roformer"
-    )
-    metadata = {
-        "sources": json.dumps(model.sources),
-        "sample_rate": str(model.samplerate),
-        "audio_channels": str(model.audio_channels),
-        "precision": "fp16" if fp16 else "fp32",
-        "model_family": "roformer",
-        "architecture": architecture,
-        "num_stems": str(model.num_stems),
-        "output_complement": "true" if model.output_complement else "false",
-        "segment_samples": str(segment_samples),
-        "stft_n_fft": str(stft["n_fft"]),
-        "stft_hop_length": str(stft["hop_length"]),
-        "stft_win_length": str(stft["win_length"]),
-        "stft_normalized": "true" if stft["normalized"] else "false",
-    }
-    if license_label:
-        metadata["license"] = license_label
-    _add_metadata(onnx_model, metadata)
+        architecture = (
+            "mel_band_roformer" if isinstance(model, MelBandRoformer) else "bs_roformer"
+        )
+        metadata = {
+            "sources": json.dumps(model.sources),
+            "sample_rate": str(model.samplerate),
+            "audio_channels": str(model.audio_channels),
+            "precision": "fp16" if fp16 else "fp32",
+            "model_family": "roformer",
+            "architecture": architecture,
+            "num_stems": str(model.num_stems),
+            "output_complement": "true" if model.output_complement else "false",
+            "segment_samples": str(segment_samples),
+            "stft_n_fft": str(stft["n_fft"]),
+            "stft_hop_length": str(stft["hop_length"]),
+            "stft_win_length": str(stft["win_length"]),
+            "stft_normalized": "true" if stft["normalized"] else "false",
+        }
+        if license_label:
+            metadata["license"] = license_label
+        _add_metadata(onnx_model, metadata)
 
-    onnx.checker.check_model(onnx_model)
-    onnx.save(onnx_model, output_path)
+        onnx.checker.check_model(onnx_model)
+        onnx.save(onnx_model, staging_path)
+        # Validate the bytes that will actually be promoted, not only the
+        # in-memory proto before serialization.
+        onnx.checker.check_model(onnx.load(staging_path))
     return output_path
 
 
@@ -524,48 +592,47 @@ def export_to_onnx(
         dummy_audio, nfft, hop_length
     )
 
-    torch.onnx.export(
-        wrapper,
-        (dummy_spec_real, dummy_spec_imag, dummy_audio),
-        output_path,
-        input_names=["spec_real", "spec_imag", "audio"],
-        output_names=["out_spec_real", "out_spec_imag", "out_wave"],
-        # Only ``batch`` is dynamic. The model always runs at exactly the
-        # trained segment length (HTDemucs.forward pads shorter inputs up and
-        # valid_length() rejects longer ones), so the time/sample axes are
-        # fixed -- advertising them as dynamic would be a false promise.
-        dynamic_axes={
-            "spec_real": {0: "batch"},
-            "spec_imag": {0: "batch"},
-            "audio": {0: "batch"},
-            "out_spec_real": {0: "batch"},
-            "out_spec_imag": {0: "batch"},
-            "out_wave": {0: "batch"},
-        },
-        opset_version=opset_version,
-        do_constant_folding=True,
-        dynamo=False,
-    )
+    with _atomic_onnx_path(output_path) as staging_path:
+        torch.onnx.export(
+            wrapper,
+            (dummy_spec_real, dummy_spec_imag, dummy_audio),
+            staging_path,
+            input_names=["spec_real", "spec_imag", "audio"],
+            output_names=["out_spec_real", "out_spec_imag", "out_wave"],
+            # Only ``batch`` is dynamic. The model always runs at exactly the
+            # trained segment length (HTDemucs.forward pads shorter inputs up and
+            # valid_length() rejects longer ones), so the time/sample axes are
+            # fixed -- advertising them as dynamic would be a false promise.
+            dynamic_axes={
+                "spec_real": {0: "batch"},
+                "spec_imag": {0: "batch"},
+                "audio": {0: "batch"},
+                "out_spec_real": {0: "batch"},
+                "out_spec_imag": {0: "batch"},
+                "out_wave": {0: "batch"},
+            },
+            opset_version=opset_version,
+            do_constant_folding=True,
+            dynamo=False,
+        )
 
-    onnx_model = onnx.load(output_path)
+        onnx_model = onnx.load(staging_path)
 
-    if fp16:
-        _convert_weights_to_fp16(onnx_model)
+        if fp16:
+            _convert_weights_to_fp16(onnx_model)
 
-    _add_metadata(
-        onnx_model,
-        {
-            "sources": json.dumps(model.sources),
-            "sample_rate": str(model.samplerate),
-            "audio_channels": str(model.audio_channels),
-            "precision": "fp16" if fp16 else "fp32",
-        },
-    )
+        _add_metadata(
+            onnx_model,
+            {
+                "sources": json.dumps(model.sources),
+                "sample_rate": str(model.samplerate),
+                "audio_channels": str(model.audio_channels),
+                "precision": "fp16" if fp16 else "fp32",
+            },
+        )
 
-    # Validate the graph before saving — catches any malformed nodes,
-    # especially after the fp16 weight/Cast surgery above.
-    onnx.checker.check_model(onnx_model)
-
-    onnx.save(onnx_model, output_path)
+        onnx.checker.check_model(onnx_model)
+        onnx.save(onnx_model, staging_path)
+        onnx.checker.check_model(onnx.load(staging_path))
 
     return output_path

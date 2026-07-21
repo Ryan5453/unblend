@@ -361,6 +361,44 @@ def test_compiled_roformer_batch_estimate_snaps_to_power_of_two(
     assert separator._initial_chunk_batch_size_estimate() == 4
 
 
+def test_cuda_constructor_restores_process_global_backend_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful CUDA setup cannot leak cuDNN/matmul policy to the host."""
+
+    class FakeCudaModel(torch.nn.Module):
+        sources = ["one"]
+        samplerate = 100
+        audio_channels = 1
+        max_allowed_segment = 1.0
+        external_normalization = False
+
+        def to(self, *_args: object, **_kwargs: object):
+            return self
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x[:, None]
+
+    monkeypatch.setattr("unblend.api._require_cuda_available", lambda: None)
+    previous_benchmark = torch.backends.cudnn.benchmark
+    previous_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.set_float32_matmul_precision("highest")
+        Separator(
+            model=FakeCudaModel(),
+            device="cuda",
+            dtype=None,
+            compile=False,
+            chunk_batch_size=1,
+        )
+        assert torch.backends.cudnn.benchmark is False
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.backends.cudnn.benchmark = previous_benchmark
+        torch.set_float32_matmul_precision(previous_precision)
+
+
 def test_enable_compile_promotes_eager_cuda_separator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -386,17 +424,22 @@ def test_enable_compile_promotes_eager_cuda_separator(
     separator._compile_enabled = False
     separator._calibration_attempts = []
     monkeypatch.setattr(separator, "_initial_chunk_batch_size_estimate", lambda: 4)
-    monkeypatch.setattr(
-        separator,
-        "_calibrate_chunk_batch_size",
-        lambda *, initial_guess, compile_enabled: initial_guess,
-    )
+    observed_during_setup: list[bool] = []
+
+    def fake_calibrate(*, initial_guess: int, compile_enabled: bool) -> int:
+        observed_during_setup.append(torch.backends.cudnn.benchmark)
+        assert compile_enabled
+        return initial_guess
+
+    monkeypatch.setattr(separator, "_calibrate_chunk_batch_size", fake_calibrate)
     previous_benchmark = torch.backends.cudnn.benchmark
     try:
+        torch.backends.cudnn.benchmark = False
         separator.enable_compile()
         assert separator._compile_enabled is True
         assert separator.chunk_batch_size == 4
-        assert torch.backends.cudnn.benchmark is True
+        assert observed_during_setup == [True]
+        assert torch.backends.cudnn.benchmark is False
     finally:
         torch.backends.cudnn.benchmark = previous_benchmark
 
@@ -600,6 +643,18 @@ def test_to_tensor_rejects_non_tensor_waveform() -> None:
         _stub_separator()._to_tensor(([0.0] * 10, 44100))
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.int16, torch.uint8, torch.bool, torch.complex64]
+)
+def test_to_tensor_rejects_non_floating_tuple_waveforms(dtype: torch.dtype) -> None:
+    """Tuple tensors must already be normalized real floating-point audio."""
+    sep = _stub_separator()
+    sep.sample_rate = 44100
+    sep.audio_channels = 1
+    with pytest.raises(ValidationError, match="floating-point"):
+        sep._to_tensor((torch.zeros(1, 10, dtype=dtype), 44100))
+
+
 def test_to_tensor_rejects_bad_sample_rate() -> None:
     """
     Non-integer and non-positive sample rates are rejected up front rather
@@ -685,6 +740,37 @@ def test_separate_rejects_bool_numeric_params() -> None:
     ):
         with pytest.raises(ValidationError):
             sep.separate(audio=b"", **kwargs)
+
+
+@pytest.mark.parametrize("stem", ["", "bass"])
+def test_init_rejects_named_only_load_before_model_load(
+    monkeypatch: pytest.MonkeyPatch, stem: str
+) -> None:
+    """Named-model stem typos fail as ValidationError before get_model."""
+
+    class FakeRepository:
+        """Registry stub whose downloader must never be reached."""
+
+        def list_models(self) -> dict[str, dict[str, object]]:
+            return {"named": {"sources": ["vocals"]}}
+
+        def get_model(self, **_kwargs: object) -> object:
+            pytest.fail("invalid only_load reached get_model")
+
+    monkeypatch.setattr("unblend.api.ModelRepository", FakeRepository)
+    with pytest.raises(ValidationError, match="not found"):
+        Separator(model="named", only_load=stem, device="cpu")
+
+
+def test_init_rejects_direct_model_empty_only_load() -> None:
+    """Direct model instances apply the same empty-stem validation."""
+    with pytest.raises(ValidationError, match="not found"):
+        Separator(
+            model=_ProgressModel(),
+            only_load="",
+            device="cpu",
+            chunk_batch_size=1,
+        )
 
 
 def test_init_rejects_invalid_chunk_batch_size_before_model_load() -> None:

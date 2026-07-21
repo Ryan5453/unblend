@@ -15,15 +15,17 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: npm
@@ -38,9 +40,11 @@ jobs:
           test "$py" = "$version" || { echo "pyproject.toml has $py, tag is $version"; exit 1; }
           test "$js" = "$version" || { echo "web/demucs/package.json has $js, tag is $version"; exit 1; }
       - name: Sync Python dependencies
+        run: uv sync --locked --extra dev --extra onnx --group onnx-test
+      - name: Verify locked Cog requirements
         run: |
-          uv sync --extra dev --extra onnx
-          uv pip install onnxruntime
+          uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt > /tmp/requirements-cog.txt
+          diff -u requirements-cog.txt /tmp/requirements-cog.txt
       - name: Check Python style
         run: |
           uv run ruff check .
@@ -73,13 +77,13 @@ jobs:
           cd web
           npm pack -w unblend --pack-destination ../release-artifacts
       - name: Upload Python distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-distributions
           path: dist/*
           if-no-files-found: error
       - name: Upload npm package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: npm-package
           path: release-artifacts/*.tgz
@@ -97,22 +101,22 @@ jobs:
       id-token: write
     steps:
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # npm >= 11.5 is required for OIDC trusted publishing.
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
       - name: Download Python distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: python-distributions
           path: dist
       - name: Download npm package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: npm-package
           path: release-artifacts
@@ -143,7 +147,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Extract changelog section for this version
         run: |
           version="${GITHUB_REF_NAME#v}"

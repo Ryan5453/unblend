@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback, type DragEvent } from 'react';
 import { useDemucs } from '../../hooks/useDemucs';
+import { useHomeReset } from '../home-reset';
 import { WaveCanvas, RulerCanvas } from '../ui/WaveLane';
 import { Braid } from '../ui/Braid';
 import { peaksFromBuffer } from '../../utils/peaks';
@@ -52,6 +53,8 @@ export function Home() {
         stemUrls,
         stemPeaks,
         trackTitle,
+        trackArtist,
+        artworkUrl,
         logs,
         audioError,
         loadModel,
@@ -316,6 +319,18 @@ export function Home() {
         setPhase('drop');
     };
 
+    // Let the header wordmark / "Studio" link trigger this same soft reset.
+    // It reuses handleNewFile, so the loaded model stays warm — no reload.
+    const reset = useHomeReset();
+    const newFileRef = useRef(handleNewFile);
+    useEffect(() => {
+        newFileRef.current = handleNewFile;
+    });
+    useEffect(() => {
+        reset?.register(() => newFileRef.current());
+        return () => reset?.register(null);
+    }, [reset]);
+
     // ---- keyboard -----------------------------------------------------
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
@@ -328,11 +343,21 @@ export function Home() {
                 else void playAll();
                 return;
             }
-            const n = parseInt(e.key, 10);
-            if (n >= 1 && n <= lanes.length) {
-                const key = lanes[n - 1].key;
-                if (e.shiftKey) toggleMute(key);
-                else toggleSolo(key);
+            // Ignore browser / OS chords (⌘ / Ctrl / Alt + key) so we never
+            // fight shortcuts like tab or profile switching.
+            if (e.metaKey || e.ctrlKey || e.altKey) return;
+            // Match the physical digit key via e.code, not e.key: with Shift
+            // held most layouts report "!" "@" … for the number row, so the old
+            // parseInt(e.key) never saw a digit and the mute chord never fired.
+            const digit = e.code.match(/^Digit([1-9])$/);
+            if (digit) {
+                const n = parseInt(digit[1], 10);
+                if (n <= lanes.length) {
+                    e.preventDefault();
+                    const key = lanes[n - 1].key;
+                    if (e.shiftKey) toggleMute(key);
+                    else toggleSolo(key);
+                }
             }
         };
         window.addEventListener('keydown', onKey);
@@ -491,7 +516,11 @@ export function Home() {
             {phase === 'studio' && (
                 <section className="view-studio animate-fade-in">
                     <div className="specrow">
-                        <span className="fn">{trackName}</span>
+                        {artworkUrl && <img className="art" src={artworkUrl} alt="" />}
+                        <div className="tmeta">
+                            <span className="fn">{trackName}</span>
+                            {trackArtist && <span className="tartist">{trackArtist}</span>}
+                        </div>
                         <span className="dots" />
                         <span className="spec st">{modelName}</span>
                         <span className="spec st">{stemKeys.length} STEMS</span>
@@ -502,7 +531,7 @@ export function Home() {
 
                     <div className="board">
                         <div className="brow rulerb">
-                            <div className="lab">TIME — CLICK TO SEEK</div>
+                            <div className="lab" />
                             <div className="wav">
                                 <RulerCanvas progress={progressFrac} duration={duration} onSeek={seek} />
                             </div>
@@ -551,7 +580,7 @@ export function Home() {
                                                 }
                                             />
                                             <span className="db">{dbLabel(lane.key)}</span>
-                                            {lane.download ? (
+                                            {lane.download && (
                                                 <button
                                                     className="dl"
                                                     onClick={() =>
@@ -561,13 +590,6 @@ export function Home() {
                                                 >
                                                     ↓
                                                 </button>
-                                            ) : (
-                                                <span
-                                                    className="db"
-                                                    style={{ width: 'auto', letterSpacing: '.12em' }}
-                                                >
-                                                    NOT IN ZIP
-                                                </span>
                                             )}
                                         </div>
                                     </div>
@@ -589,7 +611,7 @@ export function Home() {
                     </div>
 
                     <div className="hint">
-                        SPACE — PLAY/PAUSE · 1–{lanes.length} — SOLO · SHIFT+1–{lanes.length} — MUTE · CLICK WAVE — SEEK
+                        SPACE — PLAY/PAUSE · 1–{lanes.length} — SOLO · SHIFT+1–{lanes.length} — MUTE
                     </div>
                 </section>
             )}

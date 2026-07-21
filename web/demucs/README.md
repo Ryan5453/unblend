@@ -57,6 +57,8 @@ Output is always 2 channels per stem regardless of input channel count.
 
 The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-460 MB fp16) and slower per segment.
 
+> All eight FP32/weight-only-FP16 ONNX artifacts are hosted publicly under an immutable Hugging Face revision. Their exact byte sizes and SHA-256 digests are checked into `model-artifacts.ts`; maintainers can stream-verify every remote artifact with `npm run verify:model-artifacts` from this package directory.
+
 ## Constants
 
 - `SAMPLE_RATE` — `44100`. The only valid input sample rate.
@@ -69,13 +71,16 @@ The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HT
 ```ts
 import { Separator } from 'unblend';
 
+const controller = new AbortController();
 const separator = await Separator.load('htdemucs', {
   backend: 'webgpu',   // falls back to 'wasm' automatically
   precision: 'fp32',   // 'fp16' = smaller download, near-identical output (not bit-exact)
+  signal: controller.signal,
 });
 
 // audioBuffer: a 44.1kHz Web Audio AudioBuffer (1 or 2 channels)
 const result = await separator.separate(audioBuffer, {
+  signal: controller.signal,
   onProgress: (p) => console.log(p),
 });
 
@@ -93,8 +98,11 @@ Loads a model and returns a ready-to-use `Separator`. Model URLs are resolved fr
 - `options.precision`: `'fp32'` (default) | `'fp16'`. `'fp16'` is a weight-only-fp16 variant — roughly half the download with near-identical (not bit-exact) output: the weights are rounded to fp16, but compute still runs in fp32, so the difference is well below the audible floor.
 - `options.wasmPaths`: override the ORT `.wasm` asset URL prefix
 - `options.numThreads`: WASM thread count (default 4)
+- `options.signal`: optional `AbortSignal`. A pre-aborted signal creates no workers; abort during loading terminates every worker already created and rejects with the signal reason. An aborted WebGPU load never falls through into a WASM retry.
 
-Each `Separator` instance owns its own three workers (STFT, ONNX, iSTFT). Multiple instances can run concurrently — call `load()` more than once to run different models in parallel. (A single instance is not safe to call `separate` on concurrently; calls on the same instance should be sequential.)
+Each `Separator` instance owns its own three workers (STFT, ONNX, iSTFT). Multiple instances can run concurrently — call `load()` more than once to run different models in parallel. A single instance rejects concurrent `separate()` calls.
+
+Aborting an active separation, unloading during it, or encountering a worker/pipeline failure hard-terminates all three workers and permanently invalidates that `Separator`; load a fresh instance before retrying. This is deliberate because an in-flight ORT `session.run()` cannot be safely cancelled and then reused. Idle `unload()` first attempts a bounded graceful ONNX release and then terminates all workers.
 
 ### Instance members
 
@@ -103,7 +111,7 @@ Each `Separator` instance owns its own three workers (STFT, ONNX, iSTFT). Multip
 - `separator.license` — license of the model weights (`'unlicensed'` for HTDemucs; `'CC-BY-NC-SA-4.0'` for the RoFormer checkpoints).
 - `separator.backend` — `'webgpu'` | `'wasm'` actually in use after fallback.
 - `separator.precision` — `'fp32'` | `'fp16'`.
-- `separator.separate(audioBuffer, options?)` — separates one `AudioBuffer`; safe to call repeatedly.
+- `separator.separate(audioBuffer, options?)` — separates one `AudioBuffer`; successful calls may be repeated sequentially. `options.signal` cancels destructively as described above.
 - `separator.unload()` — releases model resources and tears down all three workers. The instance cannot be used afterward.
 
 ### `separate` options and result
@@ -111,6 +119,7 @@ Each `Separator` instance owns its own three workers (STFT, ONNX, iSTFT). Multip
 ```ts
 interface SeparationOptions {
     onProgress?: (p: SeparationProgress) => void;
+    signal?: AbortSignal; // abort invalidates this Separator; load a new one
     shifts?: number;    // random sub-second shifts to average, 1-20 (default 1);
                         // each extra shift reruns the separation, so runtime scales linearly
     seed?: number;      // optional integer seed for the shift-offset PRNG. With a fixed

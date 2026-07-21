@@ -4,6 +4,8 @@ These are network-free: unknown model names short-circuit before any
 download, and the format probe runs before model resolution.
 """
 
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -19,7 +21,7 @@ from unblend.cli.separate import (
     _estimate_compile_chunks,
     _maybe_enable_auto_compile,
 )
-from unblend.repo import ModelRepository
+from unblend.repo import STAGING_PREFIX, STAGING_STALE_SECONDS, ModelRepository
 
 runner = CliRunner()
 
@@ -326,13 +328,12 @@ def test_separate_dotted_track_container_fails_before_separation(
     assert "Unsupported output format" in result.output
 
 
-def test_separate_case_aliasing_paths_warn(
+def test_separate_case_aliasing_paths_fail_before_separation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Planned paths differing only by letter case can alias the same file on
-    case-insensitive filesystems; the CLI warns rather than refusing (they
-    are distinct files on case-sensitive filesystems).
+    Planned paths differing only by letter case are refused conservatively
+    before inference because they alias on common filesystems.
 
     :param tmp_path: pytest temporary directory fixture
     :param monkeypatch: pytest monkeypatch fixture
@@ -354,9 +355,60 @@ def test_separate_case_aliasing_paths_warn(
             str(tmp_path / "out" / "{track}" / "{stem}"),
         ]
     )
-    assert "differ only by letter case" in result.output
-    # The aliasing is a warning, not a refusal: the run must proceed.
-    assert "will be stored using template" in result.output
+    assert result.exit_code == 1
+    assert "filesystem aliases" in result.output
+    assert "will be stored using template" not in result.output
+
+
+def test_separate_unicode_aliasing_paths_fail_before_separation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NFC-equivalent output names are rejected before inference."""
+    _stub_model_loading(monkeypatch)
+    (tmp_path / "d1").mkdir()
+    (tmp_path / "d2").mkdir()
+    for directory, name in (("d1", "Café.wav"), ("d2", "Cafe\u0301.wav")):
+        AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(
+            tmp_path / directory / name
+        )
+
+    result = _invoke(
+        [
+            "separate",
+            str(tmp_path / "d1" / "Café.wav"),
+            str(tmp_path / "d2" / "Cafe\u0301.wav"),
+            "-o",
+            str(tmp_path / "out" / "{track}" / "{stem}"),
+        ]
+    )
+    assert result.exit_code == 1
+    assert "filesystem aliases" in result.output
+
+
+def test_separate_symlink_loop_output_fails_cleanly_before_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Path-resolution failures are reported as CLI errors, not tracebacks."""
+    _stub_model_loading(monkeypatch)
+    audio = tmp_path / "song.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(audio)
+    loop = tmp_path / "loop"
+    try:
+        loop.symlink_to(loop)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    result = _invoke(
+        [
+            "separate",
+            str(audio),
+            "-o",
+            str(loop / "{track}" / "{stem}"),
+        ]
+    )
+    assert result.exit_code == 1
+    assert "Could not resolve planned output path" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_separate_markup_in_paths_renders_literally(
@@ -535,9 +587,11 @@ def test_models_remove_all_sweeps_partial_and_temp_files(
     # One layer of the multi-layer ensemble = a genuinely partial cache.
     checksum = ModelRepository().list_models()["htdemucs_ft"]["models"][0]["checksum"]
     partial_layer = tmp_path / f"{checksum}.safetensors"
-    stale_tmp = tmp_path / "tmpq1w2e3.safetensors"
+    stale_tmp = tmp_path / f"{STAGING_PREFIX}q1w2e3.tmp"
     partial_layer.write_bytes(b"x")
     stale_tmp.write_bytes(b"y")
+    old = time.time() - STAGING_STALE_SECONDS - 1
+    os.utime(stale_tmp, (old, old))
 
     result = _invoke(["models", "remove", "--all"])
 

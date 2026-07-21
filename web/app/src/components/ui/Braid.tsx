@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react';
+import { STEMS, INK, RED, smooth, lerp, clamp01, type StemLine } from './stems';
 
 interface BraidProps {
     /** Hover/drag excitement (drop phase). */
@@ -9,61 +10,9 @@ interface BraidProps {
     audioBuffer?: AudioBuffer | null;
 }
 
-interface StemLine {
-    label: string;
-    amp: number;
-    lane: number;
-    wave: (x: number, t: number) => number;
-}
-
-// Same stem characters as SplitDiagram: each strand waves like its
-// instrument, so the braid is a true picture of the blended mix.
-const STEMS: StemLine[] = [
-    {
-        label: 'VOCALS',
-        amp: 9,
-        lane: -1,
-        wave: (x, t) => 0.55 * Math.sin(x * 0.018 + t * 2.0) + 0.45 * Math.sin(x * 0.041 - t * 1.4),
-    },
-    {
-        label: 'DRUMS',
-        amp: 13,
-        lane: -1 / 3,
-        wave: (x, t) => {
-            const u = x - t * 150;
-            const s = u / 120 - Math.floor(u / 120);
-            const beat = Math.floor(u / 120);
-            return (beat % 2 === 0 ? 1 : -0.75) * Math.exp(-s * 9);
-        },
-    },
-    {
-        label: 'BASS',
-        amp: 14,
-        lane: 1 / 3,
-        wave: (x, t) => Math.sin(x * 0.0085 - t * 1.2),
-    },
-    {
-        label: 'OTHER',
-        amp: 7,
-        lane: 1,
-        wave: (x, t) => 0.5 * Math.sin(x * 0.07 + t * 3.1) + 0.5 * Math.sin(x * 0.033 - t * 2.3),
-    },
-];
-
-const INK = [25, 25, 22];
-const RED = [207, 59, 23];
-
 const N = STEMS.length;
-// Each strand pulls out of the braid over a 40-point window of progress,
-// staggered top lane first.
-const PEEL_WINDOW = 40;
-const PEEL_STAGGER = (100 - PEEL_WINDOW) / (N - 1);
 
 const ENVELOPE_BUCKETS = 160;
-
-const smooth = (u: number) => u * u * (3 - 2 * u);
-const lerp = (a: number, b: number, k: number) => a + (b - a) * k;
-const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
 /**
  * The mix as a braided line: four strands (one per stem, each with its own
@@ -134,7 +83,9 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
         resize();
 
         let energy = 0;
-        const peel = new Float32Array(N);
+        // Separation "wavefront": 0 = fully braided, 1 = fully split into lanes.
+        // Eased toward progress so the seam glides rather than jumping.
+        let wf = 0;
         let lastT = 0;
         // Carrier phase is integrated (not speed × t) so speed changes read
         // as smooth acceleration instead of scrubbing the whole braid.
@@ -149,12 +100,8 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
             else energy += ((hot ? 1 : 0) - energy) * 0.07;
 
             const p = prog ?? 0;
-            for (let i = 0; i < N; i++) {
-                const target = prog === undefined
-                    ? 0
-                    : smooth(clamp01((p - i * PEEL_STAGGER) / PEEL_WINDOW));
-                peel[i] = snap ? target : peel[i] + (target - peel[i]) * Math.min(1, dt * 4);
-            }
+            const wfTarget = prog === undefined ? 0 : clamp01(p / 100);
+            wf = snap ? wfTarget : wf + (wfTarget - wf) * Math.min(1, dt * 4);
 
             const dpr = window.devicePixelRatio || 1;
             const w = canvas.width / dpr;
@@ -164,7 +111,11 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
 
             const cy = h / 2;
             const x0 = Math.max(16, w * 0.02);
-            const x1 = w - 92;
+            // Reserve room on the right for the lane labels + end-ticks only when
+            // the strands actually peel out to their lanes (processing). On the
+            // drop screen there are no visible labels, so mirror the left margin
+            // and keep the braid centered under the caption / on the page.
+            const x1 = w - (prog === undefined ? x0 : 92);
             const spread = Math.min(h * 0.36, 132);
             const mul = h / 340;
             const carrierAmp = 36 * mul * (1 + energy * 0.6);
@@ -188,50 +139,95 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
                 );
             };
 
+            // ---- Separation wavefront -------------------------------------
+            // A red "seam" travels left→right as progress climbs. Left of it the
+            // braid has split into its lane stems; right of it it is still wound.
+            // TW is the diagonal width over which each strand peels apart.
+            const TW = Math.max(70, (x1 - x0) * 0.16);
+            // Run the seam a full TW past x1 so the whole width settles at 100%.
+            const xf = x0 + (x1 - x0 + TW) * wf;
+            const sepAt = (x: number) =>
+                prog === undefined ? 0 : smooth(clamp01((xf - x) / TW));
+
+            const strandY = (stem: StemLine, phi: number, x: number, sx: number) => {
+                const e = envAt(x);
+                const laneY = cy + stem.lane * spread * sx;
+                const carrier = carrierAmp * e * (1 - sx) * Math.sin(k * x - phase + phi);
+                const charAmp = stem.amp * mul * (0.3 + 0.7 * sx) * (1 + energy * 0.5);
+                return laneY + carrier + stem.wave(x, t) * charAmp * e;
+            };
+
             let maxSwing = 0;
+            // Hover still warms the whole braid on the drop screen.
+            const warm = energy * 0.85;
+            const inkR = Math.round(lerp(INK[0], RED[0], warm));
+            const inkG = Math.round(lerp(INK[1], RED[1], warm));
+            const inkB = Math.round(lerp(INK[2], RED[2], warm));
+
             for (let i = 0; i < N; i++) {
                 const stem = STEMS[i];
-                const s = peel[i];
-                const laneY = cy + stem.lane * spread * s;
                 const phi = (i * Math.PI) / 2;
-                const charAmp = stem.amp * mul * (0.3 + 0.7 * s) * (1 + energy * 0.5);
 
-                // Mid-peel strands flash red, settling back to ink in their
-                // lane; hover excitement warms the whole braid.
-                const redAmt = Math.max(4 * s * (1 - s), energy * 0.85);
-                const cr = Math.round(lerp(INK[0], RED[0], redAmt));
-                const cg = Math.round(lerp(INK[1], RED[1], redAmt));
-                const cb = Math.round(lerp(INK[2], RED[2], redAmt));
-
+                // Base strand.
                 ctx.beginPath();
                 for (let x = x0; x <= x1; x += step) {
-                    const e = envAt(x);
-                    const carrier = carrierAmp * e * (1 - s) * Math.sin(k * x - phase + phi);
-                    const char = stem.wave(x, t) * charAmp * e;
-                    const y = laneY + carrier + char;
+                    const y = strandY(stem, phi, x, sepAt(x));
                     if (x === x0) ctx.moveTo(x, y);
                     else ctx.lineTo(x, y);
                     if (x < x0 + 4) maxSwing = Math.max(maxSwing, Math.abs(y - cy));
                 }
-                ctx.strokeStyle = `rgba(${cr},${cg},${cb},${0.55 + 0.3 * s})`;
+                ctx.strokeStyle = `rgba(${inkR},${inkG},${inkB},${0.55 + 0.3 * wf})`;
+                ctx.lineWidth = 1;
                 ctx.stroke();
 
-                // End tick appears with the strand's lane.
-                if (s > 0.02) {
+                // Red glow riding the peel seam (only while actively splitting).
+                if (prog !== undefined && wf > 0.001 && wf < 0.999) {
+                    const gx0 = Math.max(x0, xf - TW);
+                    const gx1 = Math.min(x1, xf);
+                    if (gx1 - gx0 > 1) {
+                        const grad = ctx.createLinearGradient(xf - TW, 0, xf, 0);
+                        grad.addColorStop(0, 'rgba(207,59,23,0)');
+                        grad.addColorStop(0.5, 'rgba(207,59,23,.95)');
+                        grad.addColorStop(1, 'rgba(207,59,23,0)');
+                        ctx.beginPath();
+                        for (let x = gx0; x <= gx1; x += step) {
+                            const y = strandY(stem, phi, x, sepAt(x));
+                            if (x === gx0) ctx.moveTo(x, y);
+                            else ctx.lineTo(x, y);
+                        }
+                        ctx.strokeStyle = grad;
+                        ctx.lineWidth = 1.6;
+                        ctx.stroke();
+                    }
+                }
+
+                // End tick + lane label track the strand's right-edge lane.
+                const sRight = sepAt(x1);
+                if (sRight > 0.02) {
                     const stemPeak = stem.amp * mul * (1 + energy * 0.5) + 3;
-                    const tickY = cy + stem.lane * spread * s;
+                    const tickY = cy + stem.lane * spread * sRight;
                     ctx.beginPath();
                     ctx.moveTo(x1 + 4, tickY - stemPeak);
                     ctx.lineTo(x1 + 4, tickY + stemPeak);
-                    ctx.strokeStyle = `rgba(${INK[0]},${INK[1]},${INK[2]},${0.5 * s})`;
+                    ctx.strokeStyle = `rgba(${INK[0]},${INK[1]},${INK[2]},${0.5 * sRight})`;
+                    ctx.lineWidth = 1;
                     ctx.stroke();
                 }
-
                 const tag = tagRefs.current[i];
                 if (tag) {
-                    tag.style.opacity = prog === undefined ? '0' : String(s);
-                    tag.style.top = `calc(50% + ${stem.lane * s} * min(36%, 132px))`;
+                    tag.style.opacity = String(sRight);
+                    tag.style.top = `calc(50% + ${stem.lane * sRight} * min(36%, 132px))`;
                 }
+            }
+
+            // Vertical seam "read head" at the wavefront.
+            if (prog !== undefined && xf > x0 + 2 && xf < x1 - 2) {
+                ctx.beginPath();
+                ctx.moveTo(xf, cy - spread - 6);
+                ctx.lineTo(xf, cy + spread + 6);
+                ctx.strokeStyle = 'rgba(207,59,23,.35)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
             }
 
             // Start tick bracketing the braid's swing at the left terminal.
@@ -239,6 +235,7 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
             ctx.moveTo(x0, cy - maxSwing - 3);
             ctx.lineTo(x0, cy + maxSwing + 3);
             ctx.strokeStyle = `rgba(${INK[0]},${INK[1]},${INK[2]},.5)`;
+            ctx.lineWidth = 1;
             ctx.stroke();
         };
 

@@ -432,6 +432,42 @@ def _split_weight(
     return weight
 
 
+def _planned_input_chunks(
+    model: Model,
+    mixes: list[Tensor | TensorChunk],
+    shifts: int,
+    overlap: float,
+    shift_offsets: list[list[int]] | None,
+) -> list[int]:
+    """
+    Return exact per-input chunk counts for a pre-drawn shift plan.
+
+    :param model: Ensemble member whose segment length determines the stride.
+    :param mixes: Input mixtures to count.
+    :param shifts: Number of shift rounds, or zero for unshifted inference.
+    :param overlap: Segment overlap ratio.
+    :param shift_offsets: Pre-drawn offsets for every round/input.
+    :return: One exact chunk count per input mixture.
+    """
+    segment_length = int(round(model.samplerate * model.max_allowed_segment))
+    stride = int((1 - overlap) * segment_length)
+    if stride < 1:
+        raise ValidationError(
+            f"split overlap {overlap} produces an invalid stride for segment "
+            f"length {segment_length}"
+        )
+    if not shifts:
+        return [-(-tensor_chunk(mix).length // stride) for mix in mixes]
+    assert shift_offsets is not None
+    max_shift = int(0.5 * model.samplerate)
+    totals = [0] * len(mixes)
+    for offsets_per_mix in shift_offsets:
+        for index, (mix, offset) in enumerate(zip(mixes, offsets_per_mix)):
+            shifted_length = mix.shape[-1] + max_shift - offset
+            totals[index] += -(-shifted_length // stride)
+    return totals
+
+
 def _should_restore_submodel_device(
     sub_model: nn.Module,
     sub_device: torch.device | None,
@@ -486,9 +522,9 @@ def apply_model(
     :param progress_callback: Optional ``callback(event_type, data)``; events:
         ``processing_start``, ``chunk_complete``, ``processing_complete``.
         Payloads include aggregate totals and per-input chunk fields. For a
-        ``ModelEnsemble`` that runs all sub-models, the reported totals span the
-        whole ensemble (``total_chunks = per_model_chunks * num_sub_models``), so
-        progress advances monotonically instead of restarting per sub-model.
+        ``ModelEnsemble`` that runs all sub-models, reported totals are the
+        exact sum of each member's chunks, so progress advances monotonically
+        instead of restarting per sub-model.
     :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
         fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
         whose weights select this stem with a clean one-hot (1.0/0.0) row,
@@ -539,6 +575,8 @@ def apply_model_multi(
     use_only_stem: str | None = None,
     chunk_batch_size: int = 1,
     oom_backoff_state: dict[str, int] | None = None,
+    *,
+    _shift_offsets: list[list[int]] | None = None,
 ) -> list[Tensor]:
     """
     Apply model to multiple mixes simultaneously, pooling tail chunks across
@@ -571,8 +609,8 @@ def apply_model_multi(
         ``input_total_chunks``, while chunk events identify ``input_index`` and
         that input's completed/total counts. For a ``ModelEnsemble`` that
         runs all sub-models, the totals also span every sub-model
-        (``total_chunks = per_model_chunks * num_sub_models``), so the progress
-        bar advances continuously rather than restarting once per sub-model.
+        (the exact sum across members), so the progress bar advances
+        continuously rather than restarting once per sub-model.
     :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
         fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
         whose weights select this stem with a clean one-hot (1.0/0.0) row,
@@ -586,6 +624,8 @@ def apply_model_multi(
         runtime CUDA-OOM halving for auto-sized eager runs (Separator
         internal); halvings persist in the dict for the caller. ``None``
         disables backoff (OOM propagates).
+    :param _shift_offsets: Internal pre-drawn ensemble shift plan; callers
+        should leave this as ``None``.
     :return: One separated-sources tensor per input mix, same shape as
         ``apply_model`` would have produced.
     :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
@@ -669,6 +709,7 @@ def apply_model_multi(
             use_only_stem=use_only_stem,
             chunk_batch_size=chunk_batch_size,
             oom_backoff_state=oom_backoff_state,
+            _shift_offsets=_shift_offsets,
         )
         results: list[Tensor] = []
         row = 0
@@ -676,6 +717,15 @@ def apply_model_multi(
             results.append(torch.cat(flat_results[row : row + span], dim=0))
             row += span
         return results
+
+    # Ensembles must reuse one set of random offsets across members. Besides
+    # making the shift trick coherent, this lets progress account for every
+    # member's exact (potentially different) segment length before work starts.
+    if shifts and _shift_offsets is None:
+        max_shift = int(0.5 * model.samplerate)
+        _shift_offsets = [
+            [random.randint(0, max_shift) for _ in mixes] for _ in range(shifts)
+        ]
 
     if isinstance(model, ModelEnsemble):
         totals = model.validated_weight_totals()
@@ -716,77 +766,61 @@ def apply_model_multi(
                         progress_callback=progress_callback,
                         chunk_batch_size=chunk_batch_size,
                         oom_backoff_state=oom_backoff_state,
+                        _shift_offsets=_shift_offsets,
                     )
 
-        # Run every sub-model with the same pooling, then weighted-average.
-        # Progress is reported as one continuous span across the whole
-        # ensemble: each sub-model processes the same chunks, so the aggregate
-        # total is ``per_model_chunks * num_sub_models``. Without this wrapper
-        # each sub-model would emit its own start/complete cycle and the bar
-        # would restart N times.
-        num_sub_models = len(model.models)
+        # Progress is one exact span even when members use different segment
+        # lengths. Totals are computed from the shared shift plan before the
+        # first model runs; child start/complete events are swallowed.
         sub_models_done = 0
-        sub_total_chunks: int | None = None
-        sub_input_total_chunks: list[int] | None = None
+        model_input_totals = [
+            _planned_input_chunks(sub_model, mixes, shifts, overlap, _shift_offsets)
+            for sub_model in model.models
+        ]
+        aggregate_input_totals = [
+            sum(per_model[index] for per_model in model_input_totals)
+            for index in range(len(mixes))
+        ]
+        aggregate_total = sum(aggregate_input_totals)
+        if progress_callback:
+            progress_callback(
+                "processing_start",
+                {
+                    "total_chunks": aggregate_total,
+                    "total_inputs": len(mixes),
+                    "input_total_chunks": aggregate_input_totals,
+                },
+            )
 
         def ensemble_progress(event_type: str, data: dict[str, Any]) -> None:
             """
-            Re-scale per-sub-model progress events into one continuous span
-            across the whole ensemble before forwarding to ``progress_callback``.
+            Map one member's chunk event into the aggregate exact span.
 
-            :param event_type: Progress event name (``"processing_start"`` or
-                ``"chunk_complete"``); per-sub-model ``"processing_complete"``
-                events are swallowed.
-            :param data: Aggregate and per-input progress payload.
+            :param event_type: Child progress event name.
+            :param data: Child progress payload.
             :return: None.
             """
-            nonlocal sub_input_total_chunks, sub_total_chunks
             assert progress_callback is not None
-            if event_type == "processing_start":
-                if sub_total_chunks is None:
-                    sub_total_chunks = int(data.get("total_chunks", 0))
-                    sub_input_total_chunks = [
-                        int(value) for value in data.get("input_total_chunks", [])
-                    ]
-                    progress_callback(
-                        "processing_start",
-                        {
-                            "total_chunks": sub_total_chunks * num_sub_models,
-                            "total_inputs": len(mixes),
-                            "input_total_chunks": [
-                                value * num_sub_models
-                                for value in sub_input_total_chunks
-                            ],
-                        },
-                    )
-            elif event_type == "chunk_complete":
-                # Use the latched first sub-model total for the span math and
-                # clamp the per-sub-model progress to it: with shifts > 1 each
-                # sub-model run draws its own random offsets, so totals can
-                # differ by a few chunks between sub-models. Clamping keeps
-                # the bar monotonic and bounded by the declared total.
-                per_model = sub_total_chunks or int(data.get("total_chunks", 0))
-                completed = sub_models_done * per_model + min(
-                    int(data.get("completed_chunks", 0)), per_model
-                )
-                mix_index = int(data["input_index"])
-                assert sub_input_total_chunks is not None
-                per_input = sub_input_total_chunks[mix_index]
-                input_completed = sub_models_done * per_input + min(
-                    int(data.get("input_completed_chunks", 0)), per_input
-                )
-                progress_callback(
-                    "chunk_complete",
-                    {
-                        "completed_chunks": completed,
-                        "total_chunks": per_model * num_sub_models,
-                        "input_index": mix_index,
-                        "input_completed_chunks": input_completed,
-                        "input_total_chunks": per_input * num_sub_models,
-                    },
-                )
-            # Swallow per-sub-model "processing_complete"; one is emitted for
-            # the whole ensemble after the loop.
+            if event_type != "chunk_complete":
+                return
+            mix_index = int(data["input_index"])
+            prior_total = sum(
+                sum(values) for values in model_input_totals[:sub_models_done]
+            )
+            prior_input = sum(
+                values[mix_index] for values in model_input_totals[:sub_models_done]
+            )
+            progress_callback(
+                "chunk_complete",
+                {
+                    "completed_chunks": prior_total + int(data["completed_chunks"]),
+                    "total_chunks": aggregate_total,
+                    "input_index": mix_index,
+                    "input_completed_chunks": prior_input
+                    + int(data["input_completed_chunks"]),
+                    "input_total_chunks": aggregate_input_totals[mix_index],
+                },
+            )
 
         sub_callback = ensemble_progress if progress_callback else None
 
@@ -804,6 +838,7 @@ def apply_model_multi(
                 progress_callback=sub_callback,
                 chunk_batch_size=chunk_batch_size,
                 oom_backoff_state=oom_backoff_state,
+                _shift_offsets=_shift_offsets,
             )
             sub_models_done += 1
             if _should_restore_submodel_device(sub_model, sub_device, device):
@@ -820,19 +855,13 @@ def apply_model_multi(
         for acc in results:
             for k in range(acc.shape[1]):
                 acc[:, k, :, :] /= totals[k]
-        if (
-            progress_callback
-            and sub_total_chunks is not None
-            and sub_input_total_chunks is not None
-        ):
+        if progress_callback:
             progress_callback(
                 "processing_complete",
                 {
-                    "total_chunks": sub_total_chunks * num_sub_models,
+                    "total_chunks": aggregate_total,
                     "total_inputs": len(mixes),
-                    "input_total_chunks": [
-                        value * num_sub_models for value in sub_input_total_chunks
-                    ],
+                    "input_total_chunks": aggregate_input_totals,
                 },
             )
         return results
@@ -852,9 +881,15 @@ def apply_model_multi(
         # chunk total across all rounds is known up front. Without this each
         # round would emit its own processing_start/complete cycle and the
         # progress bar would restart per shift.
-        all_offsets = [
-            [random.randint(0, max_shift) for _ in mixes] for _ in range(shifts)
-        ]
+        all_offsets = _shift_offsets
+        if all_offsets is None:
+            all_offsets = [
+                [random.randint(0, max_shift) for _ in mixes] for _ in range(shifts)
+            ]
+        if len(all_offsets) != shifts or any(
+            len(offsets) != len(mixes) for offsets in all_offsets
+        ):
+            raise RuntimeError("Internal shift-offset plan does not match inputs.")
 
         # Same validation as the unshifted helper, but raised before any
         # progress events fire — otherwise a doomed run emits a
@@ -1154,11 +1189,8 @@ def _apply_model_multi_unshifted(
         if n_actual < chunk_batch_size and fixed_batch_shape:
             # CUDAGraphs replay (Separator's compile path) requires the
             # captured batch shape, so tails pad all the way up. Eager models
-            # run tails at their natural size — padding would burn forward
-            # compute on zero chunks. (Natural tail shapes are only viable
-            # because eager mode leaves ``cudnn.benchmark`` off; with it on,
-            # every distinct shape costs a multi-second exhaustive algorithm
-            # search, which measured far worse than any padding waste.)
+            # run tails at their natural size to avoid forward compute on zero
+            # chunks; host applications retain control of global cuDNN policy.
             pad_count = chunk_batch_size - n_actual
             zero_pad = padded.new_zeros((pad_count, *padded.shape[1:]))
             padded = torch.cat([padded, zero_pad], dim=0)
@@ -1179,17 +1211,20 @@ def _apply_model_multi_unshifted(
             # watching; unobserved runs keep the free-running pipeline.
             torch.cuda.synchronize(device)
 
-        # Phase 1 — everything that allocates (trims are views, but the
-        # weighted product materialises a tensor per chunk). Kept strictly
-        # before the commits below so an OOM anywhere in this batch leaves
-        # the accumulators untouched: _drain can then re-run the whole batch
-        # without double-counting chunks that had already been added.
+        # Phase 1 — prepare disposable views before any accumulator commit.
+        # ``batch_out`` is not used again, so weighting its trimmed views in
+        # place avoids retaining a second full batch of materialized products.
+        # Any failure still occurs before commits, preserving whole-batch retry.
         contributions: list[tuple[int, int, Tensor, Tensor]] = []
         for i, (mix_idx, offset, chunk) in enumerate(batch_items):
             chunk_out = center_trim(batch_out[i : i + 1], chunk.length)
             chunk_length = chunk_out.shape[-1]
             w = weight[:chunk_length]
-            contributions.append((mix_idx, offset, w * chunk_out, w))
+            # ``batch_out`` was created in inference mode; in-place mutation
+            # of an inference tensor is permitted only inside the same mode.
+            with torch.inference_mode():
+                chunk_out.mul_(w)
+            contributions.append((mix_idx, offset, chunk_out, w))
 
         # Phase 2 — pure in-place adds into preallocated accumulators: no
         # allocation, so this phase cannot OOM partway through. Progress

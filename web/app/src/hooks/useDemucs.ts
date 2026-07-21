@@ -6,6 +6,10 @@ import { decodeAudioFile } from '../utils/audio-decoder';
 import { peaksFromInterleaved } from '../utils/peaks';
 import { ORT_WASM_PATHS } from '../onnx-config';
 
+function isAbortError(error: unknown): boolean {
+    return error instanceof DOMException && error.name === 'AbortError';
+}
+
 const initialState: DemucsState = {
     modelLoaded: false,
     modelLoading: false,
@@ -26,6 +30,8 @@ export function useDemucs() {
     const modelLoadInFlightRef = useRef(false);
     const separateInFlightRef = useRef(false);
     const loadAudioInFlightRef = useRef(false);
+    const modelLoadAbortRef = useRef<AbortController | null>(null);
+    const separationAbortRef = useRef<AbortController | null>(null);
     // Read at separation time (not captured at click time) so a click-time
     // closure that survives an await — e.g. Home's handleSeparate awaiting a
     // long model download while the user swaps tracks — separates the track
@@ -86,27 +92,25 @@ export function useDemucs() {
         backend: 'webgpu' | 'wasm' = 'webgpu',
         precision: ModelPrecision = 'fp16',
     ) => {
-        // Reject concurrent loads: a second call racing the first would tear
-        // down or leak the separator the first one is still creating.
         if (modelLoadInFlightRef.current) {
             const message = 'A model load is already in progress';
             addLog(message, 'error');
             setAudioError(message);
             return false;
         }
-        // Swapping models mid-separation would unload the live separator and
-        // destroy the run.
         if (separateInFlightRef.current) {
             const message = 'Cannot switch models while separation is in progress';
             addLog(message, 'error');
             setAudioError(message);
             return false;
         }
+
+        const controller = new AbortController();
+        modelLoadAbortRef.current = controller;
         modelLoadInFlightRef.current = true;
         setAudioError(null);
 
         try {
-            // If a model is already loaded, tear it down before loading another.
             if (separatorRef.current) {
                 await separatorRef.current.unload();
                 separatorRef.current = null;
@@ -121,8 +125,9 @@ export function useDemucs() {
                 backend,
                 precision,
                 wasmPaths: ORT_WASM_PATHS,
+                signal: controller.signal,
             });
-            if (!mountedRef.current) {
+            if (!mountedRef.current || controller.signal.aborted) {
                 await separator.unload();
                 return false;
             }
@@ -140,14 +145,24 @@ export function useDemucs() {
             setState(prev => ({ ...prev, modelLoading: false, modelLoaded: true }));
             return true;
         } catch (err) {
+            if (controller.signal.aborted || isAbortError(err)) {
+                if (mountedRef.current) {
+                    setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
+                }
+                return false;
+            }
             if (!mountedRef.current) return false;
-            const message = `Failed to load ${model}: ${(err as Error).message}`;
+            const detail = err instanceof Error ? err.message : String(err);
+            const message = `Failed to load ${model}: ${detail}`;
             addLog(message, 'error');
             setAudioError(message);
             setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
             return false;
         } finally {
-            modelLoadInFlightRef.current = false;
+            if (modelLoadAbortRef.current === controller) {
+                modelLoadAbortRef.current = null;
+                modelLoadInFlightRef.current = false;
+            }
         }
     }, [addLog]);
 
@@ -298,6 +313,8 @@ export function useDemucs() {
             setAudioError(message);
             return false;
         }
+        const controller = new AbortController();
+        separationAbortRef.current = controller;
         separateInFlightRef.current = true;
         setAudioError(null);
         let localUrls: string[] = [];
@@ -317,6 +334,7 @@ export function useDemucs() {
             addLog('Starting separation...', 'info');
 
             const result = await separator.separate(audioBuffer, {
+                signal: controller.signal,
                 onProgress: ({ segIdx, totalSegs, fraction }) => {
                     if (!mountedRef.current) return;
                     setStatus(`Separating segment ${segIdx} of ${totalSegs}...`);
@@ -353,16 +371,45 @@ export function useDemucs() {
             return true;
         } catch (error) {
             localUrls.forEach(url => URL.revokeObjectURL(url));
+            // Any failed worker-backed run permanently invalidates the library
+            // Separator. Detach exactly the instance this call used so a future
+            // load cannot be clobbered by a late catch/finally from this run.
+            if (separatorRef.current === separator) {
+                separatorRef.current = null;
+            }
+            await separator.unload();
+            if (controller.signal.aborted || isAbortError(error)) {
+                if (mountedRef.current) {
+                    setStatus('Separation cancelled');
+                    setProgress(0);
+                    setState(prev => ({
+                        ...prev,
+                        modelLoaded: false,
+                        modelLoading: false,
+                        separating: false,
+                    }));
+                }
+                return false;
+            }
             if (!mountedRef.current) return false;
-            const message = `Separation failed: ${(error as Error).message}`;
+            const detail = error instanceof Error ? error.message : String(error);
+            const message = `Separation failed: ${detail}`;
             addLog(message, 'error');
             setAudioError(message);
             setStatus('Error during separation');
             setProgress(0);
-            setState(prev => ({ ...prev, separating: false }));
+            setState(prev => ({
+                ...prev,
+                modelLoaded: false,
+                modelLoading: false,
+                separating: false,
+            }));
             return false;
         } finally {
-            separateInFlightRef.current = false;
+            if (separationAbortRef.current === controller) {
+                separationAbortRef.current = null;
+                separateInFlightRef.current = false;
+            }
         }
     }, [addLog, setStatus, setProgress]);
 
@@ -380,6 +427,10 @@ export function useDemucs() {
         mountedRef.current = true;
         return () => {
             mountedRef.current = false;
+            // Abort first so in-flight load/separation promises reject promptly;
+            // then unload any fully constructed Separator still owned here.
+            modelLoadAbortRef.current?.abort();
+            separationAbortRef.current?.abort();
             if (separatorRef.current) {
                 void separatorRef.current.unload();
                 separatorRef.current = null;

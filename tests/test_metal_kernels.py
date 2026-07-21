@@ -37,6 +37,12 @@ mps_only = pytest.mark.skipif(
 LP_DTYPES = [torch.float16, torch.bfloat16]
 
 
+def _inference_call(module: nn.Module, *args: torch.Tensor):
+    """Run a replacement through its shader-backed inference dispatch."""
+    with torch.inference_mode():
+        return module(*args)
+
+
 def _tol(dtype: torch.dtype) -> dict[str, float]:
     """
     Tolerance appropriate for the low-precision dtype under test.
@@ -76,7 +82,8 @@ def test_metal_rms_norm_matches_fp32_reference(
     ref_x = mps_x.cpu().float()
     ref_gamma = mps_gamma.cpu().float()
     ref = F.normalize(ref_x, dim=-1) * scale * ref_gamma
-    out = metal_rms_norm(mps_x, mps_gamma, scale).cpu().float()
+    with torch.inference_mode():
+        out = metal_rms_norm(mps_x, mps_gamma, scale).cpu().float()
 
     tolerance = dict(atol=2e-5, rtol=2e-5) if dtype == torch.float32 else _tol(dtype)
     torch.testing.assert_close(out, ref, **tolerance)
@@ -138,11 +145,97 @@ def test_metal_group_norm_matches_fallback(
     x = torch.randn(*shape)
 
     ref = mod(x.to(torch.float32))
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     assert out.dtype == dtype
     assert out.shape == ref.shape
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
+
+
+@mps_only
+def test_shader_modules_fall_back_when_autograd_is_enabled() -> None:
+    """Raw Metal kernels are bypassed whenever gradients are being recorded."""
+    mod = MetalGroupNorm(_make_gn(16)).to("mps")
+    x = torch.randn(2, 16, 32, device="mps", dtype=torch.float16, requires_grad=True)
+
+    out = mod(x)
+    out.float().sum().backward()
+
+    assert out.requires_grad
+    assert x.grad is not None
+    assert mod.weight.grad is not None
+
+    rms_x = torch.randn(2, 8, device="mps", dtype=torch.float16, requires_grad=True)
+    gamma = torch.ones(8, device="mps", requires_grad=True)
+    metal_rms_norm(rms_x, gamma, 8**0.5).float().sum().backward()
+    assert rms_x.grad is not None
+    assert gamma.grad is not None
+
+
+@mps_only
+def test_shader_modules_still_dispatch_during_inference(monkeypatch) -> None:
+    """The performance path remains active under Separator's inference mode."""
+    import unblend.metal as metal_module
+
+    calls: list[str] = []
+    original_get_kernel = metal_module._get_kernel
+
+    def recording_get_kernel(name: str, dtype: torch.dtype):
+        calls.append(name)
+        return original_get_kernel(name, dtype)
+
+    monkeypatch.setattr(metal_module, "_get_kernel", recording_get_kernel)
+    mod = MetalGroupNorm(_make_gn(16)).to("mps").eval()
+    _inference_call(mod, torch.randn(2, 16, 32, device="mps", dtype=torch.float16))
+    assert "group_norm_g1" in calls
+
+
+@mps_only
+def test_shader_parameter_caches_refresh_after_optimizer_step() -> None:
+    """Warm inference caches never hide affine/LayerScale optimizer updates."""
+    x = torch.randn(2, 16, 32, device="mps", dtype=torch.float16)
+    mod = MetalGroupNorm(_make_gn(16)).to("mps").eval()
+    _inference_call(mod, x)
+    old_affine = mod._aff_cache[(torch.float16, x.device)][0]
+
+    mod.train()
+    optimizer = torch.optim.SGD(mod.parameters(), lr=0.1)
+    optimizer.zero_grad()
+    mod(x).float().square().mean().backward()
+    optimizer.step()
+    mod.eval()
+
+    actual = _inference_call(mod, x)
+    new_affine = mod._aff_cache[(torch.float16, x.device)][0]
+    assert new_affine is not old_affine
+    expected = F.group_norm(x.float(), 1, mod.weight, mod.bias, mod.eps).half()
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), **_tol(torch.float16))
+
+    gn = _make_gn(16)
+    fused = (
+        FusedNormGluLayerScaleResid(gn, torch.ones(8, dtype=torch.float32))
+        .to("mps")
+        .eval()
+    )
+    residual = torch.randn(2, 8, 32, device="mps", dtype=torch.float16)
+    _inference_call(fused, x, residual)
+    old_scale = fused._ls_cache[(torch.float16, x.device)]
+
+    fused.train()
+    optimizer = torch.optim.SGD(fused.parameters(), lr=0.1)
+    optimizer.zero_grad()
+    fused(x, residual).float().square().mean().backward()
+    optimizer.step()
+    fused.eval()
+
+    actual = _inference_call(fused, x, residual)
+    new_scale = fused._ls_cache[(torch.float16, x.device)]
+    assert new_scale is not old_scale
+    normalized = F.group_norm(x.float(), 1, fused.weight, fused.bias, fused.eps)
+    expected = (
+        residual.float() + fused.layer_scale[:, None] * F.glu(normalized, dim=1)
+    ).half()
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), **_tol(torch.float16))
 
 
 @mps_only
@@ -163,7 +256,7 @@ def test_metal_group_norm_multi_stage(dtype: torch.dtype) -> None:
     x = torch.randn(2, channels, frames)
 
     ref = mod(x.to(torch.float32))
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
 
@@ -196,7 +289,7 @@ def test_metal_group_norm_large_dc_offset(
     x = (torch.randn(*shape) + 100.0).to(dtype)
 
     ref = mod(x.to(torch.float32))
-    out = mod.to("mps")(x.to("mps"))
+    out = _inference_call(mod.to("mps"), x.to("mps"))
 
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
 
@@ -234,7 +327,7 @@ def test_fused_group_norm_gelu_matches_fallback(
     x = torch.randn(*shape)
 
     ref = mod(x.to(torch.float32))
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     assert out.shape == ref.shape
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
@@ -281,7 +374,7 @@ def test_fused_group_norm_gelu_multi_stage(dtype: torch.dtype) -> None:
     x = torch.randn(2, channels, frames)
 
     ref = F.gelu(F.group_norm(x.to(torch.float32), 1, gn.weight, gn.bias, gn.eps))
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     assert out.shape == ref.shape
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
@@ -317,7 +410,7 @@ def test_fused_group_norm_glu_matches_fallback(
     x = torch.randn(*shape)
 
     ref = mod(x.to(torch.float32))
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     assert out.shape[1] == in_channels // 2
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
@@ -343,7 +436,7 @@ def test_fused_group_norm_glu_multi_stage(dtype: torch.dtype) -> None:
     x = torch.randn(2, in_channels, frames)
 
     ref = F.glu(F.group_norm(x.to(torch.float32), 1, gn.weight, gn.bias, gn.eps), dim=1)
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     assert out.shape[1] == in_channels // 2
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
@@ -385,7 +478,7 @@ def test_fused_norm_glu_ls_resid_matches_reference(
     ref = residual + ls[:, None] * F.glu(
         F.group_norm(zf, 1, gn.weight, gn.bias, gn.eps), dim=1
     )
-    out = mod.to("mps")(z.to("mps", dtype), residual.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), z.to("mps", dtype), residual.to("mps", dtype))
 
     assert out.dtype == dtype
     assert out.shape == ref.shape
@@ -417,7 +510,7 @@ def test_fused_norm_glu_ls_resid_multi_stage(dtype: torch.dtype) -> None:
     ref = residual + ls[:, None] * F.glu(
         F.group_norm(zf, 1, gn.weight, gn.bias, gn.eps), dim=1
     )
-    out = mod.to("mps")(z.to("mps", dtype), residual.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), z.to("mps", dtype), residual.to("mps", dtype))
 
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
 
@@ -450,7 +543,7 @@ def test_metal_my_group_norm_matches_fallback(
     x = torch.randn(*shape)  # (B, T, C)
 
     ref = mod(x.to(torch.float32))
-    out = mod.to("mps")(x.to("mps", dtype))
+    out = _inference_call(mod.to("mps"), x.to("mps", dtype))
 
     assert out.shape == ref.shape
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
@@ -492,6 +585,24 @@ def test_metal_multihead_attention_matches_reference(dtype: torch.dtype) -> None
     assert weights is None
     assert out.dtype == dtype
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
+
+
+@mps_only
+def test_metal_multihead_attention_training_preserves_dropout() -> None:
+    """Training calls use native MHA so attention dropout is not omitted."""
+    import copy
+
+    mha = nn.MultiheadAttention(16, 4, dropout=1.0, batch_first=True).train()
+    wrapped = MetalMultiheadAttention.from_mha(copy.deepcopy(mha)).to(
+        device="mps", dtype=torch.float16
+    )
+    assert wrapped.training
+    x = torch.randn(2, 7, 16, device="mps", dtype=torch.float16)
+
+    # Torch's native MPS SDPA currently rejects dropout rather than silently
+    # omitting it. The wrapper must preserve that native training behavior.
+    with torch.no_grad(), pytest.raises(NotImplementedError, match="dropout"):
+        wrapped(x, x, x, need_weights=False)
 
 
 @mps_only
@@ -565,6 +676,7 @@ def test_apply_metal_optimizations_idempotent() -> None:
     model.attn = nn.MultiheadAttention(32, 4, batch_first=True)
     model.gn = nn.GroupNorm(1, 16)
     model.mygn = MyGroupNorm(1, 16)
+    model.eval()
 
     first = apply_metal_optimizations(model)
     assert first["multi_head_attention"] == 1
@@ -575,3 +687,6 @@ def test_apply_metal_optimizations_idempotent() -> None:
     assert all(count == 0 for count in second.values()), second
     assert type(model.attn) is MetalMultiheadAttention
     assert type(model.attn._fallback) is nn.MultiheadAttention
+    assert not model.attn.training
+    assert not model.gn.training
+    assert not model.mygn.training

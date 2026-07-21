@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -13,13 +16,19 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - name: Sync dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
+      - name: Verify locked Cog requirements
+        run: |
+          uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt > /tmp/requirements-cog.txt
+          diff -u requirements-cog.txt /tmp/requirements-cog.txt
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format
@@ -32,15 +41,17 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Sync dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: Run fast tests
         run: uv run pytest -m "not slow" -q
 
@@ -49,24 +60,28 @@ jobs:
   test-macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install FFmpeg
         run: brew install ffmpeg
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - name: Sync dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: Run fast tests (incl. Metal kernels on MPS)
         run: uv run pytest -m "not slow" -q
 
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - name: Build distributions
@@ -83,41 +98,21 @@ jobs:
   onnx:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
-      - name: Sync dependencies (with onnx extra)
-        run: uv sync --extra dev --extra onnx
+      - name: Sync dependencies (with onnx test group)
+        run: uv sync --locked --extra dev --extra onnx --group onnx-test
       - name: Smoke-test ONNX import
-        run: uv run python -c "import onnx; import unblend.onnx; print('onnx', onnx.__version__)"
-      - name: Install onnxruntime (export verification)
-        run: uv pip install onnxruntime
+        run: uv run python -c "import onnx; import unblend.onnx; import onnxruntime; print('onnx', onnx.__version__, 'ort', onnxruntime.__version__)"
       - name: Run ONNX tests
         run: uv run pytest -m "not slow" -q tests/test_onnx_stft.py tests/test_onnx_roformer.py
-
-  mps:
-    # Apple-silicon runner with a real MPS device: runs the RoFormer MPS
-    # parity/policy tests and the Metal kernel suite (both skip everywhere
-    # else, so this job is their only CI coverage).
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install FFmpeg
-        run: brew install ffmpeg
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-      - name: Sync dependencies
-        run: uv sync --extra dev
-      - name: Run RoFormer MPS tests
-        run: uv run pytest -m "not slow" -q tests/test_roformer_mps.py
-      - name: Run Metal kernel tests
-        run: uv run pytest -m "not slow" -q tests/test_metal_kernels.py
 
   web:
     runs-on: ubuntu-latest
@@ -125,9 +120,11 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           cache: npm

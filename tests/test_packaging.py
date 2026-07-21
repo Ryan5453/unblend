@@ -1,78 +1,34 @@
-"""
-Packaging consistency checks.
-
-``requirements.txt`` is a hand-maintained mirror of ``[project].dependencies``
-in ``pyproject.toml`` (see the header in ``requirements.txt``): the former feeds
-the Cog image, the latter the PyPI package. These run fully offline.
-"""
+"""Offline packaging and Cog configuration consistency checks."""
 
 import json
 import re
-import sys
 from pathlib import Path
-
-import pytest
-
-if sys.version_info < (3, 11):
-    pytest.skip("tomllib requires Python 3.11+", allow_module_level=True)
-
-import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _normalize(requirement: str) -> str:
-    """
-    Strip all whitespace from a requirement string.
-
-    This keeps ordering and minor formatting differences between the two files
-    from registering as drift.
-
-    :param requirement: a single dependency specifier
-    :return: the specifier with all whitespace removed
-    """
-    return "".join(requirement.split())
+_COG_EXPORT_COMMAND = (
+    "uv export --locked --no-dev --no-hashes --no-emit-project "
+    "--format requirements-txt"
+)
 
 
-def _read_requirements_txt() -> set[str]:
-    """
-    Read and normalize the dependency specifiers from ``requirements.txt``.
+def test_cog_uses_fully_locked_uv_export() -> None:
+    """Cog installs the checked-in, fully pinned export of ``uv.lock``."""
+    cog = (ROOT / "cog.yaml").read_text()
+    assert 'python_requirements: "requirements-cog.txt"' in cog
+    assert not (ROOT / "requirements.txt").exists()
 
-    :return: the set of normalized specifiers, with comments and blanks dropped
-    """
-    reqs: set[str] = set()
-    for raw in (ROOT / "requirements.txt").read_text().splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if line:
-            reqs.add(_normalize(line))
-    return reqs
-
-
-def _read_pyproject_dependencies() -> set[str]:
-    """
-    Read and normalize ``[project].dependencies`` from ``pyproject.toml``.
-
-    :return: the set of normalized dependency specifiers
-    """
-    with open(ROOT / "pyproject.toml", "rb") as f:
-        data = tomllib.load(f)
-    return {_normalize(dep) for dep in data["project"]["dependencies"]}
-
-
-def test_requirements_txt_matches_pyproject_dependencies() -> None:
-    """
-    requirements.txt must mirror pyproject's [project].dependencies exactly.
-
-    Guards against the two drifting so the Cog image and the PyPI package always
-    install the same dependency set.
-    """
-    txt = _read_requirements_txt()
-    pyproject = _read_pyproject_dependencies()
-    assert txt == pyproject, (
-        "requirements.txt and pyproject [project].dependencies have drifted.\n"
-        f"Only in requirements.txt: {sorted(txt - pyproject)}\n"
-        f"Only in pyproject.toml:   {sorted(pyproject - txt)}"
-    )
+    exported = (ROOT / "requirements-cog.txt").read_text()
+    assert _COG_EXPORT_COMMAND in exported
+    requirement_lines = [
+        line.strip()
+        for line in exported.splitlines()
+        if line and not line[0].isspace() and not line.startswith("#")
+    ]
+    assert requirement_lines
+    assert all("==" in line for line in requirement_lines)
+    assert not any(line.startswith(("-e ", ".", "/")) for line in requirement_lines)
 
 
 def test_cog_model_url_matches_metadata() -> None:

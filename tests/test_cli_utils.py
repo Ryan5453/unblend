@@ -34,6 +34,16 @@ def test_format_output_path_substitutes_variables() -> None:
     assert out == Path("htdemucs/My Song/vocals.wav")
 
 
+def test_format_output_path_dot_components_keep_full_filename() -> None:
+    """Legal names whose stripped stem is '.'/'..' cannot escape a template."""
+    assert format_output_path(
+        "out/{track}/{stem}.{ext}", "m", Path("...wav"), "vocals", "wav"
+    ) == Path("out/...wav/vocals.wav")
+    assert format_output_path(
+        "out/{track}/{stem}.{ext}", "m", Path("..wav"), "vocals", "wav"
+    ) == Path("out/..wav/vocals.wav")
+
+
 def test_looks_like_audio_file_extension_check() -> None:
     """
     The heuristic matches known audio extensions case-insensitively.

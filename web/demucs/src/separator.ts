@@ -5,70 +5,66 @@ import {
     type ModelConfig,
     type ModelType,
 } from './constants.js';
+import { MODEL_ARTIFACTS } from './model-artifacts.js';
 import { OnnxClient } from './onnx-client.js';
 import { STFTClient } from './stft-client.js';
 import { ISTFTClient } from './istft-client.js';
 import {
     runPipeline,
+    validateSeparationOptions,
     type SeparationOptions,
     type SeparationResult,
 } from './pipeline.js';
 
 export type ModelPrecision = 'fp32' | 'fp16';
 
-const MODEL_URLS: Record<ModelType, Record<ModelPrecision, string>> = {
-    'htdemucs': {
-        fp32: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_fp32.onnx',
-        fp16: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_fp16.onnx',
-    },
-    'htdemucs_6s': {
-        fp32: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_6s_fp32.onnx',
-        fp16: 'https://huggingface.co/Ryan5453/demucs-next/resolve/main/htdemucs_6s_fp16.onnx',
-    },
-    // RoFormer weights are CC-BY-NC-SA-4.0 (non-commercial) — surfaced on
-    // Separator.license; see MODEL_CONFIGS in constants.ts.
-    'bs_roformer_sw': {
-        fp32: 'https://huggingface.co/Ryan5453/unblend/resolve/main/bs_roformer_sw_fp32.onnx',
-        fp16: 'https://huggingface.co/Ryan5453/unblend/resolve/main/bs_roformer_sw_fp16.onnx',
-    },
-    'melband_roformer_kim': {
-        fp32: 'https://huggingface.co/Ryan5453/unblend/resolve/main/melband_roformer_kim_fp32.onnx',
-        fp16: 'https://huggingface.co/Ryan5453/unblend/resolve/main/melband_roformer_kim_fp16.onnx',
-    },
-};
-
 export interface LoadModelOptions {
     /** Defaults to 'webgpu', falling back to 'wasm' if unavailable. */
     backend?: 'webgpu' | 'wasm';
     /**
-     * Model weight precision. ``'fp16'`` loads a weight-only-fp16 variant of
-     * the model: every Conv/MatMul/Gemm/ConvTranspose weight is stored as
-     * fp16 on disk, with a Cast(fp16->fp32) node inserted right after each
-     * weight so compute still runs in full fp32 (ORT folds the constant Cast
-     * at session-create, no runtime cost). The download is roughly half the
-     * size of the fp32 model. Output is near-identical to fp32 (the weights
-     * themselves are rounded to fp16, so it is not bit-exact, but compute still
-     * runs in fp32 so the difference is well below the audible floor). Defaults
-     * to ``'fp32'``.
-     *
-     * Note: this is NOT real fp16 compute. ORT-WASM doesn't accumulate fp16
-     * GEMMs in fp32 the way CUDA/MPS do, so a true fp16 graph produced
-     * audible 8-bit-style quantization noise. Weight-only fp16 sidesteps
-     * that entirely. The label is kept as ``'fp16'`` because that's what
-     * users will recognize from CUDA/MPS — it just means "smaller model" in
-     * the browser context.
+     * Model weight precision. ``'fp16'`` is weight-only storage: selected
+     * initializers are stored in fp16 and cast to fp32 before their consumers,
+     * while compute, activations, and IO remain fp32.
      */
     precision?: ModelPrecision;
     /** Override ORT's .wasm asset URL prefix; defaults to bundler-resolved. */
     wasmPaths?: string;
     /** WASM thread count; defaults to 4. */
     numThreads?: number;
+    /** Abort model probing/loading and terminate every worker already created. */
+    signal?: AbortSignal;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+    return signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw abortReason(signal);
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(abortReason(signal));
+    return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const finish = (callback: () => void) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            callback();
+        };
+        const onAbort = () => finish(() => reject(abortReason(signal)));
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(
+            value => finish(() => resolve(value)),
+            error => finish(() => reject(error)),
+        );
+    });
 }
 
 async function isWebGPUAvailable(): Promise<boolean> {
-    if (!navigator.gpu) {
-        return false;
-    }
+    if (!navigator.gpu) return false;
     try {
         const adapter = await navigator.gpu.requestAdapter();
         return adapter !== null;
@@ -82,11 +78,7 @@ export class Separator {
     readonly sources: string[];
     readonly backend: 'webgpu' | 'wasm';
     readonly precision: ModelPrecision;
-    /**
-     * License of the model weights. HTDemucs weights carry no license grant
-     * (``'unlicensed'``); the RoFormer checkpoints are CC-BY-NC-SA-4.0
-     * (non-commercial). Surface this in your app where appropriate.
-     */
+    /** License of the model weights. */
     readonly license: string;
 
     private readonly config: ModelConfig;
@@ -94,6 +86,7 @@ export class Separator {
     private readonly stft: STFTClient;
     private readonly istft: ISTFTClient;
     private disposed = false;
+    private active = false;
 
     private constructor(
         model: ModelType,
@@ -115,154 +108,163 @@ export class Separator {
         this.istft = istft;
     }
 
-    /**
-     * Load a model and return a ready-to-use Separator. Each instance owns
-     * its own three workers (STFT, iSTFT, ONNX); call load() more than once
-     * to run multiple models in parallel.
-     */
+    /** Load a model and return a ready-to-use Separator. */
     static async load(
         model: ModelType,
         options: LoadModelOptions = {}
     ): Promise<Separator> {
+        // This check intentionally precedes model validation and worker creation.
+        throwIfAborted(options.signal);
+
         const preferredBackend = options.backend ?? 'webgpu';
-        // JS callers can pass anything; fail loudly like unknown
-        // model/precision do instead of silently coercing to wasm.
         if (preferredBackend !== 'webgpu' && preferredBackend !== 'wasm') {
             throw new Error(
                 `Unknown backend '${preferredBackend}'. Valid backends: webgpu, wasm.`
             );
         }
-        // Only probe WebGPU when it could actually be used; skip the adapter
-        // request entirely if the caller explicitly asked for 'wasm'.
-        let backend: 'webgpu' | 'wasm' =
-            preferredBackend === 'webgpu' && (await isWebGPUAvailable())
-                ? 'webgpu'
-                : 'wasm';
         const precision: ModelPrecision = options.precision ?? 'fp32';
-        const modelUrls = MODEL_URLS[model];
-        if (!modelUrls) {
+        const modelArtifacts = MODEL_ARTIFACTS[model];
+        if (!modelArtifacts) {
             throw new Error(
-                `Unknown model '${model}'. Valid models: ` +
-                `${Object.keys(MODEL_URLS).join(', ')}.`
+                `Unknown model '${model}'. Valid models: ${Object.keys(MODEL_ARTIFACTS).join(', ')}.`
             );
         }
-        const modelUrl = modelUrls[precision];
-        if (!modelUrl) {
+        const artifact = modelArtifacts[precision];
+        if (!artifact) {
             throw new Error(
-                `Unknown precision '${precision}'. Valid precisions: ` +
-                `${Object.keys(modelUrls).join(', ')}.`
+                `Unknown precision '${precision}'. Valid precisions: ${Object.keys(modelArtifacts).join(', ')}.`
             );
         }
 
-        let onnx = new OnnxClient();
-        const workerOptions = {
-            wasmPaths: options.wasmPaths,
-            numThreads: options.numThreads,
-        };
-
-        try {
-            await onnx.load(modelUrl, backend, workerOptions);
-        } catch (err) {
-            // WebGPU can be available but fail at session create (driver bugs,
-            // unsupported ops); transparently fall back to WASM. The WebGPU
-            // worker may be left in an indeterminate state, so tear it down and
-            // retry on a fresh worker rather than reusing it.
-            if (backend === 'webgpu') {
-                onnx.terminate();
-                backend = 'wasm';
-                onnx = new OnnxClient();
-                try {
-                    await onnx.load(modelUrl, backend, workerOptions);
-                } catch (wasmErr) {
-                    onnx.terminate();
-                    throw wasmErr;
-                }
-            } else {
-                onnx.terminate();
-                throw err;
-            }
-        }
-
-        // The STFT/iSTFT clients spin up their own workers in their
-        // constructors, and ``new Worker(...)`` can throw synchronously (e.g.
-        // CSP blocks worker creation). If that happens, the onnx worker is
-        // already loaded — tear it down (and any stft client we did manage to
-        // create) before rethrowing so we don't leak a live worker.
-        const config = MODEL_CONFIGS[model];
+        let onnx: OnnxClient | null = null;
         let stft: STFTClient | null = null;
         let istft: ISTFTClient | null = null;
+        const cleanup = (reason?: unknown) => {
+            onnx?.terminate(reason);
+            stft?.terminate(reason);
+            istft?.terminate(reason);
+        };
+        const onAbort = () => cleanup(abortReason(options.signal!));
+        options.signal?.addEventListener('abort', onAbort, { once: true });
+
         try {
+            let backend: 'webgpu' | 'wasm' = preferredBackend === 'webgpu'
+                && await awaitWithSignal(isWebGPUAvailable(), options.signal)
+                ? 'webgpu'
+                : 'wasm';
+            throwIfAborted(options.signal);
+
+            onnx = new OnnxClient();
+            const workerOptions = {
+                wasmPaths: options.wasmPaths,
+                numThreads: options.numThreads,
+            };
+            try {
+                await awaitWithSignal(onnx.load(artifact.url, backend, workerOptions), options.signal);
+            } catch (error) {
+                // Never reinterpret an abort as a WebGPU failure/fallback.
+                throwIfAborted(options.signal);
+                if (backend !== 'webgpu') throw error;
+                onnx.terminate(error);
+                backend = 'wasm';
+                onnx = new OnnxClient();
+                await awaitWithSignal(onnx.load(artifact.url, backend, workerOptions), options.signal);
+            }
+            throwIfAborted(options.signal);
+
+            const config = MODEL_CONFIGS[model];
             stft = new STFTClient();
             istft = new ISTFTClient();
-            // Install the model's DSP geometry (FFT size, hop, segment) in
-            // both workers before any processing.
-            await Promise.all([
+            await awaitWithSignal(Promise.all([
                 stft.configure(dspConfig(config)),
                 istft.configure(dspConfig(config)),
-            ]);
-        } catch (err) {
-            onnx.terminate();
-            stft?.terminate();
-            istft?.terminate();
-            throw err;
+            ]), options.signal);
+            throwIfAborted(options.signal);
+
+            return new Separator(model, config, backend, precision, onnx, stft, istft);
+        } catch (error) {
+            cleanup(error);
+            throw error;
+        } finally {
+            options.signal?.removeEventListener('abort', onAbort);
         }
-        // Both are non-null here: the try block either assigns both or rethrows.
-        return new Separator(
-            model, config, backend, precision, onnx, stft!, istft!
-        );
     }
 
     /**
-     * Separate ``audioBuffer`` (44.1kHz, 1 or 2 channels) into stems. Safe to
-     * call repeatedly; not safe to call concurrently on the same instance.
+     * Separate one 44.1kHz AudioBuffer. Calls on one instance are sequential.
+     * Abort or any worker-backed failure invalidates this instance permanently.
      */
     async separate(
         audioBuffer: AudioBuffer,
         options: SeparationOptions = {}
     ): Promise<SeparationResult> {
-        if (this.disposed) {
-            throw new Error('Separator has been unloaded');
-        }
-        // The ONNX graph is traced at 44.1kHz; feeding another rate would
-        // silently produce pitch/tempo-wrong stems rather than erroring.
+        if (this.disposed) throw new Error('Separator has been unloaded');
+        if (this.active) throw new Error('Separation already in progress');
         if (audioBuffer.sampleRate !== SAMPLE_RATE) {
             throw new Error(
-                `Separator expects ${SAMPLE_RATE} Hz audio, got ` +
-                `${audioBuffer.sampleRate} Hz. Resample the AudioBuffer to ` +
-                `${SAMPLE_RATE} Hz before calling separate().`
+                `Separator expects ${SAMPLE_RATE} Hz audio, got ${audioBuffer.sampleRate} Hz. `
+                + `Resample the AudioBuffer to ${SAMPLE_RATE} Hz before calling separate().`
             );
         }
-        if (audioBuffer.length === 0) {
-            throw new Error('audioBuffer is empty (0 samples).');
+        if (audioBuffer.length === 0) throw new Error('audioBuffer is empty (0 samples).');
+        validateSeparationOptions(options);
+        throwIfAborted(options.signal);
+
+        this.active = true;
+        const onAbort = () => this.hardInvalidate(abortReason(options.signal!));
+        options.signal?.addEventListener('abort', onAbort, { once: true });
+        try {
+            const result = await runPipeline(
+                { onnx: this.onnx, stft: this.stft, istft: this.istft },
+                audioBuffer,
+                this.config,
+                options,
+            );
+            throwIfAborted(options.signal);
+            return result;
+        } catch (error) {
+            this.hardInvalidate(options.signal?.aborted ? abortReason(options.signal) : error);
+            throw options.signal?.aborted ? abortReason(options.signal) : error;
+        } finally {
+            options.signal?.removeEventListener('abort', onAbort);
+            this.active = false;
         }
-        return runPipeline(
-            { onnx: this.onnx, stft: this.stft, istft: this.istft },
-            audioBuffer,
-            this.config,
-            options
-        );
     }
 
-    /**
-     * Release model resources and tear down all three workers. The instance
-     * cannot be used after this returns.
-     */
+    /** Release resources. Active work is cancelled destructively. */
     async unload(): Promise<void> {
         if (this.disposed) return;
-        this.disposed = true;
+        if (this.active) {
+            this.hardInvalidate(new Error('Separator unloaded during active separation'));
+            return;
+        }
 
+        this.disposed = true;
+        let timer: ReturnType<typeof setTimeout> | undefined;
         try {
-            // Bound the graceful release so a wedged worker can't hang unload()
-            // forever; terminate() below frees it either way.
             await Promise.race([
                 this.onnx.unload(),
-                new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+                new Promise<void>(resolve => {
+                    timer = setTimeout(resolve, 2000);
+                }),
             ]);
         } catch {
-            // Worker may already be in a bad state; terminate regardless.
+            // The worker may already be unhealthy; termination below is final.
+        } finally {
+            if (timer !== undefined) clearTimeout(timer);
+            this.terminateWorkers();
         }
-        this.onnx.terminate();
-        this.stft.terminate();
-        this.istft.terminate();
+    }
+
+    private hardInvalidate(reason: unknown): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        this.terminateWorkers(reason);
+    }
+
+    private terminateWorkers(reason?: unknown): void {
+        this.onnx.terminate(reason);
+        this.stft.terminate(reason);
+        this.istft.terminate(reason);
     }
 }

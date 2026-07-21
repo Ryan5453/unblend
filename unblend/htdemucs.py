@@ -455,7 +455,10 @@ class HTDemucs(nn.Module):
         :return: Training length for consistent segment processing
         :raises ValidationError: If length exceeds the training length
         """
-        training_length = int(self.max_allowed_segment * self.samplerate)
+        # Keep the training-length contract identical to apply.py's chunk
+        # conversion. A fractional product that rounds up must not create a
+        # chunk one sample longer than this validator accepts.
+        training_length = int(round(self.max_allowed_segment * self.samplerate))
         if training_length < length:
             raise ValidationError(
                 f"Given length {length} is longer than "

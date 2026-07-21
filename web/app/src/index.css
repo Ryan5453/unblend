@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap');
 @import "tailwindcss";
 
 @theme {
@@ -208,10 +208,13 @@ canvas {
 }
 
 .drop-caption .t {
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: .28em;
-  text-transform: uppercase;
+  font-family: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+  font-size: 38px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.05;
+  text-transform: none;
+  color: var(--ink);
 }
 
 .drop-caption .s {
@@ -222,20 +225,22 @@ canvas {
 }
 
 .drop-caption .or {
-  margin-top: 20px;
-  font-size: 9px;
-  letter-spacing: .18em;
+  margin-top: 12px;
+  font-family: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+  font-size: 21px;
+  letter-spacing: 0;
   color: var(--dim);
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .u {
+  font-family: 'Instrument Serif', Georgia, 'Times New Roman', serif;
   color: var(--acc);
-  font-size: 9px;
-  letter-spacing: .18em;
+  font-size: 21px;
+  letter-spacing: 0;
   padding: 0;
   border-bottom: 1px solid transparent;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .u:hover {
@@ -316,6 +321,28 @@ canvas {
   font-size: 11px;
   letter-spacing: .06em;
   font-weight: 600;
+}
+
+.art {
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border: 1px solid var(--hair);
+  display: block;
+  flex: none;
+}
+
+.tmeta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tartist {
+  font-size: 9px;
+  letter-spacing: .1em;
+  color: var(--dim);
 }
 
 .dots {

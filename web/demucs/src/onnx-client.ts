@@ -50,7 +50,6 @@ interface UnloadResponse {
 }
 
 type WorkerResponse = LoadResponse | RunResponse | UnloadResponse;
-// The caller supplies everything but the requestId; send() assigns it.
 type OutgoingMessage =
     | Omit<LoadModelMessage, 'requestId'>
     | Omit<RunInferenceMessage, 'requestId'>
@@ -65,12 +64,18 @@ export interface InferenceResult {
     outWaveShape?: number[];
 }
 
+function asError(reason: unknown, fallback: string): Error {
+    if (reason instanceof Error) return reason;
+    return new Error(reason === undefined ? fallback : String(reason));
+}
+
 export class OnnxClient {
     private worker: Worker;
     private pendingResolve: ((value: WorkerResponse) => void) | null = null;
     private pendingReject: ((reason?: unknown) => void) | null = null;
     private requestCounter = 0;
     private pendingId = -1;
+    private terminated = false;
 
     constructor() {
         this.worker = new Worker(
@@ -79,25 +84,20 @@ export class OnnxClient {
         );
 
         this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-            // Ignore late replies from a superseded request: a reused worker may
-            // still post the result of an aborted run after the next request has
-            // installed a new pending promise. Matching on requestId prevents
-            // resolving the new request with the old run's stale payload.
-            if (event.data.requestId !== this.pendingId) return;
+            if (this.terminated || event.data.requestId !== this.pendingId) return;
             const resolve = this.pendingResolve;
-            this.pendingResolve = null;
-            this.pendingReject = null;
+            this.clearPending();
             resolve?.(event.data);
         };
 
         this.worker.onerror = (error) => {
             console.error('[onnx-worker] error:', error);
-            this.failPending(error.message || 'ONNX worker failed');
+            this.terminate(error.message || 'ONNX worker failed');
         };
 
         this.worker.onmessageerror = (event) => {
             console.error('[onnx-worker] message error:', event);
-            this.failPending('ONNX worker message deserialization failed');
+            this.terminate('ONNX worker message deserialization failed');
         };
     }
 
@@ -126,13 +126,9 @@ export class OnnxClient {
         audio?: Float32Array,
         audioShape?: number[]
     ): Promise<InferenceResult> {
-        // Transfer the spectrogram buffers instead of structured-cloning them
-        // every segment (they're multi-MB). The caller (pipeline) never reads
-        // specReal/specImag again after handing them off, so detaching them
-        // here is safe. ``audio`` is deliberately NOT transferred: it's one of
-        // the pipeline's two reused double-buffers, and transferring it would
-        // detach the buffer the next segment writes into. RoFormer models take
-        // no audio input; the worker feeds only the spectrogram pair.
+        // The spectrogram buffers are no longer read by the pipeline, so
+        // transfer ownership instead of cloning their multi-megabyte payloads.
+        // ``audio`` remains one of the pipeline's reusable double-buffers.
         const response = (await this.send({
             type: 'run',
             specReal,
@@ -159,37 +155,50 @@ export class OnnxClient {
         await this.send({ type: 'unload' });
     }
 
-    terminate(): void {
-        this.failPending('ONNX worker terminated');
+    terminate(reason?: unknown): void {
+        if (this.terminated) return;
+        this.terminated = true;
+        this.rejectPending(asError(reason, 'ONNX worker terminated'));
+        this.worker.onmessage = null;
+        this.worker.onerror = null;
+        this.worker.onmessageerror = null;
         this.worker.terminate();
     }
 
-    private failPending(message: string): void {
-        const reject = this.pendingReject;
+    private clearPending(): void {
         this.pendingResolve = null;
         this.pendingReject = null;
-        reject?.(new Error(message));
+        this.pendingId = -1;
+    }
+
+    private rejectPending(reason: unknown): void {
+        const reject = this.pendingReject;
+        this.clearPending();
+        reject?.(reason);
     }
 
     private send(
         message: OutgoingMessage,
         transfer: Transferable[] = []
     ): Promise<WorkerResponse> {
-        // Single in-flight request by contract: the pipeline awaits each
-        // response before issuing the next, so this failPending is normally a
-        // no-op. Its real job is recovery: a Separator reuses its workers
-        // across separate() calls, so if one run throws mid-pipeline it can
-        // leave a never-awaited pending here — clearing it lets the next run
-        // start clean instead of resolving against the stale promise. The
-        // requestId on the posted message lets onmessage discard any late reply
-        // from that aborted run.
-        this.failPending('Superseded by a new ONNX request');
+        if (this.terminated) {
+            return Promise.reject(new Error('ONNX worker has been terminated'));
+        }
+        if (this.pendingReject !== null) {
+            return Promise.reject(new Error('ONNX worker request already in progress'));
+        }
+
         const requestId = ++this.requestCounter;
         this.pendingId = requestId;
         return new Promise((resolve, reject) => {
             this.pendingResolve = resolve;
             this.pendingReject = reject;
-            this.worker.postMessage({ ...message, requestId }, transfer);
+            try {
+                this.worker.postMessage({ ...message, requestId }, transfer);
+            } catch (error) {
+                if (this.pendingId === requestId) this.clearPending();
+                reject(error);
+            }
         });
     }
 }

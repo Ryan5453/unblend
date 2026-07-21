@@ -33,7 +33,8 @@ dependencies = [
     # Imported directly by the CLI, not just via typer.
     "click>=8.1.0",
     "rich>=13.8.0",
-    "httpx>=0.28.1"
+    "httpx>=0.28.1",
+    "filelock>=3.20.0"
 ]
 
 [project.urls]
@@ -50,6 +51,11 @@ onnx = [
   "onnx>=1.22.0",
   # Required by the dynamo ONNX exporter (RoFormer export path).
   "onnxscript>=0.2.0",
+]
+
+[dependency-groups]
+onnx-test = [
+  "onnxruntime==1.24.4; python_version >= '3.11'",
 ]
 
 [build-system]
