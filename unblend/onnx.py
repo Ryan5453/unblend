@@ -397,6 +397,11 @@ def _materialize_nonlast_broadcast_muls(onnx_model: "onnx.ModelProto") -> int:
         ``Concat`` over (with a statically-known copy count). Fires only when
         the operands share rank, broadcast on at least one non-last axis with a
         known extent, and exactly one operand is the "small" (size-1) side.
+
+        :param a: Name of the first ``Mul`` operand.
+        :param b: Name of the second ``Mul`` operand.
+        :return: ``(small_operand, [(axis, copies), ...])``, or ``None`` if the
+            ``Mul`` should be left alone.
         """
         da, db = dims.get(a), dims.get(b)
         if not da or not db or len(da) != len(db):

@@ -207,9 +207,14 @@ async function extractMetadataWithFFmpeg(
 async function decodeWithFFmpeg(
     arrayBuffer: ArrayBuffer,
     fileName: string,
-    targetSampleRate: number
+    targetSampleRate: number,
+    onStatus?: (status: string) => void
 ): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
     debug('Loading ffmpeg.wasm for decoding...');
+    // The ffmpeg-core.wasm binary (~30MB) is fetched from a CDN here, on top
+    // of the audio decode itself — worth its own status line since it's the
+    // slowest, least predictable step in this fallback path.
+    onStatus?.('Loading fallback decoder (ffmpeg.wasm)...');
     const ffmpeg = await loadFFmpeg();
 
     const inputName = 'input' + getExtension(fileName);
@@ -391,13 +396,15 @@ async function decodeWithMediabunny(
  */
 export async function decodeAudioFile(
     file: File,
-    audioContext: AudioContext
+    audioContext: AudioContext,
+    onStatus?: (status: string) => void
 ): Promise<DecodeResult> {
     const arrayBuffer = await file.arrayBuffer();
 
     // Tier 1: Try Mediabunny first (handles most formats via WebCodecs)
     try {
         debug('Attempting to decode with Mediabunny...');
+        onStatus?.('Decoding audio...');
         const { buffer, artwork, title, artist } = await decodeWithMediabunny(arrayBuffer, audioContext.sampleRate, audioContext);
         debug('Successfully decoded with Mediabunny');
         return { buffer, artwork, title, artist, usedFallback: 'mediabunny' };
@@ -408,7 +415,7 @@ export async function decodeAudioFile(
     // Tier 2: Try ffmpeg.wasm (handles exotic codecs like ALAC, WMA, etc)
     try {
         debug('Attempting to decode with ffmpeg.wasm...');
-        const { buffer, artwork, title, artist } = await decodeWithFFmpeg(arrayBuffer, file.name, audioContext.sampleRate);
+        const { buffer, artwork, title, artist } = await decodeWithFFmpeg(arrayBuffer, file.name, audioContext.sampleRate, onStatus);
         debug('Successfully decoded with ffmpeg.wasm');
         return { buffer, artwork, title, artist, usedFallback: 'ffmpeg' };
     } catch (ffmpegError) {

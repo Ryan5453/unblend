@@ -50,11 +50,29 @@ interface UnloadResponse {
     success: boolean;
 }
 
+interface ProgressMessage {
+    type: 'progress';
+    requestId: number;
+    phase: 'download' | 'compile';
+    loaded: number;
+    total: number;
+}
+
 type WorkerResponse = LoadResponse | RunResponse | UnloadResponse;
+type IncomingMessage = WorkerResponse | ProgressMessage;
 type OutgoingMessage =
     | Omit<LoadModelMessage, 'requestId'>
     | Omit<RunInferenceMessage, 'requestId'>
     | Omit<UnloadMessage, 'requestId'>;
+
+/** Reported during `load()`: real byte progress while downloading, then a
+ *  single 'compile' call once ORT starts parsing/initializing the session
+ *  (which has no progress signal of its own). */
+export type LoadProgressCallback = (
+    phase: 'download' | 'compile',
+    loaded: number,
+    total: number
+) => void;
 
 export interface InferenceResult {
     outSpecReal: Float32Array;
@@ -76,6 +94,7 @@ export class OnnxClient {
     private pendingReject: ((reason?: unknown) => void) | null = null;
     private requestCounter = 0;
     private pendingId = -1;
+    private pendingProgress: ((msg: ProgressMessage) => void) | null = null;
     private terminated = false;
 
     constructor() {
@@ -84,8 +103,12 @@ export class OnnxClient {
             { type: 'module' }
         );
 
-        this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+        this.worker.onmessage = (event: MessageEvent<IncomingMessage>) => {
             if (this.terminated || event.data.requestId !== this.pendingId) return;
+            if (event.data.type === 'progress') {
+                this.pendingProgress?.(event.data);
+                return;
+            }
             const resolve = this.pendingResolve;
             this.clearPending();
             resolve?.(event.data);
@@ -109,16 +132,21 @@ export class OnnxClient {
             wasmPaths?: string;
             numThreads?: number;
             graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
-        } = {}
+        } = {},
+        onProgress?: LoadProgressCallback
     ): Promise<void> {
-        const response = (await this.send({
-            type: 'load',
-            modelUrl,
-            backend,
-            wasmPaths: options.wasmPaths,
-            numThreads: options.numThreads,
-            graphOptimizationLevel: options.graphOptimizationLevel,
-        })) as LoadResponse;
+        const response = (await this.send(
+            {
+                type: 'load',
+                modelUrl,
+                backend,
+                wasmPaths: options.wasmPaths,
+                numThreads: options.numThreads,
+                graphOptimizationLevel: options.graphOptimizationLevel,
+            },
+            [],
+            onProgress && (msg => onProgress(msg.phase, msg.loaded, msg.total))
+        )) as LoadResponse;
 
         if (!response.success) {
             throw new Error(response.error || 'Model load failed');
@@ -175,6 +203,7 @@ export class OnnxClient {
         this.pendingResolve = null;
         this.pendingReject = null;
         this.pendingId = -1;
+        this.pendingProgress = null;
     }
 
     private rejectPending(reason: unknown): void {
@@ -185,7 +214,8 @@ export class OnnxClient {
 
     private send(
         message: OutgoingMessage,
-        transfer: Transferable[] = []
+        transfer: Transferable[] = [],
+        onProgress?: (msg: ProgressMessage) => void
     ): Promise<WorkerResponse> {
         if (this.terminated) {
             return Promise.reject(new Error('ONNX worker has been terminated'));
@@ -196,6 +226,7 @@ export class OnnxClient {
 
         const requestId = ++this.requestCounter;
         this.pendingId = requestId;
+        this.pendingProgress = onProgress ?? null;
         return new Promise((resolve, reject) => {
             this.pendingResolve = resolve;
             this.pendingReject = reject;

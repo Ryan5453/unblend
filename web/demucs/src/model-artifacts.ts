@@ -14,10 +14,12 @@ export interface ModelArtifact {
 /**
  * Browser model artifacts published at one immutable Hugging Face revision.
  *
- * The browser passes these URLs directly to ONNX Runtime so it does not retain
- * a second 60-950 MB ArrayBuffer merely to hash it. The checked-in size/digest
- * contract is instead verified by `npm run verify:model-artifacts` before a
- * release.
+ * The onnx worker fetches these URLs itself (rather than handing them to
+ * `InferenceSession.create` directly) so it can report real download
+ * progress; this briefly doubles peak memory (fetched buffer + ORT's parsed
+ * copy) instead of ORT streaming the file on its own. The checked-in
+ * size/digest contract is verified by `npm run verify:model-artifacts` before
+ * a release, not by hashing the buffer at load time.
  */
 export const MODEL_ARTIFACTS: Record<
     ModelType,

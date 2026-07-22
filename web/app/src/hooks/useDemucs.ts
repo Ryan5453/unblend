@@ -117,8 +117,9 @@ export function useDemucs() {
             }
             if (!mountedRef.current) return false;
 
-            setState(prev => ({ ...prev, modelLoading: true, modelLoaded: false }));
+            setState(prev => ({ ...prev, modelLoading: true, modelLoaded: false, progress: 0 }));
             addLog(`Loading ${model} (${precision})...`, 'info');
+            setStatus('Connecting...');
             const start = performance.now();
 
             const separator = await Separator.load(model, {
@@ -126,6 +127,22 @@ export function useDemucs() {
                 precision,
                 wasmPaths: ORT_WASM_PATHS,
                 signal: controller.signal,
+                onProgress: (phase, loaded, total) => {
+                    if (!mountedRef.current) return;
+                    if (phase === 'download') {
+                        setStatus('Downloading model...');
+                        if (total > 0) {
+                            setProgress(Math.round((loaded / total) * 100));
+                        }
+                    } else {
+                        // Covers ORT's own wasm-runtime fetch/init plus graph
+                        // compilation — none of which report progress. By now
+                        // the download is fully counted, so there's only a
+                        // small, mostly-closed gap left to crawl.
+                        setStatus('Initializing ONNX runtime...');
+                        setProgress(100);
+                    }
+                },
             });
             if (!mountedRef.current || controller.signal.aborted) {
                 await separator.unload();
@@ -164,7 +181,7 @@ export function useDemucs() {
                 modelLoadInFlightRef.current = false;
             }
         }
-    }, [addLog]);
+    }, [addLog, setStatus, setProgress]);
 
     const clearAudioError = useCallback(() => {
         setAudioError(null);
@@ -222,7 +239,11 @@ export function useDemucs() {
             addLog(`Loading audio: ${file.name}`, 'info');
             const ctx = getAudioContext();
 
-            const { buffer: audioBuffer, artwork, title, artist, usedFallback } = await decodeAudioFile(file, ctx);
+            const { buffer: audioBuffer, artwork, title, artist, usedFallback } = await decodeAudioFile(
+                file,
+                ctx,
+                s => { if (mountedRef.current) setStatus(s); }
+            );
             if (!mountedRef.current) {
                 if (artwork) URL.revokeObjectURL(artwork);
                 return false;
@@ -273,7 +294,7 @@ export function useDemucs() {
         } finally {
             loadAudioInFlightRef.current = false;
         }
-    }, [addLog, getAudioContext]);
+    }, [addLog, getAudioContext, setStatus]);
 
     const separateAudio = useCallback(async (): Promise<boolean> => {
         const separator = separatorRef.current;

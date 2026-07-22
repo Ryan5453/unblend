@@ -10,6 +10,57 @@ import * as onnx from 'onnxruntime-web';
 
 let session: onnx.InferenceSession | null = null;
 
+/**
+ * Fetch the model with incremental progress. This trades the previous
+ * URL-based load (ORT streams the file itself, never holding a second
+ * full-size buffer in JS) for real download progress: the bytes are held
+ * here as one contiguous buffer so `InferenceSession.create` can report
+ * something better than a stalled bar for the ~100ms-950MB fetch. Peak
+ * memory is briefly ~2x model size (this buffer + ORT's parsed copy).
+ */
+async function fetchModelBytes(
+    url: string,
+    onProgress: (loaded: number, total: number) => void
+): Promise<Uint8Array> {
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+    }
+    const totalHeader = response.headers.get('Content-Length');
+    const total = totalHeader ? Number(totalHeader) : 0;
+
+    if (!response.body) {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        onProgress(bytes.byteLength, total || bytes.byteLength);
+        return bytes;
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let loaded = 0;
+    let lastReport = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.byteLength;
+        const now = performance.now();
+        if (now - lastReport >= 100) {
+            onProgress(loaded, total);
+            lastReport = now;
+        }
+    }
+    onProgress(loaded, total || loaded);
+
+    const bytes = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return bytes;
+}
+
 interface LoadMessage {
     type: 'load';
     requestId: number;
@@ -38,6 +89,14 @@ interface UnloadMessage {
 }
 
 type Message = LoadMessage | RunMessage | UnloadMessage;
+
+interface ProgressResponse {
+    type: 'progress';
+    requestId: number;
+    phase: 'download' | 'compile';
+    loaded: number;
+    total: number;
+}
 
 interface LoadResponse {
     type: 'load';
@@ -84,7 +143,26 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             }
             onnx.env.logLevel = 'warning';
 
-            session = await onnx.InferenceSession.create(msg.modelUrl, {
+            const modelBytes = await fetchModelBytes(msg.modelUrl, (loaded, total) => {
+                const progress: ProgressResponse = {
+                    type: 'progress',
+                    requestId: msg.requestId,
+                    phase: 'download',
+                    loaded,
+                    total,
+                };
+                self.postMessage(progress);
+            });
+            const compiling: ProgressResponse = {
+                type: 'progress',
+                requestId: msg.requestId,
+                phase: 'compile',
+                loaded: 0,
+                total: 0,
+            };
+            self.postMessage(compiling);
+
+            session = await onnx.InferenceSession.create(modelBytes, {
                 executionProviders: [msg.backend],
                 graphOptimizationLevel: msg.graphOptimizationLevel ?? 'all',
             });

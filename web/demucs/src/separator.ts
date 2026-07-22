@@ -6,7 +6,7 @@ import {
     type ModelType,
 } from './constants.js';
 import { MODEL_ARTIFACTS } from './model-artifacts.js';
-import { OnnxClient } from './onnx-client.js';
+import { OnnxClient, type LoadProgressCallback } from './onnx-client.js';
 import { STFTClient } from './stft-client.js';
 import { ISTFTClient } from './istft-client.js';
 import {
@@ -47,6 +47,9 @@ export interface LoadModelOptions {
     graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
     /** Abort model probing/loading and terminate every worker already created. */
     signal?: AbortSignal;
+    /** Reports model download bytes, then a single 'compile' call while ORT
+     *  initializes the session (no progress signal exists for that step). */
+    onProgress?: LoadProgressCallback;
 }
 
 function abortReason(signal: AbortSignal): unknown {
@@ -176,7 +179,10 @@ export class Separator {
                 graphOptimizationLevel: options.graphOptimizationLevel,
             };
             try {
-                await awaitWithSignal(onnx.load(modelUrl, backend, workerOptions), options.signal);
+                await awaitWithSignal(
+                    onnx.load(modelUrl, backend, workerOptions, options.onProgress),
+                    options.signal
+                );
             } catch (error) {
                 // Never reinterpret an abort as a WebGPU failure/fallback.
                 throwIfAborted(options.signal);
@@ -184,7 +190,10 @@ export class Separator {
                 onnx.terminate(error);
                 backend = 'wasm';
                 onnx = new OnnxClient();
-                await awaitWithSignal(onnx.load(modelUrl, backend, workerOptions), options.signal);
+                await awaitWithSignal(
+                    onnx.load(modelUrl, backend, workerOptions, options.onProgress),
+                    options.signal
+                );
             }
             throwIfAborted(options.signal);
 

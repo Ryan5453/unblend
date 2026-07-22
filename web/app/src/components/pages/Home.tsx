@@ -44,6 +44,7 @@ interface Lane {
 export function Home() {
     const {
         modelLoaded,
+        modelLoading,
         separating,
         progress,
         status,
@@ -188,10 +189,13 @@ export function Home() {
         return () => cancelAnimationFrame(raf);
     }, [isPlaying, clockKey]);
 
-    // Drive the big processing counter. Model download has no granular
-    // progress, so that phase shows a slow decelerating crawl; separation then
-    // continues smoothly from wherever the crawl left off (anchored by
-    // sepBaseRef) up to 100 — no backward jumps, and it always lands on 100.
+    // Drive the big processing counter. Model download reports real byte
+    // progress, mapped across the entire 0-30 pre-separation window; the
+    // compile step after it has no progress signal of its own, but by then
+    // the download has already carried the number to (near) 30, so there's
+    // only a small gap left to crawl. Separation then continues smoothly
+    // from wherever that left off (anchored by sepBaseRef) up to 100 — no
+    // backward jumps, always lands on 100.
     useEffect(() => {
         if (phase !== 'processing') return;
         let raf = 0;
@@ -205,8 +209,13 @@ export function Home() {
                     if (sepBaseRef.current === null) sepBaseRef.current = prev;
                     const base = sepBaseRef.current;
                     target = base + (progress / 100) * (100 - base);
+                } else if (modelLoading && progress > 0) {
+                    target = (progress / 100) * 30;
+                    factor = 0.25;
                 } else {
-                    // Decode + model-load: indeterminate, decelerating crawl.
+                    // Audio decode, download-start latency, or an unknown
+                    // download size (no Content-Length): indeterminate,
+                    // decelerating crawl.
                     target = 30;
                     factor = 0.03;
                 }
@@ -218,7 +227,7 @@ export function Home() {
         };
         raf = requestAnimationFrame(loop);
         return () => cancelAnimationFrame(raf);
-    }, [phase, separating, progress, stemsReady]);
+    }, [phase, modelLoading, separating, progress, stemsReady]);
 
     // ---- transport ----------------------------------------------------
     const playAll = useCallback(async () => {
