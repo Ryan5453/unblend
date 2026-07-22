@@ -343,6 +343,196 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
     onnx_model.graph.node.extend(new_cast_nodes + original_nodes)
 
 
+def _materialize_nonlast_broadcast_muls(onnx_model: "onnx.ModelProto") -> int:
+    """
+    Replicate the size-1 operand of ``Mul`` nodes that broadcast on a non-last
+    axis, via ``Concat``, so ORT-web's WebGPU backend can run them.
+
+    ORT-web's WebGPU binary kernel vectorizes along the last axis; a ``Mul``
+    that broadcasts a size-1 dimension on an *earlier* axis (the RoFormer
+    mask-apply, ``[B, 1, F*C, T] * [B, stems, F*C, T]``, when the last dim is not
+    a multiple of 4) hits a broken code path and fails at session run with
+    "Can't perform binary op on the given tensors" — even though the broadcast
+    is valid and every other execution provider (WASM/CPU/CUDA) handles it.
+
+    The fix replicates the size-1 operand up to the full extent with ``Concat``
+    (``stems`` copies along the broadcast axis), turning the broadcast multiply
+    into an equal-shape one. We deliberately use ``Concat`` rather than
+    ``Expand``/``Tile``: WebGPU's ``Expand`` reuses the *same* broken
+    broadcastability check and fails identically, whereas ``Concat`` is a pure
+    copy with no broadcast logic. The transform is numerically identical.
+
+    Only non-last broadcast axes are materialized; a size-1 *last* axis (which
+    WebGPU vectorizes correctly, e.g. attention ``[N, H, T, D] * [N, H, T, 1]``)
+    is left for the ``Mul`` to broadcast. This is a no-op for graphs with no
+    such ``Mul`` — notably single-stem Mel-Band, whose mask-apply operands are
+    already equal-shape (``stems == 1``).
+
+    :param onnx_model: Loaded ONNX ``ModelProto``; modified in place.
+    :return: Number of ``Mul`` nodes rewritten.
+    """
+    from onnx import helper, shape_inference
+
+    inferred = shape_inference.infer_shapes(
+        onnx_model, strict_mode=False, data_prop=True
+    )
+    dims: dict[str, list[int | None]] = {}
+    for collection in (
+        inferred.graph.input,
+        inferred.graph.output,
+        inferred.graph.value_info,
+    ):
+        for value in collection:
+            shape = value.type.tensor_type.shape
+            dims[value.name] = [
+                d.dim_value if d.HasField("dim_value") else None for d in shape.dim
+            ]
+
+    def plan(a: str, b: str) -> tuple[str, list[tuple[int, int]]] | None:
+        """
+        Decide how to fix one ``Mul``, or return ``None`` to leave it alone.
+
+        Returns ``(small_operand, [(axis, copies), ...])`` where ``small`` is
+        the operand to replicate and the list gives the non-last axes to
+        ``Concat`` over (with a statically-known copy count). Fires only when
+        the operands share rank, broadcast on at least one non-last axis with a
+        known extent, and exactly one operand is the "small" (size-1) side.
+        """
+        da, db = dims.get(a), dims.get(b)
+        if not da or not db or len(da) != len(db):
+            return None
+        rank = len(da)
+        for k in range(rank):
+            if da[k] is None or db[k] is None or da[k] == db[k]:
+                continue
+            if 1 not in (da[k], db[k]):
+                return None  # genuinely incompatible on static dims; don't touch
+        a_small = all(
+            da[k] is None or db[k] is None or da[k] <= db[k] for k in range(rank)
+        )
+        b_small = all(
+            da[k] is None or db[k] is None or db[k] <= da[k] for k in range(rank)
+        )
+        if a_small and not b_small:
+            small, sd, fd = a, da, db
+        elif b_small and not a_small:
+            small, sd, fd = b, db, da
+        else:
+            return None  # ambiguous (mutual broadcast); leave for a human
+        axes = [
+            (k, fd[k])
+            for k in range(rank - 1)  # last axis stays a (WebGPU-safe) broadcast
+            if sd[k] == 1 and isinstance(fd[k], int) and fd[k] > 1
+        ]
+        return (small, axes) if axes else None
+
+    new_nodes = []
+    rewritten = 0
+    for node in onnx_model.graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2:
+            fix = plan(node.input[0], node.input[1])
+            if fix is not None:
+                small, axes = fix
+                current = small
+                for axis, copies in axes:
+                    out = f"unblend_wgpu_bcast_{rewritten}_ax{axis}"
+                    new_nodes.append(
+                        helper.make_node(
+                            "Concat",
+                            [current] * copies,
+                            [out],
+                            axis=axis,
+                            name=out,
+                        )
+                    )
+                    current = out
+                for i, name in enumerate(node.input):
+                    if name == small:
+                        node.input[i] = current
+                        break
+                rewritten += 1
+        new_nodes.append(node)
+
+    if rewritten:
+        onnx_model.graph.ClearField("node")
+        onnx_model.graph.node.extend(new_nodes)
+    return rewritten
+
+
+def _materialize_matmul_rank_mismatch(onnx_model: "onnx.ModelProto") -> int:
+    """
+    Pad a 2-D left operand of ``MatMul`` up to the right operand's rank when
+    the right operand has rank > 2, so ORT-web's WebGPU backend can run it.
+
+    ONNX/numpy ``MatMul`` broadcasting allows a plain 2-D matrix on either
+    side of a higher-rank batched operand (the missing leading axes are
+    implicitly treated as size 1). Mel-Band Roformer's mask-averaging step
+    (``torch.matmul(mel_averaging_matrix, mask)``, a 2-D constant times a
+    ``[B, stems, F, T]`` mask) uses the *2-D-as-first-operand* form of this —
+    a shape signature that appears nowhere else in the graph, where every
+    other MatMul instead has the 2-D operand *second* (``[.., F] @ [F, F]``,
+    the ordinary Linear-layer pattern, proven to work) or matches rank on
+    both sides (batched attention matmuls, also proven to work). ORT-web's
+    WebGPU kernel fails only on this rarer, reversed-operand-order shape with
+    "shared dimension does not match" even though the contracted dimension is
+    identical on both operands. Explicitly ``Unsqueeze``-ing the 2-D operand
+    with leading size-1 axes turns it into the same-rank batched-matmul shape
+    that already works elsewhere in this graph; the numeric result is
+    unchanged (an explicit size-1 axis broadcasts identically to an implicit
+    one).
+
+    :param onnx_model: Loaded ONNX ``ModelProto``; modified in place.
+    :return: Number of ``MatMul`` nodes rewritten.
+    """
+    import numpy as np
+    from onnx import helper, numpy_helper, shape_inference
+
+    inferred = shape_inference.infer_shapes(
+        onnx_model, strict_mode=False, data_prop=True
+    )
+    dims: dict[str, int] = {}
+    for collection in (
+        inferred.graph.input,
+        inferred.graph.output,
+        inferred.graph.value_info,
+    ):
+        for value in collection:
+            dims[value.name] = len(value.type.tensor_type.shape.dim)
+    for init in onnx_model.graph.initializer:
+        dims[init.name] = len(init.dims)
+
+    new_nodes = []
+    new_inits = []
+    rewritten = 0
+    for node in onnx_model.graph.node:
+        if node.op_type == "MatMul" and len(node.input) == 2:
+            left, right = node.input
+            left_rank, right_rank = dims.get(left), dims.get(right)
+            if left_rank == 2 and right_rank is not None and right_rank > 2:
+                extra = right_rank - 2
+                axes_name = f"unblend_wgpu_matmul_rank_axes_{rewritten}"
+                out_name = f"unblend_wgpu_matmul_rank_unsqueeze_{rewritten}"
+                new_inits.append(
+                    numpy_helper.from_array(
+                        np.arange(extra, dtype=np.int64), name=axes_name
+                    )
+                )
+                new_nodes.append(
+                    helper.make_node(
+                        "Unsqueeze", [left, axes_name], [out_name], name=out_name
+                    )
+                )
+                node.input[0] = out_name
+                rewritten += 1
+        new_nodes.append(node)
+
+    if rewritten:
+        onnx_model.graph.ClearField("node")
+        onnx_model.graph.node.extend(new_nodes)
+        onnx_model.graph.initializer.extend(new_inits)
+    return rewritten
+
+
 @contextmanager
 def _atomic_onnx_path(output_path: str) -> Iterator[str]:
     """
@@ -422,6 +612,7 @@ def _export_roformer_to_onnx(
     opset_version: int,
     fp16: bool,
     license_label: str | None = None,
+    static_batch: bool = False,
 ) -> str:
     """
     Export a RoFormer model (BS or Mel-Band) to ONNX via the dynamo exporter.
@@ -436,6 +627,14 @@ def _export_roformer_to_onnx(
     :param opset_version: Requested opset; clamped up to 18 (dynamo minimum).
     :param fp16: Store weights as float16 (weight-only; compute stays fp32).
     :param license_label: Weights license to embed in the model metadata.
+    :param static_batch: Trace with a fixed batch=1 instead of a dynamic batch
+        axis. onnxruntime-web's WebGPU backend has a memory-planner bug with
+        this graph's symbolic batch dim (it resolves some per-band buffer
+        shapes to a bogus 0, which the final mask-apply Mul then trips over);
+        the browser runtime always calls with batch=1 regardless, so this
+        sidesteps the bug for that consumer. Server-side/library consumers
+        that batch multiple segments through the raw ONNX file should use the
+        default dynamic-batch export instead.
     :return: Path to the exported ONNX model.
     :raises ImportError: If ``onnx`` or ``onnxscript`` is not installed.
     """
@@ -455,8 +654,10 @@ def _export_roformer_to_onnx(
     stft = model.stft_kwargs
     # Batch=2 example inputs: with batch=1, torch.export 0/1-specializes the
     # batch axis (a size-1 dim is indistinguishable from broadcasting) and the
-    # exported model silently rejects batched inputs.
-    dummy_audio = torch.randn(2, model.audio_channels, segment_samples)
+    # exported model silently rejects batched inputs. Irrelevant for the
+    # static_batch path below, which specializes on batch=1 intentionally.
+    trace_batch = 1 if static_batch else 2
+    dummy_audio = torch.randn(trace_batch, model.audio_channels, segment_samples)
     dummy_real, dummy_imag = compute_roformer_stft_for_export(
         dummy_audio,
         n_fft=stft["n_fft"],
@@ -466,22 +667,33 @@ def _export_roformer_to_onnx(
     )
 
     with _atomic_onnx_path(output_path) as staging_path:
-        batch = torch.export.Dim("batch")
+        dynamic_shapes = None
+        if not static_batch:
+            batch = torch.export.Dim("batch")
+            # Like HTDemucs: only batch is dynamic. RoFormer checkpoints are
+            # trained at a fixed chunk length, so the frequency/time axes are
+            # fixed at the traced shape.
+            dynamic_shapes = {"spec_real": {0: batch}, "spec_imag": {0: batch}}
         program = torch.onnx.export(
             wrapper,
             (dummy_real, dummy_imag),
             input_names=["spec_real", "spec_imag"],
             output_names=["out_spec_real", "out_spec_imag"],
-            # Like HTDemucs: only batch is dynamic. RoFormer checkpoints are
-            # trained at a fixed chunk length, so the frequency/time axes are
-            # fixed at the traced shape.
-            dynamic_shapes={"spec_real": {0: batch}, "spec_imag": {0: batch}},
+            dynamic_shapes=dynamic_shapes,
             opset_version=max(opset_version, 18),
             dynamo=True,
         )
         program.save(staging_path)
 
         onnx_model = onnx.load(staging_path)
+        # Rewrite two WebGPU-hostile-but-ONNX-valid broadcast shapes, both done
+        # before the fp16 pass so shape inference sees the clean fp32 graph:
+        # - the mask-apply Mul broadcast (a no-op for single-stem Mel-Band,
+        #   whose mask has no stems axis to broadcast over);
+        # - the mel-averaging-matrix MatMul's reversed 2-D/N-D operand order
+        #   (a no-op for BS-RoFormer, which has no averaging matrix at all).
+        _materialize_nonlast_broadcast_muls(onnx_model)
+        _materialize_matmul_rank_mismatch(onnx_model)
         if fp16:
             _convert_weights_to_fp16(onnx_model)
 
@@ -502,6 +714,7 @@ def _export_roformer_to_onnx(
             "stft_hop_length": str(stft["hop_length"]),
             "stft_win_length": str(stft["win_length"]),
             "stft_normalized": "true" if stft["normalized"] else "false",
+            "batch_mode": "static" if static_batch else "dynamic",
         }
         if license_label:
             metadata["license"] = license_label
@@ -520,6 +733,7 @@ def export_to_onnx(
     output_path: str | None = None,
     opset_version: int = 17,
     fp16: bool = False,
+    static_batch: bool = False,
 ) -> str:
     """
     Export a model (HTDemucs or RoFormer) to ONNX. Traced at the model's
@@ -535,10 +749,17 @@ def export_to_onnx(
         float32, so output is near-identical to the fp32 model (not bit-exact,
         since weights are rounded to fp16). Avoids the audible quantization
         noise that pure-fp16 accumulation produces on ORT-WASM.
+    :param static_batch: RoFormer only. Trace with a fixed batch=1 instead of a
+        dynamic batch axis, working around an onnxruntime-web WebGPU
+        memory-planner bug with this graph's symbolic batch dim. Use for
+        browser deployment; leave off for server-side/library consumers that
+        want batched ONNX inference. Ignored (must be False) for HTDemucs,
+        whose legacy-exporter dynamic-batch graph does not hit this bug.
     :return: Path to the exported ONNX model.
     :raises ImportError: If the ``onnx`` package is not installed.
-    :raises ValueError: If the resolved model is not a supported type, or an
-        HTDemucs without complex-as-channels (``cac=False``).
+    :raises ValueError: If the resolved model is not a supported type, an
+        HTDemucs without complex-as-channels (``cac=False``), or
+        ``static_batch=True`` requested for an HTDemucs model.
     """
     try:
         import onnx
@@ -562,6 +783,13 @@ def export_to_onnx(
             opset_version=opset_version,
             fp16=fp16,
             license_label=model_info.get("license"),
+            static_batch=static_batch,
+        )
+
+    if static_batch:
+        raise ValueError(
+            "static_batch is only supported for RoFormer models; HTDemucs "
+            "export always uses the legacy exporter's dynamic batch axis."
         )
 
     if not isinstance(model, HTDemucs):

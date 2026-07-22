@@ -1,6 +1,6 @@
 # unblend
 
-Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
+Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers. **HTDemucs models are supported today; the RoFormer models are not yet usable in-browser** — see [Known Issues](#known-issues).
 
 For backend/server-side workflows, use the `unblend` Python package — it is significantly faster than the in-browser ONNX path.
 
@@ -48,14 +48,15 @@ Output is always 2 channels per stem regardless of input channel count.
 |---|---|---|---|
 | `htdemucs` | drums, bass, other, vocals | HTDemucs | unlicensed¹ |
 | `htdemucs_6s` | + guitar, piano | HTDemucs | unlicensed¹ |
-| `bs_roformer_sw` | bass, drums, other, vocals, guitar, piano | BS-RoFormer | CC-BY-NC-SA-4.0² |
-| `melband_roformer_kim` | vocals, other³ | Mel-Band RoFormer | CC-BY-NC-SA-4.0² |
+| `bs_roformer_sw`⁴ | bass, drums, other, vocals, guitar, piano | BS-RoFormer | CC-BY-NC-SA-4.0² |
+| `melband_roformer_kim`⁴ | vocals, other³ | Mel-Band RoFormer | CC-BY-NC-SA-4.0² |
 
 ¹ The HTDemucs *code* is MIT (Meta), but the released weights carry no license grant.
 ² **Non-commercial.** The RoFormer checkpoints are community-trained; surface `separator.license` in your app where appropriate.
 ³ `other` is computed client-side as `mixture - vocals` (the checkpoint has a single vocal mask head).
+⁴ **Not currently usable in-browser** — loads, but fails at inference on both WebGPU and WASM. See [Known Issues](#known-issues).
 
-The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-460 MB fp16) and slower per segment.
+The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-460 MB fp16) and slower per segment. They run correctly via the Python package and via onnxruntime's CPU/CUDA execution providers — the failures below are specific to onnxruntime-web.
 
 > All eight FP32/weight-only-FP16 ONNX artifacts are hosted publicly under an immutable Hugging Face revision. Their exact byte sizes and SHA-256 digests are checked into `model-artifacts.ts`; maintainers can stream-verify every remote artifact with `npm run verify:model-artifacts` from this package directory.
 
@@ -164,3 +165,12 @@ For broader format support (ALAC, WMA, exotic containers), use `mediabunny` or `
 - **Browser only.** WebGPU, Web Workers, and `onnxruntime-web` together are not portable to Node or Deno without significant adaptation.
 - **Speed.** ONNX in the browser is ~3× slower than the Python package on equivalent hardware. A 4-minute song takes 30–90 seconds depending on backend and device.
 - **Memory.** Model weights and inference workspaces are large, and returned stems require one full-track Float32 buffer per source. The overlap-add stage uses segment-sized circular buffers rather than a second full-track copy, but long tracks and six-stem models can still require substantial memory. Unload instances you no longer need.
+
+## Known Issues
+
+**The RoFormer models (`bs_roformer_sw`, `melband_roformer_kim`) do not currently work in-browser, on either backend.** Both fail during `separate()`, not during `Separator.load()`. This is specific to onnxruntime-web; the same checkpoints run correctly through the Python package and through onnxruntime's CPU/CUDA execution providers.
+
+- **WebGPU:** fails with `[WebGPU] Kernel "..." failed. Error: Can't perform binary op on the given tensors` (or, depending on model/build, `shared dimension does not match`). The true cause, confirmed via Chrome's own WebGPU validation errors, is upstream of either message: the RoFormer band-split step needs one storage-buffer binding per frequency band (~60), but WebGPU's spec only *guarantees* 8 storage buffers per compute stage (many GPUs offer more, but this is the floor). On a device at or near that floor, pipeline creation for the `Split`/`Concat` kernel fails outright, silently corrupting downstream tensors (visible as a wall of `AllocateMLValueTensorPreAllocateBuffer` "shape mismatch ... != {...,0}" warnings in the console) until some later, stricter kernel throws. This looks like a real onnxruntime-web WebGPU-EP limitation — the `Split`/`Concat` kernel implementation doesn't fall back to chunked dispatch when a device is near the spec-minimum binding count.
+- **WASM:** fails with `std::bad_alloc`. Both RoFormer architectures use full (non-flash) self-attention across the whole segment; at these checkpoints' trained segment lengths (~13.4s / ~8s), the raw attention-score tensor for a single layer is 1.2–2.6 GB, and the matching softmax output needs to be alive at the same time. A 32-bit WASM linear memory heap (~2–4 GB depending on browser) cannot hold this; a native 64-bit process can, which is why the same graph runs fine outside the browser.
+
+Neither failure is reachable from ONNX-graph-level fixes (rewritten broadcasts, a rank-matched MatMul, and a static-batch export were all tried and verified correct in isolation, but none of them touch either root cause above). A real fix needs either an onnxruntime-web change (chunked storage-buffer dispatch for wide `Split`/`Concat`) or a memory-efficient (flash-attention-style) reimplementation of the RoFormer attention layers for the ONNX export path. Until then, keep these two models out of any in-browser model picker; `unblend export-onnx`'s exporter-level fixes (rewritten mask-apply broadcast, rank-matched averaging-matrix MatMul, `--static-batch`) remain in place as genuine correctness/portability improvements, independent of this blocker.

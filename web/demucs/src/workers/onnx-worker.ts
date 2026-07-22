@@ -17,6 +17,8 @@ interface LoadMessage {
     backend: 'webgpu' | 'wasm';
     wasmPaths?: string;
     numThreads?: number;
+    /** Defaults to 'all'; exposed for diagnosing EP-specific optimizer bugs. */
+    graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
 }
 
 interface RunMessage {
@@ -84,7 +86,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
 
             session = await onnx.InferenceSession.create(msg.modelUrl, {
                 executionProviders: [msg.backend],
-                graphOptimizationLevel: 'all',
+                graphOptimizationLevel: msg.graphOptimizationLevel ?? 'all',
             });
 
             const response: LoadResponse = {

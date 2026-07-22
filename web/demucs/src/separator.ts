@@ -31,6 +31,20 @@ export interface LoadModelOptions {
     wasmPaths?: string;
     /** WASM thread count; defaults to 4. */
     numThreads?: number;
+    /**
+     * Fetch the ONNX weights from this URL instead of the registered
+     * Hugging Face artifact. The model's config/precision still come from
+     * ``model``; only the byte source changes. Intended for testing a locally
+     * exported model before it is published.
+     */
+    modelUrl?: string;
+    /**
+     * Override ORT's graph optimization level; defaults to 'all'. Exposed for
+     * diagnosing EP-specific optimizer bugs (a lower level skips fusion/
+     * constant-folding passes that may behave differently per execution
+     * provider).
+     */
+    graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
     /** Abort model probing/loading and terminate every worker already created. */
     signal?: AbortSignal;
 }
@@ -135,6 +149,7 @@ export class Separator {
                 `Unknown precision '${precision}'. Valid precisions: ${Object.keys(modelArtifacts).join(', ')}.`
             );
         }
+        const modelUrl = options.modelUrl ?? artifact.url;
 
         let onnx: OnnxClient | null = null;
         let stft: STFTClient | null = null;
@@ -158,9 +173,10 @@ export class Separator {
             const workerOptions = {
                 wasmPaths: options.wasmPaths,
                 numThreads: options.numThreads,
+                graphOptimizationLevel: options.graphOptimizationLevel,
             };
             try {
-                await awaitWithSignal(onnx.load(artifact.url, backend, workerOptions), options.signal);
+                await awaitWithSignal(onnx.load(modelUrl, backend, workerOptions), options.signal);
             } catch (error) {
                 // Never reinterpret an abort as a WebGPU failure/fallback.
                 throwIfAborted(options.signal);
@@ -168,7 +184,7 @@ export class Separator {
                 onnx.terminate(error);
                 backend = 'wasm';
                 onnx = new OnnxClient();
-                await awaitWithSignal(onnx.load(artifact.url, backend, workerOptions), options.signal);
+                await awaitWithSignal(onnx.load(modelUrl, backend, workerOptions), options.signal);
             }
             throwIfAborted(options.signal);
 

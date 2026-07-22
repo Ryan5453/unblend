@@ -5,6 +5,7 @@ interface LoadModelMessage {
     backend: 'webgpu' | 'wasm';
     wasmPaths?: string;
     numThreads?: number;
+    graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
 }
 
 interface RunInferenceMessage {
@@ -104,7 +105,11 @@ export class OnnxClient {
     async load(
         modelUrl: string,
         backend: 'webgpu' | 'wasm',
-        options: { wasmPaths?: string; numThreads?: number } = {}
+        options: {
+            wasmPaths?: string;
+            numThreads?: number;
+            graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
+        } = {}
     ): Promise<void> {
         const response = (await this.send({
             type: 'load',
@@ -112,6 +117,7 @@ export class OnnxClient {
             backend,
             wasmPaths: options.wasmPaths,
             numThreads: options.numThreads,
+            graphOptimizationLevel: options.graphOptimizationLevel,
         })) as LoadResponse;
 
         if (!response.success) {

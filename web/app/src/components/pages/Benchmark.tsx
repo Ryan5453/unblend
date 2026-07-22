@@ -319,6 +319,8 @@ export function Benchmark() {
                             >
                                 <option value="htdemucs">htdemucs (4 stems)</option>
                                 <option value="htdemucs_6s">htdemucs_6s (6 stems, experimental)</option>
+                                <option value="bs_roformer_sw">bs_roformer_sw (6 stems, ~360MB fp16, currently broken — see web/demucs/README.md#known-issues)</option>
+                                <option value="melband_roformer_kim">melband_roformer_kim (vocals, ~477MB fp16, currently broken — see web/demucs/README.md#known-issues)</option>
                             </select>
                         </label>
 
