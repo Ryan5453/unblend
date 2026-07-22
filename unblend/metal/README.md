@@ -1,3 +1,0 @@
-# Demucs Metal Kernels
-
-These

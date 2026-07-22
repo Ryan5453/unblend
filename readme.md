@@ -1,7 +1,77 @@
 # unblend
 
-`unblend` is a music source separation library with one `Separator` API over multiple model families: an optimized implementation of [HTDemucs](https://github.com/adefossez/demucs), plus BS-RoFormer and Mel-Band RoFormer community checkpoints (`bs_roformer_sw`, `melband_roformer_kim`). The Demucs backend runs ~2.5× faster than upstream like-for-like (FP32), up to ~6× with FP16 + `torch.compile`. When extracting single stems, unblend is 19–23x faster.
+`unblend` is a music source separation library with one `Separator` API across multiple model families: an optimized implementation of [HTDemucs](https://github.com/adefossez/demucs), plus BS-RoFormer and Mel-Band RoFormer community checkpoints (`bs_roformer_sw`, `melband_roformer_kim`). The Demucs backend runs ~2.5× faster than upstream like-for-like (FP32), up to ~6× with FP16 + `torch.compile`. When extracting single stems, unblend is 19–23x faster.
 
+## Installation
+
+### Prerequisites
+
+- FFmpeg v4+ available in your `PATH`
+- [`uv`](https://docs.astral.sh/uv/#installation)
+- C/C++ compiler such as GCC, Clang, or MSVC
+
+### Install using UV
+
+Create a virtual environment backed by a `uv`-managed Python:
+
+```bash
+uv python install 3.12
+uv venv --managed-python --python 3.12
+source .venv/bin/activate
+```
+
+Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton.
+
+Then install unblend into that environment:
+
+```bash
+uv pip install unblend --torch-backend=auto
+```
+
+The `--torch-backend=auto` flag automatically detects your GPU and installs the appropriate version of PyTorch compatible with your system.
+
+### Temporary Installation
+
+With UV, you can use the `uvx` command to run unblend without installing it permanently on your system. This sets up a temporary virtual environment for the duration of the command.
+
+```bash
+uvx unblend separate audio_file.mp3
+```
+
+**Note**: unblend does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version on Linux when using uvx. unblend will fall back to CPU if one of the above conditions are not met. 
+
+
+## CLI Usage
+
+After installing unblend, you can use it like the following:
+
+```bash
+# View separation options
+unblend separate --help
+
+# Separate one audio file
+unblend separate audio_file.mp3
+
+# Separate multiple audio files
+unblend separate audio_file_1.mp3 audio_file_2.mp3
+
+# Separate every audio file in a directory tree (recurses into subdirectories - dotfiles and dot-directories are skipped).
+unblend separate /path/to/music/folder
+```
+
+## Python API Usage
+
+unblend provides a Python API for separating audio files. Please refer to the [API docs](https://github.com/Ryan5453/unblend/blob/main/api.md) for more information.
+
+## ONNX & Browser Usage
+
+unblend can also run in the browser via ONNX. See the [ONNX export notes](https://github.com/Ryan5453/unblend/blob/main/onnx.md) and the [`unblend` npm package docs](https://github.com/Ryan5453/unblend/blob/main/web/demucs/README.md) for details.
+
+## Cog Usage
+
+unblend provides a [Cog](https://github.com/replicate/cog) for HTDemucs which allows you to easily deploy it as a REST API. You can alternatively use the hosted version at [Replicate](https://replicate.com/ryan5453/demucs).
+
+## Benchmarks
 
 <details>
 <summary>Benchmarks and SDR comparisons</summary>
@@ -71,72 +141,3 @@ Peak process RSS, htdemucs_ft: 3.3 GB vs 4.6 GB for the reference. Compiled ense
 | M2 Max | reference, CPU FP32 | 101.20 | 8.389 |
 
 </details>
-
-## Installation
-
-### Prerequisites
-
-- FFmpeg v4+ available in your `PATH`
-- [`uv`](https://docs.astral.sh/uv/#installation)
-- C/C++ compiler such as GCC, Clang, or MSVC
-
-### Install using UV
-
-Create a virtual environment backed by a `uv`-managed Python:
-
-```bash
-uv python install 3.12
-uv venv --managed-python --python 3.12
-source .venv/bin/activate
-```
-
-Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton.
-
-Then install unblend into that environment:
-
-```bash
-uv pip install unblend --torch-backend=auto
-```
-
-The `--torch-backend=auto` flag automatically detects your GPU and installs the appropriate version of PyTorch compatible with your system.
-
-### Temporary Installation
-
-With UV, you can use the `uvx` command to run unblend without installing it permanently on your system. This sets up a temporary virtual environment for the duration of the command.
-
-```bash
-uvx unblend separate audio_file.mp3
-```
-
-**Note**: unblend does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version (currently 12.8) on Linux when using uvx. unblend will fall back to CPU if one of the above conditions are not met. (This uvx default is independent of the Cog/Replicate build, which pins CUDA 12.4 in `cog.yaml`.)
-
-
-## CLI Usage
-
-After installing unblend, you can use it like the following:
-
-```bash
-# View separation options
-unblend separate --help
-
-# Separate one audio file
-unblend separate audio_file.mp3
-
-# Separate multiple audio files
-unblend separate audio_file_1.mp3 audio_file_2.mp3
-
-# Separate every audio file in a directory tree (recurses into subdirectories - dotfiles and dot-directories are skipped).
-unblend separate /path/to/music/folder
-```
-
-## Python API Usage
-
-unblend provides a Python API for separating audio files. Please refer to the [API docs](https://github.com/Ryan5453/unblend/blob/main/api.md) for more information.
-
-## ONNX & Browser Usage
-
-unblend can also run in the browser via ONNX. See the [ONNX export notes](https://github.com/Ryan5453/unblend/blob/main/onnx.md) and the [`unblend` npm package docs](https://github.com/Ryan5453/unblend/blob/main/web/demucs/README.md) for details.
-
-## Cog Usage
-
-unblend provides a [Cog](https://github.com/replicate/cog) for HTDemucs which allows you to easily deploy it as a REST API. You can alternatively use the hosted version at [Replicate](https://replicate.com/ryan5453/demucs).
