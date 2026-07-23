@@ -48,6 +48,7 @@ class RMSNorm(nn.Module):
         :param dim: Feature dimension to normalise over (last axis).
         """
         super().__init__()
+        self.dim = dim
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim))
 
@@ -55,11 +56,15 @@ class RMSNorm(nn.Module):
         """
         Normalise ``x`` to unit RMS over the last axis and apply the gain.
 
-        The norm is computed in float32 regardless of input dtype: under
-        fp16 the squared-sum inside ``F.normalize`` can overflow to inf for
-        large activations (this also matches autocast semantics, which run
-        normalisation ops in fp32). MPS inference uses an equivalent fused
-        Metal reduction; autograd and other devices retain the native path.
+        ``F.normalize(x, dim=-1) * sqrt(dim) * gamma`` is algebraically exactly
+        ``x / sqrt(mean(x^2)) * gamma`` — i.e. RMS norm — so the fused
+        ``F.rms_norm`` primitive computes the identical result while
+        accumulating the mean-square in float32 internally (stable under fp16,
+        matching autocast semantics) in a single kernel. The manual path used
+        to materialise an fp32 upcast, the normalised tensor, two scaled
+        products, and an fp16 downcast — five tensor allocations per call, all
+        of which show up as ``aten::copy_``/``aten::to`` in the transformer hot
+        loop. MPS inference keeps its equivalent fused Metal reduction.
 
         :param x: Input of shape ``[..., dim]``.
         :return: Normalised tensor of the same shape and dtype.
@@ -68,8 +73,7 @@ class RMSNorm(nn.Module):
             from .metal import metal_rms_norm
 
             return metal_rms_norm(x, self.gamma, self.scale)
-        normed = F.normalize(x.float(), dim=-1) * self.scale * self.gamma.float()
-        return normed.type(x.dtype)
+        return F.rms_norm(x, (self.dim,), self.gamma, eps=1e-12)
 
 
 class RotaryEmbedding(nn.Module):
@@ -90,114 +94,125 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
         self.freqs = nn.Parameter(freqs, requires_grad=False)
-        # Phase table cache, keyed by (seq_len, device). Chunked inference
-        # calls every attention block with the same one or two sequence
-        # lengths thousands of times; recomputing cos/sin per call measured
-        # ~12% of the whole forward on CPU. Plain dict (not a buffer) so
-        # ``state_dict`` stays checkpoint-identical.
-        self._phase_cache: dict[tuple[int, torch.device], Tensor] = {}
-        # Inductor does not generate native code for complex multiplication.
-        # CUDA's compiled path uses this equivalent real-valued cos/sin table;
-        # eager CPU/MPS/CUDA retain the faster complex representation above.
-        self._rotation_cache: dict[tuple[int, torch.device], Tensor] = {}
+        # Real-valued cos/sin tables materialised in the *working* dtype, so
+        # the eager rotation runs without upcasting q/k to fp32 and back
+        # (that up/downcast was, after the RMSNorm fusion, the single largest
+        # source of ``aten::to`` traffic in the transformer hot loop). Keyed
+        # by (seq_len, device, dtype). Chunked inference calls every attention
+        # block with the same one or two sequence lengths thousands of times,
+        # so caching the trig tables removes them from the hot loop entirely.
+        self._cos_sin_cache: dict[
+            tuple[int, torch.device, torch.dtype], tuple[Tensor, Tensor]
+        ] = {}
+        # Pre-bound cos/sin tables for the ``torch.compile`` path. Each rotary
+        # instance is shared across every block of a single axis (time OR
+        # frequency), so during inference it only ever sees one sequence
+        # length. ``prime_compiled`` binds that axis's table to these plain
+        # tensor attributes before capture, so the compiled trunk reads a
+        # frozen constant instead of doing a Python dict lookup keyed on
+        # ``(seq_len, device)`` inside every attention — that lookup is a
+        # non-GPU op that forced Inductor to split the CUDAGraph at every
+        # layer (25+ partitions, each with boundary copies that scaled with
+        # batch size, making compile slower than eager and burning ~19 GiB
+        # of graph pools). As frozen attributes the whole trunk captures as
+        # one graph.
+        self._compiled_cos: Tensor | None = None
+        self._compiled_sin: Tensor | None = None
 
-    def _phases(self, seq_len: int, device: torch.device) -> Tensor:
+    def _cos_sin(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[Tensor, Tensor]:
         """
-        Complex rotation phases ``e^{i·pos·freq}`` for one sequence length.
+        ``(cos, sin)`` rotation tables of shape ``[seq_len, dim // 2]`` in the
+        requested working dtype.
 
-        :param seq_len: Sequence length to build (or fetch) phases for.
-        :param device: Device the phases must live on.
-        :return: Complex64 tensor of shape ``[seq_len, dim // 2]``.
+        The angles are always built in float32 (trig has no half kernel and
+        the frequency spectrum spans several orders of magnitude), then cast
+        once to ``dtype`` and cached. Applying the rotation in the model dtype
+        removes the per-call fp32 upcast of q/k and the matching downcast —
+        two full-tensor copies per attention projection.
+
+        :param seq_len: Sequence length to build (or fetch) tables for.
+        :param device: Device the tables must live on.
+        :param dtype: Working dtype of the queries/keys.
+        :return: Cached ``(cos, sin)`` pair.
         """
-        key = (seq_len, device)
-        cached = self._phase_cache.get(key)
+        key = (seq_len, device, dtype)
+        cached = self._cos_sin_cache.get(key)
         if cached is None:
-            # Always float32: rotation runs in fp32 regardless of model dtype
-            # (and ``torch.polar`` has no half kernel — a model cast to fp16
-            # casts ``freqs`` with it).
             positions = torch.arange(seq_len, device=device, dtype=torch.float32)
             angles = positions[:, None] * self.freqs.to(
                 device=device, dtype=torch.float32
             )
-            cached = torch.polar(torch.ones_like(angles), angles)
-            self._phase_cache[key] = cached
+            cached = (angles.cos().to(dtype), angles.sin().to(dtype))
+            self._cos_sin_cache[key] = cached
         return cached
 
-    def _rotations(self, seq_len: int, device: torch.device) -> Tensor:
+    def prime_compiled(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
         """
-        Real-valued ``[cos, sin]`` rotation table for Inductor graphs.
+        Bind this axis's rotation table to frozen attributes ahead of
+        ``torch.compile`` capture, so the compiled trunk reads a constant
+        instead of doing a Python dict lookup per attention.
 
-        :param seq_len: Sequence length to build (or fetch) rotations for.
-        :param device: Device the rotations must live on.
-        :return: Float32 tensor of shape ``[seq_len, dim // 2, 2]``.
+        :param seq_len: The (single) sequence length this rotary sees.
+        :param device: Capture device.
+        :param dtype: Working dtype of the queries/keys.
         """
-        key = (seq_len, device)
-        cached = self._rotation_cache.get(key)
-        if cached is None:
-            positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-            angles = positions[:, None] * self.freqs.to(
-                device=device, dtype=torch.float32
-            )
-            cached = torch.stack((angles.cos(), angles.sin()), dim=-1)
-            self._rotation_cache[key] = cached
-        return cached
+        cos, sin = self._cos_sin(seq_len, device, dtype)
+        self._compiled_cos = cos
+        self._compiled_sin = sin
 
     def _apply(
         self, fn: Callable[[Tensor], Tensor], recurse: bool = True
     ) -> "RotaryEmbedding":
         """
-        Apply a dtype/device transform, then invalidate derived phase caches.
+        Apply a dtype/device transform, then invalidate derived caches.
 
         :param fn: Tensor transformation supplied by ``nn.Module.to``/``half``.
         :param recurse: Whether child modules should also be transformed.
         :return: This module after the successful transformation.
         """
         result = super()._apply(fn, recurse=recurse)
-        self._phase_cache.clear()
-        self._rotation_cache.clear()
+        self._cos_sin_cache.clear()
+        self._compiled_cos = None
+        self._compiled_sin = None
         return result
 
     def _load_from_state_dict(self, *args: object, **kwargs: object) -> None:
         """
-        Drop cached phases when weights (``freqs``) are replaced.
+        Drop cached rotation tables when weights (``freqs``) are replaced.
 
         :param args: Forwarded to ``nn.Module._load_from_state_dict``.
         :param kwargs: Forwarded to ``nn.Module._load_from_state_dict``.
         """
-        self._phase_cache.clear()
-        self._rotation_cache.clear()
+        self._cos_sin_cache.clear()
+        self._compiled_cos = None
+        self._compiled_sin = None
         super()._load_from_state_dict(*args, **kwargs)
 
     def rotate_queries_or_keys(self, t: Tensor) -> Tensor:
         """
         Apply rotary rotation over the sequence axis of ``t``.
 
-        Implemented as one complex multiply on the interleaved pairs: for a
-        pair ``(x1, x2)`` and angle ``θ``, ``(x1 + i·x2) · e^{iθ}`` is
-        exactly ``(x1·cosθ − x2·sinθ, x1·sinθ + x2·cosθ)`` — the reference
-        package's interleaved rotate-half, in a third of the kernels.
+        For an interleaved pair ``(x1, x2)`` and angle ``θ``, the complex
+        product ``(x1 + i·x2)·e^{iθ}`` is ``(x1·cosθ − x2·sinθ, x1·sinθ +
+        x2·cosθ)`` — the reference package's interleaved rotate-half, done in
+        the working dtype with no fp32 round-trip. The compiled path reads the
+        table pre-bound by ``prime_compiled`` (a frozen attribute) so no
+        Python dict lookup lands inside the captured graph.
 
         :param t: Queries or keys of shape ``[..., seq, dim]``.
         :return: Rotated tensor of the same shape and dtype.
         """
-        seq_len = t.shape[-2]
-        pairs = t.float().unflatten(-1, (-1, 2))
-        if torch.compiler.is_compiling():
-            rotations = self._rotations(seq_len, t.device)
-            real, imaginary = pairs.unbind(dim=-1)
-            cosine, sine = rotations.unbind(dim=-1)
-            rotated = torch.stack(
-                (
-                    real * cosine - imaginary * sine,
-                    real * sine + imaginary * cosine,
-                ),
-                dim=-1,
-            )
-            return rotated.flatten(-2).type(t.dtype)
-
-        phases = self._phases(seq_len, t.device)
-        complex_pairs = torch.view_as_complex(pairs.contiguous())
-        return torch.view_as_real(complex_pairs * phases).flatten(-2).type(t.dtype)
+        if torch.compiler.is_compiling() and self._compiled_cos is not None:
+            cos, sin = self._compiled_cos, self._compiled_sin
+        else:
+            cos, sin = self._cos_sin(t.shape[-2], t.device, t.dtype)
+        x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
+        rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+        return rotated.flatten(-2)
 
 
 class FeedForward(nn.Module):

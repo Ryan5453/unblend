@@ -283,6 +283,14 @@ class Separator:
     # in pathological cases (wildly wrong initial estimate) we don't spin
     # for minutes. Each attempt is one full compile+capture, ~15-30s.
     _CHUNK_BATCH_MAX_ATTEMPTS: int = 4
+    # Candidate chunk-batch sizes swept when auto-sizing a *compiled* RoFormer.
+    # The compile-optimal batch is GPU-dependent — small on V100's
+    # memory-efficient attention (larger batches measured slower), larger on
+    # flash-attention GPUs (A100/H200) where utilisation keeps improving — so
+    # rather than a hardcoded cap the calibrator times these (bounded by what
+    # fits in VRAM) and keeps the fastest. Capped at 32 to bound the number of
+    # compile+capture cycles paid at init.
+    _COMPILE_ROFORMER_CBS_CANDIDATES: tuple[int, ...] = (4, 8, 16, 32)
 
     @staticmethod
     def _prefill_htdemucs_caches(model: HTDemucs) -> None:
@@ -359,12 +367,15 @@ class Separator:
     @staticmethod
     def _prefill_roformer_caches(model: _RoformerBase) -> None:
         """
-        Materialize RoFormer rotary phases before CUDAGraph compilation.
+        Materialize RoFormer rotary tables before CUDAGraph compilation.
 
         The two axial sequence lengths are fixed by the checkpoint's training
         segment: STFT frames for the time axis and band count for the frequency
-        axis. Building these complex64 tables eagerly keeps persistent cache
-        tensors out of the CUDAGraph private pool.
+        axis. Each rotary instance is shared across every block of one axis, so
+        it only ever sees a single sequence length during inference. Binding
+        that axis's table to frozen attributes via ``prime_compiled`` keeps a
+        Python dict lookup (a non-GPU op that otherwise splits the CUDAGraph at
+        every layer) out of the captured trunk.
 
         :param model: RoFormer whose shared rotary caches should be populated.
         """
@@ -375,6 +386,7 @@ class Separator:
             len(model.band_split.dim_inputs),
         )
         device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
         seen: set[int] = set()
         for transformer_pair in model.layers:
             for axis, transformer in enumerate(transformer_pair):
@@ -382,8 +394,7 @@ class Separator:
                     rotary = attention.rotary_embed
                     if rotary is None or id(rotary) in seen:
                         continue
-                    rotary._phases(sequence_lengths[axis], device)
-                    rotary._rotations(sequence_lengths[axis], device)
+                    rotary.prime_compiled(sequence_lengths[axis], device, dtype)
                     seen.add(id(rotary))
 
     @staticmethod
@@ -529,17 +540,18 @@ class Separator:
         # would then reject.
         estimate = max(1, min(1024, int(available // transient_per_chunk)))
 
-        # Compiled RoFormer throughput is flat across nearby batch sizes, but
-        # every CUDAGraph tail must pad to the captured shape. Snapping the
-        # memory-maximized estimate down to a power of two (capped at 8) cuts
-        # common tail waste (V100: SW 6→4, Kim 9→8), measuring 1.50x/1.34x
-        # faster than eager instead of flat/slower at the unsnapped sizes.
+        # Compiled RoFormer throughput vs batch size is GPU-dependent, so the
+        # single memory-maximised estimate isn't the answer: return the VRAM
+        # ceiling (largest power of two that fits) and let the calibration
+        # sweep in ``_calibrate_chunk_batch_size`` time candidate sizes up to
+        # it and keep the fastest. (V100 favours small batches; flash-
+        # attention GPUs favour larger ones — no single constant is right.)
         has_roformer = isinstance(self.model, _RoformerBase) or (
             isinstance(self.model, ModelEnsemble)
             and any(isinstance(model, _RoformerBase) for model in self.model.models)
         )
         if self._compile_enabled and has_roformer:
-            return min(8, 1 << (estimate.bit_length() - 1))
+            return max(1, 1 << (estimate.bit_length() - 1))
         return estimate
 
     def _setup_compile(self) -> None:
@@ -608,11 +620,16 @@ class Separator:
         VRAM you actually have.
 
         For ``compile=True`` we can't reason about VRAM up front: the cudagraph
-        private pool is an opaque reservation only knowable by capturing it. So
-        we actually compile + warm up at ``initial_guess`` and, on CUDA OOM,
-        halve and retry up to ``_CHUNK_BATCH_MAX_ATTEMPTS`` times. Each retry
-        tears down the prior attempt's compile state so the released cudagraph
-        pool is reclaimable.
+        private pool is an opaque reservation only knowable by capturing it.
+        For HTDemucs (and ensembles) we compile + warm up at ``initial_guess``
+        and, on CUDA OOM, halve and retry up to ``_CHUNK_BATCH_MAX_ATTEMPTS``
+        times (``_calibrate_by_halving``). Each retry tears down the prior
+        attempt's compile state so the released cudagraph pool is reclaimable.
+
+        For a single RoFormer we instead *sweep* candidate batch sizes and
+        keep the fastest measured (``_sweep_compiled_roformer_cbs``), because
+        the compile-optimal cbs is GPU-dependent: small on V100's
+        memory-efficient attention, larger on flash-attention GPUs.
 
         :param initial_guess: Starting chunk_batch_size to verify (the math
             estimate from ``_initial_chunk_batch_size_estimate``).
@@ -627,6 +644,22 @@ class Separator:
         if not compile_enabled:
             return initial_guess
 
+        # Single RoFormer: sweep candidate batch sizes and keep the fastest
+        # (the compile-optimal cbs is GPU-dependent). Everything else
+        # (HTDemucs, ensembles) trusts the memory estimate and only backs off
+        # on OOM.
+        if isinstance(self.model, _RoformerBase):
+            return self._sweep_compiled_roformer_cbs(initial_guess, self.model)
+        return self._calibrate_by_halving(initial_guess)
+
+    def _calibrate_by_halving(self, initial_guess: int) -> int:
+        """
+        Capture-verify ``initial_guess`` and halve on CUDA OOM until it fits.
+
+        :param initial_guess: Starting chunk_batch_size to capture at.
+        :return: The largest verified chunk_batch_size at or below the guess.
+        :raises ModelLoadingError: If even batch size 1 OOMs during capture.
+        """
         candidate = max(1, initial_guess)
         last_error: BaseException | None = None
         tried: list[int] = []
@@ -657,6 +690,105 @@ class Separator:
             f"{len(tried)} attempts (tried {tried}). "
             f"Last error: {last_error}"
         )
+
+    def _time_forward_seconds_per_chunk(self, ref: Model) -> float:
+        """
+        Time one full forward at the active batch size and return the
+        per-chunk cost.
+
+        Runs the model on a full ``[chunk_batch_size, channels, segment]``
+        zero batch — the exact shape ``apply_model`` uses — so under compile it
+        replays the captured CUDAGraph rather than triggering a new one, and
+        eager it exercises the real batched forward. Dividing the best
+        full-batch latency by the batch size gives the steady-state
+        seconds-per-chunk, the metric that decides which batch size (and,
+        for the CLI, whether compiling at all) serves long audio fastest
+        (independent of the tail-padding factor, which is track-length-
+        specific and minor for real songs).
+
+        :param ref: The model (eager or compiled) to time.
+        :return: Best-of-N seconds per chunk at the current batch size.
+        """
+        segment_length = int(round(ref.samplerate * ref.max_allowed_segment))
+        device = next(ref.parameters()).device
+        dummy = torch.zeros(
+            self.chunk_batch_size,
+            ref.audio_channels,
+            segment_length,
+            device=device,
+            dtype=torch.float32,
+        )
+        with torch.inference_mode():
+            ref(dummy)
+            ref(dummy)
+        torch.cuda.synchronize()
+        best = float("inf")
+        for _ in range(5):
+            started = perf_counter()
+            with torch.inference_mode():
+                ref(dummy)
+            torch.cuda.synchronize()
+            best = min(best, perf_counter() - started)
+        return best / self.chunk_batch_size
+
+    def _sweep_compiled_roformer_cbs(self, ceiling: int, ref: Model) -> int:
+        """
+        Compile at each candidate batch size up to ``ceiling``, time it, and
+        keep the fastest.
+
+        Candidates (``_COMPILE_ROFORMER_CBS_CANDIDATES``, bounded by what fits
+        in VRAM) are tried ascending. Each is compiled + captured + timed,
+        then torn down so only one CUDAGraph pool is resident at a time; the
+        winner is recompiled at the end. The climb stops as soon as a larger
+        batch is not meaningfully faster per chunk (the throughput-vs-batch
+        curve is unimodal), so on V100 it settles at a small batch after one
+        regression while flash-attention GPUs keep climbing. A larger batch
+        must beat the incumbent by >2% to be preferred, biasing ties toward
+        the smaller batch (less VRAM, less tail padding).
+
+        :param ceiling: Largest batch size that fits in VRAM (from the
+            memory estimate).
+        :param ref: The RoFormer being compiled (used for timing).
+        :return: The selected chunk_batch_size (compiled and warmed in place).
+        :raises ModelLoadingError: If no batch size fits, even after halving.
+        """
+        candidates = [c for c in self._COMPILE_ROFORMER_CBS_CANDIDATES if c <= ceiling]
+        if not candidates:
+            candidates = [max(1, ceiling)]
+
+        best_cbs: int | None = None
+        best_seconds_per_chunk = float("inf")
+        tried: list[int] = []
+        for cbs in candidates:
+            self.chunk_batch_size = cbs
+            tried.append(cbs)
+            try:
+                self._setup_compile()
+                self._warmup_via_inference()
+            except RuntimeError as exc:
+                if not _looks_like_cuda_oom(exc):
+                    raise
+                self._teardown_compile_state()
+                # This candidate didn't fit, so no larger one will. If nothing
+                # has fit yet, fall back to halving below the smallest tried.
+                if best_cbs is None:
+                    self._calibration_attempts = tried
+                    return self._calibrate_by_halving(max(1, cbs // 2))
+                break
+            seconds_per_chunk = self._time_forward_seconds_per_chunk(ref)
+            self._teardown_compile_state()
+            if seconds_per_chunk < best_seconds_per_chunk * 0.98:
+                best_seconds_per_chunk = seconds_per_chunk
+                best_cbs = cbs
+            else:
+                break
+
+        assert best_cbs is not None
+        self.chunk_batch_size = best_cbs
+        self._setup_compile()
+        self._warmup_via_inference()
+        self._calibration_attempts = tried
+        return best_cbs
 
     def _warmup_via_inference(self) -> None:
         """

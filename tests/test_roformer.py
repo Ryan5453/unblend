@@ -368,11 +368,11 @@ def test_rotary_cache_is_invalidated_by_dtype_transform() -> None:
     warmed = RotaryEmbedding(dim=16)
     sample = torch.randn(1, 2, 8, 16)
     warmed.rotate_queries_or_keys(sample)
-    assert warmed._phase_cache
+    assert warmed._cos_sin_cache
 
     warmed.half()
-    assert not warmed._phase_cache
-    assert not warmed._rotation_cache
+    assert not warmed._cos_sin_cache
+    assert warmed._compiled_cos is None
 
     half_sample = sample.half()
     fresh = RotaryEmbedding(dim=16).half()
@@ -386,10 +386,10 @@ def test_rotary_cache_is_invalidated_by_dtype_transform() -> None:
 
 def test_rotary_rotation_accepts_half_inputs() -> None:
     """
-    Rotation must work on fp16 tensors from a model cast to half: the phase
-    table is built in float32 regardless of the (cast) ``freqs`` dtype —
-    ``torch.polar`` has no half kernel, so an fp16-following phase path
-    crashes on CUDA/MPS. Regression test for the fp16 GPU path.
+    Rotation must work on fp16 tensors from a model cast to half: the cos/sin
+    tables are built in float32 (trig has no half kernel) and cast once to the
+    working dtype, so the rotation itself runs in fp16 without a per-call fp32
+    round-trip. Regression test for the fp16 GPU path.
     """
     from unblend.roformer import RotaryEmbedding
 

@@ -28,21 +28,29 @@ from .types import ClipMode, DeviceType, ModelName, Precision, StemName
 from .utils import console, expand_paths_to_audio_files, format_output_path
 
 # Cache-free auto-compile policy. Values are conservative break-even amounts
-# of predicted eager GPU work, not raw chunk counts: a runtime batch-1 timing
-# adapts the same architecture/dtype threshold to T4, V100, A100/Hopper, etc.
-# RoFormer FP16 values include a margin over the worst measured break-even
-# eager time (T4/V100/H200); unmeasured precision/family combinations are more
-# conservative until their matrix is filled in.
+# of predicted eager GPU work (estimated chunks x a runtime batch-1 eager
+# timing), not raw chunk counts, so the same architecture/dtype threshold
+# adapts across GPUs. Each value is the worst-case (largest) measured
+# break-even across V100, L40S, A100, and H200 — break-even =
+# setup_cost x predicted_eager_seconds / (eager_wall - compile_wall) on a
+# 3.3-min track — rounded up for margin (and for the unmeasured T4, whose
+# large per-chunk cost only lowers the break-even). The break-even is set by
+# the *fastest* GPUs, where eager is quick enough that compilation's absolute
+# saving shrinks while its fixed setup (compile + the batch-size sweep) does
+# not. FP16 is the default and where compilation clearly wins; FP32/BF16
+# compilation is marginal-to-neutral on modern GPUs (often measured no faster
+# than eager), so those thresholds are deliberately high — auto mode should
+# almost never compile them.
 _AUTO_COMPILE_EAGER_SECONDS: dict[tuple[str, str], int] = {
-    ("htdemucs", "fp32"): 240,
-    ("htdemucs", "fp16"): 200,
-    ("htdemucs", "bf16"): 200,
-    ("bs_roformer", "fp32"): 160,
-    ("bs_roformer", "fp16"): 120,
-    ("bs_roformer", "bf16"): 160,
-    ("mel_band_roformer", "fp32"): 180,
-    ("mel_band_roformer", "fp16"): 135,
-    ("mel_band_roformer", "bf16"): 180,
+    ("htdemucs", "fp32"): 1100,
+    ("htdemucs", "fp16"): 700,
+    ("htdemucs", "bf16"): 1100,
+    ("bs_roformer", "fp32"): 500,
+    ("bs_roformer", "fp16"): 450,
+    ("bs_roformer", "bf16"): 500,
+    ("mel_band_roformer", "fp32"): 1000,
+    ("mel_band_roformer", "fp16"): 350,
+    ("mel_band_roformer", "bf16"): 1000,
 }
 
 

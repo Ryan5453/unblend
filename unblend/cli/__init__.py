@@ -12,6 +12,7 @@ from .. import __version__
 from .models import download_models_command, list_models_command, remove_models_command
 from .onnx import export_onnx_command
 from .separate import separate_command
+from .tune import tune_command
 from .utils import console
 
 
@@ -57,6 +58,10 @@ def build_app() -> typer.Typer:
     app.command(
         name="separate", help="Separate audio tracks into their component stems."
     )(separate_command)
+    app.command(
+        name="tune",
+        help="Measure and print the fastest batch-size / compile settings for this machine.",
+    )(tune_command)
     app.add_typer(models_app, name="models")
     app.command(name="version", help="Show the installed version of unblend.")(
         version_command

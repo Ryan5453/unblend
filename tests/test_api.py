@@ -486,7 +486,9 @@ def test_compile_roformer_targets_transformer_core_without_state_drift(
     state_keys = set(model.state_dict())
     for module in model.modules():
         if isinstance(module, RotaryEmbedding):
-            module._phase_cache.clear()
+            module._cos_sin_cache.clear()
+            module._compiled_cos = None
+            module._compiled_sin = None
 
     Separator._compile_roformer_transformer_core(model)
     with torch.no_grad():
@@ -501,8 +503,7 @@ def test_compile_roformer_targets_transformer_core_without_state_drift(
         module for module in model.modules() if isinstance(module, RotaryEmbedding)
     ]
     assert rotary_modules
-    assert all(module._phase_cache for module in rotary_modules)
-    assert all(module._rotation_cache for module in rotary_modules)
+    assert all(module._compiled_cos is not None for module in rotary_modules)
 
     separator = object.__new__(Separator)
     separator.model = model

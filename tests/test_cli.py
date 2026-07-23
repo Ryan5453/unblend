@@ -173,7 +173,7 @@ def test_auto_compile_chunk_estimate_uses_duration_shifts_and_overlap(
 
 @pytest.mark.parametrize(
     "chunks, expected",
-    [(119, False), (120, True)],
+    [(449, False), (450, True)],
 )
 def test_auto_compile_uses_predicted_eager_seconds(
     monkeypatch: pytest.MonkeyPatch,
