@@ -103,7 +103,7 @@ rich==14.3.1
     #   unblend
 safetensors==0.8.0
     # via unblend
-setuptools==80.10.2
+setuptools==83.0.0
     # via torch
 shellingham==1.5.4
     # via typer
