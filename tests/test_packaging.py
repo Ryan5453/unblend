@@ -7,12 +7,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-_COG_EXPORT_COMMAND = (
-    "uv export --locked --no-dev --no-hashes --no-emit-project "
-    "--format requirements-txt"
-)
-
-
 def test_cog_uses_fully_locked_uv_export() -> None:
     """Cog installs the checked-in, fully pinned export of ``uv.lock``."""
     cog = (ROOT / "cog.yaml").read_text()
@@ -20,7 +14,6 @@ def test_cog_uses_fully_locked_uv_export() -> None:
     assert not (ROOT / "requirements.txt").exists()
 
     exported = (ROOT / "requirements-cog.txt").read_text()
-    assert _COG_EXPORT_COMMAND in exported
     requirement_lines = [
         line.strip()
         for line in exported.splitlines()
@@ -40,8 +33,9 @@ def test_cog_requirements_have_no_environment_markers() -> None:
     ``;``, so any marker is dropped silently. A marker-split pin like
     ``numpy==2.2.6 ; python_full_version < '3.11'`` plus its ``>= '3.11'``
     counterpart therefore reaches pip as two conflicting pins and the build
-    fails with ResolutionImpossible. export_cog_requirements.py
-    pre-evaluates markers for the image's environment to prevent exactly this.
+    fails with ResolutionImpossible. The export is piped through
+    ``uv pip compile --python-platform`` (see ci.yml) to resolve markers for the
+    image's single environment, which prevents exactly this.
     """
     exported = (ROOT / "requirements-cog.txt").read_text()
     requirement_lines = [

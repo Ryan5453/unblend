@@ -41,8 +41,13 @@ jobs:
           test "$js" = "$version" || { echo "web/demucs/package.json has $js, tag is $version"; exit 1; }
       - name: Sync Python dependencies
         run: uv sync --locked --extra dev --extra onnx --group onnx-test
+      # See the matching step in ci.yml for why this pipes through pip compile.
       - name: Verify locked Cog requirements
-        run: uv run python export_cog_requirements.py --check
+        run: |
+          uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt \
+            | uv pip compile - --python-platform x86_64-manylinux_2_28 --python-version 3.12 \
+                --no-annotate --no-header --quiet > /tmp/requirements-cog.txt
+          diff -u requirements-cog.txt /tmp/requirements-cog.txt
       - name: Check Python style
         run: |
           uv run ruff check .

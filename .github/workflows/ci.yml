@@ -25,8 +25,17 @@ jobs:
           python-version: "3.12"
       - name: Sync dependencies
         run: uv sync --locked --extra dev
+      # Cog drops environment markers when it rewrites requirement lines, which
+      # turns uv's marker-split pins into conflicting duplicates and fails the
+      # build. Piping through `uv pip compile` resolves them for the image's one
+      # environment; versions still come from uv.lock, since every input is
+      # already pinned with ==.
       - name: Verify locked Cog requirements
-        run: uv run python export_cog_requirements.py --check
+        run: |
+          uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt \
+            | uv pip compile - --python-platform x86_64-manylinux_2_28 --python-version 3.12 \
+                --no-annotate --no-header --quiet > /tmp/requirements-cog.txt
+          diff -u requirements-cog.txt /tmp/requirements-cog.txt
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format

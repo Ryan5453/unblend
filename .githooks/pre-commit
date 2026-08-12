@@ -59,8 +59,18 @@ if [ "$touches_python" = true ]; then
     run "ruff format" uv run ruff format --check .
 fi
 
+# Mirrors the "Verify locked Cog requirements" step in ci.yml; see the comment
+# there for why the export is piped through pip compile.
+check_cog_requirements() {
+    uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt \
+        | uv pip compile - --python-platform x86_64-manylinux_2_28 --python-version 3.12 \
+            --no-annotate --no-header --quiet > "$log.cog"
+    diff -u requirements-cog.txt "$log.cog"
+}
+
 if [ "$touches_deps" = true ]; then
-    run "cog requirements" uv run python export_cog_requirements.py --check
+    run "cog requirements" check_cog_requirements
+    rm -f "$log.cog"
 fi
 
 run "pytest (fast)" uv run pytest -m "not slow" -q
