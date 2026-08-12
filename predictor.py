@@ -7,14 +7,15 @@
 import asyncio
 import math
 import os
+import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
-from io import BytesIO
 from pathlib import Path as PathlibPath
 from typing import TypedDict
 
 import torch
-from cog import BasePredictor, File, Input, Path
+from cog import BasePredictor, Input, Path
 
 from unblend import Separator
 
@@ -38,16 +39,26 @@ class Output(TypedDict, total=False):
     a real schema and constructs without relying on any SDK machinery.
     Keys must be declared: the generator reads only declared fields, so a
     dynamically-keyed output cannot be expressed here.
+
+    The stems are ``Path``, not ``File``. Cog inlines a ``File`` into the
+    prediction response as a base64 data URI, while a ``Path`` is uploaded to
+    object storage and returned as a URL. Both are ``format: uri`` in the
+    schema, but inlining does not survive real audio: a 225s song as wav is
+    ~160MB of stems, so ~212MB of base64 in a single JSON response. Measured on
+    an H100 -- separation 0.65s, encode 0.47s, then the prediction sat in
+    ``processing`` for over 22 minutes and never returned. The same song with
+    mp3 output (~19MB inlined) finished with predict_time 11.08s, which is what
+    identified the payload rather than the GPU as the bottleneck.
     """
 
-    drums: File
-    bass: File
-    other: File
-    vocals: File
-    no_drums: File
-    no_bass: File
-    no_other: File
-    no_vocals: File
+    drums: Path
+    bass: Path
+    other: Path
+    vocals: Path
+    no_drums: Path
+    no_bass: Path
+    no_other: Path
+    no_vocals: Path
 
 
 @dataclass
@@ -68,6 +79,36 @@ class _Request:
 # collect a real batch under any meaningful concurrency. Tune via the
 # ``COG_DEMUCS_BATCH_WINDOW_MS`` env var if real traffic shows it short.
 _BATCH_WINDOW_MS_DEFAULT = 50
+
+# Stems are written here for Cog to upload, one directory per prediction. Cog
+# uploads only after ``predict()`` returns, so a prediction cannot delete its
+# own files; instead every prediction first sweeps directories left by earlier
+# ones. The TTL just has to outlast an upload. coglet's own cleanup behaviour
+# is not inspectable (its serializer is a compiled extension), so this bounds
+# disk growth on a long-lived warm container whether or not Cog also removes
+# them.
+_OUTPUT_ROOT = PathlibPath("/tmp/unblend-outputs")
+_OUTPUT_TTL_S = 900
+
+
+def _prune_stale_outputs() -> None:
+    """
+    Delete per-prediction output directories older than ``_OUTPUT_TTL_S``.
+
+    Best-effort by design: losing a sweep wastes disk, but raising here would
+    fail a prediction whose audio is already separated.
+    """
+    try:
+        cutoff = time.time() - _OUTPUT_TTL_S
+        for entry in _OUTPUT_ROOT.iterdir():
+            try:
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                continue
+    except OSError:
+        # Root missing on the first prediction is the normal case.
+        pass
 
 
 class Predictor(BasePredictor):
@@ -226,6 +267,41 @@ class Predictor(BasePredictor):
                     f"{sep.chunk_batch_size}.",
                     flush=True,
                 )
+
+        # Force the compiled path's CUDAGraph capture now. Capture happens on
+        # the first forward, not in ``Separator()``, so without this the first
+        # real prediction pays it: 16.4s measured on an H200 against 0.29s
+        # warm, which accounts for essentially all of the ~20s predict_time
+        # seen in production on a 3s clip. Replicate does not bill setup per
+        # prediction, so moving the cost here is close to free.
+        #
+        # One warmup covers every audio length: the compiled path pads every
+        # forward to the captured ``chunk_batch_size`` shape (apply.py:1089),
+        # so input duration cannot change it. Verified on an H200 -- after a 3s
+        # warmup, 30s and 120s inputs measured 0.27s and 0.32s cold.
+        #
+        # Wrapped because a warmup that fails must degrade to a slow first
+        # prediction, never a failed boot.
+        if use_cuda:
+            for name, sep in self.separators.items():
+                try:
+                    started = time.perf_counter()
+                    samplerate = int(getattr(sep.model, "samplerate", 44100))
+                    # Noise rather than silence: separation normalizes by the
+                    # mix's standard deviation, which is zero for zeros.
+                    warmup_audio = torch.rand(2, samplerate * 3) * 0.2
+                    sep.separate((warmup_audio, samplerate))
+                    print(
+                        f"[predictor] {name}: warmup took "
+                        f"{time.perf_counter() - started:.1f}s",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - must not break boot
+                    print(
+                        f"[predictor] {name}: warmup failed, the first "
+                        f"prediction will pay compilation instead: {exc!r}",
+                        flush=True,
+                    )
 
         # Per-queue-key coalescer state. Keys are
         # (model, shifts, split_overlap, isolate_stem); each gets its own
@@ -532,13 +608,16 @@ class Predictor(BasePredictor):
         if isolate_stem != "none":
             separated = separated.isolate_stem(isolate_stem)
 
-        output_data: dict[str, BytesIO] = {}
+        _prune_stale_outputs()
+        output_dir = _OUTPUT_ROOT / uuid.uuid4().hex
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_data: dict[str, Path] = {}
         clip = None if clip_mode == "none" else clip_mode
         for stem in separated.sources:
             audio_bytes = separated.export_stem(stem, format=format, clip=clip)
-            buf = BytesIO(audio_bytes)
-            buf.name = f"{stem}.{format}"
-            output_data[stem] = buf
+            stem_path = output_dir / f"{stem}.{format}"
+            stem_path.write_bytes(audio_bytes)
+            output_data[stem] = Path(stem_path)
 
         encode_s = time.perf_counter() - started - separate_s
         sep = self.separators.get(model)

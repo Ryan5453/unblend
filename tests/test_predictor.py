@@ -59,7 +59,9 @@ class _FakeSeparator:
     device = "cpu"
     dtype = None
     sample_rate = 44100
-    model = SimpleNamespace(sources=["drums", "bass", "other", "vocals"])
+    model = SimpleNamespace(
+        sources=["drums", "bass", "other", "vocals"], samplerate=44100
+    )
     _compile_enabled = False
     _chunk_batch_size_auto = False
     _calibration_attempts: list[int] = []
@@ -74,6 +76,10 @@ class _FakeSeparator:
         self.calls.append(audio)
         if isinstance(audio, list):
             return [f"result:{path.name}" for path in audio]
+        # setup()'s warmup passes the real API's ``(samples, sample_rate)``
+        # form rather than a path; see unblend/api.py's input validation.
+        if isinstance(audio, tuple):
+            return "result:warmup"
         return f"result:{audio.name}"
 
 
@@ -294,6 +300,83 @@ def test_setup_allows_cpu_when_opted_in(monkeypatch) -> None:
     monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(
         _PREDICTOR_MODULE, "Separator", lambda **_kwargs: _FakeSeparator()
+    )
+
+    predictor = _PREDICTOR_MODULE.Predictor()
+    asyncio.run(predictor.setup())
+
+    assert "htdemucs" in predictor.separators
+
+
+def test_output_stems_upload_rather_than_inline() -> None:
+    """
+    Output stems must be ``Path`` (uploaded), never ``File`` (inlined base64).
+
+    Cog serializes a ``File`` into the prediction response as a base64 data
+    URI. That is survivable for a 3s clip and fatal for real audio: a 225s song
+    as wav is ~160MB of stems, so ~212MB of base64 in one JSON body. Measured
+    on an H100 the separation took 0.65s and the prediction then sat in
+    ``processing`` for over 22 minutes without ever returning, while the same
+    song as mp3 (~19MB inlined) completed with predict_time 11.08s. A ``Path``
+    is uploaded to object storage instead, so payload size stops mattering.
+    """
+    hints = _PREDICTOR_MODULE.Output.__annotations__
+    assert hints, "Output must declare stems for Cog's static schema generator"
+    for stem, annotation in hints.items():
+        assert annotation is _PREDICTOR_MODULE.Path, (
+            f"Output.{stem} must be Path so Cog uploads it rather than "
+            f"inlining base64; got {annotation!r}"
+        )
+
+
+def test_setup_warms_up_on_cuda(monkeypatch) -> None:
+    """
+    ``setup()`` forces the compiled path's CUDAGraph capture at boot.
+
+    Capture happens on the first forward rather than in ``Separator()``, so
+    without a warmup the first *prediction* pays it -- 16.4s measured on an
+    H200 against 0.29s warm, which is most of the ~20s predict_time seen in
+    production on a 3s clip. Replicate does not bill setup per prediction, so
+    the cost belongs here.
+    """
+    monkeypatch.setenv("UNBLEND_ALLOW_CPU", "1")
+    monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: True)
+    separator = _FakeSeparator()
+    monkeypatch.setattr(_PREDICTOR_MODULE, "Separator", lambda **_kwargs: separator)
+
+    predictor = _PREDICTOR_MODULE.Predictor()
+    asyncio.run(predictor.setup())
+
+    assert len(separator.calls) == 1, "expected exactly one warmup separation"
+    warmup = separator.calls[0]
+    assert isinstance(warmup, tuple), "warmup must use the (samples, rate) form"
+    samples, rate = warmup
+    assert rate == separator.model.samplerate
+    assert samples.shape[0] == 2, "warmup mix must be stereo"
+    assert float(samples.std()) > 0.0, (
+        "warmup must not be silence: separation normalizes by the mix's "
+        "standard deviation, which is zero for zeros"
+    )
+
+
+def test_setup_survives_a_failing_warmup(monkeypatch) -> None:
+    """
+    A warmup that raises degrades to a slow first prediction, never a dead boot.
+
+    An earlier diagnostics block read an attribute the real Separator lacked and
+    Replicate permanently disabled that version, so anything setup() runs purely
+    for performance has to be non-fatal.
+    """
+    monkeypatch.setenv("UNBLEND_ALLOW_CPU", "1")
+    monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: True)
+
+    class _ExplodingSeparator(_FakeSeparator):
+        def separate(self, audio: object, **kwargs: object) -> object:
+            """Fail the way a shape/OOM error would during capture."""
+            raise RuntimeError("CUDA error during graph capture")
+
+    monkeypatch.setattr(
+        _PREDICTOR_MODULE, "Separator", lambda **_kwargs: _ExplodingSeparator()
     )
 
     predictor = _PREDICTOR_MODULE.Predictor()

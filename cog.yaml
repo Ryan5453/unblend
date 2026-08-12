@@ -32,24 +32,27 @@ build:
   # predictor.setup() fails loudly rather than dropping to CPU if it is unmet.
   cuda: "12.8"
   python_version: "3.12"
-  # BUILD WITH COG CLI 0.16.x. Do not upgrade without reading this.
-  #
   # The CLI decides which Python SDK lands in the image, and the SDK changed
   # incompatibly at 0.17.0: it swapped the pydantic runtime for coglet, where
   # ``cog.BaseModel`` is a bare marker class with no field handling at all.
-  # predictor.py's ``Output`` relies on ``extra = "allow"`` to carry a dynamic
-  # set of stem names, so under coglet every prediction dies with
-  # "Output.__init__() got an unexpected keyword argument 'drums'" -- at
-  # predict time, long after build and setup both look healthy.
+  # ``Output`` used to be a BaseModel carrying a dynamic set of stem names via
+  # ``class Config: extra = "allow"``; under coglet that became a silent no-op
+  # and every prediction died with "Output.__init__() got an unexpected
+  # keyword argument 'drums'" -- at predict time, long after build and setup
+  # both looked healthy.
   #
-  # 0.16.x embeds a matching SDK wheel in the CLI binary and installs pydantic
-  # explicitly. 0.21.0 instead resolves `cog` from PyPI unpinned, so it always
-  # takes the coglet line. build.sdk_version looks like the fix but is not:
-  # 0.21.0 rejects any SDK below 0.17.0 with "not supported by static schema
-  # generation". The CLI version and the SDK generation are welded together.
+  # predictor.py's ``Output`` is now a TypedDict (see the rationale there),
+  # which Cog's static schema generator accepts alongside BaseModel and which
+  # is a plain dict at runtime, so it leans on no SDK machinery at all. That
+  # works on both SDK lines, so this Cog is NOT pinned to a CLI version:
+  # verified on 0.16.9 (correct 8-key Output schema generated; 4-stem,
+  # isolate_stem, and invalid-model-422 predictions all served) and on 0.21.0
+  # in production.
   #
-  # Escaping this means migrating Output off extra = "allow" to the coglet
-  # run.py:Runner interface, which changes the output schema.
+  # Note that build.sdk_version cannot be used to hold the SDK back on a new
+  # CLI: 0.21.0 rejects any SDK below 0.17.0 with "not supported by static
+  # schema generation". The CLI version and the SDK generation are welded
+  # together, which is why the fix had to be on our side.
   # Generated from uv.lock; CI fails if this export drifts.
   python_requirements: "requirements-cog.txt"
   system_packages:
