@@ -40,7 +40,7 @@ def test_cog_requirements_have_no_environment_markers() -> None:
     ``;``, so any marker is dropped silently. A marker-split pin like
     ``numpy==2.2.6 ; python_full_version < '3.11'`` plus its ``>= '3.11'``
     counterpart therefore reaches pip as two conflicting pins and the build
-    fails with ResolutionImpossible. script/export_cog_requirements.py
+    fails with ResolutionImpossible. export_cog_requirements.py
     pre-evaluates markers for the image's environment to prevent exactly this.
     """
     exported = (ROOT / "requirements-cog.txt").read_text()

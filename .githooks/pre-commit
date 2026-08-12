@@ -60,7 +60,7 @@ if [ "$touches_python" = true ]; then
 fi
 
 if [ "$touches_deps" = true ]; then
-    run "cog requirements" uv run python script/export_cog_requirements.py --check
+    run "cog requirements" uv run python export_cog_requirements.py --check
 fi
 
 run "pytest (fast)" uv run pytest -m "not slow" -q

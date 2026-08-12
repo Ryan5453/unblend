@@ -26,7 +26,7 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --extra dev
       - name: Verify locked Cog requirements
-        run: uv run python script/export_cog_requirements.py --check
+        run: uv run python export_cog_requirements.py --check
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format

@@ -42,7 +42,7 @@ jobs:
       - name: Sync Python dependencies
         run: uv sync --locked --extra dev --extra onnx --group onnx-test
       - name: Verify locked Cog requirements
-        run: uv run python script/export_cog_requirements.py --check
+        run: uv run python export_cog_requirements.py --check
       - name: Check Python style
         run: |
           uv run ruff check .
