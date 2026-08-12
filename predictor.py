@@ -7,19 +7,47 @@
 import asyncio
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path as PathlibPath
+from typing import TypedDict
 
 import torch
-from cog import BaseModel, BasePredictor, Input, Path
+from cog import BasePredictor, File, Input, Path
 
 from unblend import Separator
 
 
-class Output(BaseModel):
-    class Config:
-        extra = "allow"
+class Output(TypedDict, total=False):
+    """
+    Stems returned by a prediction, keyed by stem name.
+
+    Every key is optional because which ones appear depends on
+    ``isolate_stem``: the default returns htdemucs's four sources, while
+    isolating returns just ``{stem}`` and ``no_{stem}`` (see
+    SeparatedSources.isolate_stem in unblend/api.py).
+
+    This is a TypedDict rather than a ``cog.BaseModel`` on purpose. Cog 0.17.0
+    replaced pydantic with coglet, whose ``BaseModel`` is an empty marker class
+    -- it has no field handling and no ``__init__``, so the old
+    ``class Config: extra = "allow"`` silently became a no-op and every
+    prediction failed with "Output.__init__() got an unexpected keyword
+    argument 'drums'". Cog's static schema generator accepts BaseModel or
+    TypedDict, and a TypedDict is a plain dict at runtime, so it both declares
+    a real schema and constructs without relying on any SDK machinery.
+    Keys must be declared: the generator reads only declared fields, so a
+    dynamically-keyed output cannot be expressed here.
+    """
+
+    drums: File
+    bass: File
+    other: File
+    vocals: File
+    no_drums: File
+    no_bass: File
+    no_other: File
+    no_vocals: File
 
 
 @dataclass
@@ -95,6 +123,25 @@ class Predictor(BasePredictor):
         """
         self.separators: dict[str, Separator] = {}
         use_cuda = torch.cuda.is_available()
+        # cog.yaml declares ``gpu: true``, so a CPU fallback here is always a
+        # deployment fault, never a valid configuration.
+        #
+        # A driver too old for the installed wheel is only loud if you touch
+        # the right API: ``torch.cuda.get_device_properties`` raises
+        # "The NVIDIA driver on your system is too old", but
+        # ``is_available()`` swallows that and returns False (verified on a
+        # driver-570 host against cu130 wheels). Since we branch on
+        # ``is_available()``, we get the quiet path -- setup would succeed and
+        # the endpoint would serve correct output at a fraction of the speed
+        # forever, with compile and batching both silently off. Hence the
+        # explicit raise. Set UNBLEND_ALLOW_CPU=1 to run without a GPU.
+        if not use_cuda and os.environ.get("UNBLEND_ALLOW_CPU") != "1":
+            raise RuntimeError(
+                "CUDA is unavailable but cog.yaml declares gpu: true. "
+                f"torch {torch.__version__} was built against CUDA "
+                f"{torch.version.cuda}; check that the host driver is new "
+                "enough for it. Set UNBLEND_ALLOW_CPU=1 to run on CPU anyway."
+            )
         # This Cog serves htdemucs only. A ``compile=True`` Separator reserves
         # a CUDAGraphs private memory pool sized to its auto-detected
         # ``chunk_batch_size``; with a single resident model that pool +
@@ -111,6 +158,45 @@ class Predictor(BasePredictor):
             dtype=torch.float16 if use_cuda else None,
             compile=use_cuda,
         )
+
+        # Report what the accelerated path actually negotiated. Every one of
+        # these can silently degrade without any error: compile can fall back
+        # to eager, auto-calibration can settle on chunk_batch_size=1 after
+        # repeated OOM halving, and a mismatched driver can strand us on CPU.
+        # The symptom in all three cases is only "predictions are slow", which
+        # is indistinguishable from normal cold-start cost without these
+        # numbers in the log.
+        # Wrapped because this reads private Separator attributes: a rename
+        # upstream must degrade the log line, never fail the boot. Diagnostics
+        # that can take down setup are worse than no diagnostics.
+        try:
+            if use_cuda:
+                props = torch.cuda.get_device_properties(0)
+                driver = getattr(torch._C, "_cuda_getDriverVersion", lambda: None)()
+                print(
+                    f"[predictor] gpu={props.name} "
+                    f"sm={props.major}.{props.minor} "
+                    f"vram={props.total_memory / 1024**3:.1f}GiB "
+                    f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
+                    f"driver={driver}",
+                    flush=True,
+                )
+            for name, sep in self.separators.items():
+                stems = getattr(sep.model, "sources", None)
+                print(
+                    f"[predictor] {name}: device={sep.device} dtype={sep.dtype} "
+                    f"compile_enabled={getattr(sep, '_compile_enabled', '?')} "
+                    f"chunk_batch_size={sep.chunk_batch_size} "
+                    f"(auto={getattr(sep, '_chunk_batch_size_auto', '?')}, "
+                    f"calibration_attempts="
+                    f"{getattr(sep, '_calibration_attempts', '?')}, "
+                    f"per_chunk_steady="
+                    f"{getattr(sep, '_per_chunk_steady_bytes', '?')}) "
+                    f"stems={list(stems) if stems else '?'}",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not break setup
+            print(f"[predictor] diagnostics unavailable: {exc!r}", flush=True)
 
         # Sanity check: cog.yaml's ``concurrency.max`` (read by the Rust
         # orchestrator at startup; surfaced to Python via the
@@ -424,6 +510,13 @@ class Predictor(BasePredictor):
         )
         self._enqueue_request(key, request)
 
+        # Split the timing at the separation boundary. A compiled model pays
+        # its graph capture on the first forward of each new shape, so a slow
+        # first prediction followed by fast ones is expected warm-up, while
+        # uniformly slow separations mean compile or batching is not engaging.
+        # Reporting one number cannot tell those apart; reporting separate
+        # and encode can.
+        started = time.perf_counter()
         try:
             separated = await request.future
         except asyncio.CancelledError:
@@ -433,6 +526,8 @@ class Predictor(BasePredictor):
             if not request.future.done():
                 request.future.cancel()
             raise
+
+        separate_s = time.perf_counter() - started
 
         if isolate_stem != "none":
             separated = separated.isolate_stem(isolate_stem)
@@ -444,5 +539,28 @@ class Predictor(BasePredictor):
             buf = BytesIO(audio_bytes)
             buf.name = f"{stem}.{format}"
             output_data[stem] = buf
+
+        encode_s = time.perf_counter() - started - separate_s
+        sep = self.separators.get(model)
+        audio_s = None
+        if sep is not None and getattr(separated, "sources", None):
+            first = next(iter(separated.sources.values()))
+            audio_s = first.shape[-1] / sep.sample_rate
+        # compile_enabled/chunk_batch_size are repeated here, not just in
+        # setup(), because Replicate exposes setup output on a separate log
+        # stream that the prediction API does not return. Without them on this
+        # line there is no way to tell a compile fallback from a cold cache
+        # when all you have is a slow prediction.
+        timing = f"[predictor] separate={separate_s:.2f}s encode={encode_s:.2f}s"
+        if audio_s:
+            timing += f" audio={audio_s:.1f}s realtime={audio_s / separate_s:.2f}x"
+        if sep is not None:
+            timing += (
+                f" compile_enabled={getattr(sep, '_compile_enabled', '?')}"
+                f" cbs={sep.chunk_batch_size}"
+                f" device={sep.device} dtype={sep.dtype}"
+            )
+        timing += f" shifts={shifts} overlap={split_overlap} format={format}"
+        print(timing, flush=True)
 
         return Output(**output_data)

@@ -6,7 +6,8 @@ import importlib.util
 import sys
 import weakref
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
+from typing import IO
 
 
 class _BaseModel:
@@ -31,6 +32,9 @@ _COG.BaseModel = _BaseModel
 _COG.BasePredictor = _BasePredictor
 _COG.Input = _input
 _COG.Path = Path
+# predictor.Output declares its stems as ``File``; only the annotation is
+# needed at import time, so any type object stands in.
+_COG.File = IO[bytes]
 sys.modules.setdefault("cog", _COG)
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -47,6 +51,19 @@ class _FakeSeparator:
     """Pointwise separator stand-in recording batch calls."""
 
     chunk_batch_size = 4
+    # Mirrors the real Separator's attribute surface, which setup()'s
+    # diagnostic log line reads. Keep this in sync with unblend.api.Separator:
+    # stems live on ``model.sources``, NOT on the separator itself. An earlier
+    # version of this fake invented ``sources`` here, which let a real
+    # AttributeError reach a deployed image because the tests passed.
+    device = "cpu"
+    dtype = None
+    sample_rate = 44100
+    model = SimpleNamespace(sources=["drums", "bass", "other", "vocals"])
+    _compile_enabled = False
+    _chunk_batch_size_auto = False
+    _calibration_attempts: list[int] = []
+    _per_chunk_steady_bytes = None
 
     def __init__(self) -> None:
         """Initialize the call log."""
@@ -242,3 +259,80 @@ def test_failed_batch_falls_back_per_request_and_retires() -> None:
         assert predictor._coalescers == {}
 
     asyncio.run(scenario())
+
+
+def test_setup_rejects_cpu_fallback(monkeypatch) -> None:
+    """
+    ``setup()`` refuses to boot on CPU because cog.yaml declares ``gpu: true``.
+
+    A host driver too old for the installed CUDA wheel makes
+    ``torch.cuda.is_available()`` return False with only a UserWarning, so
+    without this guard the image boots clean and serves correct audio at ~35x
+    the latency, with compile and batching silently disabled. The failure has
+    to be loud to be diagnosable.
+    """
+    monkeypatch.delenv("UNBLEND_ALLOW_CPU", raising=False)
+    monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: False)
+    # Stubbed so that deleting the guard fails this test on the assertion
+    # below rather than by silently downloading a model in CI.
+    monkeypatch.setattr(
+        _PREDICTOR_MODULE, "Separator", lambda **_kwargs: _FakeSeparator()
+    )
+
+    predictor = _PREDICTOR_MODULE.Predictor()
+    try:
+        asyncio.run(predictor.setup())
+    except RuntimeError as exc:
+        assert "CUDA is unavailable" in str(exc)
+    else:
+        raise AssertionError("setup() booted on CPU without an opt-in")
+
+
+def test_setup_allows_cpu_when_opted_in(monkeypatch) -> None:
+    """``UNBLEND_ALLOW_CPU=1`` keeps the image runnable on a GPU-less host."""
+    monkeypatch.setenv("UNBLEND_ALLOW_CPU", "1")
+    monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        _PREDICTOR_MODULE, "Separator", lambda **_kwargs: _FakeSeparator()
+    )
+
+    predictor = _PREDICTOR_MODULE.Predictor()
+    asyncio.run(predictor.setup())
+
+    assert "htdemucs" in predictor.separators
+
+
+def test_diagnostic_attributes_exist_on_separator() -> None:
+    """
+    setup()'s diagnostic line reads private Separator attributes; keep them real.
+
+    The line is wrapped in a try/except so a rename cannot break the boot, which
+    means a typo would silently reduce it to "diagnostics unavailable" -- exactly
+    when the numbers are needed to explain a slow GPU. This asserts against the
+    real class rather than the fake above, because a fake that invented
+    ``sources`` is what let an AttributeError reach a deployed image.
+    """
+    import inspect
+    import re
+
+    from unblend import Separator
+
+    source = inspect.getsource(Separator)
+    assigned = set(
+        re.findall(r"self\.([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=", source)
+    )
+
+    for attr in (
+        "device",
+        "dtype",
+        "chunk_batch_size",
+        "sample_rate",
+        "_compile_enabled",
+        "_chunk_batch_size_auto",
+        "_calibration_attempts",
+        "_per_chunk_steady_bytes",
+    ):
+        assert attr in assigned, f"Separator no longer assigns {attr}"
+
+    # Stems come from sep.model.sources; Separator itself has no .sources.
+    assert "sources" not in assigned

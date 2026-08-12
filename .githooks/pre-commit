@@ -1,0 +1,74 @@
+#!/bin/sh
+# Runs the fast half of CI (see .github/workflows/ci.yml) before each commit.
+#
+# Enabled via `git config core.hooksPath .githooks`. Bypass a single commit
+# with `git commit --no-verify`.
+#
+# Checks run against the working tree, not the staged snapshot, so a partial
+# `git add` is linted and tested as the files actually are on disk.
+
+set -eu
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    red=$(printf '\033[31m')
+    green=$(printf '\033[32m')
+    dim=$(printf '\033[2m')
+    reset=$(printf '\033[0m')
+else
+    red='' green='' dim='' reset=''
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+
+matches() {
+    printf '%s\n' "$staged" | grep -Eq "$1"
+}
+
+# Tests and the Cog export only depend on Python sources and the lockfile, so
+# doc-only commits skip straight through.
+touches_python=false
+touches_deps=false
+matches '\.py$' && touches_python=true
+matches '^(pyproject\.toml|uv\.lock|requirements-cog\.txt)$' && touches_deps=true
+
+if [ "$touches_python" = false ] && [ "$touches_deps" = false ]; then
+    exit 0
+fi
+
+failed=''
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT INT TERM
+
+run() {
+    label=$1
+    shift
+    printf '%s· %s%s\n' "$dim" "$label" "$reset" >&2
+    if ! "$@" >"$log" 2>&1; then
+        printf '%s✗ %s%s\n' "$red" "$label" "$reset" >&2
+        cat "$log" >&2
+        failed="$failed $label"
+    fi
+}
+
+if [ "$touches_python" = true ]; then
+    run "ruff check" uv run ruff check .
+    run "ruff format" uv run ruff format --check .
+fi
+
+if [ "$touches_deps" = true ]; then
+    run "cog requirements" uv run python script/export_cog_requirements.py --check
+fi
+
+run "pytest (fast)" uv run pytest -m "not slow" -q
+
+if [ -n "$failed" ]; then
+    printf '\n%sCommit blocked:%s%s\n' "$red" "$failed" "$reset" >&2
+    printf '%sCommit anyway with `git commit --no-verify`.%s\n' "$dim" "$reset" >&2
+    exit 1
+fi
+
+printf '%s✓ pre-commit checks passed%s\n' "$green" "$reset" >&2

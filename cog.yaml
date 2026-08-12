@@ -1,7 +1,55 @@
 build:
   gpu: true
-  cuda: "12.4"
+  # Read this before changing `cuda:` -- three constraints interlock and the
+  # obvious values are all wrong.
+  #
+  # 1. The field cannot be omitted. Cog's torch matrix stops at 2.11.0, so it
+  #    cannot infer a CUDA version for our 2.13.0 pin and hard-errors with
+  #    "cog doesn't know what CUDA version is compatible with torch".
+  #
+  # 2. It cannot be 13.0, which is what actually gets installed. uv.lock
+  #    resolves the cu13 stack (nvidia-*-cu13) and pip takes it from PyPI
+  #    regardless of this field, since an unmatched torch means Cog emits no
+  #    --extra-index-url. But r8.im/cog-base publishes no cuda13.0-python3.12
+  #    image (nor 12.9), so Cog falls back to nvidia/cuda:...-ubuntu24.04, and
+  #    that fallback is broken upstream: it runs `uv python install 3.12` then
+  #    `uv run pip install` into that uv-managed interpreter, which PEP 668
+  #    rejects. Cog's --break-system-packages fix is only wired to its internal
+  #    `cog base-image` command, so build/push can never set it (thru 0.21.0).
+  #
+  # 3. It cannot be worked around with --use-cuda-base-image false. That builds
+  #    fine on python:3.12-slim, but pkg/image/build.go labels whatever base it
+  #    used as run.cog.cog-base-image-name without checking it is a Replicate
+  #    image. Replicate then tries to resolve base layers from an image its
+  #    fleet has no reason to have cached. The result is a container that never
+  #    starts, emits no logs, and cannot be cancelled.
+  #
+  # So it has to be a CUDA version with a published r8.im base, and 12.8 is the
+  # newest one. The understatement is inert: torch carries its own CUDA runtime
+  # in the pip wheels, so the base only has to be no NEWER than the wheels
+  # expect -- which is what tests/test_packaging.py enforces. The real driver
+  # floor (>= 580) comes from the cu130 wheels, not from this field, and
+  # predictor.setup() fails loudly rather than dropping to CPU if it is unmet.
+  cuda: "12.8"
   python_version: "3.12"
+  # BUILD WITH COG CLI 0.16.x. Do not upgrade without reading this.
+  #
+  # The CLI decides which Python SDK lands in the image, and the SDK changed
+  # incompatibly at 0.17.0: it swapped the pydantic runtime for coglet, where
+  # ``cog.BaseModel`` is a bare marker class with no field handling at all.
+  # predictor.py's ``Output`` relies on ``extra = "allow"`` to carry a dynamic
+  # set of stem names, so under coglet every prediction dies with
+  # "Output.__init__() got an unexpected keyword argument 'drums'" -- at
+  # predict time, long after build and setup both look healthy.
+  #
+  # 0.16.x embeds a matching SDK wheel in the CLI binary and installs pydantic
+  # explicitly. 0.21.0 instead resolves `cog` from PyPI unpinned, so it always
+  # takes the coglet line. build.sdk_version looks like the fix but is not:
+  # 0.21.0 rejects any SDK below 0.17.0 with "not supported by static schema
+  # generation". The CLI version and the SDK generation are welded together.
+  #
+  # Escaping this means migrating Output off extra = "allow" to the coglet
+  # run.py:Runner interface, which changes the output schema.
   # Generated from uv.lock; CI fails if this export drifts.
   python_requirements: "requirements-cog.txt"
   system_packages:
