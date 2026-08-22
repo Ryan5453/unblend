@@ -13,9 +13,10 @@ export type ModelType =
     | 'htdemucs'
     | 'htdemucs_6s'
     | 'bs_roformer_sw'
-    | 'melband_roformer_kim';
+    | 'melband_roformer_kim'
+    | 'scnet_small';
 
-export type ModelFamily = 'htdemucs' | 'roformer';
+export type ModelFamily = 'htdemucs' | 'roformer' | 'scnet';
 
 /**
  * Everything the pipeline needs to know about one model. The two families
@@ -47,8 +48,14 @@ export interface ModelConfig {
     normalizeInput: boolean;
     /** Whether the graph has the HTDemucs time-domain branch (``out_wave``). */
     hasTimeBranch: boolean;
+    /** Refuse the fixed-memory WASM heap and require WebGPU for this model. */
+    webgpuRequired?: boolean;
     /** License of the model weights (shown so apps can surface it). */
     license: string;
+    /** STFT analysis window; defaults to Hann when unset. */
+    window?: 'hann' | 'rectangular';
+    /** Whether the STFT is 1/sqrt(nfft)-scaled; defaults to false. */
+    stftNormalized?: boolean;
 }
 
 export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
@@ -61,7 +68,7 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
         sources: ['drums', 'bass', 'other', 'vocals'],
         normalizeInput: true,
         hasTimeBranch: true,
-        license: 'unlicensed',
+        license: 'MIT',
     },
     'htdemucs_6s': {
         family: 'htdemucs',
@@ -72,7 +79,7 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
         sources: ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano'],
         normalizeInput: true,
         hasTimeBranch: true,
-        license: 'unlicensed',
+        license: 'MIT',
     },
     'bs_roformer_sw': {
         family: 'roformer',
@@ -83,7 +90,11 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
         sources: ['bass', 'drums', 'other', 'vocals', 'guitar', 'piano'],
         normalizeInput: false,
         hasTimeBranch: false,
-        license: 'CC-BY-NC-SA-4.0',
+        // Even the mixed-fp16 low-buffer graph peaks around 4.25 GB in native
+        // ORT CPU inference. ORT-WASM's fixed heap cannot satisfy that working
+        // set; attempting it ends in std::bad_alloc and can refresh Safari.
+        webgpuRequired: true,
+        license: 'unlicensed',
     },
     'melband_roformer_kim': {
         family: 'roformer',
@@ -95,7 +106,26 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
         complement: { stem: 'vocals', name: 'other' },
         normalizeInput: false,
         hasTimeBranch: false,
-        license: 'CC-BY-NC-SA-4.0',
+        license: 'MIT',
+    },
+    'scnet_small': {
+        family: 'scnet',
+        nfft: 4096,
+        hopLength: 1024,
+        // The Python model pads its 485100-sample segment up to an even frame
+        // count before the STFT (unblend.scnet.stft_padding), and the graph is
+        // traced at that padded size. Chunking directly at the padded length
+        // reaches the same 476 frames without a separate pad/trim step.
+        segmentSamples: 486400,
+        modelSources: ['drums', 'bass', 'other', 'vocals'],
+        sources: ['drums', 'bass', 'other', 'vocals'],
+        normalizeInput: false,
+        hasTimeBranch: false,
+        // scnet_small is the masked variant, which windows its STFT and scales
+        // it by 1/sqrt(nfft); plain SCNet does neither.
+        window: 'hann',
+        stftNormalized: true,
+        license: 'unlicensed',
     },
 };
 
@@ -106,6 +136,8 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
  * centered frame count.
  */
 export function specDims(config: ModelConfig): { numBins: number; numFrames: number } {
+    // Only HTDemucs trims; roformer and scnet both keep every bin and the
+    // standard centered frame count.
     if (config.family === 'htdemucs') {
         return {
             numBins: config.nfft / 2,
@@ -148,6 +180,13 @@ export interface DSPConfig {
     nfft: number;
     hopLength: number;
     segmentSamples: number;
+    /**
+     * STFT analysis window. Plain SCNet passes no window to ``torch.stft``,
+     * so applying Hann there would silently change the result.
+     */
+    window?: 'hann' | 'rectangular';
+    /** Whether the STFT is 1/sqrt(nfft)-scaled (``normalized=True``). */
+    normalized?: boolean;
 }
 
 /** Extract the DSP subset of a model config (what the workers consume). */
@@ -157,5 +196,7 @@ export function dspConfig(config: ModelConfig): DSPConfig {
         nfft: config.nfft,
         hopLength: config.hopLength,
         segmentSamples: config.segmentSamples,
+        window: config.window,
+        normalized: config.stftNormalized,
     };
 }

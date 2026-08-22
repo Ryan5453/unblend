@@ -22,12 +22,18 @@ from typing import Any
 import torch
 import typer
 from filelock import FileLock
+from safetensors.torch import load_file as load_safetensors
 
 from unblend.api import Separator, default_device
 from unblend.cli.models import ensure_model_available
+from unblend.roformer import build_roformer
 
 REFERENCE_STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
 DEFAULT_MODELS = ["htdemucs", "htdemucs_ft"]
+# Label -> preloaded model, populated by --local-manifest. Lets a checkpoint be
+# benchmarked straight off disk, without a registry entry or an upload. Names
+# here shadow the registry, so a label may not collide with a registered model.
+LOCAL_MODELS: dict[str, Any] = {}
 DEFAULT_PRECISIONS = ["fp32", "fp16", "bf16"]
 DEFAULT_COMPILE_MODES = ["false", "true"]
 DEFAULT_SHIFTS = [1, 2, 4]
@@ -251,6 +257,72 @@ def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
     return 10.0 * math.log10(reference_energy / noise_energy)
 
 
+def _load_local_manifest(manifest_path: Path) -> dict[str, Any]:
+    """
+    Build the models described by a local-checkpoint manifest.
+
+    The manifest is JSON mapping a benchmark label to a spec with keys
+    ``checkpoint`` (path to a ``.ckpt`` or ``.safetensors``), ``architecture``
+    (``bs_roformer`` or ``mel_band_roformer``), ``config`` (constructor kwargs,
+    already filtered to the architecture's signature), ``sources``,
+    ``samplerate`` and ``segment_samples``. Checkpoints are loaded strictly, so
+    an architecture variant whose weights do not match unblend's implementation
+    fails loudly here rather than silently producing garbage separations.
+
+    :param manifest_path: Path to the manifest JSON.
+    :return: Mapping of label to constructed, weight-loaded model.
+    :raises typer.BadParameter: If the manifest is missing or unreadable.
+    """
+    if not manifest_path.is_file():
+        raise typer.BadParameter(f"Local manifest does not exist: {manifest_path}")
+    specs = json.loads(manifest_path.read_text())
+
+    models: dict[str, Any] = {}
+    for label, spec in specs.items():
+        checkpoint = Path(spec["checkpoint"])
+        if checkpoint.suffix == ".safetensors":
+            state = load_safetensors(str(checkpoint))
+        else:
+            raw = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            state = raw.get("state_dict", raw) if isinstance(raw, dict) else raw
+        models[label] = build_roformer(
+            spec["architecture"],
+            spec["config"],
+            sources=spec["sources"],
+            samplerate=spec.get("samplerate", 44100),
+            segment_samples=spec["segment_samples"],
+            state=state,
+        )
+    return models
+
+
+def _unscoreable_complement(separator: Separator) -> str | None:
+    """
+    Name of the synthesised complement stem, when it is not MUSDB-comparable.
+
+    RoFormer checkpoints with a single mask head can be configured with two
+    source names, in which case the second is synthesised as
+    ``mixture - prediction`` rather than predicted. Whether that stem is
+    comparable to a MUSDB reference depends on what the head predicts:
+
+    * A **vocals** model's complement is everything-but-vocals. It is named
+      ``other``, but MUSDB's ``other`` also excludes drums and bass, so the
+      two mean different things and scoring them together is meaningless.
+    * An **instrumental** model's complement is ``mixture - instrumental``,
+      which is exactly vocals — the same thing MUSDB's ``vocals`` reference
+      holds, so it scores fine.
+
+    :param separator: The separator whose model to inspect.
+    :return: The complement stem's name when it must be excluded from
+        scoring, otherwise ``None``.
+    """
+    model = getattr(separator, "model", None)
+    if not getattr(model, "output_complement", False):
+        return None
+    complement = model.sources[-1]
+    return None if complement == "vocals" else complement
+
+
 def _score_stems(
     separator: Separator,
     track: BenchmarkTrack,
@@ -273,6 +345,14 @@ def _score_stems(
         if only_stem is not None
         else track.reference_stems
     )
+    # Single-stem checkpoints emit a mixture-minus-prediction complement as
+    # their last source. A model whose only head predicts vocals calls that
+    # complement "other", but it means everything-but-vocals, whereas MUSDB's
+    # "other" also excludes drums and bass. Scoring the two against each other
+    # produces a badly negative SDR that looks like a real result, so drop it.
+    complement = _unscoreable_complement(separator)
+    if complement is not None:
+        scored = tuple(s for s in scored if s != complement)
     for stem_name in scored:
         if stem_name not in separated.sources:
             continue
@@ -1107,6 +1187,13 @@ def main(
         "--upstream-python",
         help="Python interpreter version to use for the upstream venv.",
     ),
+    local_manifest: Path | None = typer.Option(
+        None,
+        "--local-manifest",
+        help="JSON manifest of local RoFormer checkpoints to benchmark "
+        "alongside registry models. Its labels are usable as --model values. "
+        "Local configs only — incompatible with --include-upstream.",
+    ),
 ) -> None:
     """
     Benchmark the MUSDB matrix on the chosen device and record SDR + timing.
@@ -1128,7 +1215,16 @@ def main(
     :param include_upstream: Also benchmark the upstream demucs release.
     :param upstream_version: Git ref of upstream demucs to install.
     :param upstream_python: Python version for the upstream venv.
+    :param local_manifest: JSON manifest of local checkpoints to benchmark.
     """
+    if local_manifest is not None:
+        if include_upstream:
+            # The upstream worker resolves models by registry name in its own
+            # venv, where these labels do not exist.
+            raise typer.BadParameter(
+                "--local-manifest cannot be combined with --include-upstream."
+            )
+        LOCAL_MODELS.update(_load_local_manifest(local_manifest))
 
     # --compile-mode takes string values ("true"/"false"); a list[bool] Typer
     # option degenerates into a value-less flag (can't express "false only"),
@@ -1357,7 +1453,9 @@ def main(
             )
             continue
 
-        if not ensure_model_available(config.model):
+        if config.model not in LOCAL_MODELS and not ensure_model_available(
+            config.model
+        ):
             summary_rows.append(
                 {
                     **_summary_row_base(
@@ -1392,7 +1490,7 @@ def main(
             # separators capture the batch size at init and reject per-call
             # overrides.
             separator = Separator(
-                model=config.model,
+                model=LOCAL_MODELS.get(config.model, config.model),
                 device=device,
                 only_load=use_only_stem,
                 dtype=_precision_to_dtype(config.precision),

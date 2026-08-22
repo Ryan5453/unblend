@@ -507,6 +507,81 @@ class HTDemucs(nn.Module):
             cache.clear()
         super()._load_from_state_dict(*args, **kwargs)
 
+    def prefill_inference_caches(self) -> None:
+        """
+        Eagerly populate the positional/frequency-embedding caches via a
+        single dummy ``forward_core`` pass.
+
+        ``mode="reduce-overhead"`` wraps the graph in CUDAGraphs, which reuses
+        internal allocation slots across replays. If the first call into the
+        compiled ``forward_core`` is also what fills these caches, the cached
+        tensors end up pointing into CUDAGraphs-managed memory that gets
+        overwritten on the next replay (see ``_cached_freq_emb`` below and the
+        transformer's ``_cached_pos_emb_*``). Running one eager pass first
+        anchors each cached embedding in the regular allocator so CUDAGraphs
+        treats it as a stable external input.
+        """
+        training_length = int(self.max_allowed_segment * self.samplerate)
+        model_dtype = next(self.parameters()).dtype
+        model_device = next(self.parameters()).device
+
+        with torch.no_grad():
+            mix = torch.zeros(
+                1,
+                self.audio_channels,
+                training_length,
+                device=model_device,
+                dtype=torch.float32,
+            )
+            z = self._spec(mix)
+            x = self._magnitude(z).to(mix.device)
+            mean = x.mean(dim=(1, 2, 3), keepdim=True)
+            std = x.std(dim=(1, 2, 3), keepdim=True)
+            x = (x - mean) / (1e-5 + std)
+
+            xt = mix
+            meant = xt.mean(dim=(1, 2), keepdim=True)
+            stdt = xt.std(dim=(1, 2), keepdim=True)
+            xt = (xt - meant) / (1e-5 + stdt)
+
+            if model_dtype != torch.float32:
+                x = x.to(model_dtype)
+                xt = xt.to(model_dtype)
+
+            self.forward_core(x, xt)
+
+    def enable_compiled_core(self) -> None:
+        """
+        Compile only the heavy neural network core.
+
+        Avoids pulling STFT/iSTFT into TorchInductor — those are a poor fit for
+        Inductor and significantly inflate compile time without helping
+        steady-state throughput.
+        """
+        # Snapshot the original forward_core once so the calibration retry loop
+        # can re-call this safely without nesting torch.compile wrappers
+        # (compiling an already-compiled function breaks dynamo).
+        if not hasattr(self, "_uncompiled_forward_core"):
+            self._uncompiled_forward_core = self.forward_core
+        # Caches must be populated BEFORE compile — see prefill_inference_caches.
+        self.prefill_inference_caches()
+        self.forward_core = torch.compile(
+            self._uncompiled_forward_core, mode="reduce-overhead"
+        )
+        # CUDAGraphs replay requires the captured batch shape, so apply_model
+        # must zero-pad sub-full tail batches up to chunk_batch_size for this
+        # model (eager models run tails at their natural size instead).
+        self._fixed_batch_shape = True
+
+    def disable_compiled_core(self) -> None:
+        """
+        Restore the eager ``forward_core`` so a retry does not double-wrap it.
+        """
+        original = getattr(self, "_uncompiled_forward_core", None)
+        if original is not None:
+            self.forward_core = original
+            del self._uncompiled_forward_core
+
     def forward_core(
         self, x: torch.Tensor, xt: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -5,6 +5,8 @@ import { WaveCanvas, RulerCanvas } from '../ui/WaveLane';
 import { Braid } from '../ui/Braid';
 import { peaksFromBuffer } from '../../utils/peaks';
 import { makeZip } from '../../utils/zip';
+import type { ModelType } from 'unblend';
+import type { ProgressPhase } from '../../types';
 
 const INK = '25,25,22';
 const RED = '207,59,23';
@@ -26,6 +28,46 @@ const STEM_META: Record<string, StemMeta> = {
 
 const STEM_ORDER = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
 
+interface ModelChoice {
+    short: string;
+    description: string;
+    stems: number;
+    size: string;
+}
+
+const MODEL_CHOICES: Record<ModelType, ModelChoice> = {
+    htdemucs: {
+        short: 'HTDEMUCS',
+        description: 'FAST, BALANCED FOUR-STEM SPLIT',
+        stems: 4,
+        size: '91 MB',
+    },
+    htdemucs_6s: {
+        short: 'HTDEMUCS 6S',
+        description: 'GUITAR + PIANO, EXPERIMENTAL',
+        stems: 6,
+        size: '59 MB',
+    },
+    bs_roformer_sw: {
+        short: 'BS-ROFORMER SW',
+        description: 'HIGH-DETAIL MULTI-STEM SEPARATION',
+        stems: 6,
+        size: '364 MB',
+    },
+    melband_roformer_kim: {
+        short: 'MEL-BAND ROFORMER KIM',
+        description: 'VOCALS + FULL INSTRUMENTAL',
+        stems: 2,
+        size: '479 MB',
+    },
+    scnet_small: {
+        short: 'SCNET SMALL',
+        description: 'FOUR STEMS, BEST QUALITY PER MB',
+        stems: 4,
+        size: '29 MB',
+    },
+};
+
 const fmtTenths = (t: number) =>
     `${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60).toFixed(1).padStart(4, '0')}`;
 
@@ -41,12 +83,113 @@ interface Lane {
     download: boolean;
 }
 
+interface VisualProgressInput {
+    phase: ProgressPhase;
+    measured: number;
+    determinate: boolean;
+    segmentsDone: number;
+    segmentsTotal: number;
+    segmentStartedAtMs: number;
+    segmentExpectedMs: number;
+}
+
+/**
+ * Smooth presentation without hiding what is measured. Downloads ease toward
+ * (and never exceed) received bytes. Separation estimates only the fraction
+ * of the currently running opaque ONNX call; the exact segment counter stays
+ * visible in the status log.
+ */
+function useVisualProgress(input: VisualProgressInput): number | null {
+    const inputRef = useRef(input);
+    // Written after commit rather than during render: the only reader is the
+    // interval callback below, which just needs the latest value by the time it
+    // fires, and assigning during render trips react-hooks/refs.
+    useEffect(() => {
+        inputRef.current = input;
+    });
+    const [visual, setVisual] = useState<{ phase: ProgressPhase; value: number | null }>({
+        phase: 'idle',
+        value: null,
+    });
+
+    useEffect(() => {
+        const tick = () => {
+            setVisual(previous => {
+                const {
+                    phase,
+                    measured,
+                    determinate,
+                    segmentsDone,
+                    segmentsTotal,
+                    segmentStartedAtMs,
+                    segmentExpectedMs,
+                } = inputRef.current;
+                const samePhase = previous.phase === phase;
+                // Staying below one point per update prevents visible jumps such
+                // as 10 -> 13 when an exact segment-complete event arrives.
+                const advanceToward = (current: number, target: number) =>
+                    target <= current
+                        ? current
+                        : Math.min(target, current + 0.9);
+
+                if (phase === 'complete') {
+                    const current = previous.value ?? 100;
+                    const value = advanceToward(current, 100);
+                    return samePhase && value === current ? previous : { phase, value };
+                }
+
+                if (phase === 'download' && determinate) {
+                    const target = Math.max(0, Math.min(100, measured));
+                    const current = samePhase && previous.value !== null ? previous.value : 0;
+                    const value = advanceToward(current, target);
+                    return Math.abs(value - current) < 0.005 && samePhase
+                        ? previous
+                        : { phase, value };
+                }
+
+                if (phase === 'separate' && segmentsTotal > 0) {
+                    const elapsed = Math.max(0, performance.now() - segmentStartedAtMs);
+                    const expected = Math.max(250, segmentExpectedMs || 1_000);
+                    const withinSegment = segmentsDone >= segmentsTotal
+                        ? 0
+                        : Math.min(0.96, 0.96 * (1 - Math.exp(-2.5 * elapsed / expected)));
+                    const estimate = Math.min(
+                        99.4,
+                        ((segmentsDone + withinSegment) / segmentsTotal) * 100,
+                    );
+                    const current = samePhase && previous.value !== null
+                        ? previous.value
+                        : measured;
+                    const value = advanceToward(current, Math.max(estimate, measured));
+                    return Math.abs(value - current) < 0.005 && samePhase
+                        ? previous
+                        : { phase, value };
+                }
+
+                return previous.phase === phase && previous.value === null
+                    ? previous
+                    : { phase, value: null };
+            });
+        };
+
+        tick();
+        const id = window.setInterval(tick, 30);
+        return () => window.clearInterval(id);
+    }, []);
+
+    return visual.phase === input.phase ? visual.value : null;
+}
+
 export function Home() {
     const {
         modelLoaded,
-        modelLoading,
-        separating,
+        progressDeterminate,
+        progressPhase,
         progress,
+        segmentsDone,
+        segmentsTotal,
+        segmentStartedAtMs,
+        segmentExpectedMs,
         status,
         audioBuffer,
         audioFile,
@@ -58,6 +201,7 @@ export function Home() {
         artworkUrl,
         logs,
         audioError,
+        loadedModel,
         loadModel,
         loadAudio,
         clearAudioError,
@@ -70,7 +214,7 @@ export function Home() {
     // Drag enter/leave events fire for every child element; track depth so
     // the drag state only clears when the pointer truly leaves the page.
     const dragDepth = useRef(0);
-    const [displayPct, setDisplayPct] = useState(0);
+    const [selectedModel, setSelectedModel] = useState<ModelType>('htdemucs');
 
     const [volumes, setVolumes] = useState<Record<string, number>>({});
     const [muted, setMuted] = useState<Record<string, boolean>>({ [ORIGINAL]: true });
@@ -81,9 +225,21 @@ export function Home() {
     const [exportLabel, setExportLabel] = useState('EXPORT .ZIP ↓');
 
     const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
-    // The displayPct value captured when separation begins, so the separation
-    // phase can continue upward from the model-load crawl without jumping.
-    const sepBaseRef = useRef<number | null>(null);
+    const displayPct = useVisualProgress({
+        phase: progressPhase,
+        measured: progress,
+        determinate: progressDeterminate,
+        segmentsDone,
+        segmentsTotal,
+        segmentStartedAtMs,
+        segmentExpectedMs,
+    });
+    const displayPctInteger = displayPct === null ? null : Math.floor(displayPct);
+    let progressCaption = 'WORKING';
+    if (progressPhase === 'download') progressCaption = 'DOWNLOADED';
+    else if (progressPhase === 'separate') progressCaption = 'EST. SEPARATED';
+    else if (progressPhase === 'finalize') progressCaption = 'FINALIZING';
+    else if (progressPhase === 'complete') progressCaption = 'COMPLETE';
     const duration = audioBuffer?.duration ?? 0;
     const progressFrac = duration > 0 ? Math.min(1, currentTime / duration) : 0;
 
@@ -168,13 +324,19 @@ export function Home() {
         }
     }
 
-    // Once stems are ready, hold on 100% briefly, then reveal the studio.
+    // Keep the fixed processing layout visible until the smoothed counter has
+    // actually reached 100, then hold briefly before revealing the studio.
     const stemsReady = Object.keys(stemUrls).length > 0;
     useEffect(() => {
-        if (phase !== 'processing' || !stemsReady) return;
-        const id = setTimeout(() => setPhase('studio'), 550);
+        if (
+            phase !== 'processing'
+            || !stemsReady
+            || progressPhase !== 'complete'
+            || displayPctInteger !== 100
+        ) return;
+        const id = setTimeout(() => setPhase('studio'), 350);
         return () => clearTimeout(id);
-    }, [phase, stemsReady]);
+    }, [displayPctInteger, phase, progressPhase, stemsReady]);
 
     // Drive the currentTime clock while playing off a real stem element.
     useEffect(() => {
@@ -188,46 +350,6 @@ export function Home() {
         raf = requestAnimationFrame(loop);
         return () => cancelAnimationFrame(raf);
     }, [isPlaying, clockKey]);
-
-    // Drive the big processing counter. Model download reports real byte
-    // progress, mapped across the entire 0-30 pre-separation window; the
-    // compile step after it has no progress signal of its own, but by then
-    // the download has already carried the number to (near) 30, so there's
-    // only a small gap left to crawl. Separation then continues smoothly
-    // from wherever that left off (anchored by sepBaseRef) up to 100 — no
-    // backward jumps, always lands on 100.
-    useEffect(() => {
-        if (phase !== 'processing') return;
-        let raf = 0;
-        const loop = () => {
-            setDisplayPct(prev => {
-                let target: number;
-                let factor = 0.12;
-                if (stemsReady) {
-                    target = 100;
-                } else if (separating) {
-                    if (sepBaseRef.current === null) sepBaseRef.current = prev;
-                    const base = sepBaseRef.current;
-                    target = base + (progress / 100) * (100 - base);
-                } else if (modelLoading && progress > 0) {
-                    target = (progress / 100) * 30;
-                    factor = 0.25;
-                } else {
-                    // Audio decode, download-start latency, or an unknown
-                    // download size (no Content-Length): indeterminate,
-                    // decelerating crawl.
-                    target = 30;
-                    factor = 0.03;
-                }
-                let next = prev + (target - prev) * factor;
-                if (next < prev) next = prev; // never count down
-                return Math.abs(target - next) < 0.3 ? target : next;
-            });
-            raf = requestAnimationFrame(loop);
-        };
-        raf = requestAnimationFrame(loop);
-        return () => cancelAnimationFrame(raf);
-    }, [phase, modelLoading, separating, progress, stemsReady]);
 
     // ---- transport ----------------------------------------------------
     const playAll = useCallback(async () => {
@@ -287,15 +409,13 @@ export function Home() {
         async (file: File) => {
             clearAudioError();
             setPhase('processing');
-            setDisplayPct(0);
-            sepBaseRef.current = null;
             const ok = await loadAudio(file);
             if (!ok) {
                 setPhase('drop');
                 return;
             }
-            if (!modelLoaded) {
-                const loaded = await loadModel('htdemucs');
+            if (!modelLoaded || loadedModel !== selectedModel) {
+                const loaded = await loadModel(selectedModel);
                 if (!loaded) {
                     setPhase('drop');
                     return;
@@ -304,7 +424,15 @@ export function Home() {
             const separated = await separateAudio();
             if (!separated) setPhase('drop');
         },
-        [clearAudioError, loadAudio, loadModel, modelLoaded, separateAudio]
+        [
+            clearAudioError,
+            loadAudio,
+            loadModel,
+            modelLoaded,
+            loadedModel,
+            selectedModel,
+            separateAudio,
+        ]
     );
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -422,14 +550,13 @@ export function Home() {
     };
 
     const trackName = trackTitle || audioFile?.name?.replace(/\.[^/.]+$/, '') || 'untitled';
-    const modelName = 'HTDEMUCS';
+    const modelName = MODEL_CHOICES[selectedModel].short;
 
     return (
         <>
             <input
                 ref={fileInputRef}
                 type="file"
-                accept="audio/*"
                 onChange={handleFileChange}
                 className="hidden"
             />
@@ -496,6 +623,47 @@ export function Home() {
                                     browse files →
                                 </button>
                             </div>
+                            <div
+                                className="model-selector"
+                                role="radiogroup"
+                                aria-label="Separation model"
+                                onClick={e => e.stopPropagation()}
+                            >
+                                <div className="model-selector-head">
+                                    <span>Separation model</span>
+                                    <span className="model-selector-dots" />
+                                </div>
+                                <div className="model-board">
+                                    {(Object.entries(MODEL_CHOICES) as [ModelType, ModelChoice][])
+                                        .map(([value, choice], index) => {
+                                            const selected = value === selectedModel;
+                                            return (
+                                                <button
+                                                    key={value}
+                                                    type="button"
+                                                    role="radio"
+                                                    aria-checked={selected}
+                                                    className={`model-option${selected ? ' selected' : ''}`}
+                                                    onClick={() => setSelectedModel(value)}
+                                                >
+                                                    <span className="model-option-lab">
+                                                        <span className="model-option-index">
+                                                            {String(index + 1).padStart(2, '0')}
+                                                        </span>
+                                                        <span className="model-option-copy">
+                                                            <span className="model-option-name">{choice.short}</span>
+                                                            <span className="model-option-sub">{choice.description}</span>
+                                                        </span>
+                                                    </span>
+                                                    <span className="model-option-meta">
+                                                        <span>{choice.stems} STEMS</span>
+                                                        <span>{choice.size}</span>
+                                                    </span>
+                                                </button>
+                                            );
+                                        })}
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </section>
@@ -506,10 +674,33 @@ export function Home() {
                 <section className="view-proc animate-fade-in">
                     <div className="proc-stack">
                         <div className="proc-braid">
-                            <Braid progress={displayPct} audioBuffer={audioBuffer} />
+                            <Braid
+                                active={false}
+                                progress={progressPhase === 'separate'
+                                    ? (displayPct ?? 0)
+                                    : progressPhase === 'finalize' || progressPhase === 'complete'
+                                        ? 100
+                                        : undefined}
+                                audioBuffer={audioBuffer}
+                            />
                         </div>
                         <div className="proc">
-                            <div className="pct">{Math.round(displayPct)}</div>
+                            <div className="pct-block">
+                                <div className="pct-caption">{progressCaption}</div>
+                                <div
+                                    className={`pct${displayPctInteger === null ? ' is-indeterminate' : ''}`}
+                                    aria-label={displayPctInteger === null
+                                        ? 'Progress unavailable for this phase'
+                                        : progressPhase === 'separate'
+                                            ? `${displayPctInteger} percent estimated; ${segmentsDone} of ${segmentsTotal} segments complete`
+                                            : `${displayPctInteger} percent`}
+                                >
+                                    <span className="pct-value">
+                                        {displayPctInteger === null ? '—' : displayPctInteger}
+                                    </span>
+                                    <span className="pct-unit" aria-hidden="true">%</span>
+                                </div>
+                            </div>
                             <div className="proc-log">
                                 {logs.slice(-13).map((line, i) => (
                                     <div key={i}>&gt; {line.toUpperCase()}</div>

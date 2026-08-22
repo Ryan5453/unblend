@@ -609,9 +609,11 @@ def test_roformer_materializes_state_while_cache_lock_is_held(
 
     monkeypatch.setattr(repo_module, "_artifact_lock", tracked_lock)
     monkeypatch.setattr(repo_module, "load_file", fake_load_file)
+    # Construction now dispatches through the backend registry rather than
+    # calling build_roformer directly, so patch the registry entry point.
     monkeypatch.setattr(
-        repo_module,
-        "build_roformer",
+        repo_module.backends,
+        "build",
         lambda *_args, state, **_kwargs: (assert_state_materialized(state, locked)),
     )
 

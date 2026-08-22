@@ -11,7 +11,7 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,15 @@ if TYPE_CHECKING:
 from .blocks import pad1d, spectro
 from .htdemucs import HTDemucs
 from .repo import ModelRepository
-from .roformer import MelBandRoformer, _RoformerBase
+from .roformer import (
+    Attention,
+    FeedForward,
+    MaskEstimator,
+    MelBandRoformer,
+    RMSNorm,
+    _RoformerBase,
+)
+from .scnet import FeatureConversion, SCNet
 
 
 class HTDemucsONNXWrapper(nn.Module):
@@ -104,11 +112,28 @@ class RoformerONNXWrapper(nn.Module):
     ``reduction=add`` has patchy WebGPU support).
     """
 
-    def __init__(self, model: _RoformerBase) -> None:
+    def __init__(
+        self,
+        model: _RoformerBase,
+        *,
+        attention_query_chunk_size: int = 64,
+        attention_head_chunk_size: int = 4,
+        feedforward_hidden_chunk_size: int = 384,
+    ) -> None:
         """
         Initialize the ONNX wrapper.
 
         :param model: The RoFormer model to wrap for ONNX export.
+        :param attention_query_chunk_size: Maximum query rows materialised in
+            one attention-score tensor. The default keeps production browser
+            exports far below WASM/WebGPU allocation limits without changing
+            the attention result.
+        :param attention_head_chunk_size: Maximum attention heads projected at
+            once. Four heads keeps every production Q/K/V, score, and output
+            projection buffer below 128 MiB even in fp32.
+        :param feedforward_hidden_chunk_size: Maximum expanded MLP features
+            materialised at once. The default quarters the 1536-feature
+            production hidden layer and keeps its buffers below 128 MiB.
         """
         super().__init__()
         self.model = model
@@ -116,6 +141,32 @@ class RoformerONNXWrapper(nn.Module):
         self.samplerate = model.samplerate
         self.audio_channels = model.audio_channels
         self.num_stems = model.num_stems
+
+        if attention_query_chunk_size <= 0:
+            raise ValueError(
+                "attention_query_chunk_size must be positive, got "
+                f"{attention_query_chunk_size}"
+            )
+        if attention_head_chunk_size <= 0:
+            raise ValueError(
+                "attention_head_chunk_size must be positive, got "
+                f"{attention_head_chunk_size}"
+            )
+        if feedforward_hidden_chunk_size <= 0:
+            raise ValueError(
+                "feedforward_hidden_chunk_size must be positive, got "
+                f"{feedforward_hidden_chunk_size}"
+            )
+        for module in model.modules():
+            if isinstance(module, Attention):
+                module.onnx_query_chunk_size = attention_query_chunk_size
+                module.onnx_head_chunk_size = attention_head_chunk_size
+            elif isinstance(module, FeedForward):
+                module.onnx_hidden_chunk_size = feedforward_hidden_chunk_size
+            elif isinstance(module, MaskEstimator):
+                module.onnx_safe_glu = True
+            elif isinstance(module, RMSNorm):
+                module.onnx_safe = True
 
         if isinstance(model, MelBandRoformer):
             # A[g, j] = (freq_indices[j] == g) / bands_covering(g): applying A
@@ -185,6 +236,135 @@ class RoformerONNXWrapper(nn.Module):
             out_r = torch.cat([zeros, out_r[..., 1:, :]], dim=-2)
             out_i = torch.cat([zeros, out_i[..., 1:, :]], dim=-2)
         return out_r, out_i
+
+
+class SCNetONNXWrapper(nn.Module):
+    """
+    Wrapper that makes SCNet exportable: the STFT and iSTFT stay client-side,
+    like the HTDemucs and RoFormer pipelines.
+
+    Two SCNet-specific hazards are handled here. Its trunk applies an
+    ``irfft`` in every other dual-path layer, which lowers to an ONNX ``DFT``
+    node carrying both ``inverse`` and ``onesided`` — a combination the spec
+    forbids and onnxruntime rejects at load; enabling ``onnx_safe`` on each
+    :class:`~unblend.scnet.FeatureConversion` swaps in the algebraically
+    identical real-valued DFT instead. And its packing interleaves real and
+    imaginary parts per audio channel rather than concatenating them, which
+    this wrapper reproduces exactly rather than assuming the RoFormer layout.
+    """
+
+    def __init__(self, model: "SCNet") -> None:
+        """
+        Initialize the ONNX wrapper.
+
+        :param model: The SCNet model to wrap for export.
+        """
+        super().__init__()
+        self.model = model
+        for module in model.modules():
+            if isinstance(module, FeatureConversion):
+                module.onnx_safe = True
+
+    def forward(
+        self, spec_real: torch.Tensor, spec_imag: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run everything between the transforms.
+
+        :param spec_real: Real part of the mixture STFT ``[B, C, F, T]``.
+        :param spec_imag: Imaginary part of the mixture STFT ``[B, C, F, T]``.
+        :return: ``(out_real, out_imag)`` per-stem spectrograms, each
+            ``[B, num_stems, C, F, T]``.
+        """
+        model = self.model
+        batch, channels, freq, frames = spec_real.shape
+
+        # SCNet interleaves as [c0_real, c0_imag, c1_real, c1_imag]; the
+        # reference reaches that layout via permute+reshape of view_as_real.
+        packed = torch.stack([spec_real, spec_imag], dim=2).reshape(
+            batch, channels * 2, freq, frames
+        )
+
+        stems = len(model.sources)
+        n = model.dims[0]
+
+        if hasattr(model, "mask_layer"):
+            # Masked variants predict a complex mask over a repeated copy of
+            # the mixture rather than the spectrogram itself, and they add a
+            # frequency positional embedding first. Tracing only forward_core
+            # would silently drop both and return the raw trunk output.
+            if freq > model.max_f:
+                repeats = math.ceil(freq / model.max_f)
+                pos_f = model.pos_embed_f.repeat(1, 1, repeats, 1)[:, :, :freq, :]
+            else:
+                pos_f = model.pos_embed_f[:, :, :freq, :]
+
+            mixture = packed.repeat(1, stems, 1, 1)
+            mask = model.mask_layer(model.forward_core(packed + pos_f.float()))
+
+            pairs = (batch * stems * channels, 2, freq, frames)
+            mixture = mixture.view(batch, n, -1, freq, frames).reshape(*pairs)
+            mask = mask.view(batch, n, -1, freq, frames).reshape(*pairs)
+            # (a + bi)(c + di), kept in real arithmetic: ONNX has no complex
+            # tensor type, so view_as_complex cannot cross the boundary.
+            real = mixture[:, 0] * mask[:, 0] - mixture[:, 1] * mask[:, 1]
+            imag = mixture[:, 0] * mask[:, 1] + mixture[:, 1] * mask[:, 0]
+        else:
+            decoded = model.forward_core(packed)
+            decoded = decoded.view(batch, n, -1, freq, frames)
+            decoded = decoded.reshape(-1, 2, freq, frames)
+            real, imag = decoded[:, 0], decoded[:, 1]
+
+        out_real = real.reshape(batch, stems, channels, freq, frames)
+        out_imag = imag.reshape(batch, stems, channels, freq, frames)
+        return out_real.contiguous(), out_imag.contiguous()
+
+
+def compute_scnet_stft_for_export(
+    audio: torch.Tensor,
+    n_fft: int,
+    hop_length: int,
+    win_length: int,
+    normalized: bool,
+    window: str = "none",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute the STFT an SCNet export expects.
+
+    Plain SCNet is deliberately unwindowed -- the reference implementation
+    passes no ``window`` to ``torch.stft`` -- while the masked variants use a
+    periodic Hann window. Pass the export's ``unblend.stft_window`` metadata
+    rather than assuming either.
+
+    :param audio: Input audio ``[B, C, samples]``.
+    :param n_fft: FFT size.
+    :param hop_length: Hop length.
+    :param win_length: Window length.
+    :param normalized: Whether the STFT is normalised.
+    :param window: ``"none"`` for plain SCNet, ``"hann"`` for the masked
+        variants; take it from the export's ``unblend.stft_window`` metadata.
+    :return: ``(real, imag)`` spectrograms ``[B, C, F, T]``.
+    :raises ValueError: If ``window`` is not a recognised name.
+    """
+    if window not in ("none", "hann"):
+        raise ValueError(f"unknown STFT window {window!r}; expected none or hann")
+    batch, channels, samples = audio.shape
+    z = torch.stft(
+        audio.reshape(batch * channels, samples),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=(
+            torch.hann_window(n_fft, periodic=True, device=audio.device)
+            if window == "hann"
+            else None
+        ),
+        center=True,
+        normalized=normalized,
+        return_complex=True,
+    )
+    z = z.view(batch, channels, z.shape[-2], z.shape[-1])
+    return z.real.contiguous(), z.imag.contiguous()
 
 
 def compute_roformer_stft_for_export(
@@ -288,12 +468,60 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
         "ConvTranspose": (1, 2),
         "MatMul": (0, 1),
         "Gemm": (0, 1, 2),
+        # Recurrent weights (W, R, B). SCNet is the first LSTM architecture
+        # here, and it is LSTM-dominated: omitting these left two thirds of
+        # scnet_small's weight bytes in fp32, so --fp16 shrank it by 10% rather
+        # than half.
+        "LSTM": (1, 2, 3),
+        "GRU": (1, 2, 3),
+        "RNN": (1, 2, 3),
     }
+    # A weight input is not always the initializer itself. The exporter builds
+    # ONNX LSTM's [num_directions, 4H, C] operands by concatenating and
+    # reshaping the per-direction parameters, so the node input is a Concat
+    # output several hops from the stored tensor. Walk back through ops that
+    # only rearrange data to reach the real initializers. Non-float values met
+    # on the way (Reshape's shape, Slice's indices) are int64 and are filtered
+    # out by the FLOAT check below.
+    rearranging_ops = {
+        "Reshape",
+        "Concat",
+        "Transpose",
+        "Squeeze",
+        "Unsqueeze",
+        "Identity",
+        "Slice",
+        "Split",
+    }
+    initializer_names = {init.name for init in onnx_model.graph.initializer}
+    producer = {
+        out: node for node in onnx_model.graph.node for out in node.output if out
+    }
+
+    def source_initializers(name: str, seen: set[str]) -> set[str]:
+        """Initializers feeding ``name`` through rearranging ops only.
+
+        :param name: Graph value to trace back from.
+        :param seen: Names already visited, guarding against cycles.
+        :return: Names of initializers that ultimately supply ``name``.
+        """
+        if name in initializer_names:
+            return {name}
+        node = producer.get(name)
+        if node is None or node.op_type not in rearranging_ops or name in seen:
+            return set()
+        seen.add(name)
+        found: set[str] = set()
+        for value in node.input:
+            if value:
+                found |= source_initializers(value, seen)
+        return found
+
     weight_init_names: set[str] = set()
     for node in onnx_model.graph.node:
         for idx in weight_op_inputs.get(node.op_type, ()):
             if idx < len(node.input) and node.input[idx]:
-                weight_init_names.add(node.input[idx])
+                weight_init_names |= source_initializers(node.input[idx], set())
 
     existing_outputs = {n.output[0] for n in onnx_model.graph.node if n.output}
     existing_inputs = {i.name for i in onnx_model.graph.input}
@@ -341,6 +569,73 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
     original_nodes = list(onnx_model.graph.node)
     onnx_model.graph.ClearField("node")
     onnx_model.graph.node.extend(new_cast_nodes + original_nodes)
+
+
+def _convert_roformer_to_fp16(onnx_model: "onnx.ModelProto") -> None:
+    """Convert a RoFormer graph to browser-oriented mixed precision.
+
+    RoFormer activations dwarf its weights: weight-only fp16 still expands to
+    roughly 6--9 GiB under ORT and cannot fit a WebAssembly heap or memory-
+    constrained Safari tab. Keep model IO plus numerically sensitive
+    normalization, rotary-trig, and softmax operators in float32, while
+    converting projections, MLP activations, masks, and weights to float16.
+
+    :param onnx_model: Loaded ONNX ``ModelProto``; modified in place.
+    :raises ImportError: If ``onnxconverter-common`` is unavailable.
+    :raises RuntimeError: If the conversion produced no float16 initializers.
+    """
+    import warnings
+
+    from onnx import TensorProto
+
+    try:
+        from onnxconverter_common.float16 import convert_float_to_float16
+    except ImportError:
+        raise ImportError(
+            "onnxconverter-common is required for RoFormer fp16 export. "
+            "Install unblend with the 'onnx' extra."
+        )
+
+    blocked_ops = {
+        "Clip",
+        "Cos",
+        "Reciprocal",
+        "ReduceMean",
+        "Sin",
+        "Softmax",
+        "Sqrt",
+    }
+
+    with warnings.catch_warnings():
+        # Thousands of trained Mel-Band weights are below 1e-7. The converter
+        # deliberately maps these to the smallest portable nonzero fp16 range;
+        # one warning per initializer is noise, not an actionable condition.
+        warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            module=r"onnxconverter_common\.float16",
+        )
+        converted = convert_float_to_float16(
+            onnx_model,
+            keep_io_types=True,
+            op_block_list=sorted(blocked_ops),
+        )
+    onnx_model.CopyFrom(converted)
+
+    # ``RMSNorm`` uses 1e-12 in the fp32 graph. Mixed precision deliberately
+    # maps that scalar to the converter's 1e-7 portable floor: rsqrt(1e-12) is
+    # 1,000,000 and overflows when the fp32 normalization island returns to
+    # fp16 on silent input; rsqrt(1e-7) remains finite. Ordinary non-silent
+    # activations have mean squares many orders of magnitude larger, so their
+    # normalization is unchanged.
+
+    if not any(
+        init.data_type == TensorProto.FLOAT16 for init in onnx_model.graph.initializer
+    ):
+        raise RuntimeError(
+            "RoFormer fp16 export produced no float16 initializers; refusing "
+            "to write a model mislabeled as fp16."
+        )
 
 
 def _materialize_nonlast_broadcast_muls(onnx_model: "onnx.ModelProto") -> int:
@@ -630,7 +925,9 @@ def _export_roformer_to_onnx(
     :param model: The RoFormer model instance to export.
     :param output_path: Path to save the ONNX model.
     :param opset_version: Requested opset; clamped up to 18 (dynamo minimum).
-    :param fp16: Store weights as float16 (weight-only; compute stays fp32).
+    :param fp16: Use browser-oriented mixed precision: float16 projections,
+        MLPs, masks, activations, and weights with float32 IO, normalization,
+        rotary trig, and softmax.
     :param license_label: Weights license to embed in the model metadata.
     :param static_batch: Trace with a fixed batch=1 instead of a dynamic batch
         axis. onnxruntime-web's WebGPU backend has a memory-planner bug with
@@ -691,7 +988,12 @@ def _export_roformer_to_onnx(
         program.save(staging_path)
 
         onnx_model = onnx.load(staging_path)
-        # Rewrite two WebGPU-hostile-but-ONNX-valid broadcast shapes, both done
+        # Attention is exported in bounded query chunks and the model's band
+        # split/unbind paths use individual Slice/Gather nodes. Together these
+        # avoid both browser blockers in the old artifacts: multi-gigabyte
+        # full-attention score tensors and ~60-output WebGPU Split dispatches.
+        # Rewrite two remaining WebGPU-hostile-but-ONNX-valid broadcast shapes,
+        # both done
         # before the fp16 pass so shape inference sees the clean fp32 graph:
         # - the mask-apply Mul broadcast (a no-op for single-stem Mel-Band,
         #   whose mask has no stems axis to broadcast over);
@@ -700,7 +1002,7 @@ def _export_roformer_to_onnx(
         _materialize_nonlast_broadcast_muls(onnx_model)
         _materialize_matmul_rank_mismatch(onnx_model)
         if fp16:
-            _convert_weights_to_fp16(onnx_model)
+            _convert_roformer_to_fp16(onnx_model)
 
         architecture = (
             "mel_band_roformer" if isinstance(model, MelBandRoformer) else "bs_roformer"
@@ -733,6 +1035,132 @@ def _export_roformer_to_onnx(
     return output_path
 
 
+def _scnet_architecture(model: "SCNet") -> str:
+    """
+    Registry architecture name for an SCNet instance.
+
+    :param model: Model being exported.
+    :return: ``"scnet_masked"`` for the masking variant, else ``"scnet"``.
+    """
+    from .scnet import SCNetMasked
+
+    return "scnet_masked" if isinstance(model, SCNetMasked) else "scnet"
+
+
+def _export_scnet_to_onnx(
+    model: "SCNet",
+    output_path: str,
+    *,
+    opset_version: int,
+    fp16: bool,
+    license_label: str | None,
+    static_batch: bool,
+) -> str:
+    """
+    Export an SCNet to ONNX via the dynamo exporter.
+
+    Traced at the checkpoint's training segment, with the STFT/iSTFT left to
+    the caller (see :func:`compute_scnet_stft_for_export`) exactly as the
+    HTDemucs and RoFormer pipelines do.
+
+    :param model: The SCNet to export.
+    :param output_path: Where to write the ``.onnx`` file.
+    :param opset_version: Requested opset; raised to 18 (dynamo minimum).
+    :param fp16: Whether to convert weights to fp16.
+    :param license_label: Weights licence recorded in the model metadata.
+    :param static_batch: Trace with a fixed batch of 1.
+    :return: Path to the exported model.
+    :raises ImportError: If ``onnx``/``onnxscript`` are not installed.
+    """
+    try:
+        import onnx
+        import onnxscript  # noqa: F401  (required by the dynamo exporter)
+    except ImportError:
+        raise ImportError(
+            "ONNX export of SCNet needs 'onnx' and 'onnxscript'. "
+            "Install them with: uv pip install unblend[onnx]"
+        )
+
+    opset_version = max(opset_version, 18)
+    model.eval()
+    wrapper = SCNetONNXWrapper(model).eval()
+
+    segment = int(round(model.max_allowed_segment * model.samplerate))
+    from .scnet import stft_padding
+
+    padding = stft_padding(segment, model.hop_length)
+    device = next(model.parameters()).device
+    audio = torch.zeros(1, model.audio_channels, segment + padding, device=device)
+    spec_real, spec_imag = compute_scnet_stft_for_export(
+        audio,
+        int(model.stft_config["n_fft"]),
+        int(model.stft_config["hop_length"]),
+        int(model.stft_config["win_length"]),
+        bool(model.stft_config["normalized"]),
+    )
+
+    dynamic_shapes = None
+    if not static_batch:
+        batch = torch.export.Dim("batch")
+        dynamic_shapes = ({0: batch}, {0: batch})
+
+    with _atomic_onnx_path(output_path) as staging:
+        program = torch.onnx.export(
+            wrapper,
+            (spec_real, spec_imag),
+            input_names=["spec_real", "spec_imag"],
+            output_names=["out_real", "out_imag"],
+            opset_version=opset_version,
+            dynamo=True,
+            dynamic_shapes=dynamic_shapes,
+            verbose=False,
+        )
+        program.save(staging)
+        onnx_model = onnx.load(staging)
+        if fp16:
+            _convert_weights_to_fp16(onnx_model)
+        _add_metadata(
+            onnx_model,
+            {
+                "unblend.architecture": _scnet_architecture(model),
+                "unblend.sources": ",".join(model.sources),
+                "unblend.samplerate": str(model.samplerate),
+                "unblend.segment_samples": str(segment),
+                "unblend.stft_n_fft": str(model.stft_config["n_fft"]),
+                "unblend.stft_hop_length": str(model.stft_config["hop_length"]),
+                "unblend.stft_win_length": str(model.stft_config["win_length"]),
+                "unblend.stft_normalized": str(bool(model.stft_config["normalized"])),
+                # Plain SCNet's STFT is unwindowed while the masked variants
+                # use a periodic Hann. A client applying the wrong one silently
+                # produces bad output, so record what this model actually used.
+                "unblend.stft_window": ("hann" if hasattr(model, "window") else "none"),
+                "unblend.license": str(license_label),
+            },
+        )
+        onnx.save(onnx_model, staging)
+    return output_path
+
+
+#: Architecture family -> exporter. HTDemucs stays on the legacy path below
+#: because its export also carries a time-domain branch and a different input
+#: signature; everything spectrogram-only registers here.
+_EXPORTERS: dict[type, "Callable[..., str]"] = {}
+
+
+def register_exporter(family: type, exporter: "Callable[..., str]") -> None:
+    """
+    Register an ONNX exporter for an architecture family.
+
+    :param family: The model class the exporter handles.
+    :param exporter: Callable with ``_export_*_to_onnx``'s signature.
+    """
+    _EXPORTERS[family] = exporter
+
+
+register_exporter(_RoformerBase, _export_roformer_to_onnx)
+register_exporter(SCNet, _export_scnet_to_onnx)
+
+
 def export_to_onnx(
     model_name: str = "htdemucs",
     output_path: str | None = None,
@@ -748,12 +1176,11 @@ def export_to_onnx(
     :param output_path: Path to save the ONNX model (defaults to ``{model_name}.onnx``).
     :param opset_version: ONNX opset version (raised to 18 for RoFormer models,
         the dynamo-exporter minimum).
-    :param fp16: If True, store weights as float16 (with a Cast(fp16->fp32)
-        node inserted before each consumer) after export. This is weight-only:
-        it roughly halves the on-disk file size while compute and IO stay in
-        float32, so output is near-identical to the fp32 model (not bit-exact,
-        since weights are rounded to fp16). Avoids the audible quantization
-        noise that pure-fp16 accumulation produces on ORT-WASM.
+    :param fp16: If True, use weight-only fp16 for HTDemucs. RoFormer uses
+        browser-oriented mixed precision instead: projections, MLPs, masks,
+        activations, and weights are float16 while IO, normalization, rotary
+        trig, and softmax remain float32. The latter is required to keep its
+        much larger browser working set within WebGPU/Safari memory limits.
     :param static_batch: RoFormer only. Trace with a fixed batch=1 instead of a
         dynamic batch axis, working around an onnxruntime-web WebGPU
         memory-planner bug with this graph's symbolic batch dim. Use for
@@ -780,16 +1207,19 @@ def export_to_onnx(
     repo = ModelRepository()
     model = repo.get_model(model_name)
 
-    if isinstance(model, _RoformerBase):
-        model_info = repo.list_models().get(model_name, {})
-        return _export_roformer_to_onnx(
-            model,
-            output_path,
-            opset_version=opset_version,
-            fp16=fp16,
-            license_label=model_info.get("license"),
-            static_batch=static_batch,
-        )
+    # Dispatch through a table rather than an isinstance chain so a new
+    # architecture registers its exporter instead of editing this function.
+    for family, exporter in _EXPORTERS.items():
+        if isinstance(model, family):
+            model_info = repo.list_models().get(model_name, {})
+            return exporter(
+                model,
+                output_path,
+                opset_version=opset_version,
+                fp16=fp16,
+                license_label=model_info.get("license"),
+                static_batch=static_batch,
+            )
 
     if static_batch:
         raise ValueError(

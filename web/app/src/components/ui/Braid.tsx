@@ -21,7 +21,11 @@ const ENVELOPE_BUCKETS = 160;
  * strand into the SplitDiagram's lanes; with an AudioBuffer the amplitude
  * follows the actual track.
  */
-export function Braid({ active = false, progress, audioBuffer = null }: BraidProps) {
+export function Braid({
+    active = false,
+    progress,
+    audioBuffer = null,
+}: BraidProps) {
     const wrapRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const tagRefs = useRef<(HTMLSpanElement | null)[]>([]);
@@ -117,7 +121,9 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
             // and keep the braid centered under the caption / on the page.
             const x1 = w - (prog === undefined ? x0 : 92);
             const spread = Math.min(h * 0.36, 132);
-            const mul = h / 340;
+            // Keep the braid visually substantial in the compact drop-screen
+            // wrapper; the wrapper's whitespace should not set its amplitude.
+            const mul = Math.max(h / 340, 0.65);
             const carrierAmp = 36 * mul * (1 + energy * 0.6);
             phase += (prog !== undefined ? 2.6 : 1.1 + energy * 0.9) * dt;
             const k = (Math.PI * 2 * 3.2) / Math.max(1, w);

@@ -19,12 +19,12 @@ import {
 export type ModelPrecision = 'fp32' | 'fp16';
 
 export interface LoadModelOptions {
-    /** Defaults to 'webgpu', falling back to 'wasm' if unavailable. */
+    /** Defaults to 'webgpu'; supported models fall back to WASM if needed. */
     backend?: 'webgpu' | 'wasm';
     /**
-     * Model weight precision. ``'fp16'`` is weight-only storage: selected
-     * initializers are stored in fp16 and cast to fp32 before their consumers,
-     * while compute, activations, and IO remain fp32.
+     * Model precision. HTDemucs ``'fp16'`` uses half-precision weight storage
+     * with fp32 compute. RoFormer ``'fp16'`` uses mixed-precision weights and
+     * activations while retaining fp32 IO, normalization, trig, and softmax.
      */
     precision?: ModelPrecision;
     /** Override ORT's .wasm asset URL prefix; defaults to bundler-resolved. */
@@ -153,6 +153,13 @@ export class Separator {
             );
         }
         const modelUrl = options.modelUrl ?? artifact.url;
+        const config = MODEL_CONFIGS[model];
+        if (preferredBackend === 'wasm' && config.webgpuRequired) {
+            throw new Error(
+                `${model} requires WebGPU; its inference working set exceeds `
+                + `the WebAssembly runtime's fixed memory heap.`
+            );
+        }
 
         let onnx: OnnxClient | null = null;
         let stft: STFTClient | null = null;
@@ -166,10 +173,15 @@ export class Separator {
         options.signal?.addEventListener('abort', onAbort, { once: true });
 
         try {
-            let backend: 'webgpu' | 'wasm' = preferredBackend === 'webgpu'
-                && await awaitWithSignal(isWebGPUAvailable(), options.signal)
-                ? 'webgpu'
-                : 'wasm';
+            const webgpuAvailable = preferredBackend === 'webgpu'
+                && await awaitWithSignal(isWebGPUAvailable(), options.signal);
+            if (preferredBackend === 'webgpu' && !webgpuAvailable && config.webgpuRequired) {
+                throw new Error(
+                    `${model} requires WebGPU, but this browser did not expose `
+                    + `a usable WebGPU adapter.`
+                );
+            }
+            let backend: 'webgpu' | 'wasm' = webgpuAvailable ? 'webgpu' : 'wasm';
             throwIfAborted(options.signal);
 
             onnx = new OnnxClient();
@@ -186,7 +198,7 @@ export class Separator {
             } catch (error) {
                 // Never reinterpret an abort as a WebGPU failure/fallback.
                 throwIfAborted(options.signal);
-                if (backend !== 'webgpu') throw error;
+                if (backend !== 'webgpu' || config.webgpuRequired) throw error;
                 onnx.terminate(error);
                 backend = 'wasm';
                 onnx = new OnnxClient();
@@ -197,7 +209,6 @@ export class Separator {
             }
             throwIfAborted(options.signal);
 
-            const config = MODEL_CONFIGS[model];
             stft = new STFTClient();
             istft = new ISTFTClient();
             await awaitWithSignal(Promise.all([

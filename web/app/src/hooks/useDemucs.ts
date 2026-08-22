@@ -1,10 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import type { DemucsState } from '../types';
+import type { DemucsState, ProgressPhase } from '../types';
 import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'unblend';
-import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
-import { peaksFromInterleaved } from '../utils/peaks';
 import { ORT_WASM_PATHS } from '../onnx-config';
+import { finalizeStems } from '../utils/stem-finalizer';
 
 function isAbortError(error: unknown): boolean {
     return error instanceof DOMException && error.name === 'AbortError';
@@ -17,12 +16,30 @@ const initialState: DemucsState = {
     audioBuffer: null,
     audioFile: null,
     separating: false,
+    progressDeterminate: false,
+    progressPhase: 'idle',
     progress: 0,
+    segmentsDone: 0,
+    segmentsTotal: 0,
+    segmentStartedAtMs: 0,
+    segmentExpectedMs: 0,
     status: 'Ready',
+};
+
+const DEFAULT_SEGMENT_MS: Record<ModelType, number> = {
+    htdemucs: 1_500,
+    htdemucs_6s: 2_000,
+    bs_roformer_sw: 20_000,
+    melband_roformer_kim: 7_000,
+    // Estimate only: SCNet has not been timed in a browser yet. Its twelve
+    // sequential bidirectional LSTMs are the bulk of the work and parallelise
+    // poorly, so it is slower per second of audio than its size suggests.
+    scnet_small: 8_000,
 };
 
 export function useDemucs() {
     const [state, setState] = useState<DemucsState>(initialState);
+    const [loadedModel, setLoadedModel] = useState<ModelType | null>(null);
     const [audioError, setAudioError] = useState<string | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const separatorRef = useRef<Separator | null>(null);
@@ -76,8 +93,25 @@ export function useDemucs() {
         setState(prev => ({ ...prev, status }));
     }, []);
 
-    const setProgress = useCallback((progress: number) => {
-        setState(prev => ({ ...prev, progress }));
+    const setProgress = useCallback((
+        progress: number,
+        determinate = true,
+        progressPhase?: ProgressPhase,
+    ) => {
+        setState(prev => ({
+            ...prev,
+            progress,
+            progressDeterminate: determinate,
+            ...(progressPhase ? { progressPhase } : {}),
+            ...(progressPhase && progressPhase !== 'separate'
+                ? {
+                    segmentsDone: 0,
+                    segmentsTotal: 0,
+                    segmentStartedAtMs: 0,
+                    segmentExpectedMs: 0,
+                }
+                : {}),
+        }));
     }, []);
 
     const getAudioContext = useCallback(() => {
@@ -114,10 +148,18 @@ export function useDemucs() {
             if (separatorRef.current) {
                 await separatorRef.current.unload();
                 separatorRef.current = null;
+                setLoadedModel(null);
             }
             if (!mountedRef.current) return false;
 
-            setState(prev => ({ ...prev, modelLoading: true, modelLoaded: false, progress: 0 }));
+            setState(prev => ({
+                ...prev,
+                modelLoading: true,
+                modelLoaded: false,
+                progress: 0,
+                progressDeterminate: false,
+                progressPhase: 'initialize',
+            }));
             addLog(`Loading ${model} (${precision})...`, 'info');
             setStatus('Connecting...');
             const start = performance.now();
@@ -130,17 +172,20 @@ export function useDemucs() {
                 onProgress: (phase, loaded, total) => {
                     if (!mountedRef.current) return;
                     if (phase === 'download') {
-                        setStatus('Downloading model...');
+                        const loadedMiB = (loaded / (1024 * 1024)).toFixed(1);
                         if (total > 0) {
-                            setProgress(Math.round((loaded / total) * 100));
+                            const totalMiB = (total / (1024 * 1024)).toFixed(1);
+                            setStatus(`Downloading model... ${loadedMiB} / ${totalMiB} MiB`);
+                            setProgress((loaded / total) * 100, true, 'download');
+                        } else {
+                            setStatus(`Downloading model... ${loadedMiB} MiB`);
+                            setProgress(0, false, 'download');
                         }
                     } else {
-                        // Covers ORT's own wasm-runtime fetch/init plus graph
-                        // compilation — none of which report progress. By now
-                        // the download is fully counted, so there's only a
-                        // small, mostly-closed gap left to crawl.
+                        // ORT exposes no progress for runtime setup or graph
+                        // compilation, so do not fabricate a percentage.
                         setStatus('Initializing ONNX runtime...');
-                        setProgress(100);
+                        setProgress(0, false, 'initialize');
                     }
                 },
             });
@@ -149,6 +194,7 @@ export function useDemucs() {
                 return false;
             }
             separatorRef.current = separator;
+            setLoadedModel(model);
 
             const elapsed = ((performance.now() - start) / 1000).toFixed(2);
             if (backend === 'webgpu' && separator.backend === 'wasm') {
@@ -159,21 +205,43 @@ export function useDemucs() {
                 'success'
             );
 
-            setState(prev => ({ ...prev, modelLoading: false, modelLoaded: true }));
+            setState(prev => ({
+                ...prev,
+                modelLoading: false,
+                modelLoaded: true,
+                progress: 0,
+                progressDeterminate: false,
+                progressPhase: 'idle',
+            }));
             return true;
         } catch (err) {
             if (controller.signal.aborted || isAbortError(err)) {
                 if (mountedRef.current) {
-                    setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
+                    setState(prev => ({
+                        ...prev,
+                        modelLoading: false,
+                        modelLoaded: false,
+                        progress: 0,
+                        progressDeterminate: false,
+                        progressPhase: 'idle',
+                    }));
                 }
                 return false;
             }
             if (!mountedRef.current) return false;
             const detail = err instanceof Error ? err.message : String(err);
             const message = `Failed to load ${model}: ${detail}`;
+            setLoadedModel(null);
             addLog(message, 'error');
             setAudioError(message);
-            setState(prev => ({ ...prev, modelLoading: false, modelLoaded: false }));
+            setState(prev => ({
+                ...prev,
+                modelLoading: false,
+                modelLoaded: false,
+                progress: 0,
+                progressDeterminate: false,
+                progressPhase: 'idle',
+            }));
             return false;
         } finally {
             if (modelLoadAbortRef.current === controller) {
@@ -206,6 +274,7 @@ export function useDemucs() {
         }
         loadAudioInFlightRef.current = true;
         setLogs([]);
+        setProgress(0, false, 'audio');
         try {
             // Revoke object URLs from the previous track before it is replaced.
             if (originalUrlRef.current) {
@@ -294,7 +363,7 @@ export function useDemucs() {
         } finally {
             loadAudioInFlightRef.current = false;
         }
-    }, [addLog, getAudioContext, setStatus]);
+    }, [addLog, getAudioContext, setProgress, setStatus]);
 
     const separateAudio = useCallback(async (): Promise<boolean> => {
         const separator = separatorRef.current;
@@ -347,35 +416,72 @@ export function useDemucs() {
             stemUrlsRef.current = {};
             setStemUrls({});
             setStatus('Preparing audio...');
-            setProgress(0);
+            setProgress(0, false, 'audio');
 
             // Yield once so React paints the "separating" UI before the
             // pipeline starts hammering the main thread.
             await new Promise(resolve => setTimeout(resolve, 0));
             addLog('Starting separation...', 'info');
 
+            let segmentStartedAtMs = performance.now();
+            let segmentExpectedMs = DEFAULT_SEGMENT_MS[separator.model];
             const result = await separator.separate(audioBuffer, {
                 signal: controller.signal,
-                onProgress: ({ segIdx, totalSegs, fraction }) => {
+                onProgress: ({ stage, segIdx, totalSegs, fraction }) => {
                     if (!mountedRef.current) return;
-                    setStatus(`Separating segment ${segIdx} of ${totalSegs}...`);
-                    setProgress(fraction * 95);
+                    const now = performance.now();
+                    if (stage === 'started') {
+                        segmentStartedAtMs = now;
+                    } else {
+                        const elapsed = Math.max(1, now - segmentStartedAtMs);
+                        // Adapt to this device without letting one slow or fast
+                        // segment make the next estimate wildly optimistic.
+                        segmentExpectedMs = Math.max(
+                            250,
+                            Math.min(60_000, segmentExpectedMs * 0.55 + elapsed * 0.45),
+                        );
+                    }
+                    setStatus(stage === 'started'
+                        ? `Separating segment ${segIdx} of ${totalSegs}...`
+                        : `Completed segment ${segIdx} of ${totalSegs}.`);
+                    setState(prev => ({
+                        ...prev,
+                        progress: fraction * 100,
+                        progressDeterminate: true,
+                        progressPhase: 'separate',
+                        segmentsDone: Math.round(fraction * totalSegs),
+                        segmentsTotal: totalSegs,
+                        segmentStartedAtMs,
+                        segmentExpectedMs,
+                    }));
                 },
             });
             if (!mountedRef.current) return false;
 
             // Build blob URLs for the player UI.
             setStatus('Finalizing...');
-            setProgress(98);
+            setProgress(0, false, 'finalize');
+            // Let React paint the finalizing phase before starting the worker.
+            await new Promise(resolve => setTimeout(resolve, 0));
 
             const urls: Record<string, string> = {};
             const peaks: Record<string, number[]> = {};
+            const finalized = await finalizeStems(
+                result.stems,
+                SAMPLE_RATE,
+                controller.signal,
+                (done, total, source) => {
+                    if (mountedRef.current) {
+                        setStatus(`Finalized ${source} (${done} of ${total})...`);
+                    }
+                },
+            );
 
-            for (const [source, samples] of Object.entries(result.stems)) {
-                const blob = createWavBlob(samples, 2, SAMPLE_RATE);
-                urls[source] = URL.createObjectURL(blob);
+            for (const stem of finalized) {
+                urls[stem.source] = URL.createObjectURL(stem.blob);
+                const source = stem.source;
                 localUrls.push(urls[source]);
-                peaks[source] = peaksFromInterleaved(samples, 2);
+                peaks[source] = stem.peaks;
             }
 
             // Transfer URL ownership to the cleanup ref synchronously before
@@ -386,7 +492,7 @@ export function useDemucs() {
             localUrls = [];
 
             setStatus('Complete!');
-            setProgress(100);
+            setProgress(100, true, 'complete');
             addLog(`Finished separation in ${(result.wallMs / 1000).toFixed(2)}s.`, 'success');
             setState(prev => ({ ...prev, separating: false }));
             return true;
@@ -397,12 +503,13 @@ export function useDemucs() {
             // load cannot be clobbered by a late catch/finally from this run.
             if (separatorRef.current === separator) {
                 separatorRef.current = null;
+                setLoadedModel(null);
             }
             await separator.unload();
             if (controller.signal.aborted || isAbortError(error)) {
                 if (mountedRef.current) {
                     setStatus('Separation cancelled');
-                    setProgress(0);
+                    setProgress(0, false, 'idle');
                     setState(prev => ({
                         ...prev,
                         modelLoaded: false,
@@ -418,7 +525,7 @@ export function useDemucs() {
             addLog(message, 'error');
             setAudioError(message);
             setStatus('Error during separation');
-            setProgress(0);
+            setProgress(0, false, 'idle');
             setState(prev => ({
                 ...prev,
                 modelLoaded: false,
@@ -476,6 +583,7 @@ export function useDemucs() {
         trackTitle,
         trackArtist,
         audioError,
+        loadedModel,
         loadModel,
         loadAudio,
         clearAudioError,

@@ -5,6 +5,8 @@ These run fully offline: ``ModelRepository`` only reads the local metadata file
 and builds download URLs as strings, so no network access is required.
 """
 
+from pathlib import Path
+
 from unblend.repo import ModelRepository
 
 EXPECTED_DEMUCS_MODELS = {"htdemucs", "htdemucs_ft", "htdemucs_6s"}
@@ -23,7 +25,7 @@ def test_repository_lists_expected_models() -> None:
 def test_every_demucs_layer_has_safe_artifact_and_config() -> None:
     """Demucs entries construct allowlisted models from Safetensors only."""
     for name, info in ModelRepository().list_models().items():
-        if info.get("backend") == "roformer":
+        if info.get("backend") != "demucs":
             continue
         assert info["architecture"] == "htdemucs"
         assert info["config"]["sources"] == info["sources"]
@@ -81,3 +83,58 @@ def test_roformer_entries_are_well_formed() -> None:
         assert checkpoint["url"].endswith(".safetensors")
         assert len(checkpoint["sha256"]) == 64
         assert checkpoint["size_bytes"] > 0
+
+
+def test_scnet_entries_are_well_formed() -> None:
+    """
+    Each SCNet entry carries the fields ``build_scnet`` needs, and names the
+    architecture that matches its checkpoint: the masked variants carry
+    ``mask_layer``/``pos_embed_f`` weights that plain SCNet has no slot for, so
+    a mislabelled entry would fail to strict-load rather than degrade quietly.
+    """
+    for name, info in ModelRepository().list_models().items():
+        if info.get("backend") != "scnet":
+            continue
+        assert info["architecture"] in {"scnet", "scnet_masked"}
+        assert isinstance(info["config"], dict) and info["config"]
+        assert len(info["sources"]) == 4, f"{name} should emit four stems"
+        assert isinstance(info["samplerate"], int)
+        assert isinstance(info["segment_samples"], int)
+        checkpoint = info["checkpoint"]
+        assert checkpoint["format"] == "safetensors"
+        assert checkpoint["url"].startswith("https://")
+        assert checkpoint["url"].endswith(".safetensors")
+        assert len(checkpoint["sha256"]) == 64
+        assert checkpoint["size_bytes"] > 0
+
+
+def test_readme_license_table_matches_the_registry() -> None:
+    """
+    The readme's licensing table has to agree with ``metadata.json``.
+
+    It drifted once already: the HTDemucs weights were relabelled MIT in the
+    registry while the readme still called them ungranted, so ``unblend models
+    list`` and the readme disagreed about the terms users are bound by.
+    """
+    label_for = {"MIT": "MIT", "GPL-3.0": "GPL-3.0", "unlicensed": "No license grant"}
+    models = ModelRepository().list_models()
+
+    readme = (Path(__file__).resolve().parent.parent / "readme.md").read_text()
+    table = readme[readme.index("| Model | Weights license |") :]
+    table = table[: table.index("\n\n")]
+
+    documented: dict[str, str] = {}
+    for line in table.splitlines()[2:]:
+        names, label = (cell.strip() for cell in line.strip("|").split("|"))
+        for name in names.split(","):
+            documented[name.strip().strip("`")] = label
+
+    assert set(documented) == set(models), (
+        "readme licensing table lists "
+        f"{sorted(set(documented) ^ set(models))} differently from the registry"
+    )
+    for name, info in models.items():
+        expected = label_for[info["license"]]
+        assert documented[name] == expected, (
+            f"readme says {name} is {documented[name]!r}, registry says {expected!r}"
+        )

@@ -51,26 +51,38 @@ export const MODEL_ARTIFACTS: Record<
     },
     bs_roformer_sw: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/bs_roformer_sw_fp32.onnx',
-            sizeBytes: 708641242,
-            sha256: '987f402a9aa572518633408e83b2b0f31600f4f382afc23964e3a19362651f51',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/bs_roformer_sw_fp32.onnx',
+            sizeBytes: 713020597,
+            sha256: 'ec8f26334000e982a05365a88fb77672d9ddb10a140adfeb72e9ef572082be8f',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/bs_roformer_sw_fp16.onnx',
-            sizeBytes: 360381798,
-            sha256: '06e8d57ec29f99d54039bbdd738416f2f430abe37a48dbfc4b4df45412048996',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/bs_roformer_sw_fp16.onnx',
+            sizeBytes: 363867964,
+            sha256: '3c687f57679321e4c8ab35c267630a74605a8ce786f27b071000adca3c16218e',
         },
     },
     melband_roformer_kim: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/melband_roformer_kim_fp32.onnx',
-            sizeBytes: 949386939,
-            sha256: 'd09b0337efe649666decd73be39bed6e1b5b69e230e43da0f9d16a518871f46e',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/melband_roformer_kim_fp32.onnx',
+            sizeBytes: 951444823,
+            sha256: 'fab1113cdfee5c8ab724223e8329d91b6a76767d58df36d1e2ab245c3413af9f',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/melband_roformer_kim_fp16.onnx',
-            sizeBytes: 477311000,
-            sha256: '701bb8771efe4488aa7af784f6cecf7b171da5c61e520e353174304f84698156',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/melband_roformer_kim_fp16.onnx',
+            sizeBytes: 478901267,
+            sha256: '96d42889773713979b2c7e2f6b168942357a009fe516cc554df021321a1a89c6',
+        },
+    },
+    scnet_small: {
+        fp32: {
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/ac4b06164d974e1242bd9fc7585305e5ea022d0f/scnet_small_fp32.onnx',
+            sizeBytes: 50197643,
+            sha256: 'ff6ee6bba0f64d5ded6b540ea2fbc29b4ba169bddba44c287d56a6e4c06aaeec',
+        },
+        fp16: {
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/ac4b06164d974e1242bd9fc7585305e5ea022d0f/scnet_small_fp16.onnx',
+            sizeBytes: 29081412,
+            sha256: 'dd421539061d3b2909be4fa7aa18d66e95de44ad75c63c147c90a8e6fc12f62a',
         },
     },
 };

@@ -93,7 +93,11 @@ export function readTracksFromFileList(files: File[]): MusdbTrack[] {
 }
 
 export function supportsDirectoryPicker(): boolean {
-    return typeof (window as unknown as { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
+    // The dev-only benchmark can force the file-input fallback so automated
+    // browser runs can provide a directory without opening a native dialog.
+    const forceFileInput = new URLSearchParams(window.location.search).has('fileInput');
+    return !forceFileInput
+        && typeof (window as unknown as { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
 }
 
 export async function pickMusdbDirectory(): Promise<FileSystemDirectoryHandle> {

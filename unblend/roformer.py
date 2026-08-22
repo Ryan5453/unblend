@@ -51,6 +51,11 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim))
+        # The current dynamo ONNX decomposition of ``aten.rms_norm`` drops an
+        # explicitly supplied 1e-12 epsilon, yielding Reciprocal(Sqrt(0)) for
+        # silent input. ``RoformerONNXWrapper`` enables the explicit formula
+        # below so silence remains finite without changing native inference.
+        self.onnx_safe = False
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -69,11 +74,62 @@ class RMSNorm(nn.Module):
         :param x: Input of shape ``[..., dim]``.
         :return: Normalised tensor of the same shape and dtype.
         """
+        if self.onnx_safe:
+            working = x.float()
+            mean_square = working.square().mean(dim=-1, keepdim=True)
+            # Express the zero guard as Max instead of ``+ 1e-12``. Torch's
+            # ONNX optimizer currently drops an Add of that magnitude as a
+            # numeric no-op, recreating the divide-by-zero this path exists to
+            # prevent. Clamp is identical at zero and differs only for
+            # sub-1e-12 mean squares (far below useful audio precision).
+            normalized = working * torch.rsqrt(mean_square.clamp_min(1e-12))
+            return (normalized * self.gamma.float()).to(x.dtype)
         if x.device.type == "mps" and not torch.is_grad_enabled():
             from .metal import metal_rms_norm
 
             return metal_rms_norm(x, self.gamma, self.scale)
         return F.rms_norm(x, (self.dim,), self.gamma, eps=1e-12)
+
+
+def _binary_concat(tensors: list[Tensor], *, dim: int) -> Tensor:
+    """
+    Concatenate through a tree whose nodes have at most two inputs.
+
+    :param tensors: Tensors to concatenate; must be non-empty.
+    :param dim: Dimension to concatenate along.
+    :return: The concatenated tensor.
+    :raises ValueError: If ``tensors`` is empty.
+    """
+    if not tensors:
+        raise ValueError("cannot concatenate an empty tensor list")
+    while len(tensors) > 1:
+        tensors = [
+            torch.cat(tensors[index : index + 2], dim=dim)
+            for index in range(0, len(tensors), 2)
+        ]
+    return tensors[0]
+
+
+def _binary_sum(tensors: list[Tensor]) -> Tensor:
+    """
+    Sum through a balanced tree so no long Add chain stays live.
+
+    :param tensors: Tensors to sum; must be non-empty and broadcast-compatible.
+    :return: The summed tensor.
+    :raises ValueError: If ``tensors`` is empty.
+    """
+    if not tensors:
+        raise ValueError("cannot sum an empty tensor list")
+    while len(tensors) > 1:
+        tensors = [
+            (
+                tensors[index] + tensors[index + 1]
+                if index + 1 < len(tensors)
+                else tensors[index]
+            )
+            for index in range(0, len(tensors), 2)
+        ]
+    return tensors[0]
 
 
 class RotaryEmbedding(nn.Module):
@@ -234,6 +290,11 @@ class FeedForward(nn.Module):
             nn.Linear(dim_inner, dim),
             nn.Dropout(dropout),
         )
+        # Set only by ``RoformerONNXWrapper``. The browser graph evaluates the
+        # expanded hidden features in independent groups, then sums their
+        # contributions to the second linear layer. This preserves the MLP
+        # exactly while avoiding a 200+ MiB intermediate tensor.
+        self.onnx_hidden_chunk_size: int | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -242,7 +303,36 @@ class FeedForward(nn.Module):
         :param x: Input of shape ``[..., dim]``.
         :return: Output of the same shape.
         """
-        return self.net(x)
+        chunk_size = self.onnx_hidden_chunk_size
+        if chunk_size is None:
+            return self.net(x)
+        if chunk_size <= 0:
+            raise ValueError(
+                f"onnx_hidden_chunk_size must be positive or None, got {chunk_size}"
+            )
+
+        first = self.net[1]
+        second = self.net[4]
+        if not isinstance(first, nn.Linear) or not isinstance(second, nn.Linear):
+            raise RuntimeError("RoFormer feed-forward layout changed")
+
+        normalized = self.net[0](x)
+        partials: list[Tensor] = []
+        for start in range(0, first.out_features, chunk_size):
+            end = min(start + chunk_size, first.out_features)
+            hidden = F.linear(
+                normalized,
+                first.weight[start:end],
+                None if first.bias is None else first.bias[start:end],
+            )
+            hidden = F.gelu(hidden)
+            hidden = self.net[3](hidden)
+            partials.append(F.linear(hidden, second.weight[:, start:end], bias=None))
+
+        out = _binary_sum(partials)
+        if second.bias is not None:
+            out = out + second.bias
+        return self.net[5](out)
 
 
 def _scaled_dot_product_attention(
@@ -283,6 +373,67 @@ def _scaled_dot_product_attention(
     )
 
 
+def _chunked_scaled_dot_product_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    scale: float,
+    dropout: float,
+    training: bool,
+    query_chunk_size: int | None,
+) -> Tensor:
+    """Run exact attention without materialising the full score matrix.
+
+    Splitting only the query axis preserves ordinary scaled dot-product
+    attention exactly: every query still attends to every key, while each
+    temporary score tensor is bounded by ``query_chunk_size * key_length``.
+    The browser ONNX export enables this path because production RoFormer
+    score tensors otherwise require 1.2--2.6 GB per layer and cannot fit in a
+    32-bit WebAssembly heap (or a typical WebGPU storage buffer).
+
+    Chunks are concatenated through a binary tree so every ONNX ``Concat`` has
+    at most two inputs. This matters on WebGPU implementations that expose the
+    specification-minimum number of storage-buffer bindings per shader stage.
+
+    :param query: Queries of shape ``[batch, heads, sequence, dim]``.
+    :param key: Keys with the same shape as ``query``.
+    :param value: Values with the same shape as ``query``.
+    :param scale: Query/key dot-product scale.
+    :param dropout: Attention dropout probability.
+    :param training: Whether the containing attention module is training.
+    :param query_chunk_size: Maximum query rows per score tensor, or ``None``
+        for the normal unchunked implementation.
+    :return: Attention output with the same shape as ``query``.
+    """
+    if query_chunk_size is None or query.shape[-2] <= query_chunk_size:
+        return _scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            scale=scale,
+            dropout=dropout,
+            training=training,
+        )
+    if query_chunk_size <= 0:
+        raise ValueError(
+            f"query_chunk_size must be positive or None, got {query_chunk_size}"
+        )
+
+    chunks = [
+        _scaled_dot_product_attention(
+            query[..., start : start + query_chunk_size, :],
+            key,
+            value,
+            scale=scale,
+            dropout=dropout,
+            training=training,
+        )
+        for start in range(0, query.shape[-2], query_chunk_size)
+    ]
+    return _binary_concat(chunks, dim=-2)
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -310,6 +461,11 @@ class Attention(nn.Module):
 
         self.rotary_embed = rotary_embed
         self.dropout = dropout
+        # Set only by ``RoformerONNXWrapper``. Native PyTorch inference keeps
+        # its faster fused attention path; browser exports trade a few more
+        # dispatches for bounded peak memory.
+        self.onnx_query_chunk_size: int | None = None
+        self.onnx_head_chunk_size: int | None = None
 
         self.norm = RMSNorm(dim)
         self.to_qkv = nn.Linear(dim, dim_inner * 3, bias=False)
@@ -319,12 +475,12 @@ class Attention(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _forward_chunk(self, x: Tensor) -> Tensor:
         """
-        Run gated multi-head attention over the sequence axis.
+        Run the ordinary all-head attention path.
 
-        :param x: Input of shape ``[batch, seq, dim]``.
-        :return: Output of the same shape.
+        :param x: Input of shape ``[batch, sequence, dim]``.
+        :return: Attention output of the same shape.
         """
         batch, seq, _ = x.shape
         x = self.norm(x)
@@ -338,13 +494,14 @@ class Attention(nn.Module):
             q = self.rotary_embed.rotate_queries_or_keys(q)
             k = self.rotary_embed.rotate_queries_or_keys(k)
 
-        out = _scaled_dot_product_attention(
+        out = _chunked_scaled_dot_product_attention(
             q,
             k,
             v,
             scale=self.scale,
             dropout=self.dropout,
             training=self.training,
+            query_chunk_size=self.onnx_query_chunk_size,
         )
 
         gates = self.to_gates(x)
@@ -352,6 +509,104 @@ class Attention(nn.Module):
 
         out = out.transpose(1, 2).reshape(batch, seq, -1)
         return self.to_out(out)
+
+    def _forward_head_chunks(self, x: Tensor, head_chunk_size: int) -> Tensor:
+        """
+        Run exact attention in independently projected head groups.
+
+        Each group slices the checkpoint's combined Q/K/V projection weights,
+        performs the same all-to-all attention, and immediately applies the
+        matching columns of the output projection. Summing those partial
+        projections is algebraically identical to concatenating every head
+        and applying one large linear layer, but no Q/K/V, attention-score, or
+        output-projection input buffer spans all heads at once.
+
+        :param x: Input of shape ``[batch, sequence, dim]``.
+        :param head_chunk_size: Number of heads to project per group.
+        :return: Attention output of the same shape as ``x``.
+        """
+        batch, seq, _ = x.shape
+        x = self.norm(x)
+        dim_inner = self.to_qkv.out_features // 3
+        dim_head = dim_inner // self.heads
+        gates = self.to_gates(x).sigmoid().transpose(1, 2).unsqueeze(-1)
+        out_weight = self.to_out[0].weight
+
+        partials: list[Tensor] = []
+        for head_start in range(0, self.heads, head_chunk_size):
+            head_end = min(head_start + head_chunk_size, self.heads)
+            feature_start = head_start * dim_head
+            feature_end = head_end * dim_head
+            group_heads = head_end - head_start
+
+            q = F.linear(
+                x,
+                self.to_qkv.weight[feature_start:feature_end],
+                bias=None,
+            )
+            k = F.linear(
+                x,
+                self.to_qkv.weight[dim_inner + feature_start : dim_inner + feature_end],
+                bias=None,
+            )
+            v = F.linear(
+                x,
+                self.to_qkv.weight[
+                    2 * dim_inner + feature_start : 2 * dim_inner + feature_end
+                ],
+                bias=None,
+            )
+            q, k, v = (
+                tensor.view(batch, seq, group_heads, dim_head).transpose(1, 2)
+                for tensor in (q, k, v)
+            )
+
+            if self.rotary_embed is not None:
+                q = self.rotary_embed.rotate_queries_or_keys(q)
+                k = self.rotary_embed.rotate_queries_or_keys(k)
+
+            out = _chunked_scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                dropout=self.dropout,
+                training=self.training,
+                query_chunk_size=self.onnx_query_chunk_size,
+            )
+            out = out * gates[:, head_start:head_end]
+            out = out.transpose(1, 2).reshape(batch, seq, -1)
+            partials.append(
+                F.linear(
+                    out,
+                    out_weight[:, feature_start:feature_end],
+                    bias=None,
+                )
+            )
+
+        return self.to_out[1](_binary_sum(partials))
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Run gated multi-head attention over the sequence axis.
+
+        Browser exports additionally split attention heads into independent
+        projection groups. This bounds Q/K/V and output-projection buffers
+        without unrolling the much larger band/frame batch axes, complementing
+        query chunking's bound on attention scores while retaining useful GPU
+        parallelism.
+
+        :param x: Input of shape ``[batch, seq, dim]``.
+        :return: Output of the same shape.
+        """
+        chunk_size = self.onnx_head_chunk_size
+        if chunk_size is None or chunk_size >= self.heads:
+            return self._forward_chunk(x)
+        if chunk_size <= 0:
+            raise ValueError(
+                f"onnx_head_chunk_size must be positive or None, got {chunk_size}"
+            )
+        return self._forward_head_chunks(x, chunk_size)
 
 
 class Transformer(nn.Module):
@@ -440,11 +695,14 @@ class BandSplit(nn.Module):
         :return: Band features of shape ``[batch, time, bands, dim]``.
         """
         outs = []
-        for split_input, to_feature in zip(
-            x.split(self.dim_inputs, dim=-1), self.to_features
-        ):
-            outs.append(to_feature(split_input))
-        return torch.stack(outs, dim=-2)
+        start = 0
+        for width, to_feature in zip(self.dim_inputs, self.to_features):
+            # A single Split with one output per band needs roughly 60 WebGPU
+            # storage-buffer bindings. Independent slices keep every dispatch
+            # narrow and work on devices exposing only the spec minimum.
+            outs.append(to_feature(x[..., start : start + width]).unsqueeze(-2))
+            start += width
+        return _binary_concat(outs, dim=-2)
 
 
 def MLP(
@@ -501,6 +759,10 @@ class MaskEstimator(nn.Module):
         super().__init__()
         self.dim_inputs = dim_inputs
         self.to_freqs = nn.ModuleList([])
+        # ``RoformerONNXWrapper`` replaces GLU's two-output Split with two
+        # explicit slices. ORT-WebGPU's fp32 memory planner can otherwise
+        # resolve one Split output to a bogus zero-sized tensor at runtime.
+        self.onnx_safe_glu = False
         dim_hidden = dim * mlp_expansion_factor
         for dim_in in dim_inputs:
             self.to_freqs.append(
@@ -523,9 +785,19 @@ class MaskEstimator(nn.Module):
         :return: Masks of shape ``[batch, time, sum(dim_inputs)]``.
         """
         outs = []
-        for band_features, mlp in zip(x.unbind(dim=-2), self.to_freqs):
-            outs.append(mlp(band_features))
-        return torch.cat(outs, dim=-1)
+        for index, mlp in enumerate(self.to_freqs):
+            # Avoid exporting ``unbind`` as one wide multi-output Split for
+            # the same WebGPU binding-limit reason as ``BandSplit.forward``.
+            band = x.select(dim=-2, index=index)
+            if self.onnx_safe_glu:
+                projected = mlp[0](band)
+                width = self.dim_inputs[index]
+                outs.append(
+                    projected[..., :width] * projected[..., width : 2 * width].sigmoid()
+                )
+            else:
+                outs.append(mlp(band))
+        return _binary_concat(outs, dim=-1)
 
 
 def _slaney_mel_filter_bank(sample_rate: int, n_fft: int, n_mels: int) -> Tensor:
@@ -799,6 +1071,66 @@ class _RoformerBase(nn.Module):
         :return: Float32 Hann window of length ``stft_win_length``.
         """
         return torch.hann_window(self.stft_win_length, device=device)
+
+    #: Compiled RoFormer throughput vs batch size is GPU-dependent, so the
+    #: calibrator sweeps candidates up to the VRAM ceiling rather than trusting
+    #: a single estimate — and it sweeps powers of two.
+    prefers_power_of_two_batch = True
+
+    def prefill_inference_caches(self) -> None:
+        """
+        Materialize the rotary tables before CUDAGraph compilation.
+
+        The two axial sequence lengths are fixed by the checkpoint's training
+        segment: STFT frames for the time axis and band count for the frequency
+        axis. Each rotary instance is shared across every block of one axis, so
+        it only ever sees a single sequence length during inference. Binding
+        that axis's table to frozen attributes via ``prime_compiled`` keeps a
+        Python dict lookup (a non-GPU op that otherwise splits the CUDAGraph at
+        every layer) out of the captured trunk.
+        """
+        segment_length = int(round(self.max_allowed_segment * self.samplerate))
+        hop_length = int(self.stft_kwargs["hop_length"])
+        sequence_lengths = (
+            segment_length // hop_length + 1,
+            len(self.band_split.dim_inputs),
+        )
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        seen: set[int] = set()
+        for transformer_pair in self.layers:
+            for axis, transformer in enumerate(transformer_pair):
+                for attention, _feed_forward in transformer.layers:
+                    rotary = attention.rotary_embed
+                    if rotary is None or id(rotary) in seen:
+                        continue
+                    rotary.prime_compiled(sequence_lengths[axis], device, dtype)
+                    seen.add(id(rotary))
+
+    def enable_compiled_core(self) -> None:
+        """
+        Compile the heavy axial transformer trunk.
+
+        STFT/iSTFT, complex mask reconstruction, and the small per-band heads
+        remain eager. This mirrors HTDemucs's core-only strategy while putting
+        the roughly 90% transformer hot path under Inductor/CUDAGraphs.
+        """
+        if not hasattr(self, "_uncompiled_run_transformers"):
+            self._uncompiled_run_transformers = self._run_transformers
+        self.prefill_inference_caches()
+        self._run_transformers = torch.compile(
+            self._uncompiled_run_transformers, mode="reduce-overhead"
+        )
+        self._fixed_batch_shape = True
+
+    def disable_compiled_core(self) -> None:
+        """
+        Restore the eager transformer trunk so a retry does not double-wrap it.
+        """
+        original = getattr(self, "_uncompiled_run_transformers", None)
+        if original is not None:
+            self._run_transformers = original
+            del self._uncompiled_run_transformers
 
     def _run_transformers(self, x: Tensor) -> Tensor:
         """
@@ -1309,3 +1641,8 @@ def build_roformer(
     if state is not None:
         model.load_state_dict(state, strict=True)
     return model.eval()
+
+
+from . import backends as _backends  # noqa: E402  (avoids an import cycle)
+
+_backends.register_backend("roformer", build_roformer)

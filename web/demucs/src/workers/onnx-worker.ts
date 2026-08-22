@@ -1,65 +1,17 @@
 /**
  * ONNX Runtime worker. Handles both WebGPU and WASM backends — same code, the
- * caller picks via the ``backend`` field on the load message. Inputs, outputs,
- * activations, and compute are always float32. An "fp16" artifact uses fp16
- * only for weight storage; the exporter inserts a Cast(fp16 -> fp32) after
- * each converted weight, allowing ORT to fold the constant cast at load time.
+ * caller picks via the ``backend`` field on the load message. Model IO is
+ * always float32. HTDemucs "fp16" uses fp16 only for weight storage;
+ * RoFormer "fp16" uses mixed-precision weights and large activations while
+ * preserving fp32 normalization, rotary trig, and softmax. The exporter
+ * inserts the required Cast boundaries, so callers always exchange fp32
+ * tensors with the worker.
  */
 
 import * as onnx from 'onnxruntime-web';
+import { fetchModelBytes } from '../model-fetch.js';
 
 let session: onnx.InferenceSession | null = null;
-
-/**
- * Fetch the model with incremental progress. This trades the previous
- * URL-based load (ORT streams the file itself, never holding a second
- * full-size buffer in JS) for real download progress: the bytes are held
- * here as one contiguous buffer so `InferenceSession.create` can report
- * something better than a stalled bar for the ~100ms-950MB fetch. Peak
- * memory is briefly ~2x model size (this buffer + ORT's parsed copy).
- */
-async function fetchModelBytes(
-    url: string,
-    onProgress: (loaded: number, total: number) => void
-): Promise<Uint8Array> {
-    const response = await fetch(url);
-    if (!response.ok) {
-        throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
-    }
-    const totalHeader = response.headers.get('Content-Length');
-    const total = totalHeader ? Number(totalHeader) : 0;
-
-    if (!response.body) {
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        onProgress(bytes.byteLength, total || bytes.byteLength);
-        return bytes;
-    }
-
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let loaded = 0;
-    let lastReport = 0;
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.byteLength;
-        const now = performance.now();
-        if (now - lastReport >= 100) {
-            onProgress(loaded, total);
-            lastReport = now;
-        }
-    }
-    onProgress(loaded, total || loaded);
-
-    const bytes = new Uint8Array(loaded);
-    let offset = 0;
-    for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-    }
-    return bytes;
-}
 
 interface LoadMessage {
     type: 'load';

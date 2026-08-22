@@ -1,6 +1,6 @@
-# unblend API
+# Unblend API
 
-The unblend Python API is primarily comprised of two classes: `Separator` and `SeparatedSources`.
+The Python API is primarily comprised of two classes: `Separator` and `SeparatedSources`.
 
 ## Separator
 
@@ -20,7 +20,7 @@ separator = Separator(
 A `Separator` takes the following parameters:
 
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
-- `device` - The device/backend to use for loading and running the model. If left as `None` (the default), unblend auto-selects the best available backend at construction time (cuda > mps > cpu). Pass `"cpu"`, `"cuda"`, or `"mps"` to force one.
+- `device` - The device/backend to use for loading and running the model. If left as `None` (the default), unblend auto-selects the best available backend at construction time. Pass `"cpu"`, `"cuda"`, or `"mps"` to force one.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft). This is a **performance optimization** (smaller download and memory footprint) — it does **not** filter the output to one stem; the result still contains all of the model's sources, with only the named stem at full quality. Use `SeparatedSources.isolate_stem` to actually isolate a stem.
 - `dtype` - Inference precision. The default `"auto"` uses FP16 on CUDA GPUs with tensor cores (compute capability ≥ 7.0) and on MPS; CPU and older CUDA GPUs use FP32. HTDemucs and RoFormer FP16 both measure SDR-equal to FP32. RoFormer gains are 2.2–2.4× on a V100 and 1.06–1.07× on an M2 Max after the MPS attention/RMSNorm optimizations (10 full MUSDB18-HQ tracks). Pass `torch.float16` or `torch.bfloat16` explicitly to force reduced precision (CUDA/MPS only; CPU is rejected), or `None` / `torch.float32` to force FP32. On MPS, custom Metal kernels accelerate normalization; BF16 works but measured ~27% slower than FP16 for HTDemucs.
 - `compile` - Optional, if `True`, applies `torch.compile` (Inductor/CUDAGraphs) to the architecture's heavy neural-network core on CUDA: `forward_core` for HTDemucs and the axial transformer trunk for BS-/Mel-Band RoFormer. STFT/iSTFT and reconstruction remain eager. On a V100 FP16 compile measured 1.50× for SW and 1.34× for Kim on a 76-second track. Compilation adds initialization latency and a persistent CUDAGraph private memory pool; ensemble members each capture their own pool, which can be much larger than `torch.cuda.max_memory_allocated` reports. Auto-sized runs halve/recapture on OOM. MPS and CPU remain eager. The Python API is explicit (`compile=False`); the CLI defaults to cache-free workload-aware auto mode, with `--compile` / `--no-compile` overrides.
@@ -402,3 +402,55 @@ All raised exceptions derive from `UnblendError`:
 ```python
 from unblend import UnblendError, ValidationError, ModelLoadingError, LoadAudioError
 ```
+
+## Custom models
+
+Unblend ships a fixed registry, but you can add your own models without
+modifying the package or hosting weights anywhere.
+
+Point `UNBLEND_EXTRA_MODELS` at a JSON file (or pass `extra_models=` to
+`ModelRepository`). Its entries are **added** to the shipped registry — a file
+that reuses a built-in name is rejected rather than shadowing it, so dropping
+one in cannot silently swap the weights behind `htdemucs`.
+
+```json
+{
+  "version": 1,
+  "models": {
+    "my_scnet": {
+      "backend": "scnet",
+      "architecture": "scnet",
+      "license": "unknown",
+      "sources": ["drums", "bass", "other", "vocals"],
+      "samplerate": 44100,
+      "segment_samples": 485100,
+      "config": { "dims": [4, 64, 128, 256], "nfft": 4096, "hop_size": 1024 },
+      "checkpoint": {
+        "format": "safetensors",
+        "path": "~/models/my_scnet.safetensors"
+      }
+    }
+  }
+}
+```
+
+```bash
+export UNBLEND_EXTRA_MODELS=~/my-models.json
+unblend models list          # your model appears, marked "Local"
+unblend separate --model my_scnet track.wav
+```
+
+Notes:
+
+- **Safetensors only.** Loading stays pickle-free; convert `.ckpt`/`.pt`
+  weights yourself before registering them.
+- `checkpoint.path` is for local files; `checkpoint.url` (https) downloads and
+  caches instead, and then `sha256` and `size_bytes` are required. For a local
+  path they are optional but verified when present.
+- `architecture` must be one unblend implements — `htdemucs`, `bs_roformer`,
+  `mel_band_roformer`, `scnet`, or `scnet_masked`. Weights are loaded strictly,
+  so a mismatched checkpoint fails loudly rather than degrading silently.
+- For a single-head model given two `sources`, the second is synthesised as
+  `mixture - prediction`. Order matters: an instrumental model must declare
+  `["other", "vocals"]`, and getting it backwards produces silently wrong
+  output rather than an error.

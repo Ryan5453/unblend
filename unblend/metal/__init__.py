@@ -1514,6 +1514,36 @@ class MetalMultiheadAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def has_swappable_modules(model: nn.Module) -> bool:
+    """
+    Whether :func:`apply_metal_optimizations` would replace anything.
+
+    Checked before the pass so a model with no eligible modules does not pay
+    for shader compilation. Kept structural rather than naming architectures:
+    any model built from ``num_groups=1`` GroupNorms benefits, which is true of
+    HTDemucs and SCNet but not the RoFormers (they use RMSNorm, which already
+    routes to a Metal kernel inside its own forward).
+
+    :param model: Model to inspect.
+    :return: ``True`` if at least one module would be swapped.
+    """
+    from ..blocks import HDecLayer, HEncLayer
+    from ..transformer import MyGroupNorm
+
+    for module in model.modules():
+        if isinstance(module, (HEncLayer, HDecLayer, MyGroupNorm)):
+            return True
+        if (
+            isinstance(module, nn.GroupNorm)
+            and module.num_groups == 1
+            and module.affine
+        ):
+            return True
+        if isinstance(module, nn.MultiheadAttention):
+            return True
+    return False
+
+
 def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
     """
     Replace low-precision-slow ops with Metal-backed equivalents in-place.

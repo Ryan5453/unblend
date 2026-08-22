@@ -116,6 +116,7 @@ export function Benchmark() {
 
     const cancelRef = useRef(false);
     const audioContextRef = useRef<AudioContext | null>(null);
+    const folderInputRef = useRef<HTMLInputElement | null>(null);
 
     const log = useCallback((msg: string) => {
         const stamp = new Date().toLocaleTimeString();
@@ -144,6 +145,16 @@ export function Benchmark() {
                 setError(`Directory picker failed: ${e.message}`);
             }
         }
+    }, [log]);
+
+    const handleFolderInput = useCallback((ev: React.ChangeEvent<HTMLInputElement>) => {
+        const found = readTracksFromFileList(Array.from(ev.target.files ?? []));
+        log(`Folder yielded ${found.length} tracks`);
+        setTracks(found);
+        setResults([]);
+        setError(null);
+        // Permit choosing the same folder again after its contents change.
+        ev.target.value = '';
     }, [log]);
 
     const handleDrop = useCallback(async (ev: React.DragEvent<HTMLDivElement>) => {
@@ -227,6 +238,14 @@ export function Benchmark() {
 
                 const stemSDR: StemSDR = {};
                 for (const stem of MUSDB_STEMS) {
+                    // Kim is a vocal-vs-instrumental model. Its `other` output
+                    // is mixture - vocals (drums + bass + MUSDB `other`), so
+                    // comparing it with MUSDB's `other.wav` is invalid and
+                    // previously dragged the displayed mean below zero.
+                    if (model === 'melband_roformer_kim' && stem !== 'vocals') {
+                        stemSDR[stem] = Number.NaN;
+                        continue;
+                    }
                     const file = track.stems[stem as MusdbStem];
                     const estimate = sep.stems[stem];
                     if (!file || !estimate) {
@@ -319,8 +338,9 @@ export function Benchmark() {
                             >
                                 <option value="htdemucs">htdemucs (4 stems)</option>
                                 <option value="htdemucs_6s">htdemucs_6s (6 stems, experimental)</option>
-                                <option value="bs_roformer_sw">bs_roformer_sw (6 stems, ~360MB fp16, currently broken — see web/demucs/README.md#known-issues)</option>
-                                <option value="melband_roformer_kim">melband_roformer_kim (vocals, ~477MB fp16, currently broken — see web/demucs/README.md#known-issues)</option>
+                                <option value="bs_roformer_sw">bs_roformer_sw (6 stems, ~360MB fp16)</option>
+                                <option value="melband_roformer_kim">melband_roformer_kim (vocals, ~477MB fp16)</option>
+                                <option value="scnet_small">scnet_small (4 stems, ~29MB fp16)</option>
                             </select>
                         </label>
 
@@ -376,6 +396,28 @@ export function Benchmark() {
                                 >
                                     {tracks.length > 0 ? 'Pick a different directory…' : 'Pick directory…'}
                                 </button>
+                            )}
+                            {!supportsDirectoryPicker() && (
+                                <>
+                                    <input
+                                        ref={node => {
+                                            folderInputRef.current = node;
+                                            node?.setAttribute('webkitdirectory', '');
+                                        }}
+                                        type="file"
+                                        multiple
+                                        className="hidden"
+                                        onChange={handleFolderInput}
+                                    />
+                                    <button
+                                        type="button"
+                                        onClick={() => folderInputRef.current?.click()}
+                                        className="bench-btn bench-btn-primary"
+                                        disabled={phase === 'running' || phase === 'loading_model'}
+                                    >
+                                        {tracks.length > 0 ? 'Pick a different folder…' : 'Pick folder…'}
+                                    </button>
+                                </>
                             )}
                         </div>
                     </div>

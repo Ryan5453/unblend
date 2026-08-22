@@ -49,6 +49,7 @@ dev = [
 ]
 onnx = [
   "onnx>=1.22.0",
+  "onnxconverter-common>=1.16.0",
   # Required by the dynamo ONNX exporter (RoFormer export path).
   "onnxscript>=0.2.0",
 ]

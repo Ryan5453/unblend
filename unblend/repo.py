@@ -22,10 +22,12 @@ from filelock import Timeout as FileLockTimeout
 from safetensors import SafetensorError
 from safetensors.torch import load_file
 
+# Importing the architecture modules is what registers their builders;
+# the repository dispatches through backends rather than naming them.
+from . import backends, scnet  # noqa: F401
 from .apply import Model, ModelEnsemble
 from .exceptions import ModelLoadingError
 from .htdemucs import HTDemucs
-from .roformer import build_roformer
 
 BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 
@@ -141,6 +143,19 @@ def _load_demucs_layer(path: Path, model_info: dict) -> HTDemucs:
         raise ModelLoadingError(f"Failed to build HTDemucs from {path}: {exc}") from exc
 
 
+def _known_backends() -> frozenset[str]:
+    """
+    Backend names ``metadata.json`` may declare.
+
+    ``demucs`` is special-cased because its weights ship as a bag of layers
+    rather than one checkpoint; everything else registers a builder, so adding
+    an architecture does not require editing this module.
+
+    :return: The accepted backend names.
+    """
+    return frozenset({"demucs"}) | backends.single_checkpoint_backends()
+
+
 def get_cache_dir() -> Path:
     """
     Get the cache directory for downloaded models.
@@ -170,12 +185,19 @@ def get_cache_dir() -> Path:
 class ModelRepository:
     """Repository system for accessing models."""
 
-    def __init__(self, metadata_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        metadata_path: Path | None = None,
+        extra_models: "Path | str | list[Path | str] | None" = None,
+    ) -> None:
         """
-        Initialize the model repository from metadata.json.
+        Initialize the model repository.
 
         :param metadata_path: Path to a metadata file; defaults to the shipped
             ``unblend/metadata.json``. Mainly useful in tests.
+        :param extra_models: Additional models files to overlay on the shipped
+            registry, as a path or list of paths. Defaults to the paths in
+            ``UNBLEND_EXTRA_MODELS`` (os.pathsep-separated).
         :raises ModelLoadingError: If the metadata structure is invalid
         """
         if metadata_path is None:
@@ -197,6 +219,7 @@ class ModelRepository:
                 "Invalid metadata structure: expected a top-level 'models' dictionary."
             )
         self._models = self.metadata["models"]
+        self._merge_extra_models(extra_models)
         if not self._models:
             raise ModelLoadingError("Model metadata must contain at least one model.")
         for model_name, model_info in self._models.items():
@@ -206,7 +229,7 @@ class ModelRepository:
                 raise ModelLoadingError(
                     f"Model {model_name} metadata must be a dictionary."
                 )
-            if model_info.get("backend") not in {"demucs", "roformer"}:
+            if model_info.get("backend") not in _known_backends():
                 raise ModelLoadingError(
                     f"Model {model_name} has unknown backend "
                     f"{model_info.get('backend')!r}."
@@ -327,29 +350,87 @@ class ModelRepository:
                         f"RoFormer model {model_name} has invalid {field}: {value}."
                     )
             checkpoint = model_info.get("checkpoint")
+            # Either a remote https artifact or a local file. Local paths exist
+            # so a user-supplied models file can point at weights on disk
+            # without hosting them; the format restriction is unchanged, since
+            # Safetensors is what keeps loading pickle-free.
+            has_remote = str((checkpoint or {}).get("url", "")).startswith("https://")
+            has_local = bool((checkpoint or {}).get("path"))
             if (
                 not isinstance(checkpoint, dict)
                 or checkpoint.get("format") != "safetensors"
-                or not str(checkpoint.get("url", "")).startswith("https://")
+                or not (has_remote or has_local)
             ):
                 raise ModelLoadingError(
-                    f"RoFormer model {model_name} must declare a valid https "
-                    "Safetensors checkpoint."
+                    f"RoFormer model {model_name} must declare a Safetensors "
+                    "checkpoint with an https url or a local path."
                 )
             digest = checkpoint.get("sha256")
-            if (
-                not isinstance(digest, str)
-                or len(digest) != 64
-                or any(char not in "0123456789abcdef" for char in digest)
-            ):
-                raise ModelLoadingError(
-                    f"RoFormer model {model_name} is missing a valid sha256."
-                )
+            # A download has to be verifiable, so remote entries still require
+            # both. A local file the user already has is verified only when
+            # they supply a digest.
+            if has_remote or digest is not None:
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)
+                ):
+                    raise ModelLoadingError(
+                        f"RoFormer model {model_name} is missing a valid sha256."
+                    )
             size = checkpoint.get("size_bytes")
-            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            if has_remote or size is not None:
+                if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                    raise ModelLoadingError(
+                        f"RoFormer model {model_name} is missing positive size_bytes."
+                    )
+
+    def _merge_extra_models(
+        self, extra_models: "Path | str | list[Path | str] | None"
+    ) -> None:
+        """
+        Overlay user-supplied model entries onto the shipped registry.
+
+        Entries are added, never substituted: a file that reuses a built-in
+        name is rejected rather than shadowing it, so dropping one in cannot
+        silently swap the weights out from under existing code.
+
+        :param extra_models: Paths to overlay, or ``None`` to read
+            ``UNBLEND_EXTRA_MODELS``.
+        :raises ModelLoadingError: If a file is unreadable, malformed, or
+            redefines a name that already exists.
+        """
+        if extra_models is None:
+            raw = os.environ.get("UNBLEND_EXTRA_MODELS", "")
+            paths = [p for p in raw.split(os.pathsep) if p]
+        elif isinstance(extra_models, (str, Path)):
+            paths = [extra_models]
+        else:
+            paths = list(extra_models)
+
+        for entry in paths:
+            path = Path(entry).expanduser()
+            try:
+                with open(path, "r") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
                 raise ModelLoadingError(
-                    f"RoFormer model {model_name} is missing positive size_bytes."
+                    f"Could not read extra models file {path}: {exc}"
+                ) from exc
+            models = payload.get("models") if isinstance(payload, dict) else None
+            if not isinstance(models, dict) or not models:
+                raise ModelLoadingError(
+                    f"Extra models file {path} must contain a non-empty "
+                    "'models' object."
                 )
+            for model_name, model_info in models.items():
+                if model_name in self._models:
+                    raise ModelLoadingError(
+                        f"Extra models file {path} redefines built-in model "
+                        f"{model_name!r}; choose a different name."
+                    )
+                self._models[model_name] = model_info
+        self.metadata["models"] = self._models
 
     def _roformer_cache_path(self, model_info: dict) -> Path:
         """
@@ -713,7 +794,7 @@ class ModelRepository:
             if tmp_path is not None and tmp_path.exists():
                 tmp_path.unlink()
 
-    def _get_roformer_model(
+    def _get_single_checkpoint_model(
         self,
         name: str,
         model_info: dict,
@@ -734,6 +815,50 @@ class ModelRepository:
         :raises ModelLoadingError: If download, verification, or loading fails.
         """
         checkpoint = model_info["checkpoint"]
+
+        # A local checkpoint skips the cache entirely: there is nothing to
+        # download, and copying a file the user already has into the cache
+        # would only duplicate it. Its digest is still checked when supplied.
+        local = checkpoint.get("path")
+        if local:
+            local_path = Path(local).expanduser()
+            if not local_path.is_file():
+                raise ModelLoadingError(
+                    f"Model {name} declares a local checkpoint that does not "
+                    f"exist: {local_path}"
+                )
+            if checkpoint.get("size_bytes") is not None:
+                check_size(local_path, checkpoint["size_bytes"])
+            if checkpoint.get("sha256") is not None:
+                check_checksum(local_path, checkpoint["sha256"])
+            if progress_callback:
+                progress_callback(
+                    "layer_complete",
+                    {
+                        "model_name": name,
+                        "layer_index": 1,
+                        "total_layers": 1,
+                        "cached": True,
+                    },
+                )
+            try:
+                state = load_file(local_path, device="cpu")
+                return backends.build(
+                    model_info["backend"],
+                    model_info["architecture"],
+                    dict(model_info["config"]),
+                    sources=list(model_info["sources"]),
+                    samplerate=int(model_info["samplerate"]),
+                    segment_samples=int(model_info["segment_samples"]),
+                    state=state,
+                )
+            except ModelLoadingError:
+                raise
+            except Exception as exc:
+                raise ModelLoadingError(
+                    f"Failed to build {name} from {local_path}: {exc}"
+                ) from exc
+
         expected = checkpoint["sha256"]
         cache_path = self._roformer_cache_path(model_info)
 
@@ -795,7 +920,8 @@ class ModelRepository:
             )
 
         try:
-            return build_roformer(
+            return backends.build(
+                model_info["backend"],
                 model_info["architecture"],
                 dict(model_info["config"]),
                 sources=list(model_info["sources"]),
@@ -928,8 +1054,11 @@ class ModelRepository:
                 f"Stem {only_load!r} not found in model {name}. Available "
                 f"stems: {', '.join(info['sources'])}"
             )
-        if info is not None and info.get("backend") == "roformer":
-            return self._get_roformer_model(name, info, progress_callback)
+        if (
+            info is not None
+            and info.get("backend") in backends.single_checkpoint_backends()
+        ):
+            return self._get_single_checkpoint_model(name, info, progress_callback)
 
         layer_checksums, model_info = self._select_layers(name, only_load)
 

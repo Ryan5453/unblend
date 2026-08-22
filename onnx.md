@@ -138,6 +138,48 @@ unblend export-onnx --model bs_roformer_sw --fp16
 - **Feed exactly `segment_samples` per call** (from metadata; e.g. 588800 ≈ 13.35 s for `bs_roformer_sw`). Only the batch axis is dynamic.
 - **Single-mask checkpoints** (metadata `output_complement: "true"`, e.g. `melband_roformer_kim`) emit one stem; compute the second client-side as `mixture - stem` after the iSTFT.
 - **`--static-batch`** traces with a fixed batch=1 instead of a dynamic batch axis (metadata `batch_mode: "static"` vs `"dynamic"`). Use this for single-inference consumers; the default dynamic-batch export remains best for anyone batching multiple segments through the raw ONNX file.
-- Extra metadata keys: `model_family` (`"roformer"`), `architecture` (`bs_roformer` / `mel_band_roformer`), `num_stems`, `output_complement`, `segment_samples`, `batch_mode`, the four `stft_*` keys, and `license` (the shipped RoFormer checkpoints are CC-BY-NC-SA-4.0 — non-commercial).
+- Extra metadata keys: `model_family` (`"roformer"`), `architecture` (`bs_roformer` / `mel_band_roformer`), `num_stems`, `output_complement`, `segment_samples`, `batch_mode`, the four `stft_*` keys, and `license` (`unlicensed` for BS-RoFormer-SW and `MIT` for Mel-Band RoFormer Kim).
 
-> **Not usable in onnxruntime-web today.** Both RoFormer architectures load but fail during inference on both the WebGPU and WASM backends — a WebGPU storage-buffer-per-stage limit hit during band-splitting, and a WASM heap ceiling hit by the models' multi-gigabyte full-attention score tensors. Neither is fixable from the ONNX graph; see the [`unblend` npm package's Known Issues](https://github.com/Ryan5453/unblend/blob/main/web/demucs/README.md#known-issues) for the full diagnosis. The exported files remain correct and fully usable via the Python package or via onnxruntime's CPU/CUDA execution providers.
+> **Browser export details.** The RoFormer wrapper evaluates exact self-attention in bounded head groups and query chunks, and evaluates feed-forward expansion in bounded feature groups. This prevents full Q/K/V projections, 1.2–2.6 GB score matrices, and 200+ MB MLP activations from exhausting browser memory. It also emits per-band `Slice` operations and binary joins instead of wide `Split`/`Concat` dispatches, keeping WebGPU shader bindings within portable limits. RoFormer `--fp16` exports use mixed precision: projections, MLPs, masks, activations, and weights are fp16 while IO, normalization, rotary trig, and softmax remain fp32. Use `--static-batch` for browser artifacts; dynamic-batch exports remain available for native/server consumers.
+
+## SCNet
+
+SCNet exports through the same client-side-transform pattern as the RoFormers:
+the graph covers everything between the STFT and iSTFT, and the caller supplies
+the spectrogram via `compute_scnet_stft_for_export`.
+
+Four SCNet-specific details matter:
+
+- **The audio must be padded first.** SCNet's trunk takes a real FFT along the
+  time axis, which needs an even frame count, so the model pads its input up to
+  a hop boundary (and by one further hop if that lands on an odd count). The
+  graph is traced at the *padded* frame count and will reject a spectrogram
+  computed from unpadded audio. Use `unblend.scnet.stft_padding(samples,
+  hop_length)` — the same function the model and exporter call — then trim that
+  many samples off the end after the inverse transform. For `scnet_small` this
+  is 485100 → 486400 samples, i.e. 476 frames rather than 474. A consumer that
+  chunks at a fixed size can equivalently use the padded length as its segment
+  size and skip the pad/trim entirely, which is what the npm runtime does.
+- **The window depends on the variant.** Plain SCNet passes no `window` to
+  `torch.stft`, so a Hann window would silently change the result; the masked
+  variants use a periodic Hann. The export records which in
+  `unblend.stft_window` (`none` for `scnet_xl_wide_v5`, `hann` for
+  `scnet_small`) and `compute_scnet_stft_for_export` takes a matching `window`
+  argument — read the metadata rather than assuming either.
+- **The masking head is inside the graph.** The masked variants add a frequency
+  positional embedding before the trunk and multiply a predicted complex mask
+  against the mixture afterwards. Both are traced, so the client contract is
+  identical for either variant: STFT in, per-stem spectrograms out.
+- **`irfft` cannot be exported directly.** SCNet's trunk applies an inverse
+  real FFT in every other dual-path layer, and that lowers to an ONNX `DFT`
+  node carrying both `inverse` and `onesided`, a combination the spec forbids
+  and onnxruntime rejects at load. The exporter enables `onnx_safe` on each
+  `FeatureConversion`, substituting an algebraically identical real-valued DFT
+  expressed as two matmuls.
+
+Known caveat: on production-size checkpoints the ONNX graph differs from the
+PyTorch result by a fraction of a percent relative — measured at 0.14% for
+`scnet_small` fp32 and 0.21% for its fp16 export, against a full-segment random
+input. The DFT substitution accounts for under 1e-5 of that; the remainder
+compounds through the trunk's twelve bidirectional LSTM invocations. A two-layer
+test model matches to 6e-08.

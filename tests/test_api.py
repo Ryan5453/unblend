@@ -490,7 +490,7 @@ def test_compile_roformer_targets_transformer_core_without_state_drift(
             module._compiled_cos = None
             module._compiled_sin = None
 
-    Separator._compile_roformer_transformer_core(model)
+    model.enable_compiled_core()
     with torch.no_grad():
         actual = model(audio)
 

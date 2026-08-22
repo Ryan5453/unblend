@@ -20,7 +20,7 @@ from torch import Tensor
 from torchcodec.decoders import AudioDecoder
 from torchcodec.encoders import AudioEncoder
 
-from . import __version__
+from . import __version__, backends
 from .apply import (
     Model,
     ModelEnsemble,
@@ -292,130 +292,6 @@ class Separator:
     # compile+capture cycles paid at init.
     _COMPILE_ROFORMER_CBS_CANDIDATES: tuple[int, ...] = (4, 8, 16, 32)
 
-    @staticmethod
-    def _prefill_htdemucs_caches(model: HTDemucs) -> None:
-        """
-        Eagerly populate HTDemucs's positional/frequency-embedding caches via a
-        single dummy ``forward_core`` pass.
-
-        ``mode="reduce-overhead"`` wraps the graph in CUDAGraphs, which reuses
-        internal allocation slots across replays. If the first call into the
-        compiled ``forward_core`` is also what fills these caches, the cached
-        tensors end up pointing into CUDAGraphs-managed memory that gets
-        overwritten on the next replay (see ``_cached_freq_emb`` at
-        ``htdemucs.py:467`` and the transformer's ``_cached_pos_emb_*``). By
-        running one eager pass first we anchor each cached embedding in the
-        regular allocator so CUDAGraphs treats it as a stable external input.
-
-        :param model: HTDemucs model whose embedding caches to prefill.
-        """
-        training_length = int(model.max_allowed_segment * model.samplerate)
-        model_dtype = next(model.parameters()).dtype
-        model_device = next(model.parameters()).device
-
-        with torch.no_grad():
-            mix = torch.zeros(
-                1,
-                model.audio_channels,
-                training_length,
-                device=model_device,
-                dtype=torch.float32,
-            )
-            z = model._spec(mix)
-            x = model._magnitude(z).to(mix.device)
-            mean = x.mean(dim=(1, 2, 3), keepdim=True)
-            std = x.std(dim=(1, 2, 3), keepdim=True)
-            x = (x - mean) / (1e-5 + std)
-
-            xt = mix
-            meant = xt.mean(dim=(1, 2), keepdim=True)
-            stdt = xt.std(dim=(1, 2), keepdim=True)
-            xt = (xt - meant) / (1e-5 + stdt)
-
-            if model_dtype != torch.float32:
-                x = x.to(model_dtype)
-                xt = xt.to(model_dtype)
-
-            model.forward_core(x, xt)
-
-    @staticmethod
-    def _compile_htdemucs_forward_core(model: HTDemucs) -> None:
-        """
-        Compile only the heavy neural network core of HTDemucs.
-
-        Avoids pulling STFT/iSTFT into TorchInductor — those are a poor fit
-        for Inductor and significantly inflate compile time without helping
-        steady-state throughput.
-
-        :param model: HTDemucs model to compile
-        """
-        # Snapshot the original forward_core once so the calibration retry
-        # loop can re-call this safely without nesting torch.compile wrappers
-        # (compiling an already-compiled function breaks dynamo).
-        if not hasattr(model, "_uncompiled_forward_core"):
-            model._uncompiled_forward_core = model.forward_core
-        # Caches must be populated BEFORE compile — see _prefill_htdemucs_caches.
-        Separator._prefill_htdemucs_caches(model)
-        model.forward_core = torch.compile(
-            model._uncompiled_forward_core, mode="reduce-overhead"
-        )
-        # CUDAGraphs replay requires the captured batch shape, so apply_model
-        # must zero-pad sub-full tail batches up to chunk_batch_size for this
-        # model (eager models run tails at their natural size instead).
-        model._fixed_batch_shape = True
-
-    @staticmethod
-    def _prefill_roformer_caches(model: _RoformerBase) -> None:
-        """
-        Materialize RoFormer rotary tables before CUDAGraph compilation.
-
-        The two axial sequence lengths are fixed by the checkpoint's training
-        segment: STFT frames for the time axis and band count for the frequency
-        axis. Each rotary instance is shared across every block of one axis, so
-        it only ever sees a single sequence length during inference. Binding
-        that axis's table to frozen attributes via ``prime_compiled`` keeps a
-        Python dict lookup (a non-GPU op that otherwise splits the CUDAGraph at
-        every layer) out of the captured trunk.
-
-        :param model: RoFormer whose shared rotary caches should be populated.
-        """
-        segment_length = int(round(model.max_allowed_segment * model.samplerate))
-        hop_length = int(model.stft_kwargs["hop_length"])
-        sequence_lengths = (
-            segment_length // hop_length + 1,
-            len(model.band_split.dim_inputs),
-        )
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
-        seen: set[int] = set()
-        for transformer_pair in model.layers:
-            for axis, transformer in enumerate(transformer_pair):
-                for attention, _feed_forward in transformer.layers:
-                    rotary = attention.rotary_embed
-                    if rotary is None or id(rotary) in seen:
-                        continue
-                    rotary.prime_compiled(sequence_lengths[axis], device, dtype)
-                    seen.add(id(rotary))
-
-    @staticmethod
-    def _compile_roformer_transformer_core(model: _RoformerBase) -> None:
-        """
-        Compile the heavy axial transformer trunk of a RoFormer.
-
-        STFT/iSTFT, complex mask reconstruction, and the small per-band heads
-        remain eager. This mirrors HTDemucs's core-only strategy while putting
-        the roughly 90% transformer hot path under Inductor/CUDAGraphs.
-
-        :param model: BS- or Mel-Band RoFormer to compile.
-        """
-        if not hasattr(model, "_uncompiled_run_transformers"):
-            model._uncompiled_run_transformers = model._run_transformers
-        Separator._prefill_roformer_caches(model)
-        model._run_transformers = torch.compile(
-            model._uncompiled_run_transformers, mode="reduce-overhead"
-        )
-        model._fixed_batch_shape = True
-
     def _measure_per_chunk_steady_bytes(self) -> int | None:
         """
         Warm once, time one eager batch-1 forward, and return its peak VRAM
@@ -546,11 +422,15 @@ class Separator:
         # sweep in ``_calibrate_chunk_batch_size`` time candidate sizes up to
         # it and keep the fastest. (V100 favours small batches; flash-
         # attention GPUs favour larger ones — no single constant is right.)
-        has_roformer = isinstance(self.model, _RoformerBase) or (
-            isinstance(self.model, ModelEnsemble)
-            and any(isinstance(model, _RoformerBase) for model in self.model.models)
+        wants_power_of_two = any(
+            backends.prefers_power_of_two_batch(model)
+            for model in (
+                self.model.models
+                if isinstance(self.model, ModelEnsemble)
+                else [self.model]
+            )
         )
-        if self._compile_enabled and has_roformer:
+        if self._compile_enabled and wants_power_of_two:
             return max(1, 1 << (estimate.bit_length() - 1))
         return estimate
 
@@ -564,10 +444,7 @@ class Separator:
             else [self.model]
         )
         for model in models:
-            if isinstance(model, HTDemucs):
-                self._compile_htdemucs_forward_core(model)
-            elif isinstance(model, _RoformerBase):
-                self._compile_roformer_transformer_core(model)
+            backends.enable_compiled_core(model)
 
     def _teardown_compile_state(self) -> None:
         """
@@ -588,16 +465,7 @@ class Separator:
             else [self.model]
         )
         for model in models:
-            original_forward = getattr(model, "_uncompiled_forward_core", None)
-            if original_forward is not None and isinstance(model, HTDemucs):
-                model.forward_core = original_forward
-                del model._uncompiled_forward_core
-
-            original_transformers = getattr(model, "_uncompiled_run_transformers", None)
-            if original_transformers is not None and isinstance(model, _RoformerBase):
-                model._run_transformers = original_transformers
-                del model._uncompiled_run_transformers
-            model._fixed_batch_shape = False
+            backends.disable_compiled_core(model)
         torch._dynamo.reset()
         gc.collect()
         if self.device == "cuda":
@@ -1034,21 +902,23 @@ class Separator:
             # Metal kernels and a wrapped attention module that route around those.
             # The SCALAR_T-templated kernels compile for either ``half`` or
             # ``bfloat`` and dispatch by tensor dtype at call time. No-op for CUDA
-            # (handled by tensor cores) and CPU (no low-precision path). The
-            # kernels target HTDemucs blocks, so other backends skip the pass
-            # (and its shader compilation) entirely.
-            if (
-                self.dtype in (torch.float16, torch.bfloat16)
-                and self.device == "mps"
-                and _contains_htdemucs(self.model)
-            ):
-                from .metal import apply_metal_optimizations
+            # (handled by tensor cores) and CPU (no low-precision path).
+            # Eligibility is structural rather than per-architecture: any model
+            # built from num_groups=1 GroupNorms benefits, which covers HTDemucs
+            # and SCNet (GroupNorm is 16.6% of SCNet's MPS runtime) but not the
+            # RoFormers, whose RMSNorm already calls a Metal kernel directly.
+            # Models with nothing to swap skip shader compilation entirely.
+            if self.dtype in (torch.float16, torch.bfloat16) and self.device == "mps":
+                from .metal import apply_metal_optimizations, has_swappable_modules
 
-                if isinstance(self.model, ModelEnsemble):
-                    for m in self.model.models:
-                        apply_metal_optimizations(m)
-                else:
-                    apply_metal_optimizations(self.model)
+                members = (
+                    list(self.model.models)
+                    if isinstance(self.model, ModelEnsemble)
+                    else [self.model]
+                )
+                for member in members:
+                    if has_swappable_modules(member):
+                        apply_metal_optimizations(member)
 
             # Compute an initial chunk_batch_size from a single eager forward
             # measurement. No per-GPU table — the math uses ``mem_get_info`` and

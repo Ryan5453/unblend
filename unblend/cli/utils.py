@@ -3,7 +3,6 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -80,14 +79,20 @@ def format_output_path(
 
 def get_models() -> dict[str, dict]:
     """
-    Get models from metadata.json.
+    Get every model the repository knows about.
+
+    Goes through ``ModelRepository`` rather than reading ``metadata.json``
+    directly so models added via ``UNBLEND_EXTRA_MODELS`` appear in the CLI
+    too — otherwise ``unblend models list`` would omit models that
+    ``Separator`` can happily load.
 
     :return: Dictionary mapping model names to their metadata
     """
-    with open(METADATA_PATH, "r") as f:
-        metadata = json.load(f)
+    # Imported here: unblend.repo pulls in the model modules, and importing it
+    # at module scope would make the CLI's small helpers depend on torch.
+    from ..repo import ModelRepository
 
-    return metadata["models"]
+    return ModelRepository().list_models()
 
 
 def _looks_like_audio_file(path: Path) -> bool:

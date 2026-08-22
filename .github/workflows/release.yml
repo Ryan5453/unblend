@@ -155,8 +155,10 @@ jobs:
           persist-credentials: false
       - name: Extract changelog section for this version
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          awk -v ver="$version" '
+          # changelog.md headings keep the tag's "v" prefix (## v1.0.0), so
+          # match GITHUB_REF_NAME as-is; stripping it here would never match
+          # and would silently fall back to the placeholder body below.
+          awk -v ver="$GITHUB_REF_NAME" '
             /^## / { found = ($2 == ver); next }
             found { print }
           ' changelog.md > release-notes.md

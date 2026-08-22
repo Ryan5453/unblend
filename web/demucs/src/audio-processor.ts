@@ -4,12 +4,18 @@
  * Importing this file from the main thread would share that state across
  * the STFT worker, which is unsafe.
  *
- * Two DSP families:
+ * Three DSP families:
  * - ``htdemucs``: Demucs pre-padding + frame trims around a √N-normalized
  *   STFT with the Nyquist bin dropped (matches ``HTDemucs._spec``).
  * - ``roformer``: plain centered reflect-pad STFT keeping all bins with no
  *   normalization (matches ``torch.stft(center=True, normalized=False)`` as
  *   the RoFormer checkpoints use it).
+ * - ``scnet``: the same centered STFT, √N-normalized; plain SCNet is
+ *   unwindowed while the masked variants (``scnet_small``) use a Hann window —
+ *   plain SCNet passes no ``window`` to ``torch.stft`` and sets
+ *   ``normalized=True``. Both are handled by the roformer path via the
+ *   ``window``/``normalized`` config fields rather than a separate
+ *   implementation, since nothing else differs.
  */
 import FFT from 'fft.js';
 import type { DSPConfig, STFTResult } from './constants.js';
@@ -54,6 +60,11 @@ export function createDSP(config: DSPConfig): DSP {
     return config.family === 'htdemucs'
         ? createHTDemucsDSP(config)
         : createRoformerDSP(config);
+}
+
+/** All-ones window: ``torch.stft`` with no ``window`` argument. */
+function makeRectangularWindow(nfft: number): Float32Array {
+    return new Float32Array(nfft).fill(1);
 }
 
 function makeHannWindow(nfft: number): Float32Array {
@@ -315,7 +326,13 @@ function createRoformerDSP(config: DSPConfig): DSP {
     }
 
     const fftInstance = new FFT(NFFT);
-    const hannWindow = makeHannWindow(NFFT);
+    // SCNet shares this DSP but is unwindowed and sqrt(N)-normalised; both
+    // default to the RoFormer behaviour when unset.
+    const analysisWindow =
+        config.window === 'rectangular'
+            ? makeRectangularWindow(NFFT)
+            : makeHannWindow(NFFT);
+    const stftScale = config.normalized ? 1 / Math.sqrt(NFFT) : 1;
 
     const CENTER_PAD = NFFT / 2;
     const PADDED_LENGTH = SEGMENT_SAMPLES + 2 * CENTER_PAD;
@@ -339,7 +356,7 @@ function createRoformerDSP(config: DSPConfig): DSP {
     for (let f = 0; f < NUM_FRAMES; f++) {
         const frameStart = f * HOP_LENGTH;
         for (let i = 0; i < NFFT; i++) {
-            windowSum[frameStart + i] += hannWindow[i] * hannWindow[i];
+            windowSum[frameStart + i] += analysisWindow[i] * analysisWindow[i];
         }
     }
     const windowSumReciprocal = new Float32Array(OUT_LE);
@@ -376,16 +393,17 @@ function createRoformerDSP(config: DSPConfig): DSP {
             for (let f = 0; f < NUM_FRAMES; f++) {
                 const frameStart = f * HOP_LENGTH;
                 for (let i = 0; i < NFFT; i++) {
-                    fftInput[i * 2] = channelData[frameStart + i] * hannWindow[i];
+                    fftInput[i * 2] = channelData[frameStart + i] * analysisWindow[i];
                     fftInput[i * 2 + 1] = 0;
                 }
                 fftInstance.transform(fftOutput, fftInput);
-                // normalized=False: raw FFT sums, no 1/√N factor. Layout is
-                // planar [C][bin][frame], matching the ONNX input (B,C,F,T).
+                // ``stftScale`` is 1 for normalized=False (RoFormer: raw FFT
+                // sums) and 1/√N for normalized=True (SCNet). Layout is planar
+                // [C][bin][frame], matching the ONNX input (B,C,F,T).
                 const base = c * NUM_BINS * NUM_FRAMES;
                 for (let k = 0; k < NUM_BINS; k++) {
-                    outReal[base + k * NUM_FRAMES + f] = fftOutput[k * 2];
-                    outImag[base + k * NUM_FRAMES + f] = fftOutput[k * 2 + 1];
+                    outReal[base + k * NUM_FRAMES + f] = fftOutput[k * 2] * stftScale;
+                    outImag[base + k * NUM_FRAMES + f] = fftOutput[k * 2 + 1] * stftScale;
                 }
             }
         }
@@ -437,12 +455,16 @@ function createRoformerDSP(config: DSPConfig): DSP {
                 ifftInput[nyquist * 2] = real[nyIdx];
                 ifftInput[nyquist * 2 + 1] = imag[nyIdx];
 
-                // fft.js inverseTransform includes the 1/N factor;
-                // normalized=False needs no further scaling.
+                // fft.js inverseTransform includes the 1/N factor, which is
+                // what normalized=False wants. normalized=True means the
+                // forward transform carried 1/√N, so the inverse needs √N to
+                // undo the extra 1/√N that 1/N already applied.
                 fftInstance.inverseTransform(ifftOutput, ifftInput);
 
+                const istftScale = stftScale === 1 ? 1 : NFFT * stftScale;
                 for (let i = 0; i < NFFT; i++) {
-                    istftOutput[outBase + frameStart + i] += ifftOutput[i * 2] * hannWindow[i];
+                    istftOutput[outBase + frameStart + i] +=
+                        ifftOutput[i * 2] * analysisWindow[i] * istftScale;
                 }
             }
         }

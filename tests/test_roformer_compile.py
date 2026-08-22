@@ -5,7 +5,6 @@ from typing import Callable
 import pytest
 import torch
 
-from unblend.api import Separator
 from unblend.roformer import BSRoformer, MelBandRoformer, _RoformerBase
 
 cuda_only = pytest.mark.skipif(
@@ -74,7 +73,7 @@ def test_cuda_compiled_transformer_core_matches_eager(
     with torch.inference_mode():
         expected = model(audio)
 
-    Separator._compile_roformer_transformer_core(model)
+    model.enable_compiled_core()
     with torch.inference_mode():
         actual = model(audio)
         replay = model(audio)

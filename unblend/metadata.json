@@ -2,8 +2,8 @@
   "models": {
     "htdemucs": {
       "backend": "demucs",
-      "license": "unlicensed",
-      "license_note": "Code is MIT (Meta); the released weights carry no license grant (trained on MUSDB18-HQ + 800 proprietary songs).",
+      "license": "MIT",
+      "license_note": "MIT. Alexandre Defossez published these exact weights (matching the official signature filenames) as Safetensors on 2026-07-11 at https://huggingface.co/adefossez/HTDemucs*, which declares license: mit. Before that the weights were distributed from a bare CDN with no grant.",
       "sources": [
         "drums",
         "bass",
@@ -81,12 +81,13 @@
         "t_lr": null,
         "t_cross_first": false,
         "rescale": 0.1
-      }
+      },
+      "provenance": "HTDemucs (Meta / Alexandre Defossez), official signature 955717e8; weights at https://huggingface.co/adefossez/HTDemucs"
     },
     "htdemucs_ft": {
       "backend": "demucs",
-      "license": "unlicensed",
-      "license_note": "Code is MIT (Meta); the released weights carry no license grant (trained on MUSDB18-HQ + 800 proprietary songs).",
+      "license": "MIT",
+      "license_note": "MIT. Alexandre Defossez published these exact weights (matching the official signature filenames) as Safetensors on 2026-07-11 at https://huggingface.co/adefossez/HTDemucs*, which declares license: mit. Before that the weights were distributed from a bare CDN with no grant.",
       "sources": [
         "drums",
         "bass",
@@ -211,12 +212,13 @@
         "t_lr": null,
         "t_cross_first": false,
         "rescale": 0.1
-      }
+      },
+      "provenance": "HTDemucs fine-tuned bag of 4 (Meta / Alexandre Defossez), official signatures f7e0c4bc, d12395a8, 92cfc3b6, 04573f0d; weights at https://huggingface.co/adefossez/HTDemucs-ft"
     },
     "htdemucs_6s": {
       "backend": "demucs",
-      "license": "unlicensed",
-      "license_note": "Code is MIT (Meta); the released weights carry no license grant (trained on MUSDB18-HQ + 800 proprietary songs).",
+      "license": "MIT",
+      "license_note": "MIT. Alexandre Defossez published these exact weights (matching the official signature filenames) as Safetensors on 2026-07-11 at https://huggingface.co/adefossez/HTDemucs*, which declares license: mit. Before that the weights were distributed from a bare CDN with no grant.",
       "sources": [
         "drums",
         "bass",
@@ -298,14 +300,15 @@
         "t_lr": null,
         "t_cross_first": false,
         "rescale": 0.1
-      }
+      },
+      "provenance": "HTDemucs 6-source (Meta / Alexandre Defossez), official signature 5c90dfd2; weights at https://huggingface.co/adefossez/HTDemucs-6s"
     },
     "bs_roformer_sw": {
       "backend": "roformer",
       "architecture": "bs_roformer",
-      "license": "CC-BY-NC-SA-4.0",
-      "license_note": "Non-commercial. BS-RoFormer-SW by jarredou; license per OpenMIRLab release metadata.",
-      "provenance": "BS-RoFormer-SW (jarredou); checkpoint mirror by enerjazzer",
+      "license": "unlicensed",
+      "license_note": "No license grant at any step of the chain: jarredou's card read unlicensed, and the surviving enerjazzer mirror declares license \"unknown\".",
+      "provenance": "BS-RoFormer-SW; original trainer unidentified. jarredou published a repackaged checkpoint (BS-ROFO-SW-Fixed) and that account has since been deleted; it survives only as https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed, whose card describes it as an \"edited version of that checkpoint to allow its use with UVR and MSST\".",
       "sources": [
         "bass",
         "drums",
@@ -340,12 +343,115 @@
         "size_bytes": 698840448
       }
     },
+    "bs_roformer_anvuew": {
+      "backend": "roformer",
+      "architecture": "bs_roformer",
+      "license": "GPL-3.0",
+      "license_note": "GPL-3.0, declared by anvuew in the model card at https://huggingface.co/anvuew/BS-RoFormer (cardData license: gpl-3.0, confirmed 2026-08-21). Copyleft applied to model weights is legally untested; unblend downloads them rather than bundling them.",
+      "provenance": "BS-RoFormer vocals trained by anvuew; upstream checkpoint bs_roformer_anvuew_sdr_12.45.ckpt at https://huggingface.co/anvuew/BS-RoFormer",
+      "sources": [
+        "vocals",
+        "other"
+      ],
+      "samplerate": 44100,
+      "segment_samples": 960000,
+      "config": {
+        "dim": 256,
+        "depth": 12,
+        "stereo": true,
+        "num_stems": 1,
+        "time_transformer_depth": 1,
+        "freq_transformer_depth": 1,
+        "linear_transformer_depth": 0,
+        "freqs_per_bands": [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          24,
+          24,
+          24,
+          24,
+          24,
+          24,
+          24,
+          24,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          128,
+          129
+        ],
+        "dim_head": 64,
+        "heads": 8,
+        "attn_dropout": 0.0,
+        "ff_dropout": 0.0,
+        "stft_n_fft": 2048,
+        "stft_hop_length": 512,
+        "stft_win_length": 2048,
+        "stft_normalized": false,
+        "mask_estimator_depth": 2,
+        "mlp_expansion_factor": 4,
+        "skip_connection": false
+      },
+      "checkpoint": {
+        "format": "safetensors",
+        "url": "https://huggingface.co/Ryan5453/unblend/resolve/67fbfa22f65faad085cfb7c9897474993331163d/bs_roformer_anvuew.safetensors",
+        "sha256": "dc68a24e0525902dfdb5f18d259161e89a7fbaf9801bfaea4beb3bf38cf87766",
+        "size_bytes": 204274176
+      }
+    },
     "melband_roformer_kim": {
       "backend": "roformer",
       "architecture": "mel_band_roformer",
-      "license": "CC-BY-NC-SA-4.0",
-      "license_note": "Non-commercial. Mel-Band Roformer vocals by Kimberley Jensen; upstream repo has no license file, label per OpenMIRLab release metadata.",
-      "provenance": "Mel-Band Roformer vocals (Kimberley Jensen); checkpoint on HF KimberleyJSN/melbandroformer",
+      "license": "MIT",
+      "license_note": "MIT, declared by the author in the model card at https://huggingface.co/KimberleyJSN/melbandroformer. The repo carried no license until 2025-06, briefly declared GPL-3.0, and now declares MIT.",
+      "provenance": "Mel-Band Roformer vocals, trained by Kimberley Jensen; upstream checkpoint MelBandRoformer.ckpt at https://huggingface.co/KimberleyJSN/melbandroformer",
       "sources": [
         "vocals",
         "other"
@@ -374,6 +480,122 @@
         "url": "https://huggingface.co/Ryan5453/unblend/resolve/9ba75778acf1b64fc40a9ea05137a2c6af9cd1d5/melband_roformer_kim.safetensors",
         "sha256": "03bfc70b43df1f3e92ed1e582e8b18983f8d4adcd1a7d2133ada3b2f371b3095",
         "size_bytes": 912885624
+      }
+    },
+    "scnet_small": {
+      "backend": "scnet",
+      "architecture": "scnet_masked",
+      "license": "unlicensed",
+      "license_note": "No grant for the weights. The SCNet architecture (https://github.com/starrytong/SCNet) and ZFTurbo's Music-Source-Separation-Training, which published this checkpoint as a GitHub release asset, are both MIT, but that covers their source code -- neither declares terms for the checkpoint files themselves. Trained only on MUSDB18, whose own licence restricts it to non-commercial research.",
+      "provenance": "SCNet-small, masked variant. Published by ZFTurbo as 'SCNet Masked Small Weights', Music-Source-Separation-Training release v1.0.16, asset model_scnet_masked_ep_156_sdr_8.8149.ckpt with config config_musdb18_scnet_small.yaml. Trained on MUSDB18.",
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "samplerate": 44100,
+      "segment_samples": 485100,
+      "config": {
+        "audio_channels": 2,
+        "dims": [
+          4,
+          32,
+          64,
+          128
+        ],
+        "nfft": 4096,
+        "hop_size": 1024,
+        "win_size": 4096,
+        "normalized": true,
+        "band_SR": [
+          0.175,
+          0.392,
+          0.433
+        ],
+        "band_stride": [
+          1,
+          4,
+          16
+        ],
+        "band_kernel": [
+          3,
+          4,
+          16
+        ],
+        "conv_depths": [
+          3,
+          2,
+          1
+        ],
+        "compress": 4,
+        "conv_kernel": 3,
+        "num_dplayer": 6,
+        "expand": 1
+      },
+      "checkpoint": {
+        "format": "safetensors",
+        "url": "https://huggingface.co/Ryan5453/unblend/resolve/67fbfa22f65faad085cfb7c9897474993331163d/scnet_small.safetensors",
+        "sha256": "2d00a37f8fef51f4523a9c74b226787f11b0bd589b2b0f65774c478b88506d75",
+        "size_bytes": 42431344
+      }
+    },
+    "scnet_xl_wide_v5": {
+      "backend": "scnet",
+      "architecture": "scnet",
+      "license": "unlicensed",
+      "license_note": "No grant for the weights. The SCNet architecture (https://github.com/starrytong/SCNet) and ZFTurbo's Music-Source-Separation-Training, which published this checkpoint as a GitHub release asset, are both MIT, but that covers their source code -- neither declares terms for the checkpoint files themselves. Trained only on MUSDB18, whose own licence restricts it to non-commercial research.",
+      "provenance": "SCNet-XL, wide v5. Published by ZFTurbo as 'SCNet XL IHF Weights', Music-Source-Separation-Training release v1.0.15, asset model_scnet_ep_36_sdr_10.0891.ckpt with config config_musdb18_scnet_xl_more_wide_v5.yaml. Trained only on the MUSDB18 training split.",
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "samplerate": 44100,
+      "segment_samples": 485100,
+      "config": {
+        "audio_channels": 2,
+        "dims": [
+          4,
+          64,
+          128,
+          256
+        ],
+        "nfft": 4096,
+        "hop_size": 1024,
+        "win_size": 4096,
+        "normalized": true,
+        "band_SR": [
+          0.23,
+          0.37,
+          0.4
+        ],
+        "band_stride": [
+          1,
+          4,
+          4
+        ],
+        "band_kernel": [
+          3,
+          4,
+          4
+        ],
+        "conv_depths": [
+          3,
+          3,
+          3
+        ],
+        "compress": 4,
+        "conv_kernel": 3,
+        "num_dplayer": 8,
+        "expand": 1
+      },
+      "checkpoint": {
+        "format": "safetensors",
+        "url": "https://huggingface.co/Ryan5453/unblend/resolve/67fbfa22f65faad085cfb7c9897474993331163d/scnet_xl_wide_v5.safetensors",
+        "sha256": "84daab8341398b1b1cd2183bdab4b08685104ca2a2c7f2bb0d6640bf3629527c",
+        "size_bytes": 213925688
       }
     }
   }

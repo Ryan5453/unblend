@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import time
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -36,9 +37,13 @@ def _model_layer_count(info: dict) -> int:
     :param info: One model's registry metadata.
     :return: Number of checkpoint files used by the model.
     """
-    if info.get("backend") == "roformer":
+    # Every single-checkpoint backend is one layer; only the Demucs bags carry
+    # a "models" list. Checking the list rather than naming backends keeps this
+    # correct as architectures are added.
+    layers = info.get("models")
+    if not isinstance(layers, list):
         return 1
-    return len(info["models"])
+    return len(layers)
 
 
 def list_models_command() -> None:
@@ -64,6 +69,27 @@ def list_models_command() -> None:
         layer_count = _model_layer_count(info)
         stems = ", ".join(info.get("sources", [])) or "N/A"
         license_label = info.get("license", "unknown")
+
+        # A locally-supplied checkpoint is never "downloaded" — it is simply
+        # present (or missing), so report it from disk rather than the cache.
+        local = (info.get("checkpoint") or {}).get("path")
+        if local:
+            local_path = Path(local).expanduser()
+            if local_path.is_file():
+                model_size = format_file_size(local_path.stat().st_size)
+                status = "[green]Local[/green]"
+            else:
+                model_size = "N/A"
+                status = "[red]Missing[/red]"
+            table.add_row(
+                name,
+                str(layer_count) + (" layer" if layer_count == 1 else " layers"),
+                stems,
+                license_label,
+                model_size,
+                status,
+            )
+            continue
 
         entry = cache_info.get(name)
         if entry is None:

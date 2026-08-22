@@ -202,6 +202,41 @@ test('WebGPU load failure retries once on a fresh WASM worker', async () => {
     assert.equal(onnxWorkers[1].terminateCalls, 1);
 });
 
+test('BS-RoFormer refuses WASM before constructing workers', async () => {
+    await assert.rejects(
+        Separator.load('bs_roformer_sw', { backend: 'wasm', precision: 'fp16' }),
+        /requires WebGPU.*fixed memory heap/,
+    );
+    assert.equal(FakeWorker.instances.length, 0);
+});
+
+test('BS-RoFormer does not retry a failed WebGPU load on WASM', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { gpu: { requestAdapter: async () => ({}) } },
+    });
+    FakeWorker.handler = (worker, message) => {
+        if (message.type === 'load') {
+            worker.respond({
+                type: 'load',
+                requestId: message.requestId,
+                success: false,
+                error: 'WebGPU session failed',
+            });
+        }
+    };
+
+    await assert.rejects(
+        Separator.load('bs_roformer_sw', { backend: 'webgpu', precision: 'fp16' }),
+        /WebGPU session failed/,
+    );
+    const onnxWorkers = FakeWorker.instances.filter(worker =>
+        worker.url.includes('onnx-worker.js')
+    );
+    assert.equal(onnxWorkers.length, 1);
+    assert.equal(onnxWorkers[0].terminateCalls, 1);
+});
+
 test('idle unload is graceful, bounded, and idempotent', async () => {
     const separator = await loadedSeparator();
     const workers = [...FakeWorker.instances];

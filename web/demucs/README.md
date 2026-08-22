@@ -1,6 +1,6 @@
 # unblend
 
-Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers. **HTDemucs models are supported today; the RoFormer models are not yet usable in-browser** — see [Known Issues](#known-issues).
+Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser, spreading the STFT, ONNX inference, and iSTFT across three Web Workers. WebGPU is preferred; HTDemucs and Mel-Band can fall back to WASM, while the six-stem BS-RoFormer requires WebGPU.
 
 For backend/server-side workflows, use the `unblend` Python package — it is significantly faster than the in-browser ONNX path.
 
@@ -48,17 +48,16 @@ Output is always 2 channels per stem regardless of input channel count.
 |---|---|---|---|
 | `htdemucs` | drums, bass, other, vocals | HTDemucs | unlicensed¹ |
 | `htdemucs_6s` | + guitar, piano | HTDemucs | unlicensed¹ |
-| `bs_roformer_sw`⁴ | bass, drums, other, vocals, guitar, piano | BS-RoFormer | CC-BY-NC-SA-4.0² |
-| `melband_roformer_kim`⁴ | vocals, other³ | Mel-Band RoFormer | CC-BY-NC-SA-4.0² |
+| `bs_roformer_sw` | bass, drums, other, vocals, guitar, piano | BS-RoFormer | unlicensed² |
+| `melband_roformer_kim` | vocals, other³ | Mel-Band RoFormer | MIT |
 
 ¹ The HTDemucs *code* is MIT (Meta), but the released weights carry no license grant.
-² **Non-commercial.** The RoFormer checkpoints are community-trained; surface `separator.license` in your app where appropriate.
+² The surviving BS-RoFormer-SW checkpoint has no license grant. Surface `separator.license` in your app where appropriate.
 ³ `other` is computed client-side as `mixture - vocals` (the checkpoint has a single vocal mask head).
-⁴ **Not currently usable in-browser** — loads, but fails at inference on both WebGPU and WASM. See [Known Issues](#known-issues).
 
-The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-460 MB fp16) and slower per segment. They run correctly via the Python package and via onnxruntime's CPU/CUDA execution providers — the failures below are specific to onnxruntime-web.
+The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-480 MB fp16) and slower per segment. Their browser artifacts use exact query-chunked, head-grouped attention, feature-grouped feed-forward layers, narrow per-band slices, and binary joins. This preserves the checkpoint math while avoiding multi-gigabyte attention/QKV allocations, 200+ MB MLP activations, and WebGPU's per-stage storage-buffer binding limit.
 
-> All eight FP32/weight-only-FP16 ONNX artifacts are hosted publicly under an immutable Hugging Face revision. Their exact byte sizes and SHA-256 digests are checked into `model-artifacts.ts`; maintainers can stream-verify every remote artifact with `npm run verify:model-artifacts` from this package directory.
+> All eight FP32/FP16 ONNX artifacts are hosted publicly under immutable Hugging Face revisions. HTDemucs fp16 artifacts use half-precision weight storage with fp32 compute; RoFormer fp16 artifacts use the browser-oriented mixed-precision layout described below. Exact byte sizes and SHA-256 digests are checked into `model-artifacts.ts`; maintainers can stream-verify every remote artifact with `npm run verify:model-artifacts` from this package directory.
 
 ## Constants
 
@@ -74,7 +73,7 @@ import { Separator } from 'unblend';
 
 const controller = new AbortController();
 const separator = await Separator.load('htdemucs', {
-  backend: 'webgpu',   // falls back to 'wasm' automatically
+  backend: 'webgpu',   // falls back when the selected model fits WASM
   precision: 'fp32',   // 'fp16' = smaller download, near-identical output (not bit-exact)
   signal: controller.signal,
 });
@@ -95,8 +94,8 @@ await separator.unload();
 Loads a model and returns a ready-to-use `Separator`. Model URLs are resolved from the package's registry when loaded.
 
 - `model`: `'htdemucs'` | `'htdemucs_6s'` | `'bs_roformer_sw'` | `'melband_roformer_kim'` (see the Models table)
-- `options.backend`: `'webgpu'` (default) | `'wasm'`. WebGPU falls back to WASM automatically if unavailable or if session creation fails.
-- `options.precision`: `'fp32'` (default) | `'fp16'`. `'fp16'` is a weight-only-fp16 variant — roughly half the download with near-identical (not bit-exact) output: the weights are rounded to fp16, but compute still runs in fp32, so the difference is well below the audible floor.
+- `options.backend`: `'webgpu'` (default) | `'wasm'`. HTDemucs and Mel-Band fall back to WASM automatically if WebGPU is unavailable or session creation fails. BS-RoFormer requires WebGPU: its six-stem CPU working set exceeds ONNX Runtime Web's fixed WASM heap, so the library rejects that combination before risking an allocation crash or Safari tab refresh.
+- `options.precision`: `'fp32'` (default) | `'fp16'`. HTDemucs fp16 stores rounded weights in half precision and computes in fp32. RoFormer fp16 uses mixed precision for weights and its largest activations, retaining fp32 for model IO, normalization, rotary trig, and softmax. Both are roughly half the download and near-identical, but not bit-exact.
 - `options.wasmPaths`: override the ORT `.wasm` asset URL prefix
 - `options.numThreads`: WASM thread count (default 4)
 - `options.signal`: optional `AbortSignal`. A pre-aborted signal creates no workers; abort during loading terminates every worker already created and rejects with the signal reason. An aborted WebGPU load never falls through into a WASM retry.
@@ -109,7 +108,7 @@ Aborting an active separation, unloading during it, or encountering a worker/pip
 
 - `separator.model` — the loaded `ModelType`.
 - `separator.sources` — stem names produced by the model.
-- `separator.license` — license of the model weights (`'unlicensed'` for HTDemucs; `'CC-BY-NC-SA-4.0'` for the RoFormer checkpoints).
+- `separator.license` — license of the model weights (`'unlicensed'` for HTDemucs and BS-RoFormer-SW; `'MIT'` for Mel-Band RoFormer Kim).
 - `separator.backend` — `'webgpu'` | `'wasm'` actually in use after fallback.
 - `separator.precision` — `'fp32'` | `'fp16'`.
 - `separator.separate(audioBuffer, options?)` — separates one `AudioBuffer`; successful calls may be repeated sequentially. `options.signal` cancels destructively as described above.
@@ -166,11 +165,10 @@ For broader format support (ALAC, WMA, exotic containers), use `mediabunny` or `
 - **Speed.** ONNX in the browser is ~3× slower than the Python package on equivalent hardware. A 4-minute song takes 30–90 seconds depending on backend and device.
 - **Memory.** Model weights and inference workspaces are large, and returned stems require one full-track Float32 buffer per source. The overlap-add stage uses segment-sized circular buffers rather than a second full-track copy, but long tracks and six-stem models can still require substantial memory. Unload instances you no longer need.
 
-## Known Issues
+## RoFormer browser memory
 
-**The RoFormer models (`bs_roformer_sw`, `melband_roformer_kim`) do not currently work in-browser, on either backend.** Both fail during `separate()`, not during `Separator.load()`. This is specific to onnxruntime-web; the same checkpoints run correctly through the Python package and through onnxruntime's CPU/CUDA execution providers.
+RoFormer attention remains all-to-all, but the ONNX exporter evaluates bounded query slices within independent head groups, immediately projects each group back to the model dimension, and sums those partial projections. Each query still attends to the complete key/value sequence, so this is not windowed or approximate attention. Feed-forward expansion is likewise evaluated in feature groups and summed after the second projection. Band splitting, mask-head selection, and GLU export as explicit slices with binary joins instead of wide multi-output `Split` or `Concat` dispatches. Browser deployments should use the shipped static-batch artifacts; dynamic-batch exports are intended for native/server runtimes.
 
-- **WebGPU:** fails with `[WebGPU] Kernel "..." failed. Error: Can't perform binary op on the given tensors` (or, depending on model/build, `shared dimension does not match`). The true cause, confirmed via Chrome's own WebGPU validation errors, is upstream of either message: the RoFormer band-split step needs one storage-buffer binding per frequency band (~60), but WebGPU's spec only *guarantees* 8 storage buffers per compute stage (many GPUs offer more, but this is the floor). On a device at or near that floor, pipeline creation for the `Split`/`Concat` kernel fails outright, silently corrupting downstream tensors (visible as a wall of `AllocateMLValueTensorPreAllocateBuffer` "shape mismatch ... != {...,0}" warnings in the console) until some later, stricter kernel throws. This looks like a real onnxruntime-web WebGPU-EP limitation — the `Split`/`Concat` kernel implementation doesn't fall back to chunked dispatch when a device is near the spec-minimum binding count.
-- **WASM:** fails with `std::bad_alloc`. Both RoFormer architectures use full (non-flash) self-attention across the whole segment; at these checkpoints' trained segment lengths (~13.4s / ~8s), the raw attention-score tensor for a single layer is 1.2–2.6 GB, and the matching softmax output needs to be alive at the same time. A 32-bit WASM linear memory heap (~2–4 GB depending on browser) cannot hold this; a native 64-bit process can, which is why the same graph runs fine outside the browser.
+The RoFormer fp16 artifacts additionally keep their largest projections, MLP activations, masks, and trained weights in half precision. Numerically sensitive RMS reductions, rotary trigonometry, softmax, and the public model IO remain fp32. This materially reduces Safari/WebGPU peak memory as well as download size without changing the model architecture.
 
-Neither failure is reachable from ONNX-graph-level fixes (rewritten broadcasts, a rank-matched MatMul, and a static-batch export were all tried and verified correct in isolation, but none of them touch either root cause above). A real fix needs either an onnxruntime-web change (chunked storage-buffer dispatch for wide `Split`/`Concat`) or a memory-efficient (flash-attention-style) reimplementation of the RoFormer attention layers for the ONNX export path. Until then, keep these two models out of any in-browser model picker; `unblend export-onnx`'s exporter-level fixes (rewritten mask-apply broadcast, rank-matched averaging-matrix MatMul, `--static-batch`) remain in place as genuine correctness/portability improvements, independent of this blocker.
+Mel-Band RoFormer also completes through the WASM fallback (substantially more slowly than WebGPU). BS-RoFormer's six full spectrogram outputs push native CPU inference to roughly a 4.25 GB peak even after chunking, beyond the fixed ORT-WASM heap, so it deliberately requires WebGPU rather than attempting a known `std::bad_alloc` path.

@@ -22,18 +22,20 @@ const MAX_SHIFT = Math.floor(0.5 * SAMPLE_RATE);
 const SEGMENT_OVERLAP = 0.25;
 
 export interface SeparationProgress {
-    /** 1-based segment index that just finished (cumulative across shift rounds). */
+    /** Whether this event marks entry into or completion of the segment. */
+    stage: 'started' | 'completed';
+    /** 1-based segment index (cumulative across shift rounds). */
     segIdx: number;
     /** Total number of segments for this track across all shift rounds. */
     totalSegs: number;
-    /** Convenience: ``segIdx / totalSegs`` ∈ (0, 1]. */
+    /** Exact completed work as a fraction of all segments. */
     fraction: number;
 }
 
 export interface SeparationOptions {
     /**
-     * Fired per segment as its inference completes. Final stems are ready
-     * only when the returned promise resolves.
+     * Fired when each segment starts and completes. Final stems are ready only
+     * when the returned promise resolves.
      */
     onProgress?: (progress: SeparationProgress) => void;
     /**
@@ -354,6 +356,16 @@ export async function runPipeline(
             const specShape = [1, numChannels, stftResult.numBins, stftResult.numFrames];
             const audioShape = [1, numChannels, SEGMENT_SAMPLES];
 
+            // Report the segment before entering session.run(). RoFormer has
+            // one long WebGPU call per segment; without this callback the UI
+            // misleadingly remains on "Preparing audio" for the entire run.
+            onProgress?.({
+                stage: 'started',
+                segIdx: segsDone + 1,
+                totalSegs,
+                fraction: segsDone / totalSegs,
+            });
+
             const inferenceStart = performance.now();
             const inferencePromise = onnx.runInference(
                 stftResult.real, stftResult.imag, specShape,
@@ -411,6 +423,7 @@ export async function runPipeline(
 
             segsDone++;
             onProgress?.({
+                stage: 'completed',
                 segIdx: segsDone,
                 totalSegs,
                 fraction: segsDone / totalSegs,
