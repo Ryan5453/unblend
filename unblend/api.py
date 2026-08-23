@@ -166,6 +166,27 @@ def _is_url(audio: "str | Path") -> bool:
     return isinstance(audio, str) and "://" in audio and not os.path.exists(audio)
 
 
+_CUSTOM_KERNELS_ENV = "UNBLEND_CUSTOM_KERNELS"
+_OFF_STRINGS = frozenset({"0", "off", "false", "no"})
+
+
+def custom_kernels_enabled(setting: bool | None) -> bool:
+    """
+    Resolve the fused-kernel switch from an explicit setting plus environment.
+
+    An explicit ``True``/``False`` always wins. ``None`` (the default) keeps
+    kernels enabled unless ``UNBLEND_CUSTOM_KERNELS`` is set to one of
+    ``0`` / ``off`` / ``false`` / ``no`` — the escape hatch for SDR and
+    wall-time baselines without uninstalling anything.
+
+    :param setting: Caller-supplied setting, or ``None`` for auto.
+    :return: Whether fused native kernels may be used.
+    """
+    if setting is not None:
+        return setting
+    return os.environ.get(_CUSTOM_KERNELS_ENV, "").strip().lower() not in _OFF_STRINGS
+
+
 def default_device() -> str:
     """
     Pick the best available inference device: cuda > mps > cpu.
@@ -741,6 +762,7 @@ class Separator:
         dtype: torch.dtype | str | None = "auto",
         compile: bool = False,
         chunk_batch_size: int | None = None,
+        custom_kernels: bool | None = None,
     ) -> None:
         """
         Initialize a Separator with the specified model and device.
@@ -782,6 +804,14 @@ class Separator:
                        the CUDAGraph is captured at this size, which then
                        cannot be changed per-call. ``None`` (default) sizes
                        automatically from VRAM, with runtime OOM backoff.
+        :param custom_kernels: Allow the fused native-kernel paths (Metal
+                       shaders on MPS; CUDA extension on CUDA). ``None`` (the
+                       default) keeps them enabled unless the environment
+                       variable ``UNBLEND_CUSTOM_KERNELS`` is set to a falsy
+                       value — see :func:`custom_kernels_enabled`. ``False`
+                       forces vanilla PyTorch ops everywhere: the reference
+                       baseline for A/B benchmarks, and it skips the CUDA
+                       extension build entirely.
         :raises ValidationError: If device is not valid or only_load stem doesn't exist
         :raises ModelLoadingError: If model fails to load, or an explicit
                        ``chunk_batch_size`` OOMs during compile capture
@@ -829,6 +859,7 @@ class Separator:
 
         self.device = device
         self.dtype = dtype
+        use_custom_kernels = custom_kernels_enabled(custom_kernels)
 
         # Validate named-model stems from metadata before any cache/network
         # work. Direct model instances are validated after assignment below.
@@ -844,6 +875,20 @@ class Separator:
                     f"Stem {only_load!r} not found in model. Available stems: "
                     f"{', '.join(model_info['sources'])}"
                 )
+            # Overlap the one-time nvcc extension build with the checkpoint
+            # download instead of paying both serially. Only worth spawning a
+            # thread when this backend can actually use the kernels.
+            if (
+                device == "cuda"
+                and dtype in (torch.float16, torch.bfloat16)
+                and not compile
+                and use_custom_kernels
+                and model_info is not None
+            ):
+                from .cuda import swappable_backends, warmup_async
+
+                if model_info.get("backend") in swappable_backends():
+                    warmup_async()
             self.model = model_repo.get_model(name=model, only_load=only_load)
         else:
             self.model = model
@@ -897,18 +942,31 @@ class Separator:
                 else:
                     self.model.to(dtype=self.dtype)
 
+            # When custom kernels are disabled, also pin every RoFormer
+            # rotary instance to its eager path so forwards stay entirely on
+            # vanilla ops.
+            if not use_custom_kernels:
+                from .roformer import RotaryEmbedding
+
+                for module in self.model.modules():
+                    if isinstance(module, RotaryEmbedding):
+                        module.use_fused_cuda_kernel = False
+
             # MPS-specific low-precision optimisations: PyTorch's MPS backend
             # has slow paths for FP16/BF16 GroupNorm and SDPA. We swap in custom
             # Metal kernels and a wrapped attention module that route around those.
             # The SCALAR_T-templated kernels compile for either ``half`` or
-            # ``bfloat`` and dispatch by tensor dtype at call time. No-op for CUDA
-            # (handled by tensor cores) and CPU (no low-precision path).
-            # Eligibility is structural rather than per-architecture: any model
-            # built from num_groups=1 GroupNorms benefits, which covers HTDemucs
-            # and SCNet (GroupNorm is 16.6% of SCNet's MPS runtime) but not the
-            # RoFormers, whose RMSNorm already calls a Metal kernel directly.
-            # Models with nothing to swap skip shader compilation entirely.
-            if self.dtype in (torch.float16, torch.bfloat16) and self.device == "mps":
+            # ``bfloat`` and dispatch by tensor dtype at call time. CPU gets no
+            # low-precision path. Eligibility is structural rather than
+            # per-architecture: any model built from num_groups=1 GroupNorms
+            # benefits, which covers HTDemucs and SCNet but not the RoFormers,
+            # whose RMSNorm already calls a backend kernel directly. Models with
+            # nothing to swap skip shader compilation entirely.
+            if (
+                use_custom_kernels
+                and self.dtype in (torch.float16, torch.bfloat16)
+                and self.device == "mps"
+            ):
                 from .metal import apply_metal_optimizations, has_swappable_modules
 
                 members = (
@@ -919,6 +977,34 @@ class Separator:
                 for member in members:
                     if has_swappable_modules(member):
                         apply_metal_optimizations(member)
+
+            # CUDA-specific low-precision optimisations: fuse the memory-bound
+            # GroupNorm/GELU/GLU/Swish/DConv-envelope chains into single kernel
+            # launches (native CUDA kernels in ``unblend.cuda``). Like the Metal
+            # pass, eligibility is structural — any num_groups=1-GroupNorm model
+            # benefits, covering HTDemucs and SCNet but not the RoFormers, whose
+            # RMSNorm keeps PyTorch's fused native kernel on CUDA. Models with
+            # nothing to swap skip the extension build entirely. Compilation
+            # failures degrade softly to native PyTorch ops. Skipped under
+            # ``compile=True``: Inductor already fuses these chains optimally on
+            # CUDA, and opaque custom ops inside the compiled region would only
+            # break its graphs.
+            if (
+                use_custom_kernels
+                and self.dtype in (torch.float16, torch.bfloat16)
+                and self.device == "cuda"
+                and not compile
+            ):
+                from .cuda import apply_cuda_optimizations, has_swappable_modules
+
+                members = (
+                    list(self.model.models)
+                    if isinstance(self.model, ModelEnsemble)
+                    else [self.model]
+                )
+                for member in members:
+                    if has_swappable_modules(member):
+                        apply_cuda_optimizations(member)
 
             # Compute an initial chunk_batch_size from a single eager forward
             # measurement. No per-GPU table — the math uses ``mem_get_info`` and
@@ -1542,10 +1628,25 @@ class Separator:
         the per-stem dict. Used directly by backends trained on raw audio
         (RoFormer), where there is no track-level normalisation to reverse.
 
+        On CUDA the transfer stages through pinned host memory with a
+        ``non_blocking`` copy: pageable ``.cpu()`` on these ~100 MB outputs
+        measures several times slower (the driver bounces through a temporary
+        pinned buffer and synchronises implicitly).
+
         :param sources_tensor: ``[sources, channels, samples]`` model output.
         :return: Mapping of stem name to CPU waveform.
         """
-        if sources_tensor.device.type != "cpu":
+        if sources_tensor.device.type == "cuda" and sources_tensor.numel():
+            pinned = torch.empty(
+                tuple(sources_tensor.shape),
+                dtype=sources_tensor.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            pinned.copy_(sources_tensor.detach(), non_blocking=True)
+            torch.cuda.synchronize()
+            sources_tensor = pinned
+        elif sources_tensor.device.type != "cpu":
             sources_tensor = sources_tensor.cpu()
         # Per-stem clone so user mutation (e.g. ``sources["vocals"][:] = 0``)
         # doesn't alias across stems via the shared underlying buffer.
