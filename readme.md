@@ -1,7 +1,12 @@
 # Unblend
 
-Unblend is a music source separation library with one API across HTDemucs, BS-RoFormer,and Mel-Band RoFormer. 
-Unblend's Demucs backend runs ~6× (19–23x for single-stem extraction) faster at equal quality. 
+Unblend is a music source separation library with one API across HTDemucs, BS-RoFormer,Mel-Band RoFormer, and SCNet.
+Unblend's Demucs backend runs ~6× (19–23x for single-stem extraction) faster at equal quality on Apple Silicon,
+thanks to custom fused Metal kernels, and every model gets an additional speedup on NVIDIA GPUs
+(T4/A100/H200) from native fused CUDA kernels, used automatically for FP16/BF16 eager inference.
+Measured on MUSDB18-HQ at SDR parity (paired same-window A/B): SCNet xl-wide 1.2–2.3× and
+SCNet small 1.1–1.4× end-to-end; HTDemucs/HTDemucs-ft up to 1.5×; BS-RoFormer & Mel-Band 1.1–1.2×
+via a fused rotary kernel.
 
 ## Installation
 
@@ -10,6 +15,13 @@ Unblend's Demucs backend runs ~6× (19–23x for single-stem extraction) faster 
 - FFmpeg v4+ available in your `PATH`
 - [`uv`](https://docs.astral.sh/uv/#installation)
 - Optional: C/C++ compiler such as GCC, Clang, or MSVC (enables torch.compile support)
+
+On NVIDIA GPUs, Unblend compiles its fused CUDA kernels at runtime with
+`torch.utils.cpp_extension`, which requires the CUDA toolkit (`nvcc`) matching
+your PyTorch wheel's CUDA version. Without `nvcc`, inference still works —
+Unblend falls back to native PyTorch ops with a warning. The first run pays a
+one-time compilation cost (~1–2 minutes), cached across runs in
+`TORCH_EXTENSIONS_DIR` (respect the default or point it somewhere persistent).
 
 ### Install using uv
 
@@ -81,7 +93,7 @@ The HTDemucs weights — including `htdemucs`, which Unblend selects by default 
 The `melband_roformer_kim` weights are MIT, declared by their author Kimberley Jensen on the [upstream model card](https://huggingface.co/KimberleyJSN/melbandroformer).
 The `bs_roformer_anvuew` weights are GPL-3.0, declared by anvuew on the [upstream model card](https://huggingface.co/anvuew/BS-RoFormer). Whether copyleft attaches to model weights at all is legally untested; Unblend downloads them at runtime rather than bundling them.
 The `bs_roformer_sw` weights carry no grant, and their origin is murky: the original trainer is unidentified, the account that published the checkpoint has since been deleted, and the surviving mirror declares its license as "unknown".
-The two SCNet checkpoints carry no grant either. Both the SCNet architecture and ZFTurbo's Music-Source-Separation-Training, which published them, are MIT — but that covers their source code, not the checkpoint files, which are attached as release assets with no stated terms. Both were trained only on MUSDB18, whose own license restricts it to non-commercial research.
+The two registered SCNet checkpoints carry no grant either. Both the SCNet architecture and ZFTurbo's Music-Source-Separation-Training, which published them, are MIT — but that covers their source code, not the checkpoint files, which are attached as release assets with no stated terms. They were trained only on MUSDB18, whose own license restricts it to non-commercial research.
 
 Run `unblend models list` to see the license for any model, or read [`unblend/metadata.json`](https://github.com/Ryan5453/unblend/blob/main/unblend/metadata.json) for the full per-model notes.
 Confirming that your use of a given model complies with its terms is your responsibility; this summary is not legal advice.

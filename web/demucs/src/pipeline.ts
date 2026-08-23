@@ -139,6 +139,7 @@ export async function runPipeline(
     const numChannels = 2;
     const numSamples = audioBuffer.length;
     const SEGMENT_SAMPLES = config.segmentSamples;
+    const MODEL_INPUT_SAMPLES = config.modelInputSamples ?? SEGMENT_SAMPLES;
     const modelSources = config.modelSources;
     const { numBins: expectBins, numFrames: expectFrames } = specDims(config);
 
@@ -302,7 +303,10 @@ export async function runPipeline(
         // centered window pulls real context across the view edges and zeros
         // outside the padded track.
         function prepareInterleaved(windowStart: number): Float32Array {
-            const interleaved = new Float32Array(SEGMENT_SAMPLES * numChannels);
+            // SCNet's graph-facing input is longer than its logical chunk:
+            // Python appends zeros before the STFT. Allocate the graph length
+            // but copy at most one logical chunk so the tail stays zero.
+            const interleaved = new Float32Array(MODEL_INPUT_SAMPLES * numChannels);
             const base = viewOffset + windowStart;
             const from = Math.max(0, -base);
             const to = Math.min(SEGMENT_SAMPLES, paddedSamples - base);

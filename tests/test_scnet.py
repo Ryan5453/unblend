@@ -35,6 +35,12 @@ def test_scnet_registers_itself_as_a_backend() -> None:
     assert "scnet" in backends.single_checkpoint_backends()
 
 
+def test_scnet_does_not_apply_demucs_track_normalization() -> None:
+    """SCNet defaults to raw input unless a checkpoint opts into normalization."""
+    model = SCNet(sources=["a", "b", "c", "d"], **_tiny())
+    assert model.external_normalization is False
+
+
 def test_build_scnet_rejects_unknown_architecture() -> None:
     """An unknown architecture fails loudly rather than silently defaulting."""
     with pytest.raises(ValidationError, match="Unknown SCNet architecture"):
@@ -224,6 +230,18 @@ def test_extra_models_file_adds_a_local_checkpoint(tmp_path) -> None:
     assert out.shape == (1, 4, 2, 4096)
 
 
+def test_local_checkpoint_is_not_treated_as_managed_cache(tmp_path) -> None:
+    """Cache inspection/removal must never delete a user-owned model file."""
+    from unblend.repo import ModelRepository
+
+    models_file, weights = _write_local_model(tmp_path)
+    repo = ModelRepository(extra_models=models_file)
+
+    assert "my_scnet" not in repo.get_cache_info()
+    assert repo.remove_model("my_scnet") is False
+    assert weights.is_file()
+
+
 def test_extra_models_file_cannot_shadow_a_builtin(tmp_path) -> None:
     """
     Redefining a shipped name is rejected.
@@ -316,3 +334,48 @@ def test_onnx_wrapper_reproduces_the_masked_forward() -> None:
 
     assert actual.shape == expected.shape
     assert torch.allclose(actual, expected, atol=1e-4)
+
+
+def test_scnet_export_uses_browser_io_and_records_both_segment_lengths(
+    tmp_path,
+) -> None:
+    """The exported graph advertises the exact contract consumed in JS."""
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+
+    from unblend.onnx import _export_scnet_to_onnx
+    from unblend.scnet import SCNetMasked, stft_padding
+
+    sources = ["drums", "bass", "other", "vocals"]
+    segment = 4096
+    model = SCNetMasked(sources=sources, **_tiny())
+    model.configure_inference(
+        sources=sources,
+        samplerate=44100,
+        segment_samples=segment,
+    )
+    path = str(tmp_path / "scnet.onnx")
+    _export_scnet_to_onnx(
+        model,
+        path,
+        opset_version=18,
+        fp16=False,
+        license_label="unlicensed",
+        static_batch=True,
+    )
+
+    exported = onnx.load(path)
+    assert [value.name for value in exported.graph.input] == [
+        "spec_real",
+        "spec_imag",
+    ]
+    assert [value.name for value in exported.graph.output] == [
+        "out_spec_real",
+        "out_spec_imag",
+    ]
+    metadata = {item.key: item.value for item in exported.metadata_props}
+    assert metadata["unblend.logical_segment_samples"] == str(segment)
+    assert metadata["unblend.segment_samples"] == str(
+        segment + stft_padding(segment, model.hop_length)
+    )
+    assert metadata["unblend.stft_window"] == "hann"

@@ -586,7 +586,7 @@ def test_roformer_materializes_state_while_cache_lock_is_held(
     }
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
-    cache_path = repo._roformer_cache_path(repo.list_models()["tiny"])
+    cache_path = repo._checkpoint_cache_path(repo.list_models()["tiny"])
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_bytes(checkpoint.read_bytes())
 

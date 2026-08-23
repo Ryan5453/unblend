@@ -199,6 +199,10 @@ export class Separator {
                 // Never reinterpret an abort as a WebGPU failure/fallback.
                 throwIfAborted(options.signal);
                 if (backend !== 'webgpu' || config.webgpuRequired) throw error;
+                console.warn(
+                    `[unblend] ${model} failed to initialize with WebGPU; falling back to WASM:`,
+                    error,
+                );
                 onnx.terminate(error);
                 backend = 'wasm';
                 onnx = new OnnxClient();

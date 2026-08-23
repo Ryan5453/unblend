@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
+import { MODEL_CONFIGS } from '../dist/constants.js';
 import { MODEL_ARTIFACTS } from '../dist/model-artifacts.js';
 
 const MODELS = [
@@ -9,6 +11,7 @@ const MODELS = [
     'bs_roformer_sw',
     'melband_roformer_kim',
     'scnet_small',
+    'scnet_xl_wide_v5',
 ];
 const PRECISIONS = ['fp32', 'fp16'];
 const REVISIONS = {
@@ -17,7 +20,24 @@ const REVISIONS = {
     bs_roformer_sw: 'a80a71b41face40edc91178c07edfedeca4cbb19',
     melband_roformer_kim: 'a80a71b41face40edc91178c07edfedeca4cbb19',
     scnet_small: 'ac4b06164d974e1242bd9fc7585305e5ea022d0f',
+    scnet_xl_wide_v5: '396e6583cea8e5104f35c05d87cf60883794a58e',
 };
+
+test('browser SCNet catalog matches the Python registry', () => {
+    const metadata = JSON.parse(
+        readFileSync(new URL('../../../unblend/metadata.json', import.meta.url), 'utf8')
+    );
+    const pythonModels = Object.entries(metadata.models)
+        .filter(([, info]) => info.backend === 'scnet')
+        .map(([name]) => name)
+        .sort();
+    const browserModels = Object.entries(MODEL_CONFIGS)
+        .filter(([, info]) => info.family === 'scnet')
+        .map(([name]) => name)
+        .sort();
+
+    assert.deepEqual(browserModels, pythonModels);
+});
 
 test('model artifact registry is complete, immutable, and well-formed', () => {
     assert.deepEqual(Object.keys(MODEL_ARTIFACTS).sort(), [...MODELS].sort());

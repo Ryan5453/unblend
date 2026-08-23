@@ -1,6 +1,6 @@
 # unblend
 
-Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)) and the RoFormer family (BS-RoFormer / Mel-Band RoFormer community checkpoints). Runs entirely in the browser, spreading the STFT, ONNX inference, and iSTFT across three Web Workers. WebGPU is preferred; HTDemucs and Mel-Band can fall back to WASM, while the six-stem BS-RoFormer requires WebGPU.
+Browser-side audio source separation using ONNX models — HTDemucs (from [Demucs](https://github.com/adefossez/demucs)), the RoFormer family, and SCNet. Runs entirely in the browser, spreading the STFT, ONNX inference, and iSTFT across three Web Workers. WebGPU is preferred; SCNet XL IHF and the six-stem BS-RoFormer require WebGPU because their working sets exceed ONNX Runtime Web's WASM heap.
 
 For backend/server-side workflows, use the `unblend` Python package — it is significantly faster than the in-browser ONNX path.
 
@@ -50,14 +50,17 @@ Output is always 2 channels per stem regardless of input channel count.
 | `htdemucs_6s` | + guitar, piano | HTDemucs | unlicensed¹ |
 | `bs_roformer_sw` | bass, drums, other, vocals, guitar, piano | BS-RoFormer | unlicensed² |
 | `melband_roformer_kim` | vocals, other³ | Mel-Band RoFormer | MIT |
+| `scnet_small` | drums, bass, other, vocals | SCNet Masked Small | unlicensed⁴ |
+| `scnet_xl_wide_v5` | drums, bass, other, vocals | SCNet XL IHF | unlicensed⁴ |
 
 ¹ The HTDemucs *code* is MIT (Meta), but the released weights carry no license grant.
 ² The surviving BS-RoFormer-SW checkpoint has no license grant. Surface `separator.license` in your app where appropriate.
 ³ `other` is computed client-side as `mixture - vocals` (the checkpoint has a single vocal mask head).
+⁴ The SCNet code is MIT, but the published checkpoint carries no license grant and was trained on MUSDB18.
 
 The RoFormer models are markedly higher quality (SDR ~11-14 dB vs ~8-9 dB for HTDemucs on vocals) but larger (~350-480 MB fp16) and slower per segment. Their browser artifacts use exact query-chunked, head-grouped attention, feature-grouped feed-forward layers, narrow per-band slices, and binary joins. This preserves the checkpoint math while avoiding multi-gigabyte attention/QKV allocations, 200+ MB MLP activations, and WebGPU's per-stage storage-buffer binding limit.
 
-> All eight FP32/FP16 ONNX artifacts are hosted publicly under immutable Hugging Face revisions. HTDemucs fp16 artifacts use half-precision weight storage with fp32 compute; RoFormer fp16 artifacts use the browser-oriented mixed-precision layout described below. Exact byte sizes and SHA-256 digests are checked into `model-artifacts.ts`; maintainers can stream-verify every remote artifact with `npm run verify:model-artifacts` from this package directory.
+> All twelve FP32/FP16 ONNX artifacts are hosted publicly under immutable Hugging Face revisions. HTDemucs and SCNet fp16 artifacts use half-precision weight storage with fp32 compute; RoFormer fp16 artifacts use the browser-oriented mixed-precision layout described below. Exact byte sizes and SHA-256 digests are checked into `model-artifacts.ts`; maintainers can stream-verify every remote artifact with `npm run verify:model-artifacts` from this package directory.
 
 ## Constants
 
@@ -93,9 +96,9 @@ await separator.unload();
 
 Loads a model and returns a ready-to-use `Separator`. Model URLs are resolved from the package's registry when loaded.
 
-- `model`: `'htdemucs'` | `'htdemucs_6s'` | `'bs_roformer_sw'` | `'melband_roformer_kim'` (see the Models table)
-- `options.backend`: `'webgpu'` (default) | `'wasm'`. HTDemucs and Mel-Band fall back to WASM automatically if WebGPU is unavailable or session creation fails. BS-RoFormer requires WebGPU: its six-stem CPU working set exceeds ONNX Runtime Web's fixed WASM heap, so the library rejects that combination before risking an allocation crash or Safari tab refresh.
-- `options.precision`: `'fp32'` (default) | `'fp16'`. HTDemucs fp16 stores rounded weights in half precision and computes in fp32. RoFormer fp16 uses mixed precision for weights and its largest activations, retaining fp32 for model IO, normalization, rotary trig, and softmax. Both are roughly half the download and near-identical, but not bit-exact.
+- `model`: any model identifier in the Models table, including both Python-registered `scnet_*` checkpoints.
+- `options.backend`: `'webgpu'` (default) | `'wasm'`. Models fall back to WASM automatically if WebGPU is unavailable or session creation fails, except BS-RoFormer and `scnet_xl_wide_v5`. Those graphs require WebGPU, so the library rejects an incompatible browser before risking an allocation crash or Safari tab refresh.
+- `options.precision`: `'fp32'` (default) | `'fp16'`. HTDemucs and SCNet fp16 store rounded weights in half precision and compute in fp32. RoFormer fp16 uses mixed precision for weights and its largest activations, retaining fp32 for model IO, normalization, rotary trig, and softmax. Both layouts are roughly half the download and near-identical, but not bit-exact.
 - `options.wasmPaths`: override the ORT `.wasm` asset URL prefix
 - `options.numThreads`: WASM thread count (default 4)
 - `options.signal`: optional `AbortSignal`. A pre-aborted signal creates no workers; abort during loading terminates every worker already created and rejects with the signal reason. An aborted WebGPU load never falls through into a WASM retry.
@@ -108,7 +111,7 @@ Aborting an active separation, unloading during it, or encountering a worker/pip
 
 - `separator.model` — the loaded `ModelType`.
 - `separator.sources` — stem names produced by the model.
-- `separator.license` — license of the model weights (`'unlicensed'` for HTDemucs and BS-RoFormer-SW; `'MIT'` for Mel-Band RoFormer Kim).
+- `separator.license` — license of the model weights (`'unlicensed'` for HTDemucs, BS-RoFormer-SW, and all SCNet checkpoints; `'MIT'` for Mel-Band RoFormer Kim).
 - `separator.backend` — `'webgpu'` | `'wasm'` actually in use after fallback.
 - `separator.precision` — `'fp32'` | `'fp16'`.
 - `separator.separate(audioBuffer, options?)` — separates one `AudioBuffer`; successful calls may be repeated sequentially. `options.signal` cancels destructively as described above.
@@ -144,7 +147,7 @@ interface SeparationResult {
 
 Each stem `Float32Array` has length `numSamples * 2` and is interleaved: `[L0, R0, L1, R1, ...]`. To produce a WAV blob for download or playback, encode it yourself — see `web/app/src/utils/wav-utils.ts` in the demo app.
 
-The pipeline processes the audio in overlapping segments (~7.8s for HTDemucs; the RoFormer models use their own traced chunk lengths, e.g. ~13.4s for `bs_roformer_sw`) with crossfaded boundaries, pipelined across the STFT, ONNX, and iSTFT workers so STFT for segment N+1 runs while segment N is in inference.
+The pipeline processes audio in model-specific overlapping segments (~7.8s for HTDemucs, ~11s for every SCNet checkpoint, and ~13.4s for BS-RoFormer-SW) with crossfaded boundaries. SCNet preserves its distinct 485100-sample logical chunk and 486400-sample zero-padded graph input. Work is pipelined across the STFT, ONNX, and iSTFT workers so STFT for segment N+1 runs while segment N is in inference.
 
 ## Decoding Audio
 

@@ -12,8 +12,8 @@ A third architecture family alongside HTDemucs and the RoFormers, and unrelated
 to both. Where a RoFormer splits the spectrum into bands and runs axial
 attention over them, SCNet splits into three bands and applies a *different
 compression ratio to each* — dense modelling where the signal lives, aggressive
-compression where it does not — then runs a dual-path LSTM trunk over the
-compressed representation. There is no attention and no rotary embedding.
+compression where it does not — then runs either a dual-path LSTM or
+transformer trunk over the compressed representation.
 
 Module and parameter names are deliberately identical to the reference
 implementation (``SDlayer``, ``conv_modules``, ``globalconv``, ``convtrs``,
@@ -580,6 +580,10 @@ class SCNet(nn.Module):
     it directly.
     """
 
+    # Most published SCNet configs disable track-level normalization. The two
+    # starrytong checkpoints opt in through the constructor instead.
+    external_normalization = False
+
     def __init__(
         self,
         sources: list[str] | None = None,
@@ -597,6 +601,7 @@ class SCNet(nn.Module):
         conv_kernel: int = 3,
         num_dplayer: int = 6,
         expand: int = 1,
+        external_normalization: bool = False,
     ) -> None:
         """
         Sparse Compression Network.
@@ -616,6 +621,8 @@ class SCNet(nn.Module):
         :param conv_kernel: Convolution module kernel size.
         :param num_dplayer: Number of dual-path layers.
         :param expand: LSTM hidden expansion factor.
+        :param external_normalization: Whether the caller applies track-level
+            mean/std normalization around inference.
         """
         super().__init__()
         sources = list(sources) if sources else ["drums", "bass", "other", "vocals"]
@@ -626,6 +633,7 @@ class SCNet(nn.Module):
         conv_depths = list(conv_depths) if conv_depths else [3, 2, 1]
 
         self.sources = sources
+        self.external_normalization = bool(external_normalization)
         self.audio_channels = audio_channels
         self.dims = dims
         band_keys = ["low", "mid", "high"]
@@ -925,7 +933,7 @@ def build_scnet(
     """
     Construct an SCNet variant from registry metadata and load a checkpoint.
 
-    :param architecture: Must be ``"scnet"``.
+    :param architecture: Registered SCNet architecture name.
     :param config: Constructor kwargs, as stored in ``metadata.json``.
     :param sources: Output stem names.
     :param samplerate: Sample rate the checkpoint operates at.

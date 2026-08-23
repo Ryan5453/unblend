@@ -6,8 +6,8 @@
  *
  * The client sends one 'configure' message (model DSP geometry) before the
  * first 'process'; unconfigured workers fall back to the HTDemucs defaults.
- * RoFormer models have no time branch: 'process' arrives without ``wave`` and
- * the chunk is the weighted iSTFT alone.
+ * RoFormer and SCNet models have no time branch: 'process' arrives without
+ * ``wave`` and the chunk is the weighted iSTFT alone.
  */
 
 import { createDSP, type DSP } from '../audio-processor.js';
@@ -32,7 +32,7 @@ interface ProcessMessage {
     requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
-    /** Absent for models without a time-domain branch (RoFormer). */
+    /** Absent for models without a time-domain branch. */
     wave?: Float32Array;
     numSources: number;
     numChannels: number;
@@ -76,7 +76,7 @@ interface ISTFTErrorResponse {
 
 function setup(config: DSPConfig): void {
     dsp = createDSP(config);
-    splitWeight = createSplitWeight(config.segmentSamples);
+    splitWeight = createSplitWeight(config.chunkSamples ?? config.segmentSamples);
     // Largest per-channel spectrogram the ONNX model can emit for one
     // segment, ×2 channels. Derived from the DSP so it can't silently
     // undersize (the STFT producer uses the same geometry).

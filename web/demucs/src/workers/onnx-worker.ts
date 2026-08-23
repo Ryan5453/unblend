@@ -29,7 +29,7 @@ interface RunMessage {
     requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
-    /** Absent for models without an audio input (RoFormer). */
+    /** Absent for models without an audio input (RoFormer and SCNet). */
     audio?: Float32Array;
     specShape: number[];
     audioShape?: number[];
@@ -179,8 +179,12 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 owned.push(tensor);
             }
 
-            const outSpecReal = results.out_spec_real;
-            const outSpecImag = results.out_spec_imag;
+            // Current exports use the canonical out_spec_* contract. The
+            // first published SCNet artifacts used out_real/out_imag, so keep
+            // those aliases loadable rather than forcing every deployed app
+            // and cached model to update in lockstep.
+            const outSpecReal = results.out_spec_real ?? results.out_real;
+            const outSpecImag = results.out_spec_imag ?? results.out_imag;
             const outWave = results.out_wave;
 
             // The model's IO is float32 by design (Cast nodes bracket fp16

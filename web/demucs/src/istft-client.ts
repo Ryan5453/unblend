@@ -3,7 +3,7 @@ import type { DSPConfig } from './constants.js';
 interface ISTFTRequest {
     specReal: Float32Array;
     specImag: Float32Array;
-    /** Absent for models without a time-domain branch (RoFormer). */
+    /** Absent for models without a time-domain branch. */
     wave?: Float32Array;
     numSources: number;
     numChannels: number;

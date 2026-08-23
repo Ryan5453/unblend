@@ -85,4 +85,16 @@ export const MODEL_ARTIFACTS: Record<
             sha256: 'dd421539061d3b2909be4fa7aa18d66e95de44ad75c63c147c90a8e6fc12f62a',
         },
     },
+    scnet_xl_wide_v5: {
+        fp32: {
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/396e6583cea8e5104f35c05d87cf60883794a58e/scnet_xl_wide_v5_fp32.onnx',
+            sizeBytes: 247151158,
+            sha256: 'f9c11da7debc10b29ea5032c7996c032796376ac39791cd34cd89c98213bad2a',
+        },
+        fp16: {
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/396e6583cea8e5104f35c05d87cf60883794a58e/scnet_xl_wide_v5_fp16.onnx',
+            sizeBytes: 140330178,
+            sha256: '0fa7447b5e7cf2f889ec727548a09f5c9eb2b8981c9c4fe9a09efe052b78477d',
+        },
+    },
 };

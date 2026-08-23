@@ -49,15 +49,16 @@ def export_onnx_command(
         bool,
         typer.Option(
             "--static-batch",
-            help="RoFormer only. Trace with a fixed batch=1 instead of a dynamic "
-            "batch axis; works around an onnxruntime-web WebGPU memory-planner bug. "
+            help="RoFormer and SCNet only. Trace with a fixed batch=1 instead "
+            "of a dynamic batch axis; works around an onnxruntime-web WebGPU "
+            "memory-planner bug. "
             "Use for browser deployment. Leave off for server-side/library "
             "consumers that want batched ONNX inference.",
         ),
     ] = False,
 ) -> None:
     """
-    Export a model (HTDemucs or RoFormer) to the ONNX format.
+    Export a model (HTDemucs, RoFormer, or SCNet) to the ONNX format.
 
     This is an internal developer tool for creating ONNX models for deployment.
 
@@ -66,8 +67,8 @@ def export_onnx_command(
         {model}_fp32.onnx depending on --fp16)
     :param opset: ONNX opset version
     :param fp16: Store weights as float16 (weight-only; compute and IO stay fp32)
-    :param static_batch: RoFormer only. Trace with a fixed batch=1 instead of a
-        dynamic batch axis (see ``export_to_onnx`` for details)
+    :param static_batch: RoFormer and SCNet only. Trace with a fixed batch=1
+        instead of a dynamic batch axis (see ``export_to_onnx`` for details)
     """
     if output is not None:
         output_path = output

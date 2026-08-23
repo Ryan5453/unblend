@@ -67,8 +67,20 @@ build-backend = "uv_build"
 module-name = "unblend"
 module-root = ""
 
-source-include = ["unblend/metal/*.metal"]
-wheel-include = ["unblend/metal/*.metal"]
+source-include = [
+    "unblend/metal/*.metal",
+    "unblend/cuda/*.cu",
+    "unblend/cuda/*.cuh",
+    "unblend/cuda/*.cpp",
+    "unblend/cuda/*.h",
+]
+wheel-include = [
+    "unblend/metal/*.metal",
+    "unblend/cuda/*.cu",
+    "unblend/cuda/*.cuh",
+    "unblend/cuda/*.cpp",
+    "unblend/cuda/*.h",
+]
 
 [tool.pytest.ini_options]
 addopts = "-m 'not slow'"

@@ -293,6 +293,14 @@ def separate_command(
             rich_help_panel="Processing",
         ),
     ] = None,
+    custom_kernels: Annotated[
+        bool | None,
+        typer.Option(
+            "--custom-kernels/--native-ops",
+            help="Fused kernel policy. --native-ops forces vanilla PyTorch ops (SDR/wall-time baseline, skips the CUDA extension build); the default keeps fused CUDA/Metal kernels where eligible.",
+            rich_help_panel="Processing",
+        ),
+    ] = None,
     precision: Annotated[
         Precision,
         typer.Option(
@@ -349,6 +357,11 @@ def separate_command(
     :param compile_model: CUDA compile override: ``True`` forces compile,
         ``False`` forces eager, and ``None`` automatically compares estimated
         eager GPU work with the architecture/dtype break-even threshold.
+    :param custom_kernels: Fused-kernel override: ``False`` (``--native-ops``)
+        forces vanilla PyTorch ops on every device, ``True`` keeps fused
+        CUDA/Metal kernels where eligible, and ``None`` defers to the
+        ``UNBLEND_CUSTOM_KERNELS`` environment variable (enabled unless it is
+        set to a falsy value).
     :param precision: Inference precision; auto picks fp16 on CUDA (with tensor
         cores) and MPS, fp32 on CPU
     :param output: Output path template; variables are {model}, {track}, {stem},
@@ -451,6 +464,7 @@ def separate_command(
             only_load=only_load_stem,
             dtype=dtype,
             compile=compile_model is True,
+            custom_kernels=custom_kernels,
         )
     except (ValidationError, ModelLoadingError) as error:
         console.print(

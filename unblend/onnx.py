@@ -1040,11 +1040,13 @@ def _scnet_architecture(model: "SCNet") -> str:
     Registry architecture name for an SCNet instance.
 
     :param model: Model being exported.
-    :return: ``"scnet_masked"`` for the masking variant, else ``"scnet"``.
+    :return: Registry architecture name.
     """
     from .scnet import SCNetMasked
 
-    return "scnet_masked" if isinstance(model, SCNetMasked) else "scnet"
+    if isinstance(model, SCNetMasked):
+        return "scnet_masked"
+    return "scnet"
 
 
 def _export_scnet_to_onnx(
@@ -1109,7 +1111,10 @@ def _export_scnet_to_onnx(
             wrapper,
             (spec_real, spec_imag),
             input_names=["spec_real", "spec_imag"],
-            output_names=["out_real", "out_imag"],
+            # Match the stable browser/runtime contract used by HTDemucs and
+            # RoFormer. The worker retains aliases for the first SCNet files
+            # published with the shorter out_real/out_imag names.
+            output_names=["out_spec_real", "out_spec_imag"],
             opset_version=opset_version,
             dynamo=True,
             dynamic_shapes=dynamic_shapes,
@@ -1125,7 +1130,11 @@ def _export_scnet_to_onnx(
                 "unblend.architecture": _scnet_architecture(model),
                 "unblend.sources": ",".join(model.sources),
                 "unblend.samplerate": str(model.samplerate),
-                "unblend.segment_samples": str(segment),
+                # This is the exact graph-facing audio length from which the
+                # fixed STFT shape is derived. Preserve the training/logical
+                # chunk separately: SCNet appends zeros between the two.
+                "unblend.segment_samples": str(segment + padding),
+                "unblend.logical_segment_samples": str(segment),
                 "unblend.stft_n_fft": str(model.stft_config["n_fft"]),
                 "unblend.stft_hop_length": str(model.stft_config["hop_length"]),
                 "unblend.stft_win_length": str(model.stft_config["win_length"]),
@@ -1134,6 +1143,9 @@ def _export_scnet_to_onnx(
                 # use a periodic Hann. A client applying the wrong one silently
                 # produces bad output, so record what this model actually used.
                 "unblend.stft_window": ("hann" if hasattr(model, "window") else "none"),
+                "unblend.external_normalization": str(
+                    bool(model.external_normalization)
+                ),
                 "unblend.license": str(license_label),
             },
         )
@@ -1169,24 +1181,23 @@ def export_to_onnx(
     static_batch: bool = False,
 ) -> str:
     """
-    Export a model (HTDemucs or RoFormer) to ONNX. Traced at the model's
+    Export a model (HTDemucs, RoFormer, or SCNet) to ONNX. Traced at the model's
     training length so runtime callers must feed exactly that segment size.
 
     :param model_name: Name of the model to export.
     :param output_path: Path to save the ONNX model (defaults to ``{model_name}.onnx``).
-    :param opset_version: ONNX opset version (raised to 18 for RoFormer models,
-        the dynamo-exporter minimum).
+    :param opset_version: ONNX opset version (raised to 18 for RoFormer and
+        SCNet models, the dynamo-exporter minimum).
     :param fp16: If True, use weight-only fp16 for HTDemucs. RoFormer uses
         browser-oriented mixed precision instead: projections, MLPs, masks,
         activations, and weights are float16 while IO, normalization, rotary
         trig, and softmax remain float32. The latter is required to keep its
         much larger browser working set within WebGPU/Safari memory limits.
-    :param static_batch: RoFormer only. Trace with a fixed batch=1 instead of a
-        dynamic batch axis, working around an onnxruntime-web WebGPU
-        memory-planner bug with this graph's symbolic batch dim. Use for
-        browser deployment; leave off for server-side/library consumers that
-        want batched ONNX inference. Ignored (must be False) for HTDemucs,
-        whose legacy-exporter dynamic-batch graph does not hit this bug.
+    :param static_batch: RoFormer and SCNet only. Trace with a fixed batch=1
+        instead of a dynamic batch axis. Use for browser deployment; leave off
+        for server-side/library consumers that want batched ONNX inference.
+        Ignored (must be False) for HTDemucs, whose legacy-exporter graph uses
+        a dynamic batch axis.
     :return: Path to the exported ONNX model.
     :raises ImportError: If the ``onnx`` package is not installed.
     :raises ValueError: If the resolved model is not a supported type, an
@@ -1223,14 +1234,14 @@ def export_to_onnx(
 
     if static_batch:
         raise ValueError(
-            "static_batch is only supported for RoFormer models; HTDemucs "
+            "static_batch is only supported for RoFormer and SCNet models; HTDemucs "
             "export always uses the legacy exporter's dynamic batch axis."
         )
 
     if not isinstance(model, HTDemucs):
         raise ValueError(
             f"Model {model_name} is not a supported model type. "
-            f"Expected HTDemucs or a RoFormer, got {type(model).__name__}"
+            f"Expected HTDemucs, a RoFormer, or SCNet, got {type(model).__name__}"
         )
     if not model.cac:
         raise ValueError(

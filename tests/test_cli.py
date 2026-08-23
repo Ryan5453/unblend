@@ -104,14 +104,18 @@ def test_models_download_accepts_roformer_metadata(
     assert "2 total layers" in result.output
 
 
-def test_ensure_model_available_downloads_uncached_roformer(
+@pytest.mark.parametrize("backend", ["roformer", "scnet"])
+def test_ensure_model_available_downloads_uncached_single_checkpoint_backend(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ) -> None:
     """
-    The benchmark/CLI availability preflight can download a RoFormer whose
-    metadata has one ``checkpoint`` instead of a Demucs ``models`` list.
+    The benchmark/CLI availability preflight can download any registered
+    backend whose metadata has one ``checkpoint`` instead of a Demucs
+    ``models`` list.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param backend: Registered single-checkpoint backend under test.
     """
     import unblend.cli.models as models_cli
 
@@ -128,9 +132,9 @@ def test_ensure_model_available_downloads_uncached_roformer(
             """
             return self
 
-    roformer = {"roformer": {"backend": "roformer"}}
-    monkeypatch.setattr(models_cli, "get_models", lambda: roformer)
-    monkeypatch.setattr(ModelRepository, "list_models", lambda self: roformer)
+    models = {backend: {"backend": backend}}
+    monkeypatch.setattr(models_cli, "get_models", lambda: models)
+    monkeypatch.setattr(ModelRepository, "list_models", lambda self: models)
     monkeypatch.setattr(ModelRepository, "get_cache_info", lambda self: {})
     monkeypatch.setattr(
         ModelRepository,
@@ -138,7 +142,31 @@ def test_ensure_model_available_downloads_uncached_roformer(
         lambda self, **kwargs: DownloadedModel(),
     )
 
-    assert models_cli.ensure_model_available("roformer") is True
+    assert models_cli.ensure_model_available(backend) is True
+
+
+def test_ensure_model_available_accepts_local_single_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A custom local checkpoint is available without entering download code."""
+    import unblend.cli.models as models_cli
+
+    checkpoint = tmp_path / "custom.safetensors"
+    checkpoint.write_bytes(b"weights")
+    models = {
+        "custom_scnet": {
+            "backend": "scnet",
+            "checkpoint": {"path": str(checkpoint)},
+        }
+    }
+    monkeypatch.setattr(ModelRepository, "list_models", lambda self: models)
+    monkeypatch.setattr(
+        models_cli,
+        "_download_model_with_progress",
+        lambda *args, **kwargs: pytest.fail("local model attempted a download"),
+    )
+
+    assert models_cli.ensure_model_available("custom_scnet") is True
 
 
 def test_auto_compile_chunk_estimate_uses_duration_shifts_and_overlap(

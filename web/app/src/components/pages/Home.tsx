@@ -61,10 +61,16 @@ const MODEL_CHOICES: Record<ModelType, ModelChoice> = {
         size: '479 MB',
     },
     scnet_small: {
-        short: 'SCNET SMALL',
-        description: 'FOUR STEMS, BEST QUALITY PER MB',
+        short: 'SCNET MASKED SMALL',
+        description: 'MASKED SMALL MODEL',
         stems: 4,
         size: '29 MB',
+    },
+    scnet_xl_wide_v5: {
+        short: 'SCNET XL IHF',
+        description: 'WIDE HIGH-FREQUENCY XL MODEL',
+        stems: 4,
+        size: '140 MB',
     },
 };
 

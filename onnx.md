@@ -1,7 +1,7 @@
 # ONNX Export
 
-`unblend` includes the ability to export its models (HTDemucs and the RoFormer family) to the ONNX format for deployment in browsers, mobile, or other runtimes.
-This is how the [un/blend web app](https://demucs.app) runs source separation in-browser. HTDemucs specifics are below; RoFormer differences are in [RoFormer models](#roformer-models) at the end.
+`unblend` includes the ability to export its HTDemucs, RoFormer, and SCNet models to the ONNX format for deployment in browsers, mobile, or other runtimes.
+This is how the [un/blend web app](https://demucs.app) runs source separation in-browser. HTDemucs specifics are below; the other architectures are covered in [RoFormer models](#roformer-models) and [SCNet](#scnet).
 
 ## Export
 
@@ -157,15 +157,15 @@ Four SCNet-specific details matter:
   computed from unpadded audio. Use `unblend.scnet.stft_padding(samples,
   hop_length)` — the same function the model and exporter call — then trim that
   many samples off the end after the inverse transform. For `scnet_small` this
-  is 485100 → 486400 samples, i.e. 476 frames rather than 474. A consumer that
-  chunks at a fixed size can equivalently use the padded length as its segment
-  size and skip the pad/trim entirely, which is what the npm runtime does.
+  is 485100 → 486400 samples, i.e. 476 frames rather than 474. The npm runtime
+  keeps those lengths separate: it overlaps logical 485100-sample chunks,
+  appends 1300 zeros to each model input, and trims the same tail after iSTFT.
 - **The window depends on the variant.** Plain SCNet passes no `window` to
   `torch.stft`, so a Hann window would silently change the result; the masked
   variants use a periodic Hann. The export records which in
-  `unblend.stft_window` (`none` for `scnet_xl_wide_v5`, `hann` for
-  `scnet_small`) and `compute_scnet_stft_for_export` takes a matching `window`
-  argument — read the metadata rather than assuming either.
+  `unblend.stft_window`: `hann` for `scnet_small` and `none` for
+  `scnet_xl_wide_v5`. `compute_scnet_stft_for_export` takes a matching
+  `window` argument — read the metadata rather than assuming either.
 - **The masking head is inside the graph.** The masked variants add a frequency
   positional embedding before the trunk and multiply a predicted complex mask
   against the mixture afterwards. Both are traced, so the client contract is
@@ -178,8 +178,9 @@ Four SCNet-specific details matter:
   expressed as two matmuls.
 
 Known caveat: on production-size checkpoints the ONNX graph differs from the
-PyTorch result by a fraction of a percent relative — measured at 0.14% for
-`scnet_small` fp32 and 0.21% for its fp16 export, against a full-segment random
-input. The DFT substitution accounts for under 1e-5 of that; the remainder
-compounds through the trunk's twelve bidirectional LSTM invocations. A two-layer
-test model matches to 6e-08.
+PyTorch result by a fraction of a percent relative. Against one real 11-second
+segment, the two registered browser fp16 artifacts measured 0.058%–0.512%
+relative L2 error. The DFT substitution itself
+accounts for under 1e-5; most of the accumulated difference comes from the
+trunk's repeated bidirectional LSTM operations. A two-layer test model matches
+to 6e-08.

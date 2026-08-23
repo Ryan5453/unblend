@@ -14,7 +14,8 @@ export type ModelType =
     | 'htdemucs_6s'
     | 'bs_roformer_sw'
     | 'melband_roformer_kim'
-    | 'scnet_small';
+    | 'scnet_small'
+    | 'scnet_xl_wide_v5';
 
 export type ModelFamily = 'htdemucs' | 'roformer' | 'scnet';
 
@@ -28,13 +29,22 @@ export type ModelFamily = 'htdemucs' | 'roformer' | 'scnet';
  * - `roformer`: plain centered reflect-pad STFT (all `nfft/2 + 1` bins, no
  *   normalization — the checkpoints use `torch.stft(normalized=False)`), raw
  *   audio in (no normalization), spectrogram masking only (no time branch).
+ * - `scnet`: centered STFT (all bins, per-variant window), track-level input
+ *   normalization, and spectrogram-only output. Some checkpoints internally
+ *   zero-pad each logical chunk before the STFT; `modelInputSamples` records
+ *   that graph-facing length without changing overlap/chunk boundaries.
  */
 export interface ModelConfig {
     family: ModelFamily;
     nfft: number;
     hopLength: number;
-    /** The ONNX graph is traced at exactly this many samples per segment. */
+    /** Logical chunk length used for splitting, overlap-add, and output trim. */
     segmentSamples: number;
+    /**
+     * Samples transformed and fed to the graph when the architecture pads a
+     * logical chunk internally. Defaults to `segmentSamples`.
+     */
+    modelInputSamples?: number;
     /** Stems the ONNX graph emits, in output order. */
     modelSources: string[];
     /** Final stems returned to the caller (includes any complement stem). */
@@ -44,7 +54,7 @@ export interface ModelConfig {
      * as ``mixture - stem`` after separation.
      */
     complement?: { stem: string; name: string };
-    /** Track-level mean/std normalization around the model (HTDemucs only). */
+    /** Track-level mean/std normalization around the model. */
     normalizeInput: boolean;
     /** Whether the graph has the HTDemucs time-domain branch (``out_wave``). */
     hasTimeBranch: boolean;
@@ -112,18 +122,40 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
         family: 'scnet',
         nfft: 4096,
         hopLength: 1024,
-        // The Python model pads its 485100-sample segment up to an even frame
-        // count before the STFT (unblend.scnet.stft_padding), and the graph is
-        // traced at that padded size. Chunking directly at the padded length
-        // reaches the same 476 frames without a separate pad/trim step.
-        segmentSamples: 486400,
+        // Python chunks at 485100 samples, then SCNet appends 1300 zeros so
+        // its real FFT sees an even 476-frame sequence. Keep the logical and
+        // graph lengths separate: filling those 1300 samples from the next
+        // part of the song changes every segment boundary and model output.
+        segmentSamples: 485100,
+        modelInputSamples: 486400,
         modelSources: ['drums', 'bass', 'other', 'vocals'],
         sources: ['drums', 'bass', 'other', 'vocals'],
         normalizeInput: false,
         hasTimeBranch: false,
-        // scnet_small is the masked variant, which windows its STFT and scales
-        // it by 1/sqrt(nfft); plain SCNet does neither.
+        // scnet_small is the masked variant, which windows its STFT. Both
+        // shipped SCNet checkpoints scale their STFT by 1/sqrt(nfft).
         window: 'hann',
+        stftNormalized: true,
+        license: 'unlicensed',
+    },
+    'scnet_xl_wide_v5': {
+        family: 'scnet',
+        nfft: 4096,
+        hopLength: 1024,
+        // XL uses the same logical chunk and internal zero padding as Small.
+        // Its plain SCNet boundary transform is rectangular, not Hann.
+        segmentSamples: 485100,
+        modelInputSamples: 486400,
+        modelSources: ['drums', 'bass', 'other', 'vocals'],
+        sources: ['drums', 'bass', 'other', 'vocals'],
+        normalizeInput: false,
+        hasTimeBranch: false,
+        // XL's graph uses only the same WebGPU-supported operators as Small,
+        // but its activation working set exceeds ONNX Runtime Web's fixed
+        // WASM heap. Reject a missing WebGPU adapter instead of loading the
+        // model in WASM and failing later with std::bad_alloc.
+        webgpuRequired: true,
+        window: 'rectangular',
         stftNormalized: true,
         license: 'unlicensed',
     },
@@ -144,9 +176,10 @@ export function specDims(config: ModelConfig): { numBins: number; numFrames: num
             numFrames: Math.ceil(config.segmentSamples / config.hopLength),
         };
     }
+    const inputSamples = config.modelInputSamples ?? config.segmentSamples;
     return {
         numBins: config.nfft / 2 + 1,
-        numFrames: Math.floor(config.segmentSamples / config.hopLength) + 1,
+        numFrames: Math.floor(inputSamples / config.hopLength) + 1,
     };
 }
 
@@ -180,6 +213,8 @@ export interface DSPConfig {
     nfft: number;
     hopLength: number;
     segmentSamples: number;
+    /** Logical overlap-add chunk length; defaults to `segmentSamples`. */
+    chunkSamples?: number;
     /**
      * STFT analysis window. Plain SCNet passes no window to ``torch.stft``,
      * so applying Hann there would silently change the result.
@@ -195,7 +230,8 @@ export function dspConfig(config: ModelConfig): DSPConfig {
         family: config.family,
         nfft: config.nfft,
         hopLength: config.hopLength,
-        segmentSamples: config.segmentSamples,
+        segmentSamples: config.modelInputSamples ?? config.segmentSamples,
+        chunkSamples: config.segmentSamples,
         window: config.window,
         normalized: config.stftNormalized,
     };

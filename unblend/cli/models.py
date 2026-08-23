@@ -19,6 +19,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from .. import backends
 from ..apply import Model, ModelEnsemble
 from ..exceptions import ModelLoadingError
 from ..repo import ModelRepository
@@ -330,7 +331,10 @@ def _download_model_with_progress(name: str, only_load: str | None = None) -> bo
 
     try:
         info = models.get(name)
-        if info is not None and info.get("backend") == "roformer":
+        if (
+            info is not None
+            and info.get("backend") in backends.single_checkpoint_backends()
+        ):
             layer_count = _model_layer_count(info)
         else:
             layer_count = len(model_repo.required_layers(name, only_load=only_load))
@@ -397,7 +401,17 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
         )
         return False
 
-    if info.get("backend") == "roformer":
+    if info.get("backend") in backends.single_checkpoint_backends():
+        local = info.get("checkpoint", {}).get("path")
+        if local:
+            local_path = Path(local).expanduser()
+            if local_path.is_file():
+                return True
+            console.print(
+                f"[red]✗[/red] [bold]{escape(name)}[/bold]: Local checkpoint "
+                f"does not exist: {escape(str(local_path))}"
+            )
+            return False
         cached = model_repo.get_cache_info().get(name, {}).get("complete", False)
         if cached:
             return True

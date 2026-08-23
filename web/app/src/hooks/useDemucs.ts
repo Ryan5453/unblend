@@ -31,10 +31,11 @@ const DEFAULT_SEGMENT_MS: Record<ModelType, number> = {
     htdemucs_6s: 2_000,
     bs_roformer_sw: 20_000,
     melband_roformer_kim: 7_000,
-    // Estimate only: SCNet has not been timed in a browser yet. Its twelve
-    // sequential bidirectional LSTMs are the bulk of the work and parallelise
-    // poorly, so it is slower per second of audio than its size suggests.
-    scnet_small: 8_000,
+    // Initial per-segment estimates from the controlled Safari/WebGPU/fp16
+    // benchmark. Once the first segment completes, the progress estimator
+    // replaces these with the observed time for this device.
+    scnet_small: 2_500,
+    scnet_xl_wide_v5: 30_300,
 };
 
 export function useDemucs() {

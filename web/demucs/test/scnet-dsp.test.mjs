@@ -12,6 +12,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createDSP } from '../dist/audio-processor.js';
+import { MODEL_CONFIGS, dspConfig, specDims } from '../dist/constants.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = JSON.parse(
@@ -72,4 +73,27 @@ test('scnet DSP round-trips through its own iSTFT', () => {
         }
     }
     assert.ok(maxDiff < 1e-3, `round-trip max |diff| = ${maxDiff}`);
+});
+
+test('scnet registry preserves Python normalization and internal zero padding', () => {
+    for (const [name, window, normalizeInput, webgpuRequired] of [
+        ['scnet_small', 'hann', false, false],
+        ['scnet_xl_wide_v5', 'rectangular', false, true],
+    ]) {
+        const config = MODEL_CONFIGS[name];
+        assert.equal(config.normalizeInput, normalizeInput);
+        assert.equal(Boolean(config.webgpuRequired), webgpuRequired);
+        assert.equal(config.segmentSamples, 485100);
+        assert.equal(config.modelInputSamples, 486400);
+        assert.deepEqual(specDims(config), { numBins: 2049, numFrames: 476 });
+        assert.deepEqual(dspConfig(config), {
+            family: 'scnet',
+            nfft: 4096,
+            hopLength: 1024,
+            segmentSamples: 486400,
+            chunkSamples: 485100,
+            window,
+            normalized: true,
+        });
+    }
 });

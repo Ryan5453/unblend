@@ -234,7 +234,10 @@ export function Benchmark() {
             try {
                 const mixBuffer = await decodeWavFast(track.mixture, ctx);
                 const durationSec = mixBuffer.length / mixBuffer.sampleRate;
-                const sep = await separator.separate(mixBuffer);
+                // Keep model-to-model comparisons reproducible: the public
+                // app deliberately randomizes the shift trick, but a benchmark
+                // must use the same offset on every run.
+                const sep = await separator.separate(mixBuffer, { seed: 1234 });
 
                 const stemSDR: StemSDR = {};
                 for (const stem of MUSDB_STEMS) {
@@ -340,7 +343,10 @@ export function Benchmark() {
                                 <option value="htdemucs_6s">htdemucs_6s (6 stems, experimental)</option>
                                 <option value="bs_roformer_sw">bs_roformer_sw (6 stems, ~360MB fp16)</option>
                                 <option value="melband_roformer_kim">melband_roformer_kim (vocals, ~477MB fp16)</option>
-                                <option value="scnet_small">scnet_small (4 stems, ~29MB fp16)</option>
+                                <optgroup label="SCNet — four stems">
+                                    <option value="scnet_small">scnet_small (masked)</option>
+                                    <option value="scnet_xl_wide_v5">scnet_xl_wide_v5 (XL IHF)</option>
+                                </optgroup>
                             </select>
                         </label>
 
@@ -477,6 +483,7 @@ export function Benchmark() {
                                             <th>Track</th>
                                             <th>Duration</th>
                                             <th>Wall</th>
+                                            <th>Inference</th>
                                             <th>Realtime</th>
                                             <th>Mean SDR</th>
                                             {MUSDB_STEMS.map(stem => (
@@ -490,6 +497,7 @@ export function Benchmark() {
                                                 <td>{r.name}</td>
                                                 <td>{fmt(r.durationSec, 1)}s</td>
                                                 <td>{fmt(r.wallSec, 2)}s</td>
+                                                <td>{fmt(r.inferenceSec, 2)}s</td>
                                                 <td>{fmt(r.realtime, 1)}×</td>
                                                 <td style={{ fontWeight: 600 }}>{fmt(r.meanSDR, 3)}</td>
                                                 {MUSDB_STEMS.map(stem => (

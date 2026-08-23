@@ -69,7 +69,10 @@ class RMSNorm(nn.Module):
         to materialise an fp32 upcast, the normalised tensor, two scaled
         products, and an fp16 downcast — five tensor allocations per call, all
         of which show up as ``aten::copy_``/``aten::to`` in the transformer hot
-        loop. MPS inference keeps its equivalent fused Metal reduction.
+        loop. MPS inference keeps its equivalent fused Metal reduction instead;
+        CUDA keeps ``F.rms_norm`` (already a fused single-kernel op there —
+        measured faster than the custom-CUDA variant, which stays available in
+        ``unblend.cuda`` for explicit use).
 
         :param x: Input of shape ``[..., dim]``.
         :return: Normalised tensor of the same shape and dtype.
@@ -160,6 +163,11 @@ class RotaryEmbedding(nn.Module):
         self._cos_sin_cache: dict[
             tuple[int, torch.device, torch.dtype], tuple[Tensor, Tensor]
         ] = {}
+        # Per-instance kill switch for the fused CUDA rotary kernel. Defaults
+        # to True; ``Separator(custom_kernels=False)`` flips it off on every
+        # instance of a loaded model so forwards stay entirely on vanilla ops
+        # (SDR/benchmark baseline). Not a buffer — must not reach state dicts.
+        self.use_fused_cuda_kernel = True
         # Pre-bound cos/sin tables for the ``torch.compile`` path. Each rotary
         # instance is shared across every block of a single axis (time OR
         # frequency), so during inference it only ever sees one sequence
@@ -266,6 +274,21 @@ class RotaryEmbedding(nn.Module):
             cos, sin = self._compiled_cos, self._compiled_sin
         else:
             cos, sin = self._cos_sin(t.shape[-2], t.device, t.dtype)
+
+        # Native-CUDA fast path: one fused kernel instead of seven
+        # elementwise passes. Eager inference only — the compiled trunk keeps
+        # its captured-table math above.
+        if (
+            t.device.type == "cuda"
+            and self.use_fused_cuda_kernel
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and t.dtype in (torch.float16, torch.bfloat16)
+        ):
+            from .cuda import fused_roformer_rotary
+
+            return fused_roformer_rotary(t, cos, sin)
+
         x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
         rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return rotated.flatten(-2)

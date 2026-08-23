@@ -432,9 +432,12 @@ class ModelRepository:
                 self._models[model_name] = model_info
         self.metadata["models"] = self._models
 
-    def _roformer_cache_path(self, model_info: dict) -> Path:
+    def _checkpoint_cache_path(self, model_info: dict) -> Path:
         """
-        Content-addressed cache path for a RoFormer checkpoint.
+        Content-addressed cache path for a single-checkpoint backend.
+
+        Shared by every backend registered in
+        :func:`backends.single_checkpoint_backends` (RoFormer, SCNet, …).
 
         :param model_info: The model's registry entry.
         :return: ``<cache dir>/<sha256[:16]>.safetensors``.
@@ -476,8 +479,15 @@ class ModelRepository:
             }
 
         for name, info in self._models.items():
-            if info.get("backend") == "roformer":
-                path = self._roformer_cache_path(info)
+            if info.get("backend") in backends.single_checkpoint_backends():
+                # User-owned local checkpoints are deliberately outside the
+                # managed cache.  Callers that need to determine their
+                # availability inspect ``checkpoint.path`` directly; listing
+                # them here would also make cache removal look authorized to
+                # delete a file Unblend does not own.
+                if info.get("checkpoint", {}).get("path"):
+                    continue
+                path = self._checkpoint_cache_path(info)
                 try:
                     size_bytes = path.stat().st_size
                 except OSError:
@@ -801,8 +811,9 @@ class ModelRepository:
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> Model:
         """
-        Build a RoFormer model, downloading and caching its checkpoint if a
-        verified copy isn't already present.
+        Build a single-checkpoint-backend model (RoFormer, SCNet, …),
+        downloading and caching its checkpoint if a verified copy isn't
+        already present.
 
         The checkpoint is a tensor-only Safetensors artifact. Its exact size
         and SHA-256 are verified before strict loading into the allowlisted
@@ -860,7 +871,7 @@ class ModelRepository:
                 ) from exc
 
         expected = checkpoint["sha256"]
-        cache_path = self._roformer_cache_path(model_info)
+        cache_path = self._checkpoint_cache_path(model_info)
 
         if progress_callback:
             progress_callback("download_start", {"model_name": name, "total_layers": 1})
@@ -1195,8 +1206,12 @@ class ModelRepository:
         info = self._models[name]
         removed_any = False
 
-        if info.get("backend") == "roformer":
-            path = self._roformer_cache_path(info)
+        if info.get("backend") in backends.single_checkpoint_backends():
+            # A local checkpoint belongs to the user, not Unblend's cache.
+            # ``models remove`` must never unlink it.
+            if info.get("checkpoint", {}).get("path"):
+                return False
+            path = self._checkpoint_cache_path(info)
             with _artifact_lock(path):
                 try:
                     path.unlink()
