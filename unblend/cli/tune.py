@@ -16,8 +16,8 @@ from ..apply import ModelEnsemble
 from ..exceptions import ModelLoadingError, ValidationError
 from ..htdemucs import HTDemucs
 from ..roformer import _RoformerBase
-from .types import DeviceType, ModelName, Precision
-from .utils import console
+from .types import DeviceType, Precision
+from .utils import complete_model_name, console, validate_model_names
 
 # Batch sizes probed to find the smallest eager batch that already saturates
 # throughput (bigger ones only cost VRAM). Bounded low because these models
@@ -245,11 +245,13 @@ def _tune_one(model_name: str, device: str, dtype: object) -> dict[str, object]:
 
 def tune_command(
     models: Annotated[
-        list[ModelName] | None,
+        list[str] | None,
         typer.Option(
             "-m",
             "--model",
             help="Model(s) to tune (repeat to add more). Defaults to one of each architecture.",
+            callback=validate_model_names,
+            autocompletion=complete_model_name,
         ),
     ] = None,
     precision: Annotated[
@@ -283,7 +285,7 @@ def tune_command(
     else:
         dtype = torch.bfloat16
 
-    model_names = [m.value for m in models] if models else list(_DEFAULT_TUNE_MODELS)
+    model_names = list(models) if models else list(_DEFAULT_TUNE_MODELS)
 
     header = f"unblend tune \u00b7 {resolved_device}"
     if resolved_device == "cuda" and torch.cuda.is_available():

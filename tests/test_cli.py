@@ -4,6 +4,7 @@ These are network-free: unknown model names short-circuit before any
 download, and the format probe runs before model resolution.
 """
 
+import json
 import os
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import typer
 from click.testing import Result
 from torchcodec.encoders import AudioEncoder
 from typer.testing import CliRunner
@@ -104,18 +106,18 @@ def test_models_download_accepts_roformer_metadata(
     assert "2 total layers" in result.output
 
 
-@pytest.mark.parametrize("backend", ["roformer", "scnet"])
+@pytest.mark.parametrize("architecture", ["bs_roformer", "mel_band_roformer", "scnet"])
 def test_ensure_model_available_downloads_uncached_single_checkpoint_backend(
-    monkeypatch: pytest.MonkeyPatch,
-    backend: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     """
-    The benchmark/CLI availability preflight can download any registered
-    backend whose metadata has one ``checkpoint`` instead of a Demucs
-    ``models`` list.
+    The availability preflight downloads an uncached remote model whatever
+    architecture it uses, going through the real registry rather than a
+    hand-shaped metadata stub.
 
+    :param tmp_path: Pytest temporary directory fixture.
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param backend: Registered single-checkpoint backend under test.
+    :param architecture: Registered single-checkpoint architecture under test.
     """
     import unblend.cli.models as models_cli
 
@@ -132,41 +134,86 @@ def test_ensure_model_available_downloads_uncached_single_checkpoint_backend(
             """
             return self
 
-    models = {backend: {"backend": backend}}
-    monkeypatch.setattr(models_cli, "get_models", lambda: models)
-    monkeypatch.setattr(ModelRepository, "list_models", lambda self: models)
-    monkeypatch.setattr(ModelRepository, "get_cache_info", lambda self: {})
+    extra = tmp_path / "extra-models.json"
+    extra.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "custom": {
+                        "architecture": architecture,
+                        "sources": ["vocals", "other"],
+                        "samplerate": 44100,
+                        "segment_samples": 44100,
+                        "config": {"dim": 16},
+                        "checkpoint": {
+                            "format": "safetensors",
+                            "url": "https://example.invalid/custom.safetensors",
+                            "sha256": "a" * 64,
+                            "size_bytes": 16,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(extra))
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(
         ModelRepository,
         "get_model",
         lambda self, **kwargs: DownloadedModel(),
     )
 
-    assert models_cli.ensure_model_available(backend) is True
+    assert models_cli.ensure_model_available("custom") is True
 
 
-def test_ensure_model_available_accepts_local_single_checkpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "entry_factory",
+    [
+        lambda path: {
+            "architecture": "scnet",
+            "sources": ["vocals", "other"],
+            "samplerate": 44100,
+            "segment_samples": 44100,
+            "config": {"dims": [4, 8]},
+            "checkpoint": {"format": "safetensors", "path": str(path)},
+        },
+        lambda path: {
+            "architecture": "htdemucs",
+            "sources": ["vocals", "other"],
+            "config": {"sources": ["vocals", "other"]},
+            "models": [{"format": "safetensors", "path": str(path)}],
+        },
+    ],
+    ids=["single-checkpoint", "demucs-layer"],
+)
+def test_ensure_model_available_accepts_local_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_factory: object
 ) -> None:
-    """A custom local checkpoint is available without entering download code."""
+    """
+    Local weights are available without entering download code, whichever
+    backend loads them — a Demucs bag of layers included.
+    """
     import unblend.cli.models as models_cli
 
     checkpoint = tmp_path / "custom.safetensors"
     checkpoint.write_bytes(b"weights")
-    models = {
-        "custom_scnet": {
-            "backend": "scnet",
-            "checkpoint": {"path": str(checkpoint)},
-        }
-    }
-    monkeypatch.setattr(ModelRepository, "list_models", lambda self: models)
+    extra = tmp_path / "extra-models.json"
+    extra.write_text(
+        json.dumps({"models": {"custom": entry_factory(checkpoint)}})  # type: ignore[operator]
+    )
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(extra))
     monkeypatch.setattr(
         models_cli,
         "_download_model_with_progress",
         lambda *args, **kwargs: pytest.fail("local model attempted a download"),
     )
 
-    assert models_cli.ensure_model_available("custom_scnet") is True
+    assert models_cli.ensure_model_available("custom") is True
+
+    # A declared file that is not there is reported, not silently downloaded.
+    checkpoint.unlink()
+    assert models_cli.ensure_model_available("custom") is False
 
 
 def test_auto_compile_chunk_estimate_uses_duration_shifts_and_overlap(
@@ -613,8 +660,8 @@ def test_models_remove_all_sweeps_partial_and_temp_files(
     """
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path))
     # One layer of the multi-layer ensemble = a genuinely partial cache.
-    checksum = ModelRepository().list_models()["htdemucs_ft"]["models"][0]["checksum"]
-    partial_layer = tmp_path / f"{checksum}.safetensors"
+    layer = ModelRepository().list_models()["htdemucs_ft"]["models"][0]
+    partial_layer = tmp_path / f"{layer['sha256'][:16]}.safetensors"
     stale_tmp = tmp_path / f"{STAGING_PREFIX}q1w2e3.tmp"
     partial_layer.write_bytes(b"x")
     stale_tmp.write_bytes(b"y")
@@ -626,3 +673,30 @@ def test_models_remove_all_sweeps_partial_and_temp_files(
     assert result.exit_code == 0
     assert not partial_layer.exists()
     assert not stale_tmp.exists()
+
+
+def test_unknown_combine_mode_is_rejected_before_any_work() -> None:
+    """
+    ``--combine`` is checked against the implemented modes, listing them, so a
+    typo fails at parse time instead of after a model download.
+    """
+    result = _invoke(["separate", "--combine", "telepathy", "track.wav"])
+
+    assert result.exit_code != 0
+    assert "not a known combine mode" in result.output
+    assert "min_fft" in result.output
+
+
+def test_model_names_include_locally_added_models() -> None:
+    """
+    ``--model`` accepts every registered name — the choices used to be a fixed
+    enum that could not name a custom model and had drifted from the registry.
+    """
+    from unblend.cli.utils import complete_model_name, validate_model_name
+
+    assert validate_model_name("auto") == "auto"
+    assert validate_model_name("scnet_xl_wide_v5") == "scnet_xl_wide_v5"
+    assert "roformer_vocals_ensemble" in complete_model_name("roformer")
+
+    with pytest.raises(typer.BadParameter, match="not a known model"):
+        validate_model_name("no_such_model")

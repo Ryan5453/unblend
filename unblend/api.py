@@ -443,6 +443,13 @@ class Separator:
         # sweep in ``_calibrate_chunk_batch_size`` time candidate sizes up to
         # it and keep the fastest. (V100 favours small batches; flash-
         # attention GPUs favour larger ones — no single constant is right.)
+        #
+        # ``any`` rather than ``all``: in a mixed ensemble one member's
+        # preference rounds the shared batch down for every member, which costs
+        # the others nothing. This only applies under compile, where the
+        # throughput-vs-cbs curve is flat (see _CUDAGRAPH_RESERVATION_FACTOR) —
+        # a smaller batch is free there, while denying a member the shape it
+        # asked for is not.
         wants_power_of_two = any(
             backends.prefers_power_of_two_batch(model)
             for model in (
@@ -763,6 +770,8 @@ class Separator:
         compile: bool = False,
         chunk_batch_size: int | None = None,
         custom_kernels: bool | None = None,
+        combine: str | None = None,
+        combine_params: dict | None = None,
     ) -> None:
         """
         Initialize a Separator with the specified model and device.
@@ -812,6 +821,18 @@ class Separator:
                        forces vanilla PyTorch ops everywhere: the reference
                        baseline for A/B benchmarks, and it skips the CUDA
                        extension build entirely.
+        :param combine: For an ensemble, how member outputs are combined,
+                       overriding the registry's ``combine``. One of
+                       ``unblend.apply.COMBINE_MODES``: the ``weighted_mean``
+                       default (also spelled ``avg_wave``), the waveform
+                       selections ``median_wave``/``min_wave``/``max_wave``, or
+                       the spectral ``avg_fft``/``median_fft``/``min_fft``/
+                       ``max_fft`` (with ``uvr_min_spec``/``uvr_max_spec`` as
+                       UVR's names for the last two). The selection modes need
+                       a 0/1 weight mask, and they hold every member's output
+                       at once where ``weighted_mean`` accumulates in place.
+        :param combine_params: STFT geometry for the spectral modes, e.g.
+                       ``{"n_fft": 2048, "hop_length": 512}``.
         :raises ValidationError: If device is not valid or only_load stem doesn't exist
         :raises ModelLoadingError: If model fails to load, or an explicit
                        ``chunk_batch_size`` OOMs during compile capture
@@ -895,6 +916,21 @@ class Separator:
 
         if self.model is None:
             raise ModelLoadingError("Failed to load model")
+
+        # An explicit combine mode overrides whatever the registry declared,
+        # so every mode is reachable without writing a metadata entry.
+        if combine is not None or combine_params is not None:
+            if not isinstance(self.model, ModelEnsemble):
+                raise ValidationError(
+                    "combine only applies to an ensemble; "
+                    f"{model if isinstance(model, str) else type(self.model).__name__} "
+                    "has a single member."
+                )
+            self.model.set_combine(
+                combine if combine is not None else self.model.combine,
+                combine_params,
+            )
+
         self.model.eval()
 
         # Reduced-precision auto-defaults are per-backend, per-device

@@ -24,8 +24,18 @@ from ..htdemucs import HTDemucs
 from ..roformer import BSRoformer, MelBandRoformer
 from .models import ensure_model_available
 from .progress import FileProgressTracker
-from .types import ClipMode, DeviceType, ModelName, Precision, StemName
-from .utils import console, expand_paths_to_audio_files, format_output_path
+from .types import ClipMode, DeviceType, Precision
+from .utils import (
+    AUTO_MODEL,
+    complete_combine_mode,
+    complete_model_name,
+    complete_stem_name,
+    console,
+    expand_paths_to_audio_files,
+    format_output_path,
+    validate_combine_mode,
+    validate_model_name,
+)
 
 # Cache-free auto-compile policy. Values are conservative break-even amounts
 # of predicted eager GPU work (estimated chunks x a runtime batch-1 eager
@@ -240,14 +250,27 @@ def separate_command(
     ] = None,
     # Model Selection
     model: Annotated[
-        ModelName,
+        str,
         typer.Option(
             "-m",
             "--model",
-            help="Model to use for separation",
+            help="Model to use for separation ('auto', a registered model, or one added via UNBLEND_EXTRA_MODELS)",
             rich_help_panel="Model Selection",
+            callback=validate_model_name,
+            autocompletion=complete_model_name,
         ),
-    ] = ModelName.auto,
+    ] = AUTO_MODEL,
+    combine: Annotated[
+        str | None,
+        typer.Option(
+            "--combine",
+            help="For an ensemble model, how member outputs are combined (default: the model's own)",
+            show_default=False,
+            rich_help_panel="Model Selection",
+            callback=validate_combine_mode,
+            autocompletion=complete_combine_mode,
+        ),
+    ] = None,
     # Processing Options
     device: Annotated[
         DeviceType | None,
@@ -320,10 +343,11 @@ def separate_command(
         ),
     ] = "separated/{model}/{track}/{stem}.{ext}",
     isolate_stem: Annotated[
-        StemName | None,
+        str | None,
         typer.Option(
-            help="Only creates a {stem} and no_{stem} stem/file",
+            help="Only creates a {stem} and no_{stem} stem/file (any stem the chosen model emits; see 'models list')",
             rich_help_panel="Output",
+            autocompletion=complete_stem_name,
         ),
     ] = None,
     clip_mode: Annotated[
@@ -348,6 +372,7 @@ def separate_command(
 
     :param tracks: Paths to audio files or directories containing audio files
     :param model: Model to use for separation
+    :param combine: For an ensemble, how member outputs are combined
     :param device: Device to process separation on
     :param shifts: Number of random shifts for equivariant stabilization;
         increases separation time but improves quality
@@ -424,16 +449,16 @@ def separate_command(
     effective_format = template_suffix if template_suffix else format
     _validate_output_format(effective_format)
 
-    if model.value == ModelName.auto.value:
+    if model == AUTO_MODEL:
         selected_model_name, only_load_stem = select_model(
-            isolate_stem=isolate_stem.value if isolate_stem else None,
+            isolate_stem=isolate_stem,
         )
         console.print(
             f"[cyan]Auto-selected model:[/cyan] [bold]{selected_model_name}[/bold]"
         )
     else:
-        selected_model_name = model.value
-        only_load_stem = isolate_stem.value if isolate_stem else None
+        selected_model_name = model
+        only_load_stem = isolate_stem
 
     # only_load keeps the download to the single specialist layer when set.
     if not ensure_model_available(selected_model_name, only_load=only_load_stem):
@@ -465,6 +490,7 @@ def separate_command(
             dtype=dtype,
             compile=compile_model is True,
             custom_kernels=custom_kernels,
+            combine=combine,
         )
     except (ValidationError, ModelLoadingError) as error:
         console.print(
@@ -488,9 +514,9 @@ def separate_command(
     # Also covers the case where --isolate-stem is set but only_load is not (the
     # auto path can pick a single model where only_load is a no-op): the stem
     # must still exist in the loaded model's sources.
-    if isolate_stem is not None and isolate_stem.value not in separator.model.sources:
+    if isolate_stem is not None and isolate_stem not in separator.model.sources:
         console.print(
-            f'[red]✗[/red] [bold]{selected_model_name}[/bold]: error: stem "{isolate_stem.value}" is not in selected model. STEM must be one of {", ".join(separator.model.sources)}.'
+            f'[red]✗[/red] [bold]{selected_model_name}[/bold]: error: stem "{isolate_stem}" is not in selected model. STEM must be one of {", ".join(separator.model.sources)}.'
         )
         raise typer.Exit(1)
 
@@ -502,7 +528,7 @@ def separate_command(
     # the same file on case-insensitive filesystems (macOS/Windows), which
     # isn't knowable up front, so those only warn below.
     if isolate_stem is not None:
-        planned_stems = [isolate_stem.value, f"no_{isolate_stem.value}"]
+        planned_stems = [isolate_stem, f"no_{isolate_stem}"]
     else:
         planned_stems = list(separator.model.sources)
 
@@ -656,8 +682,7 @@ def separate_command(
                 )
 
                 if isolate_stem is not None:
-                    stem_name = isolate_stem.value
-                    separated = separated.isolate_stem(stem_name)
+                    separated = separated.isolate_stem(isolate_stem)
 
                 for stem_name in separated.sources:
                     stem_path = format_output_path(

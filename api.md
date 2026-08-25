@@ -408,31 +408,34 @@ from unblend import UnblendError, ValidationError, ModelLoadingError, LoadAudioE
 Unblend ships a fixed registry, but you can add your own models without
 modifying the package or hosting weights anywhere.
 
-Point `UNBLEND_EXTRA_MODELS` at a JSON file (or pass `extra_models=` to
+Point `UNBLEND_EXTRA_MODELS` at a models file (or pass `extra_models=` to
 `ModelRepository`). Its entries are **added** to the shipped registry — a file
 that reuses a built-in name is rejected rather than shadowing it, so dropping
 one in cannot silently swap the weights behind `htdemucs`.
 
-```json
-{
-  "version": 1,
-  "models": {
-    "my_scnet": {
-      "backend": "scnet",
-      "architecture": "scnet",
-      "license": "unknown",
-      "sources": ["drums", "bass", "other", "vocals"],
-      "samplerate": 44100,
-      "segment_samples": 485100,
-      "config": { "dims": [4, 64, 128, 256], "nfft": 4096, "hop_size": 1024 },
-      "checkpoint": {
-        "format": "safetensors",
-        "path": "~/models/my_scnet.safetensors"
-      }
-    }
-  }
-}
+```yaml
+version: 1
+models:
+  my_scnet:
+    architecture: scnet_masked
+    license: see upstream model card
+    sources: [drums, bass, other, vocals]
+    samplerate: 44100
+    segment_samples: 485100
+    config:                       # the upstream config's `model:` section, verbatim
+      dims: [4, 32, 64, 128]
+      nfft: 4096
+      hop_size: 1024
+    checkpoint:
+      format: safetensors
+      path: ~/models/my_scnet.safetensors
 ```
+
+Models files are YAML, which is what the ecosystem's configs are written in —
+so an upstream `model:` section is a paste, not a translation, and an entry can
+carry comments. A file named `.json` is read as JSON, so anything already
+written that way keeps working. The shipped registry is
+[`unblend/metadata.yaml`](https://github.com/Ryan5453/unblend/blob/main/unblend/metadata.yaml).
 
 ```bash
 export UNBLEND_EXTRA_MODELS=~/my-models.json
@@ -440,17 +443,228 @@ unblend models list          # your model appears, marked "Local"
 unblend separate --model my_scnet track.wav
 ```
 
-Notes:
+### Entry fields
 
-- **Safetensors only.** Loading stays pickle-free; convert `.ckpt`/`.pt`
-  weights yourself before registering them.
-- `checkpoint.path` is for local files; `checkpoint.url` (https) downloads and
-  caches instead, and then `sha256` and `size_bytes` are required. For a local
-  path they are optional but verified when present.
-- `architecture` must be one unblend implements — `htdemucs`, `bs_roformer`,
-  `mel_band_roformer`, `scnet`, or `scnet_masked`. Weights are loaded strictly,
-  so a mismatched checkpoint fails loudly rather than degrading silently.
+| Field | Meaning |
+| --- | --- |
+| `architecture` | Which implementation builds the model. One of `htdemucs`, `bs_roformer`, `mel_band_roformer`, `scnet`, `scnet_masked`. |
+| `sources` | Output stem names, in the order the model emits them. |
+| `samplerate` | Sample rate the weights operate at. |
+| `segment_samples` | Training chunk length, in samples. |
+| `config` | Constructor kwargs for the architecture — the upstream config file's `model:` section, verbatim. |
+| `checkpoint` | Where the weights are (see below), for a single-model entry. |
+| `members` | For an ensemble: one entry per member instead of `checkpoint` (see below). `models` is the same thing under the Demucs bags' original spelling, where each item is an artifact rather than a member wrapping one. |
+| `license` | Free-form label, passed through to `models list` and `list_models` untouched. Unblend does not interpret it. |
+| `weights` | For an ensemble: one row per member, one column per source. Defaults to all ones. |
+| `combine`, `combine_params` | For an ensemble: how member outputs are combined (see below). |
+| `segment` | Optional: shortens (never enlarges) the configured training segment. |
+
+`backend` — the loader family — is derived from `architecture` and only worth
+setting if you like the redundancy. Every architecture belongs to exactly one
+family: `htdemucs` to `demucs`, the two RoFormers to `roformer`, the two SCNets
+to `scnet`.
+
+### Where the weights come from
+
+Every backend describes its weights the same way, and either source works for
+any architecture:
+
+```yaml
+format: safetensors
+path: ~/models/my_model.safetensors
+```
+
+```yaml
+format: safetensors
+url: https://huggingface.co/me/my-model/resolve/main/model.safetensors
+sha256: 3f786850e387550fdab836ed7e6dc881de23001b00000000000000000000beef
+size_bytes: 219000000
+```
+
+- A **local `path`** is read where it lies. Nothing is copied into the cache, so
+  `models remove` will never delete it and `models list` reports it as `Local`.
+  `sha256` and `size_bytes` are optional there, and verified when present.
+- An **https `url`** is downloaded once into the model cache
+  (`UNBLEND_CACHE_DIR`, default `~/.unblend/models`) and served from there on
+  every later run. A download has to be verifiable, so `sha256` and
+  `size_bytes` are required — the file is checked before it is promoted into the
+  cache, and again on each load.
+- A Demucs entry lists one such artifact per layer under `models`, and may mix
+  local and remote layers. Its `config` must declare the same `sources` as the
+  entry.
+
+### Ensembles
+
+An ensemble entry lists `members` instead of a `checkpoint`. A member inherits
+anything it does not state from the entry, so a bag of same-architecture
+checkpoints stays terse while a mixed one spells each member out:
+
+```yaml
+version: 1
+models:
+  my_bag:
+    architecture: scnet          # inherited by both members below
+    sources: [drums, bass, other, vocals]
+    samplerate: 44100
+    segment_samples: 485100
+    config:
+      dims: [4, 64, 128, 256]
+      nfft: 4096
+      hop_size: 1024
+    combine: avg_wave
+    members:
+      - checkpoint: { format: safetensors, path: ~/models/a.safetensors }
+      - checkpoint: { format: safetensors, path: ~/models/b.safetensors }
+```
+
+A member can also just name another registered model, which is how you ensemble
+models that already ship without restating their config:
+
+```yaml
+version: 1
+models:
+  my_vocals:
+    sources: [vocals, other]
+    combine: min_fft
+    members:
+      - model: melband_roformer_kim
+      - model: bs_roformer_anvuew
+```
+
+Members must agree on stems (same names, same order), sample rate and channel
+count. They need *not* agree on normalization: HTDemucs wants track-level
+normalized audio and the other architectures want it raw, so an ensemble mixing
+them takes raw audio and normalizes around the members that need it — each sees
+exactly what it would see running alone, and members are combined in the input's
+own scale.
+
+Members that share a checkpoint with another registered model share its cache
+file, so an ensemble of registered models downloads nothing new (and
+`models remove` on it removes those shared files).
+
+Unblend ships two, so the modes below are usable without writing any config:
+`roformer_vocals_ensemble` (Mel-Band + BS-RoFormer, two stems) and
+`htdemucs_scnet_ensemble` (HTDemucs + SCNet xl-wide, four stems). Each costs
+both members' inference time.
+
+### Combining members
+
+`combine` names how member outputs are reduced. The names are the ecosystem's
+(ZFTurbo's Music-Source-Separation-Training, audio-separator, UVR), so a recipe
+written against those transfers verbatim.
+
+| Mode | What it does |
+| --- | --- |
+| `weighted_mean` (default), `avg_wave` | Per-source weighted average of the waveforms. |
+| `median_wave` | Element-wise median of the waveforms. |
+| `min_wave`, `max_wave` | The sample with the smallest/largest absolute value, sign kept. |
+| `avg_fft` | Weighted average of the complex spectrograms. |
+| `median_fft` | Per bin, the member ranked in the middle by magnitude. |
+| `min_fft`, `max_fft` | Per bin, the whole complex value from the member with the smallest/largest magnitude. |
+| `uvr_min_spec`, `uvr_max_spec` | UVR's names for `min_fft`/`max_fft` — the same operation. |
+
+`combine_params` sets the STFT geometry for the spectral modes; it defaults to
+`{"n_fft": 1024, "hop_length": 256}`, and `n_fft` must be a whole multiple of
+`hop_length`.
+
+Three things worth knowing:
+
+- **The selection modes need a 0/1 mask.** `median_*`, `min_*` and `max_*` pick
+  among members rather than blending them, so a real-valued weight has nowhere
+  to apply. Upstream tools silently ignore weights there; Unblend rejects them,
+  so a recipe never quietly does something other than what it says. A zero still
+  means "this member does not contribute to this stem".
+- **Only `weighted_mean` streams.** It is linear, so it folds into a running
+  accumulator and holds two tensors at a time. The others need every member's
+  finished output side by side; the spectral ones transform in blocks so peak
+  memory tracks the block rather than the track.
+- **`avg_wave` is the quality default.** ZFTurbo's own testing found the plain
+  weighted average was always better or equal in SDR; the other modes are for
+  taste and interop (`min_fft` is the conservative one — it keeps only what the
+  members agree on). Unblend has not measured them.
+
+Anything registered can be overridden per run without touching metadata:
+
+```bash
+unblend separate --model roformer_vocals_ensemble --combine min_fft track.wav
+```
+
+```python
+Separator(model="roformer_vocals_ensemble", combine="min_fft")
+```
+
+### Importing a checkpoint from elsewhere
+
+Unblend does not define a weight layout of its own: module and parameter names
+in every architecture are pinned to their reference implementations (lucidrains
+/ ZFTurbo for the RoFormers, the official SCNet, Meta's Demucs), so community
+checkpoints trained against those load verbatim, `strict=True`. What Unblend
+insists on is the *container*: Safetensors, so loading is pickle-free.
+
+`unblend models import` does the repackaging:
+
+```bash
+unblend models import model.ckpt --config config.yaml --name my_model \
+    --license "see upstream model card"
+```
+
+```
+✓ Loaded as mel_band_roformer and strict-loaded 1219 tensors
+✓ Wrote ~/.unblend/imported/my_model.safetensors (869.4 MB)
+✓ Registered my_model in ~/.unblend/models.json
+
+Try it: unblend separate --model my_model track.wav
+```
+
+What it does:
+
+- **Reads the tensors out of whatever container they arrived in** — a bare
+  state dict, or a training framework's checkpoint with the weights under
+  `state_dict` and a `model.` / `module.` prefix on every key. It loads with
+  `torch.load(weights_only=True)`, so a checkpoint that needs real unpickling
+  is refused rather than executed.
+- **Translates the config.** ZFTurbo's Music-Source-Separation-Training layout
+  is understood directly: `model:` is the constructor config, `audio.chunk_size`
+  and `audio.sample_rate` are the geometry, `training.instruments` are the
+  stems. A `training.target_instrument` marks a single-head model, whose second
+  stem is synthesised as `mixture - prediction`. Anything the config does not
+  say can be given with `--architecture`, `--stem`, `--samplerate` and
+  `--segment-samples`.
+- **Infers the architecture and proves it.** Parameter names identify the
+  family, and the masked SCNet is identifiable from weights plain SCNet has no
+  slot for. BS- and Mel-Band RoFormer share their names, so the config decides —
+  and failing that both are tried. Whichever candidate is chosen, the model is
+  *built and strict-loaded* before anything is written: a mistranslated config
+  or a mislabelled architecture fails here, naming what did not fit, instead of
+  producing an entry that breaks at separation time. `--architecture` is
+  verified the same way, not trusted.
+- **Writes a self-describing artifact.** The registry fields go into the
+  Safetensors header, which the file's own sha256 covers — so an embedded
+  config is verified along with the weights, which a models file beside it is
+  not. A hand-written entry for such a file needs only its `sources` and where
+  it is; the rest is read from the header (a few KB, whatever the file's size).
+- **Registers and re-loads it**, so the entry is known to survive the
+  registry's validation. `--print` emits the entry instead of writing it, and
+  `--models-file` chooses where it lands (default: `$UNBLEND_EXTRA_MODELS`, else
+  `~/.unblend/models.yaml`).
+
+Only architectures Unblend implements can load at all. MDX-Net and VR-arch
+weights (much of UVR's model list, including everything shipped as `.onnx`) are
+different architectures, not different packaging — the import says so rather
+than failing obscurely.
+
+### Notes
+
+- Weights load strictly, so a config that disagrees with the checkpoint fails
+  loudly rather than degrading silently.
+- Everything is validated when the repository is constructed — a malformed
+  entry fails before any download starts, not part-way through one.
 - For a single-head model given two `sources`, the second is synthesised as
   `mixture - prediction`. Order matters: an instrumental model must declare
   `["other", "vocals"]`, and getting it backwards produces silently wrong
   output rather than an error.
+- `--isolate-stem` on an ensemble runs (and downloads) one member when only one
+  contributes to that stem, whatever the combine mode: every mode reduces to
+  the identity over a single member. `htdemucs_ft`'s one-hot matrix is what
+  makes single-stem extraction there cost one member instead of four. When
+  several members contribute, all of them run.

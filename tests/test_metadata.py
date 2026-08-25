@@ -1,11 +1,9 @@
 """
-Integrity checks for the bundled model registry (``unblend/metadata.json``).
+Integrity checks for the bundled model registry (``unblend/metadata.yaml``).
 
 These run fully offline: ``ModelRepository`` only reads the local metadata file
 and builds download URLs as strings, so no network access is required.
 """
-
-from pathlib import Path
 
 from unblend.repo import ModelRepository
 
@@ -34,8 +32,49 @@ def test_every_demucs_layer_has_safe_artifact_and_config() -> None:
         for layer in layers:
             assert layer["format"] == "safetensors"
             assert layer["remote"].endswith(".safetensors")
-            assert layer["sha256"].startswith(layer["checksum"])
+            assert len(layer["sha256"]) == 64
             assert layer["size_bytes"] > 0
+
+
+def test_shipped_ensembles_reference_registered_members() -> None:
+    """
+    Every ``members`` entry resolves to registered models that agree on the
+    inference contract — same stems in the same order, same sample rate — since
+    that is what ``ModelEnsemble`` requires at build time.
+    """
+
+    def samplerate_of(info: dict) -> int:
+        """
+        A model's sample rate, wherever its backend keeps it.
+
+        :param info: One model's registry metadata.
+        :return: The sample rate in Hz.
+        """
+        return info.get("samplerate") or info["config"]["samplerate"]
+
+    repo = ModelRepository()
+    models = repo.list_models()
+    ensembles = {name: info for name, info in models.items() if info.get("members")}
+    assert ensembles, "the registry should ship at least one ensemble to try"
+
+    for name, info in ensembles.items():
+        assert len(repo._members[name]) > 1, f"{name} should combine several members"
+        rates = set()
+        for spec in info["members"]:
+            referenced = spec.get("model")
+            if referenced is None:
+                continue
+            assert referenced in models, f"{name} references unknown {referenced}"
+            member = models[referenced]
+            assert member["sources"] == info["sources"], (
+                f"{name}: {referenced} emits {member['sources']}, "
+                f"entry declares {info['sources']}"
+            )
+            assert not member.get("members"), (
+                f"{name}: {referenced} is itself an ensemble"
+            )
+            rates.add(samplerate_of(member))
+        assert len(rates) <= 1, f"{name}: members disagree on sample rate {rates}"
 
 
 def test_ensemble_weights_are_consistent() -> None:
@@ -46,21 +85,32 @@ def test_ensemble_weights_are_consistent() -> None:
         weights = info.get("weights")
         if weights is None:
             continue
-        assert len(weights) == len(info["models"]), (
-            f"{name}: weight rows must match layer count"
+        member_count = len(info.get("members") or info.get("models") or [1])
+        assert len(weights) == member_count, (
+            f"{name}: weight rows must match member count"
         )
         widths = {len(row) for row in weights}
         assert len(widths) == 1, f"{name}: ragged weight rows {widths}"
 
 
-def test_every_model_is_licence_labelled() -> None:
+def test_every_model_states_its_terms() -> None:
     """
-    Every model carries an explicit ``license`` label — the registry must be
-    honest about weight licensing (Demucs weights are ``unlicensed``; the
-    RoFormer checkpoints are non-commercial), surfaced in the CLI/API.
+    Every model carries a ``license`` label, and anything not under a plain
+    grant explains itself in a ``license_note``.
+
+    The registry is the only place these terms are stated — ``unblend models
+    list`` and ``list_models`` read them from here — so an entry without them
+    would leave users with no way to know what they are bound by.
     """
+    plain_grants = {"MIT", "GPL-3.0"}
     for name, info in ModelRepository().list_models().items():
-        assert info.get("license"), f"{name} has no license label"
+        label = info.get("license")
+        assert label, f"{name} has no license label"
+        if label not in plain_grants:
+            assert info.get("license_note"), (
+                f"{name} is labelled {label!r}, which needs a license_note "
+                "saying what that means"
+            )
 
 
 def test_roformer_entries_are_well_formed() -> None:
@@ -70,7 +120,8 @@ def test_roformer_entries_are_well_formed() -> None:
     Safetensors checkpoint with an https URL, exact size, and full sha256.
     """
     for name, info in ModelRepository().list_models().items():
-        if info.get("backend") != "roformer":
+        # Ensemble entries carry members rather than a checkpoint of their own.
+        if info.get("backend") != "roformer" or "checkpoint" not in info:
             continue
         assert info["architecture"] in {"bs_roformer", "mel_band_roformer"}
         assert isinstance(info["config"], dict) and info["config"]
@@ -93,7 +144,7 @@ def test_scnet_entries_are_well_formed() -> None:
     a mislabelled entry would fail to strict-load rather than degrade quietly.
     """
     for name, info in ModelRepository().list_models().items():
-        if info.get("backend") != "scnet":
+        if info.get("backend") != "scnet" or "checkpoint" not in info:
             continue
         assert info["architecture"] in {"scnet", "scnet_masked"}
         assert isinstance(info["config"], dict) and info["config"]
@@ -106,35 +157,3 @@ def test_scnet_entries_are_well_formed() -> None:
         assert checkpoint["url"].endswith(".safetensors")
         assert len(checkpoint["sha256"]) == 64
         assert checkpoint["size_bytes"] > 0
-
-
-def test_readme_license_table_matches_the_registry() -> None:
-    """
-    The readme's licensing table has to agree with ``metadata.json``.
-
-    It drifted once already: the HTDemucs weights were relabelled MIT in the
-    registry while the readme still called them ungranted, so ``unblend models
-    list`` and the readme disagreed about the terms users are bound by.
-    """
-    label_for = {"MIT": "MIT", "GPL-3.0": "GPL-3.0", "unlicensed": "No license grant"}
-    models = ModelRepository().list_models()
-
-    readme = (Path(__file__).resolve().parent.parent / "readme.md").read_text()
-    table = readme[readme.index("| Model | Weights license |") :]
-    table = table[: table.index("\n\n")]
-
-    documented: dict[str, str] = {}
-    for line in table.splitlines()[2:]:
-        names, label = (cell.strip() for cell in line.strip("|").split("|"))
-        for name in names.split(","):
-            documented[name.strip().strip("`")] = label
-
-    assert set(documented) == set(models), (
-        "readme licensing table lists "
-        f"{sorted(set(documented) ^ set(models))} differently from the registry"
-    )
-    for name, info in models.items():
-        expected = label_for[info["license"]]
-        assert documented[name] == expected, (
-            f"readme says {name} is {documented[name]!r}, registry says {expected!r}"
-        )

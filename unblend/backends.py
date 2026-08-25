@@ -9,24 +9,27 @@ The contract every separation architecture implements.
 Inference itself needs only four members — ``sources``, ``samplerate``,
 ``max_allowed_segment`` and ``forward`` — which is why ``apply_model`` can
 drive a foreign architecture unchanged. Everything beyond that is optional
-acceleration: cache prefill, a compiled hot path, and batch-shape preferences.
+acceleration: a compiled hot path and batch-shape preferences.
 
 Those optional pieces used to live in ``Separator`` as ``isinstance`` branches
 over ``HTDemucs``/``_RoformerBase``, which meant a third architecture had to
 edit the API layer to be usable. They are declared here and implemented by each
 architecture instead, so adding one touches its own module, the builder
-registry, and ``metadata.json`` — and nothing else.
+registry, and ``metadata.yaml`` — and nothing else.
 
 The protocol is structural on purpose: architectures are *not* required to
 inherit from it. HTDemucs is reconstructed from legacy pickles that name its
 class directly, so changing its bases would be a compatibility hazard for no
-benefit. Callers use :func:`prefill_caches`/:func:`enable_compiled_core`/
-:func:`disable_compiled_core`, which no-op for models that implement nothing.
+benefit. Callers use :func:`enable_compiled_core`/:func:`disable_compiled_core`,
+which no-op for models that implement nothing. An architecture with lazily-built
+inference caches (rotary tables, positional embeddings) populates them inside
+its own ``enable_compiled_core``: allocating them under CUDAGraph capture would
+poison the graph, and swapping in the compiled core is the moment that matters.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Iterable, Protocol, runtime_checkable
 
 import torch
 from torch import Tensor
@@ -57,21 +60,6 @@ class SeparationModel(Protocol):
         :return: ``(batch, stems, channels, samples)`` estimates.
         """
         ...
-
-
-def prefill_caches(model: torch.nn.Module) -> None:
-    """
-    Materialise any lazily-built inference caches before compilation.
-
-    Rotary tables and positional embeddings are allocated on first use. Under
-    CUDAGraph capture that allocation happens inside the graph and poisons it,
-    so architectures that build caches lazily populate them here instead.
-
-    :param model: The model to prepare; no-ops if it declares no caches.
-    """
-    hook = getattr(model, "prefill_inference_caches", None)
-    if hook is not None:
-        hook()
 
 
 def enable_compiled_core(model: torch.nn.Module) -> None:
@@ -113,20 +101,42 @@ def prefers_power_of_two_batch(model: torch.nn.Module) -> bool:
 
 
 #: Builders for architectures whose weights ship as one verified Safetensors
-#: checkpoint plus a config, keyed by ``metadata.json``'s ``backend`` field.
+#: checkpoint plus a config, keyed by ``metadata.yaml``'s ``backend`` field.
 #: Registering here is what makes a new architecture loadable — the repository
 #: dispatches through this table instead of naming families inline.
 _BUILDERS: dict[str, "Callable[..., torch.nn.Module]"] = {}
 
+#: The architecture names each backend can build. Populated by
+#: ``register_backend`` so registry validation and the architecture -> backend
+#: lookup below never hard-code an architecture list.
+_ARCHITECTURES: dict[str, frozenset[str]] = {}
 
-def register_backend(name: str, builder: "Callable[..., torch.nn.Module]") -> None:
+
+def register_backend(
+    name: str,
+    builder: "Callable[..., torch.nn.Module]",
+    architectures: "Iterable[str]",
+) -> None:
     """
     Register a single-checkpoint architecture family.
 
-    :param name: The ``backend`` value used in ``metadata.json``.
+    :param name: The ``backend`` value used in ``metadata.yaml``.
     :param builder: Callable with ``build_*``'s signature.
+    :param architectures: The ``architecture`` values ``builder`` accepts.
+    :raises ValueError: If an architecture is already owned by another
+        backend. Architecture names are globally unique so a registry entry
+        can name only its architecture and have the backend derived from it.
     """
+    names = frozenset(architectures)
+    for architecture in names:
+        owner = backend_for_architecture(architecture)
+        if owner is not None and owner != name:
+            raise ValueError(
+                f"Architecture {architecture!r} is already registered to "
+                f"backend {owner!r}."
+            )
     _BUILDERS[name] = builder
+    _ARCHITECTURES[name] = names
 
 
 def single_checkpoint_backends() -> frozenset[str]:
@@ -136,6 +146,33 @@ def single_checkpoint_backends() -> frozenset[str]:
     :return: The registered backend names.
     """
     return frozenset(_BUILDERS)
+
+
+def architectures(backend: str) -> frozenset[str]:
+    """
+    Architectures a registered backend can build.
+
+    :param backend: Backend name.
+    :return: Its architecture names, empty if the backend is unregistered.
+    """
+    return _ARCHITECTURES.get(backend, frozenset())
+
+
+def backend_for_architecture(architecture: str) -> str | None:
+    """
+    The backend that builds a given architecture.
+
+    Lets a registry entry declare only ``architecture``: since every
+    architecture belongs to exactly one loader family, ``backend`` is
+    redundant information that can be derived instead of restated.
+
+    :param architecture: Architecture name.
+    :return: The owning backend, or ``None`` if nothing claims the name.
+    """
+    for backend, names in _ARCHITECTURES.items():
+        if architecture in names:
+            return backend
+    return None
 
 
 def build(
@@ -153,7 +190,7 @@ def build(
 
     :param backend: Registered backend name.
     :param architecture: Architecture within that backend.
-    :param config: Constructor kwargs from ``metadata.json``.
+    :param config: Constructor kwargs from ``metadata.yaml``.
     :param sources: Output stem names.
     :param samplerate: Sample rate the checkpoint operates at.
     :param segment_samples: Training chunk length in samples.

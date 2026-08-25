@@ -28,12 +28,20 @@ from unblend.repo import (
     get_cache_dir,
 )
 
+#: Fake layer digests for the metadata fixtures below. A cache file is named
+#: after the first 16 characters of its artifact's sha256, so the tests derive
+#: their expected filenames the same way the repository does.
+FIRST_SHA = "abcd1234" + "a" * 56
+FIRST_KEY = FIRST_SHA[:16]
+SECOND_SHA = "ef012345" + "b" * 56
+SECOND_KEY = SECOND_SHA[:16]
+
 
 def _good_metadata() -> dict:
     """
     Minimal valid metadata blob accepted by ``ModelRepository.__init__``.
 
-    :return: A metadata dict shaped like ``unblend/metadata.json``.
+    :return: A metadata dict shaped like ``unblend/metadata.yaml``.
     """
     sources = ["drums", "bass", "other", "vocals"]
     return {
@@ -55,8 +63,7 @@ def _good_metadata() -> dict:
                     {
                         "format": "safetensors",
                         "remote": "https://example.invalid/abcd.safetensors",
-                        "checksum": "abcd1234",
-                        "sha256": "abcd1234" + "a" * 56,
+                        "sha256": FIRST_SHA,
                         "size_bytes": 1024,
                     }
                 ],
@@ -141,12 +148,11 @@ def test_demucs_download_rejects_wrong_content_length(
     monkeypatch.setattr("unblend.repo.httpx.stream", lambda *_a, **_k: Response())
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     with pytest.raises(ModelLoadingError, match="expected 4"):
-        repo._download_and_load_layer(
+        repo._download_verified_file(
             "https://example.invalid/model",
             tmp_path / "cache" / "model.safetensors",
             "0" * 64,
             4,
-            _good_metadata()["models"]["fakemodel"],
         )
 
 
@@ -332,7 +338,7 @@ def test_get_cache_info_lists_present_layers(
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
-    (cache_dir / "abcd1234.safetensors").write_bytes(b"x" * 1024)
+    (cache_dir / f"{FIRST_KEY}.safetensors").write_bytes(b"x" * 1024)
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     info = repo.get_cache_info()
@@ -364,7 +370,7 @@ def test_remove_model_unlinks_cached_layers(
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
-    layer = cache_dir / "abcd1234.safetensors"
+    layer = cache_dir / f"{FIRST_KEY}.safetensors"
     layer.write_bytes(b"x")
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
@@ -380,7 +386,7 @@ def test_layer_sha256_lookup(tmp_path: Path) -> None:
     :param tmp_path: pytest temporary directory fixture
     """
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
-    assert repo.layer_sha256("abcd1234") == "abcd1234" + "a" * 56
+    assert repo.layer_sha256(FIRST_KEY) == FIRST_SHA
     with pytest.raises(KeyError):
         repo.layer_sha256("nothere")
 
@@ -396,33 +402,31 @@ def test_get_model_redownloads_corrupt_cached_layer(
     :param tmp_path: pytest temporary directory fixture
     :param monkeypatch: pytest monkeypatch fixture
     """
-    # Build a known-good repo against fake metadata. The "abcd1234" layer's
+    # Build a known-good repo against fake metadata. The first layer's
     # sha256 expects the registered digest, so any other content trips
     # check_checksum and exercises the redownload branch.
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
 
-    corrupt_path = cache_dir / "abcd1234.safetensors"
+    corrupt_path = cache_dir / f"{FIRST_KEY}.safetensors"
     corrupt_path.write_bytes(b"this is not a real model checkpoint")
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
 
     download_calls: list[dict] = []
 
-    def fake_download_and_load_layer(self, **kwargs):
+    def fake_download_verified_file(self, **kwargs):
         """
-        Record the call and return a placeholder rather than hit the network.
+        Record the call rather than hit the network.
 
         :param self: bound ``ModelRepository`` instance
         :param kwargs: forwarded download kwargs
-        :return: a stand-in object representing a loaded layer
         """
         download_calls.append(kwargs)
-        return object()  # placeholder layer; never actually used downstream
 
     monkeypatch.setattr(
-        ModelRepository, "_download_and_load_layer", fake_download_and_load_layer
+        ModelRepository, "_download_verified_file", fake_download_verified_file
     )
 
     # get_model swallows the bad cache hit, removes the file, then hits the
@@ -440,7 +444,7 @@ def test_get_model_redownloads_corrupt_cached_layer(
     )
     assert len(download_calls) == 1
     assert download_calls[0]["cache_path"] == corrupt_path
-    assert download_calls[0]["expected_checksum"] == "abcd1234" + "a" * 56
+    assert download_calls[0]["expected_sha256"] == FIRST_SHA
 
 
 def test_repository_instances_coordinate_one_artifact_download(
@@ -453,11 +457,13 @@ def test_repository_instances_coordinate_one_artifact_download(
     model = SimpleNamespace(
         sources=["drums", "bass", "other", "vocals"], max_allowed_segment=1.0
     )
-    monkeypatch.setattr("unblend.repo._load_demucs_layer", lambda *_args: model)
+    # The fake download writes placeholder bytes, so stub reading and building.
+    monkeypatch.setattr("unblend.repo._read_state", lambda _path: {})
+    monkeypatch.setattr("unblend.repo._build_demucs_layer", lambda *_args: model)
     calls = 0
     calls_lock = threading.Lock()
 
-    def fake_download(self: ModelRepository, **kwargs: object):
+    def fake_download(self: ModelRepository, **kwargs: object) -> None:
         """Populate the cache slowly enough for the other thread to wait."""
         nonlocal calls
         del self
@@ -467,9 +473,8 @@ def test_repository_instances_coordinate_one_artifact_download(
         path = kwargs["cache_path"]
         assert isinstance(path, Path)
         path.write_bytes(b"x" * 1024)
-        return model
 
-    monkeypatch.setattr(ModelRepository, "_download_and_load_layer", fake_download)
+    monkeypatch.setattr(ModelRepository, "_download_verified_file", fake_download)
     metadata_path = _write_metadata(tmp_path, _good_metadata())
     repos = [ModelRepository(metadata_path=metadata_path) for _ in range(2)]
     barrier = threading.Barrier(3)
@@ -502,8 +507,7 @@ def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
         {
             "format": "safetensors",
             "remote": "https://example.invalid/ef.safetensors",
-            "checksum": "ef012345",
-            "sha256": "ef012345" + "b" * 56,
+            "sha256": SECOND_SHA,
             "size_bytes": 2,
         }
     )
@@ -513,8 +517,8 @@ def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
     ]
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
     assert repo.required_layers("fakemodel", only_load="drums") == [
-        "abcd1234",
-        "ef012345",
+        FIRST_KEY,
+        SECOND_KEY,
     ]
 
 
@@ -526,7 +530,7 @@ def test_get_model_rejects_only_load_before_cache_or_network(
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     monkeypatch.setattr(
         repo,
-        "_download_and_load_layer",
+        "_download_verified_file",
         lambda **_kwargs: pytest.fail("invalid only_load touched the downloader"),
     )
     with pytest.raises(ModelLoadingError, match="not found"):
@@ -679,8 +683,7 @@ def test_get_cache_info_reports_partial_models(
         {
             "format": "safetensors",
             "remote": "https://example.invalid/ef.safetensors",
-            "checksum": "ef012345",
-            "sha256": "ef012345" + "b" * 56,
+            "sha256": SECOND_SHA,
             "size_bytes": 2,
         }
     )
@@ -688,14 +691,14 @@ def test_get_cache_info_reports_partial_models(
 
     assert repo.get_cache_info() == {}
 
-    (cache / "abcd1234.safetensors").write_bytes(b"xxxx")
+    (cache / f"{FIRST_KEY}.safetensors").write_bytes(b"xxxx")
     info = repo.get_cache_info()
     assert info["fakemodel"]["complete"] is False
     assert info["fakemodel"]["total_layers"] == 2
     assert info["fakemodel"]["size_bytes"] == 4
-    assert list(info["fakemodel"]["layers"]) == ["abcd1234"]
+    assert list(info["fakemodel"]["layers"]) == [FIRST_KEY]
 
-    (cache / "ef012345.safetensors").write_bytes(b"yy")
+    (cache / f"{SECOND_KEY}.safetensors").write_bytes(b"yy")
     info = repo.get_cache_info()
     assert info["fakemodel"]["complete"] is True
     assert info["fakemodel"]["size_bytes"] == 6
@@ -715,7 +718,7 @@ def test_sweep_stale_downloads_removes_staging_files(
     active.write_bytes(b"active")
     old = time.time() - STAGING_STALE_SECONDS - 1
     os.utime(stale, (old, old))
-    cached = cache / "abcd1234.safetensors"
+    cached = cache / f"{FIRST_KEY}.safetensors"
     cached.write_bytes(b"cached layer")
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
@@ -767,7 +770,7 @@ def test_get_model_preserves_cache_on_read_failures(
     cache_dir.mkdir()
     monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache_dir)
 
-    cached = cache_dir / "abcd1234.safetensors"
+    cached = cache_dir / f"{FIRST_KEY}.safetensors"
     cached.write_bytes(b"x" * 1024)
 
     cause = OSError(13, "Permission denied")
@@ -796,7 +799,7 @@ def test_get_model_preserves_cache_on_read_failures(
         """
         pytest.fail("read failure must not trigger a redownload")
 
-    monkeypatch.setattr(ModelRepository, "_download_and_load_layer", fail_download)
+    monkeypatch.setattr(ModelRepository, "_download_verified_file", fail_download)
 
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     with pytest.raises(ModelLoadingError) as excinfo:
@@ -957,7 +960,6 @@ def test_registered_layer_loads_safetensors_without_pickle(
                     {
                         "format": "safetensors",
                         "remote": "https://example.invalid/layer.safetensors",
-                        "checksum": digest[:16],
                         "sha256": digest,
                         "size_bytes": packed.stat().st_size,
                     }
@@ -971,3 +973,619 @@ def test_registered_layer_loads_safetensors_without_pickle(
     loaded = repo.get_model("tiny")
     assert isinstance(loaded, HTDemucs)
     assert loaded.sources == ["a", "b"]
+
+
+def _tiny_demucs_layer(
+    tmp_path: Path, sources: list[str] | None = None
+) -> tuple[Path, dict]:
+    """
+    Save a small real HTDemucs checkpoint for the custom-model tests.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param sources: Stems it should emit; two by default
+    :return: ``(checkpoint path, constructor config)``
+    """
+    from safetensors.torch import save_file
+
+    from unblend.htdemucs import HTDemucs
+
+    config = dict(
+        sources=list(sources) if sources else ["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    path = tmp_path / "layer.safetensors"
+    save_file(dict(HTDemucs(**config).state_dict()), path)
+    return path, config
+
+
+def _tiny_scnet_checkpoint(tmp_path: Path, sources: list[str]) -> tuple[Path, dict]:
+    """
+    Save a small real SCNet, for testing ensembles that mix architectures.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param sources: Stems the model should emit
+    :return: ``(checkpoint path, constructor config)``
+    """
+    from safetensors.torch import save_file
+
+    from unblend.scnet import SCNet
+
+    config = dict(
+        audio_channels=2,
+        dims=[4, 8, 16, 32],
+        nfft=512,
+        hop_size=128,
+        win_size=512,
+        band_stride=[1, 2, 4],
+        band_kernel=[3, 4, 4],
+        conv_depths=[1, 1, 1],
+        num_dplayer=1,
+    )
+    model = SCNet(sources=list(sources), **config)
+    path = tmp_path / "scnet.safetensors"
+    save_file(
+        {key: value.contiguous() for key, value in model.state_dict().items()}, path
+    )
+    return path, config
+
+
+def _extra_models_file(tmp_path: Path, entry: dict) -> Path:
+    """
+    Write a one-model ``UNBLEND_EXTRA_MODELS`` file.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param entry: The model entry to register as ``custom``
+    :return: Path to the written file
+    """
+    path = tmp_path / "extra-models.json"
+    path.write_text(json.dumps({"models": {"custom": entry}}))
+    return path
+
+
+def test_demucs_model_loads_from_a_local_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A user-supplied Demucs checkpoint loads from disk, with the backend
+    derived from its architecture and its licence label passed through
+    untouched.
+    """
+    from unblend.htdemucs import HTDemucs
+
+    weights, config = _tiny_demucs_layer(tmp_path)
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
+    extra = _extra_models_file(
+        tmp_path,
+        {
+            "architecture": "htdemucs",
+            "license": "my own terms",
+            "sources": config["sources"],
+            "config": config,
+            "models": [{"format": "safetensors", "path": str(weights)}],
+        },
+    )
+
+    repo = ModelRepository(extra_models=extra)
+    listed = repo.list_models()["custom"]
+    assert listed["backend"] == "demucs", "backend should follow from architecture"
+    assert listed["license"] == "my own terms", "licence is a pass-through label"
+
+    model = repo.get_model("custom")
+    assert isinstance(model, HTDemucs)
+    assert model.sources == ["a", "b"]
+
+    # A file the user owns is not cache: nothing to fetch, nothing to account
+    # for, and ``models remove`` must never unlink it.
+    assert repo.is_fully_local("custom")
+    assert repo.local_artifacts("custom") == [weights]
+    assert repo.required_layers("custom") == []
+    assert repo.get_cache_info() == {}
+    assert repo.remove_model("custom") is False
+    assert weights.is_file()
+
+
+def test_demucs_layer_from_a_url_is_fetched_once_then_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An https layer is downloaded once into the content-addressed cache and
+    served from there afterwards, so repeated runs don't refetch it.
+    """
+    weights, config = _tiny_demucs_layer(tmp_path)
+    payload = weights.read_bytes()
+    digest = sha256(payload).hexdigest()
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(cache))
+    url = "https://example.invalid/layer.safetensors"
+    extra = _extra_models_file(
+        tmp_path,
+        {
+            "architecture": "htdemucs",
+            "sources": config["sources"],
+            "config": config,
+            "models": [
+                {
+                    "format": "safetensors",
+                    "url": url,
+                    "sha256": digest,
+                    "size_bytes": len(payload),
+                }
+            ],
+        },
+    )
+
+    downloads: list[str] = []
+
+    def fake_download(
+        self: ModelRepository, *, url: str, cache_path: Path, **_: object
+    ) -> None:
+        """Stand in for the network by promoting known-good bytes."""
+        del self
+        downloads.append(url)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(payload)
+
+    monkeypatch.setattr(ModelRepository, "_download_verified_file", fake_download)
+
+    repo = ModelRepository(extra_models=extra)
+    # No explicit ``checksum``: the cache filename comes from the digest.
+    cached = cache / f"{digest[:16]}.safetensors"
+    assert repo.required_layers("custom") == [digest[:16]]
+
+    repo.get_model("custom")
+    assert downloads == [url]
+    assert cached.is_file()
+
+    # A second repository re-verifies the cached bytes instead of refetching.
+    ModelRepository(extra_models=extra).get_model("custom")
+    assert downloads == [url]
+
+    entry = repo.get_cache_info()["custom"]
+    assert entry["complete"] is True
+    assert entry["size_bytes"] == len(payload)
+    assert repo.remove_model("custom") is True
+    assert not cached.exists()
+
+
+def test_mixed_local_and_remote_layers_only_account_for_the_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ensemble may mix a local layer with a downloaded one; only the remote
+    layer is something the cache can report on.
+    """
+    weights, config = _tiny_demucs_layer(tmp_path)
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
+    extra = _extra_models_file(
+        tmp_path,
+        {
+            "architecture": "htdemucs",
+            "sources": config["sources"],
+            "config": config,
+            "models": [
+                {"format": "safetensors", "path": str(weights)},
+                {
+                    "format": "safetensors",
+                    "url": "https://example.invalid/second.safetensors",
+                    "sha256": "b" * 64,
+                    "size_bytes": 8,
+                },
+            ],
+        },
+    )
+
+    repo = ModelRepository(extra_models=extra)
+    assert repo.is_fully_local("custom") is False
+    assert repo.local_artifacts("custom") == [weights]
+    assert repo.required_layers("custom") == ["b" * 16]
+
+
+def test_entry_without_a_known_architecture_is_rejected(tmp_path: Path) -> None:
+    """An entry naming neither a backend nor a known architecture fails."""
+    bad = {
+        "models": {
+            "mystery": {
+                "architecture": "wavenet",
+                "sources": ["a"],
+                "config": {"a": 1},
+                "checkpoint": {
+                    "format": "safetensors",
+                    "path": "/models/mystery.safetensors",
+                },
+            }
+        }
+    }
+    with pytest.raises(ModelLoadingError, match="known architecture"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
+
+
+def test_backend_cannot_build_a_foreign_architecture(tmp_path: Path) -> None:
+    """A backend/architecture pair from different families is rejected."""
+    bad = _good_metadata()
+    bad["models"]["fakemodel"]["architecture"] = "scnet"
+    with pytest.raises(ModelLoadingError, match="cannot build"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
+
+
+def test_single_checkpoint_entries_are_validated_at_construction(
+    tmp_path: Path,
+) -> None:
+    """
+    Every backend's artifacts are checked up front. An SCNet entry with an
+    unverifiable download used to construct fine and fail mid-``get_model``.
+    """
+    bad = {
+        "models": {
+            "custom_scnet": {
+                "architecture": "scnet_masked",
+                "sources": ["vocals", "other"],
+                "samplerate": 44100,
+                "segment_samples": 44100,
+                "config": {"dims": [4, 8]},
+                "checkpoint": {
+                    "format": "safetensors",
+                    "url": "https://example.invalid/x.safetensors",
+                },
+            }
+        }
+    }
+    with pytest.raises(ModelLoadingError, match="sha256"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
+
+
+@pytest.mark.parametrize(
+    "checkpoint, expected",
+    [
+        (
+            {
+                "format": "safetensors",
+                "url": "http://example.invalid/x.safetensors",
+                "sha256": "a" * 64,
+                "size_bytes": 1,
+            },
+            "https",
+        ),
+        (
+            {
+                "format": "safetensors",
+                "path": "/models/x.safetensors",
+                "url": "https://example.invalid/x.safetensors",
+                "sha256": "a" * 64,
+                "size_bytes": 1,
+            },
+            "pick one",
+        ),
+        ({"format": "safetensors"}, "local path or an https url"),
+        ({"format": "pickle", "path": "/models/x.pt"}, "Safetensors"),
+    ],
+    ids=["plain-http", "both-sources", "no-source", "not-safetensors"],
+)
+def test_artifact_source_rules_are_enforced(
+    tmp_path: Path, checkpoint: dict, expected: str
+) -> None:
+    """Every artifact is one Safetensors file, named locally or over https."""
+    bad = {
+        "models": {
+            "custom_scnet": {
+                "architecture": "scnet",
+                "sources": ["vocals", "other"],
+                "samplerate": 44100,
+                "segment_samples": 44100,
+                "config": {"dims": [4, 8]},
+                "checkpoint": checkpoint,
+            }
+        }
+    }
+    with pytest.raises(ModelLoadingError, match=expected):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
+
+
+def _local_htdemucs_entry(weights: Path, config: dict) -> dict:
+    """
+    A one-checkpoint entry for the tiny local HTDemucs.
+
+    :param weights: Path to the saved checkpoint.
+    :param config: Its constructor config.
+    :return: A registry entry.
+    """
+    return {
+        "architecture": "htdemucs",
+        "sources": config["sources"],
+        "config": config,
+        "checkpoint": {"format": "safetensors", "path": str(weights)},
+    }
+
+
+def test_ensemble_members_build_and_honour_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A ``members`` list builds an ensemble; a one-hot column still collapses to
+    the single contributing member when a stem is isolated.
+    """
+    from unblend.apply import ModelEnsemble
+    from unblend.htdemucs import HTDemucs
+
+    weights, config = _tiny_demucs_layer(tmp_path)
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
+    artifact = {"format": "safetensors", "path": str(weights)}
+    extra = _extra_models_file(
+        tmp_path,
+        {
+            "architecture": "htdemucs",
+            "sources": config["sources"],
+            "config": config,
+            "members": [{"checkpoint": artifact}, {"checkpoint": artifact}],
+            "weights": [[1.0, 0.0], [0.0, 1.0]],
+        },
+    )
+
+    repo = ModelRepository(extra_models=extra)
+    ensemble = repo.get_model("custom")
+    assert isinstance(ensemble, ModelEnsemble)
+    assert len(ensemble.models) == 2
+
+    # One contributor for stem "b", so isolating it builds that member alone.
+    isolated = repo.get_model("custom", only_load="b")
+    assert isinstance(isolated, HTDemucs)
+    assert repo.required_layers("custom", only_load="b") == []
+
+
+def test_member_can_reference_another_registered_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ensemble can be built out of models that are already registered, which
+    is how a user combines shipped models without restating their config.
+    """
+    from unblend.apply import ModelEnsemble
+
+    weights, config = _tiny_demucs_layer(tmp_path)
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
+    extra = tmp_path / "extra-models.json"
+    extra.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "base": _local_htdemucs_entry(weights, config),
+                    "pair": {
+                        "sources": config["sources"],
+                        "combine": "max_wave",
+                        "members": [{"model": "base"}, {"model": "base"}],
+                    },
+                }
+            }
+        )
+    )
+
+    repo = ModelRepository(extra_models=extra)
+    ensemble = repo.get_model("pair")
+    assert isinstance(ensemble, ModelEnsemble)
+    assert len(ensemble.models) == 2
+    assert ensemble.combine_mode == "max_wave"
+    # The referenced model's own fields carried over, unstated by the ensemble.
+    assert repo.list_models()["pair"]["backend"] == "demucs"
+    assert repo.is_fully_local("pair")
+
+
+def test_heterogeneous_members_report_the_ensemble_backend(tmp_path: Path) -> None:
+    """
+    An entry whose members are built by different families has no single
+    backend, so it reports ``ensemble``.
+    """
+    metadata = {
+        "models": {
+            "mixed": {
+                "sources": ["vocals", "other"],
+                "members": [
+                    {
+                        "architecture": "htdemucs",
+                        "config": {"sources": ["vocals", "other"]},
+                        "checkpoint": {
+                            "format": "safetensors",
+                            "path": "/models/htdemucs.safetensors",
+                        },
+                    },
+                    {
+                        "architecture": "mel_band_roformer",
+                        "config": {"dim": 16},
+                        "samplerate": 44100,
+                        "segment_samples": 44100,
+                        "checkpoint": {
+                            "format": "safetensors",
+                            "path": "/models/melband.safetensors",
+                        },
+                    },
+                ],
+            }
+        }
+    }
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
+    assert repo.list_models()["mixed"]["backend"] == "ensemble"
+
+
+def test_ensemble_can_mix_architectures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An HTDemucs and an SCNet combine in one ensemble even though they disagree
+    about normalisation: the ensemble takes raw audio and normalises around the
+    member that wants it.
+    """
+    from unblend.apply import ModelEnsemble
+
+    stems = ["drums", "bass", "other", "vocals"]
+    demucs_weights, demucs_config = _tiny_demucs_layer(tmp_path, stems)
+    scnet_weights, scnet_config = _tiny_scnet_checkpoint(tmp_path, stems)
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
+    extra = _extra_models_file(
+        tmp_path,
+        {
+            "sources": stems,
+            "combine": "max_wave",
+            "weights": [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
+            "members": [
+                {
+                    "architecture": "htdemucs",
+                    "config": demucs_config,
+                    "checkpoint": {
+                        "format": "safetensors",
+                        "path": str(demucs_weights),
+                    },
+                },
+                {
+                    "architecture": "scnet",
+                    "config": scnet_config,
+                    "samplerate": demucs_config["samplerate"],
+                    "segment_samples": 4096,
+                    "checkpoint": {
+                        "format": "safetensors",
+                        "path": str(scnet_weights),
+                    },
+                },
+            ],
+        },
+    )
+
+    repo = ModelRepository(extra_models=extra)
+    assert repo.list_models()["custom"]["backend"] == "ensemble"
+
+    ensemble = repo.get_model("custom")
+    assert isinstance(ensemble, ModelEnsemble)
+    # HTDemucs wants normalised audio, SCNet raw, so the caller supplies raw
+    # and the HTDemucs member is normalised around its own pass.
+    assert ensemble.member_normalization == [True, False]
+    assert ensemble.external_normalization is False
+
+    from unblend.htdemucs import HTDemucs
+    from unblend.scnet import SCNet
+
+    assert isinstance(ensemble.models[0], HTDemucs)
+    assert isinstance(ensemble.models[1], SCNet)
+    assert ensemble.sources == stems
+    # What the members then receive is covered exactly, on affine stand-ins,
+    # by test_apply's normalisation tests.
+
+
+@pytest.mark.parametrize(
+    "entries, expected",
+    [
+        (
+            {"a": {"sources": ["x"], "members": [{"model": "nope"}]}},
+            "references unknown model",
+        ),
+        (
+            {
+                "a": {"sources": ["x"], "members": [{"model": "b"}]},
+                "b": {"sources": ["x"], "members": [{"model": "a"}]},
+            },
+            "reference cycle",
+        ),
+    ],
+    ids=["unknown-reference", "cycle"],
+)
+def test_bad_member_references_are_rejected(
+    tmp_path: Path, entries: dict, expected: str
+) -> None:
+    """A member reference must name a real, single, non-recursive model."""
+    with pytest.raises(ModelLoadingError, match=expected):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, {"models": entries}))
+
+
+def test_reference_to_an_ensemble_is_rejected(tmp_path: Path) -> None:
+    """Members must be single models: nesting ensembles is not supported."""
+    weights, config = _tiny_demucs_layer(tmp_path)
+    metadata = {
+        "models": {
+            "base": _local_htdemucs_entry(weights, config),
+            "pair": {
+                "sources": config["sources"],
+                "members": [{"model": "base"}, {"model": "base"}],
+            },
+            "nested": {
+                "sources": config["sources"],
+                "members": [{"model": "pair"}, {"model": "base"}],
+            },
+        }
+    }
+    with pytest.raises(ModelLoadingError, match="itself an ensemble"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
+
+
+def test_referenced_member_must_emit_the_same_stems(tmp_path: Path) -> None:
+    """Members have to agree on stem names and order, so mismatches fail early."""
+    weights, config = _tiny_demucs_layer(tmp_path)
+    metadata = {
+        "models": {
+            "base": _local_htdemucs_entry(weights, config),
+            "pair": {
+                "sources": list(reversed(config["sources"])),
+                "members": [{"model": "base"}],
+            },
+        }
+    }
+    with pytest.raises(ModelLoadingError, match="same stems in the same order"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
+
+
+def test_entry_must_name_its_weights_exactly_once(tmp_path: Path) -> None:
+    """``checkpoint``, ``members`` and ``models`` are mutually exclusive."""
+    weights, config = _tiny_demucs_layer(tmp_path)
+    entry = _local_htdemucs_entry(weights, config)
+    entry["members"] = [{"checkpoint": entry["checkpoint"]}]
+    with pytest.raises(ModelLoadingError, match="exactly one of"):
+        ModelRepository(
+            metadata_path=_write_metadata(tmp_path, {"models": {"custom": entry}})
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"weights": [[1.0, 1.0]]}, "one weight row per member"),
+        ({"weights": [[1.0], [1.0]]}, "must contain 2 source weights"),
+        ({"weights": [[1.0, 0.0], [1.0, 0.0]]}, "no member contributing"),
+        (
+            {"weights": [[0.5, 1.0], [1.0, 1.0]], "combine": "min_fft"},
+            "participation mask",
+        ),
+        ({"combine": "telepathy"}, "Unknown ensemble combine mode"),
+        (
+            {"combine": "min_fft", "combine_params": {"n_fft": 1000}},
+            "whole multiple",
+        ),
+    ],
+    ids=[
+        "row-count",
+        "row-width",
+        "orphan-stem",
+        "non-binary-mask",
+        "unknown-mode",
+        "bad-geometry",
+    ],
+)
+def test_ensemble_combination_is_validated_offline(
+    tmp_path: Path, overrides: dict, expected: str
+) -> None:
+    """
+    How members combine is checked when the repository is built, so a bad
+    recipe never survives to a download.
+    """
+    weights, config = _tiny_demucs_layer(tmp_path)
+    artifact = {"format": "safetensors", "path": str(weights)}
+    entry = {
+        "architecture": "htdemucs",
+        "sources": config["sources"],
+        "config": config,
+        "members": [{"checkpoint": artifact}, {"checkpoint": artifact}],
+        **overrides,
+    }
+    with pytest.raises(ModelLoadingError, match=expected):
+        ModelRepository(
+            metadata_path=_write_metadata(tmp_path, {"models": {"custom": entry}})
+        )

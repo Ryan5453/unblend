@@ -1640,7 +1640,7 @@ def build_roformer(
     load a checkpoint into it.
 
     :param architecture: ``"bs_roformer"`` or ``"mel_band_roformer"``.
-    :param config: Constructor kwargs, as stored in ``metadata.json``
+    :param config: Constructor kwargs, as stored in ``metadata.yaml``
         (mirrors the reference config-file ``model:`` section).
     :param sources: Output stem names (see
         ``_RoformerBase.configure_inference`` for the single-stem
@@ -1668,4 +1668,4 @@ def build_roformer(
 
 from . import backends as _backends  # noqa: E402  (avoids an import cycle)
 
-_backends.register_backend("roformer", build_roformer)
+_backends.register_backend("roformer", build_roformer, _ARCHITECTURES)

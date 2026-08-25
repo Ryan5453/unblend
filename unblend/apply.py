@@ -60,26 +60,413 @@ def _looks_like_cuda_oom(exc: BaseException) -> bool:
 Model: TypeAlias = HTDemucs | _RoformerBase
 
 
+#: Default way to combine an ensemble's members: the per-source weighted mean
+#: that Demucs bags have always used.
+COMBINE_DEFAULT = "weighted_mean"
+
+#: Modes that are the same operation under another project's name. Recipes are
+#: written in these vocabularies, so they are accepted verbatim rather than
+#: forcing a translation step.
+COMBINE_ALIASES: dict[str, str] = {
+    # MSST's weighted waveform average is exactly ``weighted_mean``.
+    "avg_wave": COMBINE_DEFAULT,
+    # UVR's Min/Max Spec take the whole complex bin from whichever member has
+    # the smaller/larger magnitude, which is what min_fft/max_fft do. The two
+    # differ only in STFT geometry, which ``combine_params`` controls.
+    "uvr_min_spec": "min_fft",
+    "uvr_max_spec": "max_fft",
+}
+
+#: Modes that *select* among members per sample or per frequency bin instead of
+#: blending them. A real-valued weight has nowhere to apply in a min or a
+#: median, so these require a 0/1 participation mask. Upstream tools silently
+#: ignore weights here; rejecting them means a recipe never quietly does
+#: something other than what it says.
+COMBINE_SELECTION_MODES = frozenset(
+    {"median_wave", "min_wave", "max_wave", "median_fft", "min_fft", "max_fft"}
+)
+
+#: Modes that work on the STFT rather than the waveform.
+COMBINE_SPECTRAL_MODES = frozenset({"avg_fft", "median_fft", "min_fft", "max_fft"})
+
+#: Every accepted ``combine`` value.
+COMBINE_MODES = (
+    frozenset({COMBINE_DEFAULT})
+    | COMBINE_SELECTION_MODES
+    | COMBINE_SPECTRAL_MODES
+    | frozenset(COMBINE_ALIASES)
+)
+
+#: STFT geometry for the spectral modes, matching MSST's ensemble script.
+DEFAULT_COMBINE_STFT: dict[str, int] = {"n_fft": 1024, "hop_length": 256}
+
+
+def canonical_combine(mode: str) -> str:
+    """
+    Resolve a combine mode to the implementation that runs it.
+
+    :param mode: Mode name as written in metadata.
+    :return: The canonical mode name.
+    :raises ValidationError: If the mode is not one Unblend implements.
+    """
+    if not isinstance(mode, str) or mode not in COMBINE_MODES:
+        raise ValidationError(
+            f"Unknown ensemble combine mode {mode!r}; expected one of "
+            f"{', '.join(sorted(COMBINE_MODES))}."
+        )
+    return COMBINE_ALIASES.get(mode, mode)
+
+
+def validate_combine_weights(mode: str, weights: list[list[float]] | None) -> None:
+    """
+    Enforce the weight contract for a combine mode.
+
+    :param mode: Mode name, alias or canonical.
+    :param weights: The per-member, per-source weight matrix, or ``None``.
+    :raises ValidationError: If a selection mode was given weights that are not
+        a 0/1 participation mask.
+    """
+    if weights is None or canonical_combine(mode) not in COMBINE_SELECTION_MODES:
+        return
+    for row_index, row in enumerate(weights):
+        for column, value in enumerate(row):
+            if float(value) not in (0.0, 1.0):
+                raise ValidationError(
+                    f"combine={mode!r} selects among members rather than "
+                    "blending them, so its weights must be a 0/1 participation "
+                    f"mask; weights[{row_index}][{column}] is {value}."
+                )
+
+
+def resolve_combine_params(params: dict | None) -> dict[str, int]:
+    """
+    Fill in and check the STFT geometry used by the spectral modes.
+
+    :param params: Caller-supplied overrides, or ``None`` for the defaults.
+    :return: Complete ``{"n_fft", "hop_length"}`` geometry.
+    :raises ValidationError: If a value is not a positive integer, or if the
+        two are not commensurate.
+    """
+    resolved = dict(DEFAULT_COMBINE_STFT)
+    for key in ("n_fft", "hop_length"):
+        if params is None or key not in params:
+            continue
+        value = params[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValidationError(
+                f"combine_params[{key!r}] must be a positive integer, got {value!r}."
+            )
+        resolved[key] = value
+    if resolved["n_fft"] % resolved["hop_length"]:
+        raise ValidationError(
+            "combine_params: n_fft must be a whole multiple of hop_length so "
+            "that block boundaries land on the same frame grid a whole-track "
+            "transform would use."
+        )
+    return resolved
+
+
+#: Floor keeping the reverse of the normalisation well-defined for silence.
+#: Must stay identical to ``Separator._normalize``.
+NORMALIZATION_EPSILON = 1e-5
+
+
+def normalization_stats(mix: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Track-level mean and standard deviation, the way the Demucs lineage
+    normalises.
+
+    Mirrors ``Separator._normalize`` exactly — the same channel reduction and
+    the same Bessel correction — because a member normalised here must see what
+    it would have seen running alone.
+
+    :param mix: ``[batch, channels, samples]`` audio.
+    :return: ``(mean, std)``, one of each per batch entry.
+    """
+    reference = mix.mean(dim=-2)
+    mean = reference.mean(dim=-1)
+    # Preserve the training-time sample standard deviation for normal audio,
+    # but avoid the undefined one-sample Bessel correction.
+    correction = 1 if reference.shape[-1] > 1 else 0
+    std = reference.std(dim=-1, correction=correction)
+    return mean, std
+
+
+def _normalize_mix(mix: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+    """
+    Apply track-level normalisation to a batch of mixtures.
+
+    :param mix: ``[batch, channels, samples]`` audio.
+    :param mean: Per-batch means from :func:`normalization_stats`.
+    :param std: Per-batch deviations from :func:`normalization_stats`.
+    :return: The normalised audio.
+    """
+    shape = (-1,) + (1,) * (mix.dim() - 1)
+    return (mix - mean.reshape(shape)) / (NORMALIZATION_EPSILON + std.reshape(shape))
+
+
+def _denormalize_sources(sources: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+    """
+    Undo :func:`_normalize_mix` on a member's separated sources.
+
+    :param sources: ``[batch, stems, channels, samples]`` estimates.
+    :param mean: The means used to normalise.
+    :param std: The deviations used to normalise.
+    :return: Sources back in the input's scale.
+    """
+    shape = (-1,) + (1,) * (sources.dim() - 1)
+    return sources * (NORMALIZATION_EPSILON + std.reshape(shape)) + mean.reshape(shape)
+
+
+def sole_contributor(weights: list[list[float]], stem_index: int) -> int | None:
+    """
+    The one member a stem's output depends on, when only one contributes.
+
+    Every combine mode collapses to the identity over a single member -- a mean
+    of one, a median of one, a min of one -- which is what lets
+    ``--isolate-stem vocals`` on a bag of specialists fetch and run a single
+    checkpoint whatever the mode is.
+
+    :param weights: Per-member, per-source weight matrix.
+    :param stem_index: Index of the stem within ``sources``.
+    :return: The member's index, or ``None`` if none or several contribute.
+    """
+    contributors = [
+        index
+        for index, row in enumerate(weights)
+        if stem_index < len(row) and abs(float(row[stem_index])) > 1e-9
+    ]
+    return contributors[0] if len(contributors) == 1 else None
+
+
+def _select_by_magnitude(stacked: Tensor, mode: str) -> Tensor:
+    """
+    Reduce over dim 0 by ranking values on magnitude.
+
+    ``min``/``max`` keep the value with the smallest/largest absolute value,
+    sign and (for a spectrogram) phase included -- the convention MSST and UVR
+    both use. ``median`` ranks by magnitude and takes the middle value,
+    averaging the two middles for an even member count. Note that MSST's
+    ``median_fft`` instead inherits numpy's lexicographic ordering of complex
+    numbers, which ranks by real part first; ranking by magnitude is the
+    consistent reading and is what the other spectral modes do.
+
+    :param stacked: Real or complex tensor whose dim 0 indexes members.
+    :param mode: ``"min"``, ``"max"`` or ``"median"``.
+    :return: The reduced tensor, without dim 0.
+    """
+    magnitude = stacked.abs()
+    count = stacked.shape[0]
+    middle = count // 2
+    if mode == "min":
+        index = magnitude.argmin(dim=0, keepdim=True)
+    elif mode == "max":
+        index = magnitude.argmax(dim=0, keepdim=True)
+    else:
+        order = magnitude.argsort(dim=0)
+        if count % 2 == 0:
+            lower = torch.gather(stacked, 0, order.narrow(0, middle - 1, 1))
+            upper = torch.gather(stacked, 0, order.narrow(0, middle, 1))
+            return ((lower + upper) / 2).squeeze(0)
+        index = order.narrow(0, middle, 1)
+    return torch.gather(stacked, 0, index).squeeze(0)
+
+
+def _median_signed(stacked: Tensor) -> Tensor:
+    """
+    Element-wise median of signed values over dim 0.
+
+    Averages the two middles for an even member count, as numpy's ``median``
+    does -- ``torch.median`` would return the lower of the two.
+
+    :param stacked: Real tensor whose dim 0 indexes members.
+    :return: The median, without dim 0.
+    """
+    ordered, _ = stacked.sort(dim=0)
+    count = stacked.shape[0]
+    middle = count // 2
+    if count % 2:
+        return ordered.narrow(0, middle, 1).squeeze(0)
+    pair = ordered.narrow(0, middle - 1, 1) + ordered.narrow(0, middle, 1)
+    return pair.squeeze(0) / 2
+
+
+def _reduce_waveforms(parts: list[Tensor], mode: str) -> Tensor:
+    """
+    Combine one stem's per-member waveforms.
+
+    :param parts: One ``[B, C, T]`` tensor per contributing member.
+    :param mode: Canonical waveform mode.
+    :return: The combined ``[B, C, T]`` waveform.
+    """
+    stacked = torch.stack(parts)
+    if mode == "median_wave":
+        return _median_signed(stacked)
+    return _select_by_magnitude(stacked, "min" if mode == "min_wave" else "max")
+
+
+def _reduce_spectra(stacked: Tensor, mode: str, weights: Tensor) -> Tensor:
+    """
+    Combine stacked complex spectrograms.
+
+    :param stacked: ``[members, ...]`` complex spectrograms.
+    :param mode: Canonical spectral mode.
+    :param weights: Per-member weights, used only by ``avg_fft``.
+    :return: The combined spectrogram, without dim 0.
+    """
+    if mode == "avg_fft":
+        shape = (-1,) + (1,) * (stacked.dim() - 1)
+        scaled = stacked * weights.reshape(shape).to(stacked.dtype)
+        return scaled.sum(dim=0) / weights.sum()
+    if mode == "median_fft":
+        return _select_by_magnitude(stacked, "median")
+    return _select_by_magnitude(stacked, "min" if mode == "min_fft" else "max")
+
+
+def _reduce_spectral(
+    parts: list[Tensor], mode: str, weights: list[float], stft: dict[str, int]
+) -> Tensor:
+    """
+    Combine one stem's per-member waveforms in the STFT domain.
+
+    Done in blocks so peak memory tracks the block, not the track: a spectrogram
+    is several times the size of the waveform it came from, and a six-minute
+    track would otherwise need gigabytes per member. Blocks and their margins
+    are whole numbers of hops, so every frame lands exactly where a whole-track
+    transform would put it, and the margins are discarded so the modified
+    spectrum's edge effects never reach the output.
+
+    :param parts: One ``[B, C, T]`` tensor per contributing member.
+    :param mode: Canonical spectral mode.
+    :param weights: Per-member weights for this stem.
+    :param stft: ``{"n_fft", "hop_length"}`` geometry.
+    :return: The combined ``[B, C, T]`` waveform.
+    """
+    n_fft = stft["n_fft"]
+    hop = stft["hop_length"]
+    reference = parts[0]
+    total = reference.shape[-1]
+    window = torch.hann_window(n_fft, device=reference.device, dtype=torch.float32)
+    weight_tensor = torch.tensor(weights, dtype=torch.float32, device=reference.device)
+    margin = n_fft * 4
+    block = max(hop * 8192, margin * 4)
+
+    combined = torch.empty_like(reference)
+    start = 0
+    while start < total:
+        stop = min(start + block, total)
+        # Margins are whole hops and ``start`` is a whole number of blocks, so
+        # the frame grid is identical in every block.
+        left = min(margin, start)
+        right = min(margin, total - stop)
+        length = left + (stop - start) + right
+        spectra = torch.stack(
+            [
+                torch.stft(
+                    part[..., start - left : stop + right].reshape(-1, length).float(),
+                    n_fft,
+                    hop,
+                    window=window,
+                    return_complex=True,
+                    center=True,
+                    pad_mode="constant",
+                )
+                for part in parts
+            ]
+        )
+        waveform = torch.istft(
+            _reduce_spectra(spectra, mode, weight_tensor),
+            n_fft,
+            hop,
+            window=window,
+            length=length,
+            center=True,
+        ).reshape(reference.shape[:-1] + (length,))
+        combined[..., start:stop] = waveform[..., left : left + (stop - start)].to(
+            combined.dtype
+        )
+        start = stop
+    return combined
+
+
+def combine_member_outputs(
+    members: list[Tensor],
+    weights: list[list[float]],
+    mode: str,
+    stft: dict[str, int],
+) -> Tensor:
+    """
+    Combine one mix's per-member outputs into a single result.
+
+    Contribution is per stem: a zero weight drops a member from that stem
+    entirely, so a stem with one contributor is copied through untouched
+    whatever the mode.
+
+    :param members: One ``[B, S, C, T]`` output per ensemble member.
+    :param weights: Per-member, per-source weight matrix.
+    :param mode: Canonical combine mode (never ``weighted_mean``, which is
+        accumulated in place as members finish).
+    :param stft: STFT geometry for the spectral modes.
+    :return: The combined ``[B, S, C, T]`` output.
+    """
+    combined = torch.empty_like(members[0])
+    for stem in range(combined.shape[1]):
+        contributing = [
+            index
+            for index in range(len(members))
+            if stem < len(weights[index]) and abs(float(weights[index][stem])) > 1e-9
+        ]
+        parts = [members[index][:, stem] for index in contributing]
+        if len(parts) == 1:
+            combined[:, stem] = parts[0]
+        elif mode in COMBINE_SPECTRAL_MODES:
+            combined[:, stem] = _reduce_spectral(
+                parts,
+                mode,
+                [float(weights[index][stem]) for index in contributing],
+                stft,
+            )
+        else:
+            combined[:, stem] = _reduce_waveforms(parts, mode)
+    return combined
+
+
 class ModelEnsemble(nn.Module):
     def __init__(
         self,
         models: list[Model],
         weights: list[list[float]] | None = None,
         segment: float | None = None,
+        combine: str = COMBINE_DEFAULT,
+        combine_params: dict | None = None,
     ) -> None:
         """
         Represents a model ensemble with specific weights.
         You should call ``apply_model`` rather than calling the forward directly
         for optimal performance.
 
-        :param models: List of Demucs models.
+        :param models: Ensemble members. They need not share an architecture,
+            but must agree on sources, sample rate, channel count, and the
+            external-normalization contract.
         :param weights: List of per-model weight lists. If ``None``, assumed to
             be all ones, otherwise a list of N lists (N number of models),
-            each containing S floats (S number of sources).
+            each containing S floats (S number of sources). For the selection
+            modes it is a 0/1 participation mask.
         :param segment: Overrides the ``segment`` attribute of each model
             (performed in-place, be careful if you reuse the models passed).
+        :param combine: How member outputs are combined; see ``COMBINE_MODES``.
+        :param combine_params: STFT geometry overrides for the spectral modes.
+        :raises ValidationError: If the mode is unknown, its weight contract is
+            violated, or the members disagree on the inference contract.
         """
         super().__init__()
+        # ``combine`` keeps the caller's spelling for display; ``combine_mode``
+        # is the implementation it resolves to, validated here so an unknown
+        # mode fails at construction rather than mid-separation.
+        self.combine = combine
+        self.combine_mode = canonical_combine(combine)
+        self.combine_params = resolve_combine_params(combine_params)
+        validate_combine_weights(combine, weights)
         if not models:
             raise ValidationError("ModelEnsemble requires at least one model.")
         if segment is not None and (
@@ -93,7 +480,15 @@ class ModelEnsemble(nn.Module):
             )
 
         first = models[0]
-        normalization = getattr(first, "external_normalization", True)
+        # Members may disagree about normalisation: HTDemucs wants track-level
+        # normalised audio, the other architectures want it raw. When they do,
+        # the ensemble takes raw audio and each member that needs normalising
+        # gets it applied (and undone) around its own pass, so selection modes
+        # compare real audio rather than differently-scaled numbers.
+        member_normalization = [
+            bool(getattr(other, "external_normalization", True)) for other in models
+        ]
+        normalization = all(member_normalization)
         for index, other in enumerate(models):
             if other.sources != first.sources:
                 raise ValidationError(
@@ -110,11 +505,6 @@ class ModelEnsemble(nn.Module):
                     f"Ensemble model {index} has {other.audio_channels} channels, "
                     f"expected {first.audio_channels}."
                 )
-            if getattr(other, "external_normalization", True) != normalization:
-                raise ValidationError(
-                    "Ensemble members must share the same external_normalization "
-                    "contract."
-                )
             maximum = float(other.max_allowed_segment)
             if not math.isfinite(maximum) or maximum <= 0:
                 raise ValidationError(
@@ -128,6 +518,9 @@ class ModelEnsemble(nn.Module):
         self.samplerate = first.samplerate
         self.sources = first.sources
         self.external_normalization = normalization
+        #: Per member, whether it expects normalised audio. Consulted only when
+        #: the ensemble itself takes raw audio (i.e. members disagree).
+        self.member_normalization = member_normalization
         self.models = nn.ModuleList(models)
 
         if weights is None:
@@ -163,6 +556,27 @@ class ModelEnsemble(nn.Module):
         # used before every inference (the public attribute remains mutable).
         self.weights = [list(row) for row in normalized_weights]
         self.validated_weight_totals()
+
+    def set_combine(self, combine: str, combine_params: dict | None = None) -> None:
+        """
+        Change how this ensemble combines its members.
+
+        Lets a caller try a mode against a registered ensemble without editing
+        metadata — ``unblend separate --combine min_fft`` is this. The mode and
+        its weight contract are revalidated, so an override cannot leave the
+        ensemble in a state its metadata would have been rejected for.
+
+        :param combine: Mode name, alias or canonical.
+        :param combine_params: STFT geometry overrides, or ``None`` to reset to
+            the defaults.
+        :raises ValidationError: If the mode is unknown or its weight contract
+            is violated by the current weights.
+        """
+        mode = canonical_combine(combine)
+        validate_combine_weights(combine, self.weights)
+        self.combine = combine
+        self.combine_mode = mode
+        self.combine_params = resolve_combine_params(combine_params)
 
     @property
     def max_allowed_segment(self) -> float:
@@ -497,6 +911,43 @@ def _should_restore_submodel_device(
     )
 
 
+def _run_ensemble_member(
+    sub_model: Model,
+    mixes: list[Tensor | TensorChunk],
+    *,
+    normalize: bool,
+    stats: list[tuple[Tensor, Tensor]] | None,
+    **kwargs: Any,
+) -> list[Tensor]:
+    """
+    Run one ensemble member, normalising around it if that is its contract.
+
+    An ensemble whose members disagree about normalisation takes raw audio, so
+    the members that want it normalised have it applied here and undone on
+    their output. Members are therefore combined in the input's own scale,
+    which is what the selection modes need to compare like with like.
+
+    :param sub_model: The member to run.
+    :param mixes: Staged input mixtures.
+    :param normalize: Whether this member needs normalisation applied here.
+    :param stats: Per-mix ``(mean, std)`` when any member needs them.
+    :param kwargs: Forwarded to :func:`apply_model_multi`.
+    :return: The member's per-mix estimates, in the input's scale.
+    """
+    if not normalize:
+        return apply_model_multi(sub_model, mixes, **kwargs)
+
+    assert stats is not None
+    normalized = [
+        _normalize_mix(mix, mean, std) for mix, (mean, std) in zip(mixes, stats)
+    ]
+    outputs = apply_model_multi(sub_model, normalized, **kwargs)
+    return [
+        _denormalize_sources(output, mean, std)
+        for output, (mean, std) in zip(outputs, stats)
+    ]
+
+
 def apply_model(
     model: ModelEnsemble | Model,
     mix: Tensor | TensorChunk,
@@ -729,36 +1180,42 @@ def apply_model_multi(
 
     if isinstance(model, ModelEnsemble):
         totals = model.validated_weight_totals()
-        # Same specialisation shortcut as apply_model: when use_only_stem points
-        # at a model that has a 1.0 weight for that stem (and zeros elsewhere),
-        # we can run that sub-model alone.
+        combine = getattr(model, "combine_mode", COMBINE_DEFAULT)
+
+        # When members disagree about normalisation the ensemble takes raw
+        # audio, so whichever members want it normalised get it here — computed
+        # once from the same staged mixes ``Separator`` would have used, so a
+        # member sees exactly what it would running alone.
+        member_normalization = list(
+            getattr(model, "member_normalization", [False] * len(model.models))
+        )
+        if getattr(model, "external_normalization", True):
+            member_normalization = [False] * len(model.models)
+        mix_stats: list[tuple[Tensor, Tensor]] | None = None
+        if any(member_normalization):
+            materialized = [
+                mix.padded(mix.length) if isinstance(mix, TensorChunk) else mix
+                for mix in mixes
+            ]
+            mix_stats = [normalization_stats(mix) for mix in materialized]
+            mixes = materialized
+        # Specialisation shortcut: when only one member contributes to the stem
+        # being isolated, every combine mode reduces to that member's output,
+        # so run it alone. This is what makes single-stem extraction from a bag
+        # of specialists cost one member's inference instead of all of them.
         if use_only_stem:
             try:
                 stem_index = model.sources.index(use_only_stem)
             except ValueError:
                 stem_index = None
             if stem_index is not None:
-                model_index: int | None = None
-                for i, weights in enumerate(model.weights):
-                    if (
-                        len(weights) > stem_index
-                        and abs(weights[stem_index] - 1.0) < 1e-6
-                        and all(
-                            abs(w) < 1e-6
-                            for j, w in enumerate(weights)
-                            if j != stem_index
-                        )
-                        and all(
-                            other_index == i or abs(other_weights[stem_index]) < 1e-6
-                            for other_index, other_weights in enumerate(model.weights)
-                        )
-                    ):
-                        model_index = i
-                        break
+                model_index = sole_contributor(model.weights, stem_index)
                 if model_index is not None:
-                    return apply_model_multi(
+                    return _run_ensemble_member(
                         model.models[model_index],
                         mixes,
+                        normalize=member_normalization[model_index],
+                        stats=mix_stats,
                         device=device,
                         shifts=shifts,
                         overlap=overlap,
@@ -824,13 +1281,22 @@ def apply_model_multi(
 
         sub_callback = ensemble_progress if progress_callback else None
 
+        # ``weighted_mean`` is linear, so it folds into a running accumulator
+        # and holds two tensors at a time. The selection and spectral modes are
+        # not: min, median and per-bin picks need every member's finished output
+        # side by side, so those buffer one output per member.
         results: list[Tensor] | None = None
-        for sub_model, model_weights in zip(model.models, model.weights):
+        buffered: list[list[Tensor]] = []
+        for member_index, (sub_model, model_weights) in enumerate(
+            zip(model.models, model.weights)
+        ):
             sub_param = next(sub_model.parameters(), None)
             sub_device = sub_param.device if sub_param is not None else None
-            sub_outs = apply_model_multi(
+            sub_outs = _run_ensemble_member(
                 sub_model,
                 mixes,
+                normalize=member_normalization[member_index],
+                stats=mix_stats,
                 device=device,
                 shifts=shifts,
                 overlap=overlap,
@@ -843,18 +1309,33 @@ def apply_model_multi(
             sub_models_done += 1
             if _should_restore_submodel_device(sub_model, sub_device, device):
                 sub_model.to(sub_device)
-            for k, inst_weight in enumerate(model_weights):
-                for sub_out in sub_outs:
-                    sub_out[:, k, :, :] *= inst_weight
-            if results is None:
-                results = sub_outs
+            if combine == COMBINE_DEFAULT:
+                for k, inst_weight in enumerate(model_weights):
+                    for sub_out in sub_outs:
+                        sub_out[:, k, :, :] *= inst_weight
+                if results is None:
+                    results = sub_outs
+                else:
+                    for acc, sub_out in zip(results, sub_outs):
+                        acc += sub_out
             else:
-                for acc, sub_out in zip(results, sub_outs):
-                    acc += sub_out
-        assert results is not None
-        for acc in results:
-            for k in range(acc.shape[1]):
-                acc[:, k, :, :] /= totals[k]
+                buffered.append(sub_outs)
+
+        if combine == COMBINE_DEFAULT:
+            assert results is not None
+            for acc in results:
+                for k in range(acc.shape[1]):
+                    acc[:, k, :, :] /= totals[k]
+        else:
+            results = [
+                combine_member_outputs(
+                    [member[index] for member in buffered],
+                    model.weights,
+                    combine,
+                    model.combine_params,
+                )
+                for index in range(len(mixes))
+            ]
         if progress_callback:
             progress_callback(
                 "processing_complete",

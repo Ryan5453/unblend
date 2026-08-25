@@ -219,12 +219,94 @@ def test_model_ensemble_propagates_contract_and_segment_cap() -> None:
     assert second.max_allowed_segment == 3.0
 
 
-def test_model_ensemble_rejects_mixed_normalization_contracts() -> None:
-    """Members requiring raw and externally-normalized audio cannot mix."""
-    raw = _DoublingModel()
-    raw.external_normalization = False
-    with pytest.raises(ValidationError, match="external_normalization"):
-        ModelEnsemble([_DoublingModel(), raw])
+class _OffsetModel(torch.nn.Module):
+    """
+    Adds a constant to the input, which is what makes normalisation visible:
+    an affine model run on normalised audio and scaled back returns
+    ``x + (1e-5 + std)`` rather than ``x + 1``.
+    """
+
+    sources = ["one", "two"]
+    samplerate = 100
+    audio_channels = 1
+    max_allowed_segment = 1.0
+
+    def __init__(self, external_normalization: bool) -> None:
+        """
+        :param external_normalization: Whether this member expects the caller
+            to have normalised its input.
+        """
+        super().__init__()
+        self.external_normalization = external_normalization
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Return ``x + 1`` as both sources.
+
+        :param x: Input of shape ``[batch, channels, samples]``.
+        :return: Output of shape ``[batch, 2, channels, samples]``.
+        """
+        return torch.stack([x + 1, x + 1], dim=1)
+
+
+def test_members_with_different_normalization_contracts_can_ensemble() -> None:
+    """
+    HTDemucs wants track-level normalised audio and the other architectures
+    want it raw; a mixed ensemble takes raw audio and normalises around the
+    members that need it, so each sees what it would see running alone.
+    """
+    ensemble = ModelEnsemble(
+        [_OffsetModel(True), _OffsetModel(False)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    assert ensemble.member_normalization == [True, False]
+    # The caller is handed raw audio, since one member could not use normalised.
+    assert ensemble.external_normalization is False
+
+    mix = torch.randn(1, 400)
+    reference = mix.mean(dim=0)
+    std = reference.std(correction=1)
+
+    out = apply_model(ensemble, mix)
+
+    torch.testing.assert_close(
+        out[:, 0], mix[None] + (1e-5 + std), rtol=1e-5, atol=1e-5
+    )
+    torch.testing.assert_close(out[:, 1], mix[None] + 1.0, rtol=1e-5, atol=1e-5)
+
+
+def test_uniform_normalization_contract_stays_with_the_caller() -> None:
+    """
+    When every member agrees, the contract is the ensemble's and normalisation
+    happens once in ``Separator`` — unchanged for the shipped Demucs bags.
+    """
+    ensemble = ModelEnsemble([_OffsetModel(True), _OffsetModel(True)])
+    assert ensemble.external_normalization is True
+
+    mix = torch.randn(1, 400)
+    out = apply_model(ensemble, mix)
+
+    # Nothing was normalised inside the ensemble: the members saw the raw input.
+    torch.testing.assert_close(out[:, 0], mix[None] + 1.0)
+
+
+def test_isolated_member_is_normalized_like_the_full_ensemble() -> None:
+    """
+    The single-member shortcut must apply that member's normalisation too —
+    skipping it would feed raw audio to a model expecting normalised.
+    """
+    ensemble = ModelEnsemble(
+        [_OffsetModel(True), _OffsetModel(False)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    mix = torch.randn(1, 400)
+    std = mix.mean(dim=0).std(correction=1)
+
+    out = apply_model(ensemble, mix, use_only_stem="one")
+
+    torch.testing.assert_close(
+        out[:, 0], mix[None] + (1e-5 + std), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_htdemucs_valid_length_matches_rounded_apply_segment() -> None:
@@ -643,3 +725,232 @@ def test_oom_during_accumulation_phase_is_retry_safe(monkeypatch) -> None:
     total = chunk_events[-1]["total_chunks"]
     assert chunk_events[-1]["completed_chunks"] == total
     assert all(d["completed_chunks"] <= total for d in chunk_events)
+
+
+class _ScalingModel(torch.nn.Module):
+    """
+    Stand-in model returning ``[a*x, b*x]``.
+
+    Pointwise and linear, so every combine mode's expected output is a known
+    multiple of the input: an average is the weighted mean of the scales, and
+    a magnitude-keyed pick is whichever scale has the smallest/largest
+    magnitude — in the waveform *and* the STFT domain, since the transform is
+    linear too.
+    """
+
+    sources = ["one", "two"]
+    samplerate = 100
+    audio_channels = 1
+    max_allowed_segment = 1.0
+    external_normalization = False
+
+    def __init__(self, first: float, second: float) -> None:
+        """
+        :param first: Scale applied for source ``one``.
+        :param second: Scale applied for source ``two``.
+        """
+        super().__init__()
+        self.scales = (first, second)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Scale the input independently per source.
+
+        :param x: Input of shape ``[batch, channels, samples]``.
+        :return: Output of shape ``[batch, 2, channels, samples]``.
+        """
+        return torch.stack([self.scales[0] * x, self.scales[1] * x], dim=1)
+
+
+@pytest.mark.parametrize(
+    "combine, expected_scale",
+    [
+        ("weighted_mean", 3.0),
+        ("avg_wave", 3.0),
+        ("median_wave", 2.0),
+        ("min_wave", 1.0),
+        ("max_wave", 6.0),
+        ("avg_fft", 3.0),
+        ("median_fft", 2.0),
+        ("min_fft", 1.0),
+        ("max_fft", 6.0),
+        ("uvr_min_spec", 1.0),
+        ("uvr_max_spec", 6.0),
+    ],
+)
+def test_combine_modes_reduce_members_as_specified(
+    combine: str, expected_scale: float
+) -> None:
+    """
+    Every mode combines three members exactly as its definition says.
+
+    Scales 1, 2 and 6 make the four reductions distinguishable: mean 3,
+    median 2, min 1, max 6.
+    """
+    members = [_ScalingModel(scale, scale) for scale in (1.0, 2.0, 6.0)]
+    ensemble = ModelEnsemble(members, combine=combine)
+    mix = torch.randn(1, 400)
+
+    out = apply_model(ensemble, mix)
+
+    torch.testing.assert_close(
+        out[:, 0], expected_scale * mix[None], rtol=2e-5, atol=2e-5
+    )
+    torch.testing.assert_close(
+        out[:, 1], expected_scale * mix[None], rtol=2e-5, atol=2e-5
+    )
+
+
+def test_selection_modes_reject_non_binary_weights() -> None:
+    """
+    Real-valued weights have nowhere to apply in a min or a median, so they
+    are rejected rather than silently ignored (as upstream tools do).
+    """
+    with pytest.raises(ValidationError, match="participation mask"):
+        ModelEnsemble(
+            [_ScalingModel(1.0, 1.0), _ScalingModel(2.0, 2.0)],
+            weights=[[0.5, 1.0], [1.0, 1.0]],
+            combine="min_wave",
+        )
+
+
+def test_weighted_mean_still_accepts_real_weights() -> None:
+    """The blending default keeps its per-source weighted average."""
+    ensemble = ModelEnsemble(
+        [_ScalingModel(1.0, 1.0), _ScalingModel(3.0, 3.0)],
+        weights=[[3.0, 1.0], [1.0, 1.0]],
+    )
+    mix = torch.randn(1, 200)
+
+    out = apply_model(ensemble, mix)
+
+    # Source one: (3*1 + 1*3)/4 = 1.5. Source two: (1 + 3)/2 = 2.
+    torch.testing.assert_close(out[:, 0], 1.5 * mix[None])
+    torch.testing.assert_close(out[:, 1], 2.0 * mix[None])
+
+
+@pytest.mark.parametrize("combine", ["min_wave", "max_fft", "median_wave"])
+def test_zero_weight_excludes_a_member_per_stem(combine: str) -> None:
+    """
+    Contribution is per stem: a zero drops that member from that stem, so a
+    stem with one contributor passes straight through under any mode.
+    """
+    ensemble = ModelEnsemble(
+        [_ScalingModel(5.0, 5.0), _ScalingModel(9.0, 9.0)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+        combine=combine,
+    )
+    mix = torch.randn(1, 300)
+
+    out = apply_model(ensemble, mix)
+
+    torch.testing.assert_close(out[:, 0], 5.0 * mix[None], rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(out[:, 1], 9.0 * mix[None], rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("combine", ["weighted_mean", "max_fft", "median_wave"])
+def test_isolate_stem_runs_one_member_under_every_mode(combine: str) -> None:
+    """
+    The single-stem shortcut is about contribution, not linearity: with one
+    contributor every mode reduces to that member, so only it runs.
+    """
+    calls: list[int] = []
+
+    class Counting(_ScalingModel):
+        """Records that its forward ran."""
+
+        def __init__(self, scale: float, tag: int) -> None:
+            super().__init__(scale, scale)
+            self.tag = tag
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Record the call, then scale as usual."""
+            calls.append(self.tag)
+            return super().forward(x)
+
+    ensemble = ModelEnsemble(
+        [Counting(4.0, 0), Counting(7.0, 1)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+        combine=combine,
+    )
+    mix = torch.randn(1, 200)
+
+    out = apply_model(ensemble, mix, use_only_stem="two")
+
+    assert set(calls) == {1}, "only the contributing member should run"
+    torch.testing.assert_close(out[:, 1], 7.0 * mix[None], rtol=2e-5, atol=2e-5)
+
+
+def test_spectral_combine_is_seamless_across_blocks() -> None:
+    """
+    The spectral modes transform in blocks to bound memory; a tiny geometry
+    forces several blocks, and the result must still be exact — a misaligned
+    frame grid or an undiscarded margin would show up as a seam.
+    """
+    ensemble = ModelEnsemble(
+        [_ScalingModel(1.0, 1.0), _ScalingModel(4.0, 4.0)],
+        combine="max_fft",
+        combine_params={"n_fft": 32, "hop_length": 8},
+    )
+    mix = torch.randn(1, 200_000)
+
+    out = apply_model(ensemble, mix)
+
+    torch.testing.assert_close(out[:, 0], 4.0 * mix[None], rtol=2e-4, atol=2e-4)
+
+
+def test_unknown_combine_mode_is_rejected() -> None:
+    """An unimplemented mode fails at construction, naming the alternatives."""
+    with pytest.raises(ValidationError, match="Unknown ensemble combine mode"):
+        ModelEnsemble([_ScalingModel(1.0, 1.0)], combine="telepathy")
+
+
+@pytest.mark.parametrize(
+    "params, expected",
+    [
+        ({"n_fft": 1000, "hop_length": 256}, "whole multiple"),
+        ({"n_fft": 0, "hop_length": 256}, "positive integer"),
+        ({"hop_length": 1.5}, "positive integer"),
+    ],
+)
+def test_combine_params_are_validated(params: dict, expected: str) -> None:
+    """STFT geometry has to be usable before any audio is processed."""
+    with pytest.raises(ValidationError, match=expected):
+        ModelEnsemble(
+            [_ScalingModel(1.0, 1.0)], combine="min_fft", combine_params=params
+        )
+
+
+def test_compile_is_applied_to_every_ensemble_member() -> None:
+    """
+    ``torch.compile`` targets each member's own hot path, so an ensemble
+    compiles member by member — including one whose members are different
+    architectures, where each has its own compiled core.
+    """
+    from unblend.api import Separator
+
+    compiled: list[int] = []
+
+    class Compilable(_OffsetModel):
+        """Records that its compiled core was swapped in and out."""
+
+        def __init__(self, tag: int, external_normalization: bool) -> None:
+            super().__init__(external_normalization)
+            self.tag = tag
+
+        def enable_compiled_core(self) -> None:
+            """Stand in for swapping in the compiled hot path."""
+            compiled.append(self.tag)
+
+        def disable_compiled_core(self) -> None:
+            """Stand in for restoring the eager hot path."""
+            compiled.remove(self.tag)
+
+    ensemble = ModelEnsemble([Compilable(0, True), Compilable(1, False)])
+    separator = Separator(model=ensemble, device="cpu")
+
+    separator._setup_compile()
+    assert sorted(compiled) == [0, 1], "every member should be compiled"
+
+    separator._teardown_compile_state()
+    assert compiled == [], "teardown must restore every member"

@@ -59,7 +59,7 @@ jobs:
       - name: Verify wheel contents
         run: |
           listing=$(unzip -l dist/*.whl)
-          echo "$listing" | grep -q "unblend/metadata.json"
+          echo "$listing" | grep -q "unblend/metadata.yaml"
           echo "$listing" | grep -qi "licenses/LICENSE"
           for kernel in unblend/metal/*.metal; do
             echo "$listing" | grep -q "$kernel"

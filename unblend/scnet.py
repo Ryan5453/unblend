@@ -934,7 +934,7 @@ def build_scnet(
     Construct an SCNet variant from registry metadata and load a checkpoint.
 
     :param architecture: Registered SCNet architecture name.
-    :param config: Constructor kwargs, as stored in ``metadata.json``.
+    :param config: Constructor kwargs, as stored in ``metadata.yaml``.
     :param sources: Output stem names.
     :param samplerate: Sample rate the checkpoint operates at.
     :param segment_samples: Training chunk length in samples.
@@ -957,4 +957,4 @@ def build_scnet(
     return model.eval()
 
 
-backends.register_backend("scnet", build_scnet)
+backends.register_backend("scnet", build_scnet, _ARCHITECTURES)

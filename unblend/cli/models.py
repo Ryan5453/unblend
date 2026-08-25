@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import os
 import time
 from pathlib import Path
 from typing import Annotated
@@ -19,7 +20,6 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .. import backends
 from ..apply import Model, ModelEnsemble
 from ..exceptions import ModelLoadingError
 from ..repo import ModelRepository
@@ -29,22 +29,19 @@ from .utils import console, format_file_size, get_models
 
 def _model_layer_count(info: dict) -> int:
     """
-    Return the number of independently downloaded files for a model.
+    Return the number of weight files a model is built from.
 
-    Demucs ensembles describe their files in ``models``; a RoFormer has one
-    checkpoint instead. Keeping that registry difference here prevents CLI
-    progress and summary code from assuming a Demucs-only metadata shape.
+    An ensemble lists them under ``members`` (or ``models``, the Demucs bags'
+    original spelling); anything else is a single checkpoint.
 
     :param info: One model's registry metadata.
     :return: Number of checkpoint files used by the model.
     """
-    # Every single-checkpoint backend is one layer; only the Demucs bags carry
-    # a "models" list. Checking the list rather than naming backends keeps this
-    # correct as architectures are added.
-    layers = info.get("models")
-    if not isinstance(layers, list):
-        return 1
-    return len(layers)
+    for key in ("members", "models"):
+        members = info.get(key)
+        if isinstance(members, list):
+            return len(members)
+    return 1
 
 
 def list_models_command() -> None:
@@ -71,13 +68,14 @@ def list_models_command() -> None:
         stems = ", ".join(info.get("sources", [])) or "N/A"
         license_label = info.get("license", "unknown")
 
-        # A locally-supplied checkpoint is never "downloaded" — it is simply
-        # present (or missing), so report it from disk rather than the cache.
-        local = (info.get("checkpoint") or {}).get("path")
-        if local:
-            local_path = Path(local).expanduser()
-            if local_path.is_file():
-                model_size = format_file_size(local_path.stat().st_size)
+        # Locally-supplied weights are never "downloaded" — they are simply
+        # present (or missing), so report them from disk rather than the cache.
+        if model_repo.is_fully_local(name):
+            paths = model_repo.local_artifacts(name)
+            if all(path.is_file() for path in paths):
+                model_size = format_file_size(
+                    sum(path.stat().st_size for path in paths)
+                )
                 status = "[green]Local[/green]"
             else:
                 model_size = "N/A"
@@ -330,14 +328,7 @@ def _download_model_with_progress(name: str, only_load: str | None = None) -> bo
     model_repo = ModelRepository()
 
     try:
-        info = models.get(name)
-        if (
-            info is not None
-            and info.get("backend") in backends.single_checkpoint_backends()
-        ):
-            layer_count = _model_layer_count(info)
-        else:
-            layer_count = len(model_repo.required_layers(name, only_load=only_load))
+        layer_count = len(model_repo.required_layers(name, only_load=only_load))
     except ModelLoadingError as error:
         console.print(f"[red]✗[/red] [bold]{escape(name)}[/bold]: {escape(str(error))}")
         return False
@@ -401,21 +392,18 @@ def ensure_model_available(name: str, only_load: str | None = None) -> bool:
         )
         return False
 
-    if info.get("backend") in backends.single_checkpoint_backends():
-        local = info.get("checkpoint", {}).get("path")
-        if local:
-            local_path = Path(local).expanduser()
-            if local_path.is_file():
-                return True
+    if model_repo.is_fully_local(name):
+        missing = [
+            path for path in model_repo.local_artifacts(name) if not path.is_file()
+        ]
+        if not missing:
+            return True
+        for path in missing:
             console.print(
                 f"[red]✗[/red] [bold]{escape(name)}[/bold]: Local checkpoint "
-                f"does not exist: {escape(str(local_path))}"
+                f"does not exist: {escape(str(path))}"
             )
-            return False
-        cached = model_repo.get_cache_info().get(name, {}).get("complete", False)
-        if cached:
-            return True
-        return _download_model_with_progress(name, only_load=only_load)
+        return False
 
     try:
         required = model_repo.required_layers(name, only_load=only_load)
@@ -460,6 +448,12 @@ def _download_models_batch(model_names: list[str]) -> None:
     to_download = []
     for name in model_names:
         if name in unknown:
+            continue
+        if model_repo.is_fully_local(name):
+            console.print(
+                f"[green]✓[/green] [bold]{escape(name)}[/bold]: Local weights, "
+                "nothing to download"
+            )
             continue
         # Partially-cached models (interrupted downloads) still need the
         # download pass; get_model fetches only the missing layers.
@@ -550,3 +544,192 @@ def _download_single_model_in_batch(
             f"{escape(str(e))}"
         )
         return False
+
+
+def _default_models_file() -> Path:
+    """
+    Where ``models import`` registers a model unless told otherwise.
+
+    Prefers the first path in ``UNBLEND_EXTRA_MODELS`` so a repeat import lands
+    in the file the user already loads.
+
+    :return: Path to the user models file.
+    """
+    configured = os.environ.get("UNBLEND_EXTRA_MODELS", "")
+    for entry in configured.split(os.pathsep):
+        if entry:
+            return Path(entry).expanduser()
+    return Path.home() / ".unblend" / "models.yaml"
+
+
+def import_model_command(
+    checkpoint: Annotated[
+        Path,
+        typer.Argument(
+            help="Checkpoint to import (.ckpt, .pt, .th or .safetensors)",
+            show_default=False,
+        ),
+    ],
+    name: Annotated[
+        str,
+        typer.Option("--name", "-n", help="Name to register the model under"),
+    ],
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Training config to translate (Music-Source-Separation-Training YAML, or JSON)",
+            show_default=False,
+        ),
+    ] = None,
+    architecture: Annotated[
+        str | None,
+        typer.Option(
+            "--architecture",
+            "-a",
+            help="Architecture; inferred from the weights when omitted",
+            show_default=False,
+        ),
+    ] = None,
+    stems: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--stem",
+            help="Output stem name, in order (repeat). Overrides the config.",
+            show_default=False,
+        ),
+    ] = None,
+    samplerate: Annotated[
+        int | None,
+        typer.Option("--samplerate", help="Sample rate the weights operate at"),
+    ] = None,
+    segment_samples: Annotated[
+        int | None,
+        typer.Option("--segment-samples", help="Training chunk length in samples"),
+    ] = None,
+    license_label: Annotated[
+        str,
+        typer.Option("--license", help="Licence label recorded in the entry"),
+    ] = "unknown",
+    note: Annotated[
+        str | None,
+        typer.Option("--note", help="Provenance note recorded in the entry"),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Where to write the converted weights",
+            show_default=False,
+        ),
+    ] = None,
+    models_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--models-file",
+            help="Models file to register in",
+            show_default=False,
+        ),
+    ] = None,
+    register: Annotated[
+        bool,
+        typer.Option(
+            "--register/--print",
+            help="Register the entry, or just print it",
+        ),
+    ] = True,
+) -> None:
+    """
+    Import a checkpoint from elsewhere: repackage it as Safetensors, prove it
+    loads, and register it.
+
+    :param checkpoint: Checkpoint to import
+    :param name: Name to register the model under
+    :param config: Training config to translate
+    :param architecture: Architecture, inferred when omitted
+    :param stems: Output stem names, overriding the config
+    :param samplerate: Sample rate the weights operate at
+    :param segment_samples: Training chunk length in samples
+    :param license_label: Licence label recorded in the entry
+    :param note: Provenance note recorded in the entry
+    :param output: Where to write the converted weights
+    :param models_file: Models file to register in
+    :param register: Register the entry, or print it instead
+    :raises typer.Exit: If the checkpoint cannot be imported
+    """
+    from ..exceptions import UnblendError
+    from ..importer import import_checkpoint, register_entry
+
+    if not checkpoint.is_file():
+        console.print(f"[red]✗[/red] No such checkpoint: {escape(str(checkpoint))}")
+        raise typer.Exit(1)
+
+    artifact = output or (Path.home() / ".unblend" / "imported" / f"{name}.safetensors")
+    artifact = artifact.expanduser()
+    if artifact.is_dir():
+        artifact = artifact / f"{name}.safetensors"
+
+    try:
+        entry, summary = import_checkpoint(
+            checkpoint,
+            artifact,
+            config_path=config,
+            architecture=architecture,
+            sources=stems or None,
+            samplerate=samplerate,
+            segment_samples=segment_samples,
+            license_label=license_label,
+            note=note,
+        )
+    except UnblendError as error:
+        console.print(f"[red]✗[/red] {escape(str(error))}")
+        raise typer.Exit(1) from error
+
+    console.print(
+        f"[green]✓[/green] Loaded as [bold]{summary['architecture']}[/bold] and "
+        f"strict-loaded {summary['tensors']} tensors"
+    )
+    console.print(
+        f"[green]✓[/green] Wrote [bold]{escape(str(artifact))}[/bold] "
+        f"({format_file_size(summary['size_bytes'])})"
+    )
+
+    if not register:
+        from ..config_io import dump_mapping
+
+        console.print(dump_mapping({"models": {name: entry}}, Path("entry.yaml")))
+        return
+
+    target = (models_file or _default_models_file()).expanduser()
+    try:
+        register_entry(target, name, entry)
+    except UnblendError as error:
+        console.print(f"[red]✗[/red] {escape(str(error))}")
+        raise typer.Exit(1) from error
+    console.print(
+        f"[green]✓[/green] Registered [bold]{escape(name)}[/bold] in "
+        f"{escape(str(target))}"
+    )
+
+    # Prove the round trip: the entry has to survive the registry's own
+    # validation, or the user finds out at separation time instead.
+    try:
+        ModelRepository(extra_models=target).list_models()[name]
+    except (ModelLoadingError, KeyError) as error:
+        console.print(
+            f"[red]✗[/red] The registered entry does not load: {escape(str(error))}"
+        )
+        raise typer.Exit(1) from error
+
+    configured = os.environ.get("UNBLEND_EXTRA_MODELS", "")
+    if str(target) not in configured:
+        console.print(
+            f"\n[yellow]![/yellow] Set [bold]UNBLEND_EXTRA_MODELS={escape(str(target))}"
+            "[/bold] for Unblend to see it:"
+        )
+        console.print(f"    export UNBLEND_EXTRA_MODELS={escape(str(target))}")
+    console.print(
+        f"\nTry it: [bold]unblend separate --model {escape(name)} track.wav[/bold]"
+    )

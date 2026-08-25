@@ -9,7 +9,12 @@ import sys
 import typer
 
 from .. import __version__
-from .models import download_models_command, list_models_command, remove_models_command
+from .models import (
+    download_models_command,
+    import_model_command,
+    list_models_command,
+    remove_models_command,
+)
 from .onnx import export_onnx_command
 from .separate import separate_command
 from .tune import tune_command
@@ -51,6 +56,10 @@ def build_app() -> typer.Typer:
     models_app.command(
         name="download", help="Download and cache models for offline use."
     )(download_models_command)
+    models_app.command(
+        name="import",
+        help="Import a checkpoint from elsewhere and register it.",
+    )(import_model_command)
     models_app.command(name="remove", help="Remove downloaded models from the cache.")(
         remove_models_command
     )

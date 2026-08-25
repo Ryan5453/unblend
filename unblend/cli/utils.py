@@ -7,12 +7,13 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import typer
 from rich.console import Console
 from rich.markup import escape
 
 console = Console()
 
-METADATA_PATH = Path(__file__).parent.parent / "metadata.json"
+METADATA_PATH = Path(__file__).parent.parent / "metadata.yaml"
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -75,6 +76,113 @@ def format_output_path(
     formatted_path = pattern.sub(lambda m: variables[m.group(0)[1:-1]], template)
 
     return Path(formatted_path)
+
+
+#: ``--model auto`` is not a registered model; it asks the CLI to pick one.
+AUTO_MODEL = "auto"
+
+
+def validate_model_name(value: str) -> str:
+    """
+    Accept any model the repository knows about, plus ``auto``.
+
+    Typer callback. The choices used to be a hand-written enum, which could
+    never name a model added through ``UNBLEND_EXTRA_MODELS`` — and had drifted
+    from the shipped registry besides.
+
+    :param value: The name the user passed.
+    :return: The same name, once known.
+    :raises typer.BadParameter: If no such model is registered.
+    """
+    if value == AUTO_MODEL:
+        return value
+    known = get_models()
+    if value not in known:
+        raise typer.BadParameter(
+            f"{value!r} is not a known model. Choose one of: "
+            f"{AUTO_MODEL}, {', '.join(known)}."
+        )
+    return value
+
+
+def validate_model_names(values: list[str] | None) -> list[str] | None:
+    """
+    Validate a repeatable ``--model`` option against the registry.
+
+    :param values: The names the user passed, if any.
+    :return: The same names, once known.
+    :raises typer.BadParameter: If any name is not registered.
+    """
+    if not values:
+        return values
+    return [validate_model_name(value) for value in values]
+
+
+def complete_model_name(incomplete: str) -> list[str]:
+    """
+    Shell completion for model names, including locally-added models.
+
+    :param incomplete: The partial name typed so far.
+    :return: Matching model names.
+    """
+    candidates = [AUTO_MODEL, *get_models()]
+    return [name for name in candidates if name.startswith(incomplete)]
+
+
+def _combine_modes() -> list[str]:
+    """
+    Every ensemble combine mode, sorted.
+
+    Imported lazily: ``unblend.apply`` pulls in torch, and the CLI's small
+    helpers must stay importable without it.
+
+    :return: The accepted mode names.
+    """
+    from ..apply import COMBINE_MODES
+
+    return sorted(COMBINE_MODES)
+
+
+def validate_combine_mode(value: str | None) -> str | None:
+    """
+    Accept any implemented ensemble combine mode.
+
+    :param value: The mode the user passed, or ``None`` to use the model's own.
+    :return: The same value, once known.
+    :raises typer.BadParameter: If no such mode exists.
+    """
+    if value is None:
+        return None
+    modes = _combine_modes()
+    if value not in modes:
+        raise typer.BadParameter(
+            f"{value!r} is not a known combine mode. Choose one of: {', '.join(modes)}."
+        )
+    return value
+
+
+def complete_combine_mode(incomplete: str) -> list[str]:
+    """
+    Shell completion for combine modes.
+
+    :param incomplete: The partial name typed so far.
+    :return: Matching mode names.
+    """
+    return [mode for mode in _combine_modes() if mode.startswith(incomplete)]
+
+
+def complete_stem_name(incomplete: str) -> list[str]:
+    """
+    Shell completion for stem names across every registered model.
+
+    Only completion: which stems are actually valid depends on the model that
+    ends up selected, so the check lives there.
+
+    :param incomplete: The partial name typed so far.
+    :return: Matching stem names.
+    """
+    stems = {stem for info in get_models().values() for stem in info.get("sources", [])}
+    return sorted(stem for stem in stems if stem.startswith(incomplete))
 
 
 def get_models() -> dict[str, dict]:

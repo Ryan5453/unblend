@@ -1,8 +1,9 @@
 """Offline packaging and Cog configuration consistency checks."""
 
-import json
 import re
 from pathlib import Path
+
+from unblend.config_io import load_mapping
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -103,7 +104,7 @@ def test_cog_cuda_not_newer_than_locked_wheels() -> None:
 
 def test_cog_model_url_matches_metadata() -> None:
     """
-    The htdemucs layer URL baked into the Cog image must match metadata.json.
+    The htdemucs layer URL baked into the Cog image must match metadata.yaml.
 
     cog.yaml's build.run commands execute before the repo is mounted, so the
     URL is necessarily hardcoded there; this guards it against drifting from
@@ -117,8 +118,8 @@ def test_cog_model_url_matches_metadata() -> None:
     assert match, "cog.yaml no longer bakes the htdemucs Safetensors layer"
     baked_filename, baked_url = match.groups()
 
-    with open(ROOT / "unblend" / "metadata.json") as f:
-        layers = json.load(f)["models"]["htdemucs"]["models"]
+    registry = load_mapping(ROOT / "unblend" / "metadata.yaml")
+    layers = registry["models"]["htdemucs"]["models"]
     assert len(layers) == 1, "cog.yaml bakes exactly one layer but htdemucs has more"
 
     # Absolute remotes are used verbatim; relative ones resolve against the
@@ -136,6 +137,6 @@ def test_cog_model_url_matches_metadata() -> None:
         expected_url = f"{base.group(1)}/{remote}"
 
     assert baked_url == expected_url
-    assert baked_filename == f"{layers[0]['checksum']}.safetensors"
+    assert baked_filename == f"{layers[0]['sha256'][:16]}.safetensors"
     assert f"--max-filesize {layers[0]['size_bytes']}" in cog
     assert layers[0]["sha256"] in cog

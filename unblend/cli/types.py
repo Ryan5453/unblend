@@ -12,25 +12,6 @@ class DeviceType(str, Enum):
     mps = "mps"
 
 
-class ModelName(str, Enum):
-    auto = "auto"
-    htdemucs = "htdemucs"
-    htdemucs_ft = "htdemucs_ft"
-    htdemucs_6s = "htdemucs_6s"
-    # RoFormer backends (non-commercial weights — see ``models list``).
-    bs_roformer_sw = "bs_roformer_sw"
-    melband_roformer_kim = "melband_roformer_kim"
-
-
-class StemName(str, Enum):
-    drums = "drums"
-    bass = "bass"
-    other = "other"
-    vocals = "vocals"
-    guitar = "guitar"  # Only provided by htdemucs_6s
-    piano = "piano"  # Only provided by htdemucs_6s
-
-
 class ClipMode(str, Enum):
     rescale = "rescale"
     clamp = "clamp"
