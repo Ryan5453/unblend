@@ -1,50 +1,5 @@
 """
-Custom CUDA kernels for low-precision (FP16/BF16) inference on NVIDIA GPUs.
-
-This is the CUDA counterpart of ``unblend.metal``: PyTorch's native CUDA
-backend already has strong FP16/BF16 matmul/conv paths, but HTDemucs still
-spends a large share of its step time in unfused memory-bound op chains —
-``group_norm`` followed by ``gelu``/``glu``, the DConv envelope (norm → GLU
-→ layer-scale → residual), and the transformer's transpose-heavy
-``MyGroupNorm``. Each of those round-trips its input through HBM several
-times. This module ships drop-in replacements that fuse those chains into
-single kernel launches:
-
-- :class:`CUDAGroupNorm` — wraps PyTorch's ``nn.GroupNorm`` with fused
-  FP16/BF16/FP32 kernels (single-stage one-block-per-batch-element, or a
-  three-kernel tiled path for small-batch/large-per-batch shapes).
-- :class:`CUDAMyGroupNorm` — replaces the transformer's ``MyGroupNorm``
-  with a transpose-avoiding channel-last kernel: the op folds onto
-  ``(B, T*C)`` with the affine broadcast over the trailing ``C`` axis,
-  skipping both transposes and the ~6-op pointwise chain PyTorch would
-  dispatch.
-- :class:`CUDAMultiheadAttention` — keeps Q/K/V/output linear projections
-  in the input dtype and runs the attention through
-  ``F.scaled_dot_product_attention`` directly. On CUDA the fused SDPA
-  kernels (flash / cuDNN / memory-efficient) already run the attention in
-  the input dtype and beat any manual matmul decomposition — unlike MPS,
-  where ``unblend.metal`` hand-rolls the matmul chain — so the win here is
-  only skipping ``nn.MultiheadAttention``'s per-call Python/dispatch
-  overhead. Because that overhead is small next to the C++ inference fast
-  path, this wrapper is NOT applied by :func:`apply_cuda_optimizations`;
-  it stays available for explicit use. Masked/causal calls fall back to
-  the wrapped MHA.
-
-The kernels are native CUDA C++ (``*.cu`` files shipped alongside this
-package), compiled once per environment with ``torch.utils.cpp_extension``
-and cached across processes. Unlike the Metal side there is no per-dtype
-recompilation: the kernels are C++ templates instantiated for float, half,
-and bfloat16 at build time, and each binding dispatches on the input
-tensor's scalar type.
-
-These are activated automatically by :func:`apply_cuda_optimizations`,
-which :class:`unblend.api.Separator` calls when the user opts into FP16 or
-BF16 on CUDA with eager execution (the pass is skipped under
-``compile=True``, where Inductor already fuses these chains optimally).
-RoFormer's ``RMSNorm`` deliberately keeps PyTorch's fused ``F.rms_norm``
-on CUDA — measured faster than the custom kernel here,
-:func:`cuda_rms_norm`, which remains exported for explicit use. CPU/MPS
-paths use PyTorch's native ops (or the Metal kernels on MPS).
+CUDA kernels for low-precision inference on NVIDIA GPUs.
 """
 
 from __future__ import annotations
@@ -67,15 +22,9 @@ def _pow2_tgs(max_threads: int, cap: int | None = None) -> int:
     """
     Largest power of two ``<= min(cap, max_threads)``.
 
-    Mirrors the Metal side: power-of-two blocks keep warp reductions full
-    and strided loops evenly balanced. CUDA reports
-    ``max_threads_per_block == 1024`` on every current device, so capping
-    at ``cap`` already yields a power of two.
-
-    :param max_threads: The device's ``max_threads_per_block``
-    :param cap: Upper bound on the returned block size; defaults to the
-        ``UNBLEND_CUDA_TGS_CAP`` environment variable or 256
-    :return: The largest power-of-two block size within the bounds
+    :param max_threads: The device's ``max_threads_per_block``.
+    :param cap: Upper bound on the returned block size; defaults to the.
+    :return: The largest power-of-two block size within the bounds.
     """
     if cap is None:
         cap = int(os.environ.get("UNBLEND_CUDA_TGS_CAP", "256"))
@@ -85,32 +34,6 @@ def _pow2_tgs(max_threads: int, cap: int | None = None) -> int:
         tgs *= 2
     return tgs
 
-
-# ---------------------------------------------------------------------------
-# CUDA kernel sources
-# ---------------------------------------------------------------------------
-#
-# The CUDA sources live in sibling files, split by purpose (mirroring the
-# ``.metal`` layout):
-#
-#   kernels.cuh            — shared prelude (Scalar4 packed loads, warp/block
-#                            reduction helpers); included by every .cu file
-#   bindings.h             — host-side launcher declarations + dispatch macros
-#   group_norm.cu          — basic GroupNorm (channel-first + channel-last)
-#                            + reduction primitives (``partial_reduce`` +
-#                            ``finalize_meanvar``, shared by every
-#                            multi-stage path below)
-#   group_norm_gelu.cu     — GroupNorm fused with GELU
-#   group_norm_glu.cu      — GroupNorm fused with GLU (channel halving)
-#   dconv_envelope.cu      — DConv post-conv2 envelope
-#                            (residual + layer_scale * glu(group_norm(z)))
-#   rms_norm.cu            — RoFormer last-dimension RMSNorm
-#   bindings.cpp           — pybind11 module wiring the launchers up
-#
-# All reductions accumulate in FP32 inside the kernels; FP16/BF16 only cross
-# the device-memory boundary at load and store. Loads/stores vectorize to
-# 4-element packed types when alignment permits, with scalar fallbacks
-# compiled into the same kernel (uniform runtime branch).
 
 _SOURCE_FILES: list[str] = [
     "group_norm.cu",
@@ -123,29 +46,21 @@ _SOURCE_FILES: list[str] = [
 ]
 
 _KERNEL_SOURCES: dict[str, str] = {
-    # group_norm.cu — basic GroupNorm + reduction primitives
     "group_norm_g1": "group_norm.cu",
     "group_norm_g1_chlast": "group_norm.cu",
     "partial_reduce": "group_norm.cu",
     "finalize_meanvar": "group_norm.cu",
     "apply_norm": "group_norm.cu",
     "apply_norm_chlast": "group_norm.cu",
-    # group_norm_gelu.cu — GN fused with GELU
     "group_norm_g1_gelu": "group_norm_gelu.cu",
     "apply_norm_gelu": "group_norm_gelu.cu",
-    # group_norm_gelu.cu — standalone elementwise gelu(a + b)
     "add_gelu": "group_norm_gelu.cu",
-    # group_norm_glu.cu — GN fused with GLU (channel halving)
     "group_norm_g1_glu": "group_norm_glu.cu",
     "apply_norm_glu": "group_norm_glu.cu",
-    # dconv_envelope.cu — DConv post-conv2 fusion paths
     "norm_glu_ls_resid": "dconv_envelope.cu",
     "apply_norm_glu_ls_resid": "dconv_envelope.cu",
-    # rms_norm.cu — RoFormer last-dimension RMSNorm
     "rms_norm": "rms_norm.cu",
-    # rotary.cu — fused interleaved RoFormer rotation
     "roformer_rotary": "rotary.cu",
-    # chlast_act.cu — channel-last (channels_last/NHWC) activation fusions
     "group_norm_g1_chlast_gelu": "chlast_act.cu",
     "apply_norm_chlast_gelu": "chlast_act.cu",
     "group_norm_g1_chlast_glu": "chlast_act.cu",
@@ -154,10 +69,6 @@ _KERNEL_SOURCES: dict[str, str] = {
     "apply_norm_glu_ls_resid_chlast": "chlast_act.cu",
 }
 
-# The HTDemucs fusion kernels dispatch for reduced precision (and would also
-# work in FP32, but PyTorch's native FP32 GroupNorm is already single-pass
-# and the fusion win shrinks). RoFormer's RMSNorm kernel deliberately also
-# supports explicitly requested FP32.
 _LP_DTYPES = frozenset((torch.float16, torch.bfloat16))
 _RMS_DTYPES = frozenset((torch.float32, *_LP_DTYPES))
 
@@ -170,49 +81,29 @@ _max_threads_cache: dict[int, int] = {}
 _sm_count_cache: dict[int, int] = {}
 _OPS_REGISTERED = False
 
-# Model-registry ``backend`` values whose architectures contain modules the
-# fused kernels can swap (num_groups=1 affine GroupNorms). RoFormer is
-# deliberately absent — its RMSNorm keeps PyTorch's fused native kernel and
-# only its rotary path uses a custom op, so there is nothing to pre-build.
 _SWAPPABLE_BACKENDS = frozenset({"demucs", "scnet"})
 
 
 def swappable_backends() -> frozenset[str]:
-    """
-    Registry backend names whose models can take fused-kernel module swaps.
+    """Eligible backend names for fused-kernel swaps.
 
-    Used to decide, before any checkpoint download starts, whether warming
-    the extension in the background is worthwhile.
-
-    :return: The eligible backend names.
+    :return: Backend names.
     """
     return _SWAPPABLE_BACKENDS
 
 
-# Custom-op namespace. Under ``torch.compile``, kernel launches go through
-# these registered ops instead of the raw pybind bindings: plain extension
-# functions are opaque to Dynamo, forcing a graph break (and an empty CUDA
-# Graph) at every launch, while registered ops stay inside the compiled
-# graph and remain capturable by the reduce-overhead CUDA Graphs.
 _OP_NAMESPACE = "unblend_cuda"
 
 
 def _ensure_custom_ops() -> None:
     """
-    Register every CUDA kernel as a ``torch.library`` custom op (once).
-
-    The wrappers resolve the compiled extension lazily at call time, so
-    registration is safe at import time — before (or without) any build.
-    Mutated arguments are declared via ``mutates_args``, which is sound
-    because no kernel ever changes an argument's shape or dtype.
+    Register CUDA kernels as torch.library custom ops.
     """
+
     global _OPS_REGISTERED
     if _OPS_REGISTERED:
         return
 
-    # The generic signature approach cannot express each kernel's distinct
-    # tensor/scalar layout through one factory (schemas come from type
-    # hints), so each kernel gets an explicit typed definition below.
     @torch.library.custom_op(f"{_OP_NAMESPACE}::group_norm_g1", mutates_args={"out"})
     def group_norm_g1(
         out: torch.Tensor,
@@ -224,7 +115,8 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``group_norm_g1`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``group_norm_g1`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
@@ -234,7 +126,6 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("group_norm_g1", x.dtype)(out, x, weight, bias, C, N, eps, tgs)
 
@@ -251,7 +142,8 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``group_norm_g1_chlast`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``group_norm_g1_chlast`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
@@ -261,7 +153,6 @@ def _ensure_custom_ops() -> None:
         :param total: Total elements per batch element (``T * C``).
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("group_norm_g1_chlast", x.dtype)(
             out, x, weight, bias, C, total, eps, tgs
@@ -278,15 +169,15 @@ def _ensure_custom_ops() -> None:
         num_tiles: int,
         tgs: int,
     ) -> None:
-        """Launch the ``partial_reduce`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``partial_reduce`` CUDA kernel (custom-op wrapper).
 
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalization.
+        :param inject: Optional second input added elementwise before normalizat...
         :param scratch: FP32 ``(B, num_tiles, 2)`` scratch buffer, written in place.
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("partial_reduce", x.dtype)(
             x, inject, scratch, total_per_b, num_tiles, tgs
@@ -305,17 +196,17 @@ def _ensure_custom_ops() -> None:
         inject: torch.Tensor,
         tgs: int,
     ) -> None:
-        """Launch the ``finalize_meanvar`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``finalize_meanvar`` CUDA kernel (custom-op wrapper).
 
         :param scratch: FP32 ``(B, num_tiles, 2)`` scratch buffer, written in place.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in place.
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param eps: Variance epsilon.
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalization.
+        :param inject: Optional second input added elementwise before normalizat...
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("finalize_meanvar", x.dtype)(
             scratch, meanvar, total_per_b, num_tiles, eps, x, inject, tgs
@@ -333,18 +224,18 @@ def _ensure_custom_ops() -> None:
         N: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in place.
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param N: Spatial element count per batch element.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("apply_norm", x.dtype)(
             out, x, meanvar, weight, bias, total_per_b, num_tiles, N, tgs
@@ -364,18 +255,18 @@ def _ensure_custom_ops() -> None:
         C: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_chlast`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_chlast`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in place.
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param C: Channel count of the reduction space.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("apply_norm_chlast", x.dtype)(
             out, x, meanvar, weight, bias, total_per_b, num_tiles, C, tgs
@@ -395,18 +286,18 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``group_norm_g1_gelu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``group_norm_g1_gelu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalization.
+        :param inject: Optional second input added elementwise before normalizat...
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param C: Channel count of the reduction space.
         :param N: Spatial element count per batch element.
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("group_norm_g1_gelu", x.dtype)(
             out, x, inject, weight, bias, C, N, eps, tgs
@@ -425,19 +316,19 @@ def _ensure_custom_ops() -> None:
         N: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_gelu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_gelu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalization.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in place.
+        :param inject: Optional second input added elementwise before normalizat...
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param N: Spatial element count per batch element.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("apply_norm_gelu", x.dtype)(
             out, x, inject, meanvar, weight, bias, total_per_b, num_tiles, N, tgs
@@ -456,7 +347,8 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``group_norm_g1_glu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``group_norm_g1_glu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
@@ -466,7 +358,6 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("group_norm_g1_glu", x.dtype)(out, x, weight, bias, C, N, eps, tgs)
 
@@ -484,11 +375,12 @@ def _ensure_custom_ops() -> None:
         C_half: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_glu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_glu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in place.
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_in_per_b: Input-space elements per batch element.
@@ -497,7 +389,6 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param C_half: Half the GLU input channel count.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("apply_norm_glu", x.dtype)(
             out,
@@ -528,7 +419,8 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``norm_glu_ls_resid`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``norm_glu_ls_resid`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param z: GroupNorm/GLU input of ``2C`` channels.
@@ -540,7 +432,6 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("norm_glu_ls_resid", z.dtype)(
             out, z, residual, nweight, nbias, layer_scale, C2, N, eps, tgs
@@ -564,7 +455,8 @@ def _ensure_custom_ops() -> None:
         C: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_glu_ls_resid`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_glu_ls_resid`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param z: GroupNorm/GLU input of ``2C`` channels.
@@ -579,7 +471,6 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param C: Half the GLU input channel count (output channels).
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("apply_norm_glu_ls_resid", z.dtype)(
             out,
@@ -611,7 +502,8 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``group_norm_g1_chlast_gelu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``group_norm_g1_chlast_gelu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor in channel-last storage.
@@ -622,7 +514,6 @@ def _ensure_custom_ops() -> None:
         :param total: Flat per-batch element count (``X * C``).
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("group_norm_g1_chlast_gelu", x.dtype)(
             out, x, inject, weight, bias, C, total, eps, tgs
@@ -643,7 +534,8 @@ def _ensure_custom_ops() -> None:
         C: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_chlast_gelu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_chlast_gelu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor in channel-last storage.
@@ -655,7 +547,6 @@ def _ensure_custom_ops() -> None:
         :param num_tiles: Tile count for the multi-stage launches.
         :param C: Channel count.
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("apply_norm_chlast_gelu", x.dtype)(
             out, x, inject, meanvar, weight, bias, total_per_b, num_tiles, C, tgs
@@ -674,17 +565,17 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``group_norm_g1_chlast_glu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``group_norm_g1_chlast_glu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param x: Input tensor with ``C2 = 2 * C`` channels in channel-last storage.
+        :param x: Input tensor with ``C2 = 2 * C`` channels in channel-last...
         :param weight: Affine weight over the full ``C2`` input channels.
         :param bias: Affine bias over the full ``C2`` input channels.
         :param C2: Input channel count (even).
         :param X: Spatial size.
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("group_norm_g1_chlast_glu", x.dtype)(
             out, x, weight, bias, C2, X, eps, tgs
@@ -705,10 +596,11 @@ def _ensure_custom_ops() -> None:
         C: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_chlast_glu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_chlast_glu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param x: Input tensor with ``2 * C`` channels in channel-last storage.
+        :param x: Input tensor with ``2 * C`` channels in channel-last stor...
         :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer.
         :param weight: Affine weight over the input channels.
         :param bias: Affine bias over the input channels.
@@ -717,7 +609,6 @@ def _ensure_custom_ops() -> None:
         :param num_tiles: Tile count for the multi-stage launches.
         :param C: Output channel count.
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("apply_norm_chlast_glu", x.dtype)(
             out,
@@ -747,10 +638,11 @@ def _ensure_custom_ops() -> None:
         eps: float,
         tgs: int,
     ) -> None:
-        """Launch the ``norm_glu_ls_resid_chlast`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``norm_glu_ls_resid_chlast`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param z: GroupNorm/GLU input of ``C2`` channels, channel-last storage.
+        :param z: GroupNorm/GLU input of ``C2`` channels, channel-last stor...
         :param resid: Residual tensor added at the end.
         :param nweight: GroupNorm affine weight over the ``C2`` input channels.
         :param nbias: GroupNorm affine bias over the ``C2`` input channels.
@@ -759,7 +651,6 @@ def _ensure_custom_ops() -> None:
         :param X: Spatial size.
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("norm_glu_ls_resid_chlast", z.dtype)(
             out, z, resid, nweight, nbias, layer_scale, C2, X, eps, tgs
@@ -782,10 +673,11 @@ def _ensure_custom_ops() -> None:
         C: int,
         tgs: int,
     ) -> None:
-        """Launch the ``apply_norm_glu_ls_resid_chlast`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``apply_norm_glu_ls_resid_chlast`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param z: GroupNorm/GLU input of ``2 * C`` channels, channel-last storage.
+        :param z: GroupNorm/GLU input of ``2 * C`` channels, channel-last s...
         :param resid: Residual tensor added at the end.
         :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer.
         :param nweight: GroupNorm affine weight over the input channels.
@@ -796,7 +688,6 @@ def _ensure_custom_ops() -> None:
         :param num_tiles: Tile count for the multi-stage launches.
         :param C: Output channel count.
         :param tgs: Block size (threads per block).
-        :return: Nothing; ``out`` is written in place.
         """
         _get_kernel("apply_norm_glu_ls_resid_chlast", z.dtype)(
             out,
@@ -837,7 +728,8 @@ def _ensure_custom_ops() -> None:
         scale: float,
         tgs: int,
     ) -> None:
-        """Launch the ``rms_norm`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``rms_norm`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
@@ -845,7 +737,6 @@ def _ensure_custom_ops() -> None:
         :param dim: RMSNorm feature dimension.
         :param scale: RoFormer's ``sqrt(dim)`` scale.
         :param tgs: Block size (threads per block).
-        :return: Nothing; output buffers are written in place.
         """
         _get_kernel("rms_norm", x.dtype)(out, x, gamma, dim, scale, tgs)
 
@@ -859,13 +750,9 @@ def _launch(name: str, dtype: torch.dtype, *args: Any) -> None:
     """
     Launch a kernel, routing through the custom op under ``torch.compile``.
 
-    The raw pybind binding is the fastest eager path; the registered
-    ``torch.ops`` form is Dynamo-traceable and keeps the launch inside the
-    compiled graph (and its CUDA Graph capture).
-
-    :param name: Kernel name (a key of ``_KERNEL_SOURCES``)
-    :param dtype: Tensor dtype of the first tensor argument
-    :param args: Full kernel argument list (tensors then scalars)
+    :param name: Kernel name (a key of ``_KERNEL_SOURCES``).
+    :param dtype: Tensor dtype of the first tensor argument.
+    :param args: Full kernel argument list (tensors then scalars).
     """
     if torch.compiler.is_compiling():
         getattr(torch.ops.unblend_cuda, name)(*args)
@@ -892,15 +779,7 @@ def _build_extension() -> Any:
     """
     Compile the CUDA kernel extension with ``torch.utils.cpp_extension``.
 
-    The build is cached by torch across processes (keyed on the sources AND
-    the current device's compute capability, so a shared
-    ``TORCH_EXTENSIONS_DIR`` never hands an sm_90 binary to an sm_80 device).
-    Compilation targets the GPU visible on the machine (or
-    ``TORCH_CUDA_ARCH_LIST`` if set).
-
-    :return: The compiled extension module exposing one function per kernel
-    :raises RuntimeError: If nvcc or a C++ compiler is unavailable, or the
-        build fails for any other reason
+    :return: The compiled extension module exposing one function per k...
     """
     from torch.utils import cpp_extension
 
@@ -913,7 +792,6 @@ def _build_extension() -> Any:
 
     suffix = ""
     if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-        # Per-arch cache entry unless the user asked for a fat build.
         major, minor = torch.cuda.get_device_capability(
             torch.device("cuda", torch.cuda.current_device())
         )
@@ -929,12 +807,9 @@ def _build_extension() -> Any:
 
 def _notify_build_start() -> None:
     """
-    Warn once per process that a blocking nvcc build is starting.
-
-    When the background warmup won the race, the caller usually just waits on
-    an already-running build; the warning still fires (once) because from the
-    caller's perspective the stall is identical.
+    Warn once that a blocking nvcc build is starting.
     """
+
     global _build_notice_sent
     if _build_notice_sent:
         return
@@ -952,13 +827,7 @@ def _get_extension() -> Any:
     """
     Return the compiled kernel extension, building it on first use.
 
-    Safe to call concurrently: a background :func:`warmup_async` thread and a
-    synchronous caller share one build under the lock, and the loser waits
-    for the winner rather than compiling twice.
-
-    :return: The extension module
-    :raises RuntimeError: If a previous build attempt failed; the original
-        error text is preserved in the message
+    :return: The extension module.
     """
     global _extension, _extension_error
     with _extension_lock:
@@ -979,11 +848,6 @@ def warmup_async() -> None:
     """
     Start building the kernel extension in a daemon thread, if needed.
 
-    Called by the API layer before the checkpoint download so the one-time
-    nvcc build overlaps the transfer instead of running after it. Idempotent:
-    no-op when already built, already building, previously failed, or when no
-    CUDA device is present. Build errors surface later through the normal
-    synchronous path (soft-fail with a warning).
     """
     global _warmup_thread
     if not torch.cuda.is_available():
@@ -1005,16 +869,9 @@ def _get_kernel(name: str, dtype: torch.dtype) -> Any:
     """
     Look up a CUDA kernel binding by ``(name, dtype)``.
 
-    The ``dtype`` argument exists for signature parity with the Metal side
-    (whose kernels recompile per scalar type); the CUDA kernels are typed
-    templates and each binding dispatches on the runtime tensor dtype, so
-    the returned callable is shared across dtypes.
-
-    :param name: Kernel function name (a key of ``_KERNEL_SOURCES``)
-    :param dtype: Scalar dtype the caller will run in (unused; see above)
-    :return: The callable binding for ``name``
-    :raises RuntimeError: If the extension has not compiled successfully
-    :raises KeyError: If ``name`` is not a known CUDA kernel
+    :param name: Kernel function name (a key of ``_KERNEL_SOURCES``).
+    :param dtype: Scalar dtype the caller will run in (unused; see above).
+    :return: The callable binding for ``name``.
     """
     ext = _get_extension()
     fn = getattr(ext, name, None)
@@ -1045,15 +902,8 @@ def _is_cuda_lp(t: torch.Tensor) -> bool:
     """
     Report whether a tensor is on CUDA in a kernel-supported low-precision dtype.
 
-    True only for a low-precision (FP16/BF16) tensor on CUDA outside grad
-    mode — the sole case the custom CUDA kernels handle. Every other
-    (device, dtype) combination falls back to PyTorch. Names the dispatch
-    condition that every fused module's ``forward`` shares, so the fallback
-    gate reads the same way in one place instead of being open-coded at each
-    call site.
-
-    :param t: Tensor whose device and dtype are checked
-    :return: ``True`` if ``t`` is on CUDA and FP16/BF16 under inference, else ``False``
+    :param t: Tensor whose device and dtype are checked.
+    :return: ``True`` if ``t`` is on CUDA and FP16/BF16 under inferenc...
     """
     return (
         t.device.type == "cuda"
@@ -1066,13 +916,8 @@ def _is_chlast_4d(t: torch.Tensor) -> bool:
     """
     Report whether a rank-4 tensor is stored in channels_last (NHWC) layout.
 
-    Our fused kernels come in two indexing flavours: channel-first (affine
-    index ``i / N``) and channel-last (``i % C``). A channels_last tensor
-    must take the latter — feeding it to a channel-first kernel silently
-    misindexes every element.
-
-    :param t: Tensor to inspect
-    :return: True when ``t`` is rank-4 and contiguous in channels_last order
+    :param t: Tensor to inspect.
+    :return: True when ``t`` is rank-4 and contiguous in channels_last...
     """
     return (
         t.dim() == 4
@@ -1083,24 +928,10 @@ def _is_chlast_4d(t: torch.Tensor) -> bool:
 
 def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
     """
-    Prepare a tensor for kernel dispatch: dense in a supported layout with a
-    4-element-aligned storage offset.
+    Prepare a tensor for kernel dispatch: dense in a supported layout with a 4-element-aligned storage offset.
 
-    The kernels reinterpret their buffers as 4-element packed vectors on the
-    vectorized paths, which needs 8-byte alignment for the 2-byte dtypes (and
-    16 bytes for FP32, implied by the same check). A contiguous tensor can
-    still be a view at an odd element offset into a pooled allocation, so
-    clone those (in practice the inputs are fresh conv/linear outputs at
-    offset 0 and this never fires).
-
-    Layout is preserved: channels_last tensors stay channels_last (they are
-    routed to the ``_chlast`` kernel family), and only tensors that are not
-    contiguous in any supported layout get materialized by ``.contiguous()``.
-    An unconditional ``.contiguous()`` here would silently rewrite NHWC data
-    into channel-first order.
-
-    :param t: Tensor to prepare
-    :return: ``t`` itself if already safe, else an aligned dense copy
+    :param t: Tensor to prepare.
+    :return: ``t`` itself if already safe, else an aligned dense copy.
     """
     if t.is_contiguous() or (
         t.dim() == 4 and t.is_contiguous(memory_format=torch.channels_last)
@@ -1112,12 +943,6 @@ def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
 def cuda_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
     """
     Apply RoFormer's last-dimension RMSNorm with one fused CUDA kernel.
-
-    The reduction and affine arithmetic use FP32 for every storage dtype.
-    Non-CUDA and unsupported-dtype inputs take the exact PyTorch path;
-    callers that need autograd should also use that fallback because custom
-    extension kernels are inference-only. If the extension cannot be built
-    (e.g. no ``nvcc``), warns once and falls back to native PyTorch ops.
 
     :param x: Input tensor normalized over its final dimension.
     :param gamma: Learnable gain with length ``x.shape[-1]``.
@@ -1155,47 +980,17 @@ def cuda_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.T
     return out.view_as(x)
 
 
-# ---------------------------------------------------------------------------
-# Module replacements
-# ---------------------------------------------------------------------------
-
-
 class CUDAGroupNorm(nn.Module):
-    """Replacement for ``nn.GroupNorm(num_groups=1)`` on CUDA in FP16/BF16.
-
-    Two fused kernel paths and one PyTorch fallback:
-
-    - **Single-stage**: one block per batch element. Fully fused; lowest
-      launch overhead. Best for the high-B, low-per-batch shapes that
-      dominate count in HTDemucs (DConv internals).
-    - **Multi-stage**: three kernels — partial-reduce per tile, finalise
-      mean/scale per batch, apply per tile. Tiles parallelise across many
-      blocks so the GPU stays saturated even when ``B == 2``. Used for the
-      outermost encoder/decoder GroupNorms and the transformer norms.
-    - **PyTorch fallback** (``F.group_norm``): non-CUDA devices, FP32
-      inputs, and any autograd-enabled call.
-
-    :meth:`_use_single_stage` picks between the two kernel paths.
+    """
+    Replacement for ``nn.GroupNorm(num_groups=1)`` on CUDA in FP16/BF16.
     """
 
-    # Hard per-batch ceiling for the single-stage path: above this even a
-    # large-B launch is better served by tiles.
     _SINGLE_STAGE_LIMIT = 1_500_000
-    # The single-stage kernel launches exactly ``B`` blocks. Discrete NVIDIA
-    # GPUs have far more SMs than an Apple GPU has cores (40 on a T4 up to
-    # 132+ on H100-class parts), so — unlike the Metal twin, which can use a
-    # fixed batch threshold — the minimum batch for single-stage dispatch is
-    # scaled to keep every SM busy: ``B >= _SINGLE_STAGE_MIN_BATCH_FACTOR *
-    # SM count``. Below that we tile.
+
     _SINGLE_STAGE_MIN_BATCH_FACTOR = 4
-    # ...but for small per-batch work the multi-stage path's two extra
-    # kernel launches cost more than the parallelism buys. Same constant as
-    # the Metal side; at these sizes even one block per batch element is a
-    # short-lived launch.
+
     _SINGLE_STAGE_SMALL_PER_BATCH = 49_152
-    # Target tile size for the multi-stage path. Each stage-1/3 block
-    # processes ``~TILE_SIZE`` elements; we pick ``num_tiles`` so each tile
-    # is roughly this size, capped to avoid excessive scratch.
+
     _MULTI_STAGE_TILE_SIZE = 16_384
     _MULTI_STAGE_MAX_TILES = 4096
 
@@ -1222,16 +1017,9 @@ class CUDAGroupNorm(nn.Module):
         """
         Size the multi-stage tiling so stages 1/3 saturate the GPU.
 
-        Mirrors the Metal heuristic (target ~16K elements per tile, power-of-two
-        count) with one CUDA-specific addition: the tile count is floored so
-        that ``B * num_tiles`` covers the SM complement several times over,
-        which matters for the small-B/large-per-batch shapes this path exists
-        for.
-
-        :param tile_space: Element count ``num_tiles`` is sized against — the
-            *output* space, so stage 3 gets evenly sized tiles
-        :param B: Number of batch elements participating in the launch
-        :return: The power-of-two tile count to launch with
+        :param tile_space: Element count ``num_tiles`` is sized against — the.
+        :param B: Number of batch elements participating in the launch.
+        :return: The power-of-two tile count to launch with.
         """
         num_tiles = min(
             self._MULTI_STAGE_MAX_TILES,
@@ -1241,7 +1029,7 @@ class CUDAGroupNorm(nn.Module):
                 // self._MULTI_STAGE_TILE_SIZE,
             ),
         )
-        # Floor for occupancy: aim for >= 4 tiles per SM overall.
+
         min_tiles = max(
             1,
             (4 * _sm_count(torch.device("cuda", torch.cuda.current_device())))
@@ -1262,18 +1050,14 @@ class CUDAGroupNorm(nn.Module):
         inject: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         """
-        Run multi-stage stages 1+2: per-tile partial reduce, then finalize
-        per-batch ``(mean, rsqrt(var+eps))``.
+        Run multi-stage stages 1+2: per-tile partial reduce, then finalize per-batch ``(mean, rsqrt(var+eps))``.
 
-        :param x_contig: Contiguous kernel-ready input, ``(B, per_batch_in)`` flat
-        :param B: Number of batch elements
-        :param per_batch_in: Elements reduced per batch element
-        :param tile_space: Element count ``num_tiles`` is sized against — the
-            *output* space, so stage 3 (which the caller launches with the
-            returned ``num_tiles``) gets evenly sized tiles
-        :param inject: Optional second input added elementwise before the
-            reduction (encoder ``conv + inject`` fusion)
-        :return: The ``(B, 2)`` FP32 meanvar buffer and ``num_tiles``
+        :param x_contig: Contiguous kernel-ready input, ``(B, per_batch_in)`` flat.
+        :param B: Number of batch elements.
+        :param per_batch_in: Elements reduced per batch element.
+        :param tile_space: Element count ``num_tiles`` is sized against — the.
+        :param inject: Optional second input added elementwise before the.
+        :return: The ``(B, 2)`` FP32 meanvar buffer and ``num_tiles``.
         """
         num_tiles = self._multi_stage_num_tiles(tile_space, B)
 
@@ -1285,8 +1069,7 @@ class CUDAGroupNorm(nn.Module):
 
         max_threads = _max_threads(x_contig.device)
         tgs1 = _pow2_tgs(max_threads)
-        # Stage 2 reduces ``num_tiles`` floats per batch; size block to at
-        # most ``num_tiles`` (pow-2 keeps the strided loop balanced).
+
         tgs2 = min(num_tiles, max_threads)
         pow2 = 1
         while pow2 * 2 <= tgs2:
@@ -1338,7 +1121,7 @@ class CUDAGroupNorm(nn.Module):
             raise ValueError("CUDAGroupNorm requires affine=True")
         self.num_channels = gn.num_channels
         self.eps = gn.eps
-        # Affine parameters live in FP32 storage; we cast lazily and cache.
+
         self.weight = nn.Parameter(gn.weight.detach().to(torch.float32).clone())
         self.bias = nn.Parameter(gn.bias.detach().to(torch.float32).clone())
         self.train(gn.training)
@@ -1367,10 +1150,7 @@ class CUDAGroupNorm(nn.Module):
         if cache is None:
             cache = {}
             object.__setattr__(self, "_aff_cache", cache)
-        # Version tracking must be invisible to Dynamo: ``_version`` reads
-        # graph-break the compiled region. Under ``torch.compile`` the cache
-        # was already populated by the eager warmup, so the lookup below hits
-        # and the invalidation logic specializes out entirely.
+
         if not torch.compiler.is_compiling():
             versions = (
                 id(self.weight),
@@ -1391,7 +1171,9 @@ class CUDAGroupNorm(nn.Module):
         return cached
 
     def _clear_parameter_caches(self) -> None:
-        """Discard all derived low-precision parameter copies."""
+        """
+        Discard all derived low-precision parameter copies.
+        """
         for name in ("_aff_cache", "_ls_cache"):
             cache = getattr(self, name, None)
             if cache:
@@ -1418,14 +1200,8 @@ class CUDAGroupNorm(nn.Module):
         """
         Reload parameters and invalidate the lazily-cast affine/LayerScale caches.
 
-        The affine (and, in subclasses, LayerScale) params are cast to the input
-        dtype/device on first forward and cached by ``(dtype, device)``. If a
-        caller reloads weights via ``load_state_dict`` after a forward has run,
-        those cached casts would be stale — so drop them here and let the next
-        forward re-derive them from the updated parameters.
-
-        :param args: Positional arguments forwarded to ``nn.Module._load_from_state_dict``.
-        :param kwargs: Keyword arguments forwarded to ``nn.Module._load_from_state_dict``.
+        :param args: Positional arguments forwarded to ``nn.Module._load_from_...
+        :param kwargs: Keyword arguments forwarded to ``nn.Module._load_from_sta...
         """
         super()._load_from_state_dict(*args, **kwargs)
         self._clear_parameter_caches()
@@ -1434,18 +1210,11 @@ class CUDAGroupNorm(nn.Module):
         """
         Apply ``num_groups=1`` group normalization, using a fused CUDA kernel on FP16/BF16.
 
-        :param x: Input tensor of shape ``(B, C, ...)``
-        :param gelu: Also apply GELU to the normalized output in the same
-            kernel launch (the ``gelu(group_norm(x))`` pattern HTDemucs's
-            decoder uses after ``conv_tr``). Ignored by the PyTorch fallback
-            path's normalization step only insofar as GELU is applied there
-            too, as an extra op.
-        :return: Normalized, affine-transformed tensor with the same shape as ``x``
+        :param x: Input tensor of shape ``(B, C, ...)``.
+        :param gelu: Also apply GELU to the normalized output in the same.
+        :return: Normalized, affine-transformed tensor with the same shape...
         """
-        # FP32 / non-CUDA / unsupported low-precision dtype: defer to PyTorch.
-        # The affine params are stored in FP32, so any non-FP32 input must be
-        # upcast (the CUDA-LP path is handled below) — otherwise F.group_norm
-        # raises on the dtype mismatch (e.g. an FP16 tensor on a non-CUDA device).
+
         if not _is_cuda_lp(x):
             if x.dtype == torch.float32:
                 y = F.group_norm(x, 1, self.weight, self.bias, self.eps)
@@ -1464,8 +1233,6 @@ class CUDAGroupNorm(nn.Module):
         weight, bias = self._lp_affine(x.dtype, x.device)
         max_threads = _max_threads(x.device)
 
-        # Channel-last storage flips the affine index from ``i / N`` to
-        # ``i % C``; route to the matching kernel family.
         suffix = "_chlast" if _is_chlast_4d(x_contig) else ""
         if self._use_single_stage(B, per_batch):
             tgs = _pow2_tgs(max_threads)
@@ -1516,9 +1283,6 @@ class CUDAGroupNorm(nn.Module):
                     )
             return out.view_as(x)
 
-        # Multi-stage path. Tile the per-batch work so that ``B * num_tiles``
-        # blocks participate in stage 1 and 3 — enough to keep the GPU fully
-        # busy even when ``B == 2``.
         meanvar, num_tiles = self._multi_stage_meanvar(
             x_contig, B, per_batch, per_batch
         )
@@ -1573,16 +1337,8 @@ class CUDAGroupNorm(nn.Module):
 
 
 class FusedGroupNormGelu(CUDAGroupNorm):
-    """Drop-in for the ``gelu(group_norm(...))`` pattern.
-
-    Same shape contract as ``nn.GroupNorm`` (input == output shape) but the
-    forward applies GELU at the same time as the normalize+affine, saving a
-    memory round-trip on the activation tensor. The kernel uses the tanh
-    GELU approximation (matching the Metal kernels; the gap vs exact erf is
-    sub-FP16-precision); the FP32 fallback below uses exact erf.
-
-    Activated automatically via :func:`apply_cuda_optimizations` for the
-    ``self.norm1`` slots in HEncLayer/HDecLayer/DConv where a GELU follows.
+    """
+    Drop-in for the ``gelu(group_norm(...))`` pattern.
     """
 
     def forward(
@@ -1591,15 +1347,11 @@ class FusedGroupNormGelu(CUDAGroupNorm):
         """
         Apply ``gelu(group_norm(x + inject))`` fused into one CUDA kernel on FP16/BF16.
 
-        :param x: Input tensor of shape ``(B, C, ...)``
-        :param inject: Optional second input added elementwise before the
-            normalization (the HTDemucs encoder's ``conv + inject`` pattern,
-            fused here to avoid a separate tensor round-trip)
-        :return: GELU-activated normalized tensor with the same shape as ``x``
+        :param x: Input tensor of shape ``(B, C, ...)``.
+        :param inject: Optional second input added elementwise before the.
+        :return: GELU-activated normalized tensor with the same shape as `...
         """
-        # FP32 / non-CUDA / unsupported low-precision dtype: hand to PyTorch.
-        # Affine params are FP32, so upcast any non-FP32 input to avoid a
-        # dtype mismatch in F.group_norm.
+
         if not _is_cuda_lp(x):
             if inject is not None:
                 x = x + inject
@@ -1645,7 +1397,6 @@ class FusedGroupNormGelu(CUDAGroupNorm):
             )
             return out.view_as(x)
 
-        # Multi-stage: reuse partial_reduce / finalize, then apply_norm_gelu.
         meanvar, num_tiles = self._multi_stage_meanvar(
             x_contig, B, per_batch, per_batch, inject=inj_contig
         )
@@ -1672,14 +1423,8 @@ class FusedGroupNormGelu(CUDAGroupNorm):
 
 
 class FusedGroupNormGlu(CUDAGroupNorm):
-    """Drop-in for the ``glu(group_norm(rewrite(...)), dim=1)`` pattern.
-
-    Input shape: ``(B, 2C, ...)``. Output shape: ``(B, C, ...)``. The
-    GroupNorm reduces over all 2C input channels (so the per-batch mean
-    matches ``F.group_norm`` exactly), then for each output channel pair
-    we read ``a = norm(in[c])`` and ``b = norm(in[c + C])`` and combine
-    via ``a * sigmoid(b)`` — all without ever writing the post-norm
-    full-size tensor to memory.
+    """
+    Drop-in for the ``glu(group_norm(rewrite(...)), dim=1)`` pattern.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1690,8 +1435,7 @@ class FusedGroupNormGlu(CUDAGroupNorm):
         :return: GLU-gated normalized tensor of shape ``(B, C, ...)``
         :raises ValueError: If the input channel dimension is not even
         """
-        # Affine params are FP32, so upcast any non-FP32 input to avoid a
-        # dtype mismatch in F.group_norm.
+
         if not _is_cuda_lp(x):
             if x.dtype == torch.float32:
                 return F.glu(
@@ -1718,16 +1462,14 @@ class FusedGroupNormGlu(CUDAGroupNorm):
         per_batch_out = C_half * N
         weight, bias = self._lp_affine(x.dtype, x.device)
         max_threads = _max_threads(x.device)
-        # Channel-last GLU halves the trailing channel axis; the dedicated
-        # kernels take (input channels, spatial size).
+
         suffix = "_chlast" if _is_chlast_4d(x_contig) else ""
         if self._use_single_stage(B, per_batch_in):
             tgs = _pow2_tgs(max_threads)
             while tgs > 1 and tgs > per_batch_out:
                 tgs //= 2
             out_shape = (B, C_half) + tuple(x_contig.shape[2:])
-            # Channel-last kernels write NHWC-ordered data: the output buffer
-            # must carry the matching format flag.
+
             fmt = dict(memory_format=torch.channels_last) if suffix else {}
             out = torch.empty(out_shape, dtype=x.dtype, device=x.device, **fmt)
             if suffix:
@@ -1758,21 +1500,15 @@ class FusedGroupNormGlu(CUDAGroupNorm):
                 )
             return out
 
-        # Multi-stage: partial-reduce/finalize over the FULL input
-        # (per_batch_in elements per batch), then apply_norm_glu over the
-        # OUTPUT space (per_batch_out elements per batch).
         meanvar, num_tiles = self._multi_stage_meanvar(
             x_contig, B, per_batch_in, per_batch_out
         )
         out_shape = (B, C_half) + tuple(x_contig.shape[2:])
-        # Channel-last kernels write NHWC-ordered data: the output buffer
-        # must carry the matching format flag.
+
         fmt = dict(memory_format=torch.channels_last) if suffix else {}
         out = torch.empty(out_shape, dtype=x.dtype, device=x.device, **fmt)
         tgs3 = _pow2_tgs(max_threads)
-        # Stage 3 tiles the OUTPUT (per_batch_out elements) and writes
-        # half-channel output. The chlast stage-3 kernel takes the OUTPUT
-        # channel count instead of the spatial size (one fewer positional).
+
         if suffix:
             _launch(
                 "apply_norm_chlast_glu",
@@ -1808,16 +1544,8 @@ class FusedGroupNormGlu(CUDAGroupNorm):
 
 
 class FusedNormGluLayerScaleResid(CUDAGroupNorm):
-    """Single fused op for the DConv envelope after the second conv:
-    ``residual + layer_scale * glu(group_norm(z), dim=1)``.
-
-    Replaces FOUR previously-separate ops (group_norm, glu, layerscale mul,
-    residual add) with one kernel — saves three intermediate tensor
-    writes and the matching reads. ``z`` has 2C input channels, output has
-    C channels.
-
-    Inherits ``CUDAGroupNorm`` for the affine-cache and dispatch logic;
-    additionally owns the LayerScale parameter.
+    """
+    Single fused op for the DConv envelope after the second conv: ``residual + layer_scale * glu(group_norm(z), dim=1)``.
     """
 
     def __init__(
@@ -1864,8 +1592,7 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         if cache is None:
             cache = {}
             object.__setattr__(self, "_ls_cache", cache)
-        # See _lp_affine: version tracking graph-breaks under compile and
-        # specializes away (the eager warmup has already populated the cache).
+
         if not torch.compiler.is_compiling():
             version = (id(self.layer_scale), self.layer_scale._version)
             if getattr(self, "_ls_version", None) != version:
@@ -1888,10 +1615,7 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         :return: The fused result of shape ``(B, C, ...)``
         :raises ValueError: If the GLU input channel dimension is not even
         """
-        # FP32 / non-CUDA / unsupported low-precision dtype: explicit eltwise.
-        # weight/bias/layer_scale are FP32, so a non-FP32 input is computed in
-        # FP32 and cast back (avoids a group_norm dtype mismatch and keeps the
-        # output dtype equal to ``z``).
+
         if not _is_cuda_lp(z):
             if z.dtype == torch.float32:
                 zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
@@ -1920,15 +1644,12 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         max_threads = _max_threads(z.device)
 
         suffix = "_chlast" if _is_chlast_4d(z_c) else ""
-        # Channel-last kernels write NHWC-ordered data: the output buffer
-        # must carry the matching format flag.
+
         fmt = dict(memory_format=torch.channels_last) if suffix else {}
         out = torch.empty(out_shape, dtype=z.dtype, device=z.device, **fmt)
         if self._use_single_stage(B, per_batch_in):
             tgs = _pow2_tgs(max_threads)
-            # Don't launch more threads than the apply loop has output
-            # elements (the reduction over per_batch_in still covers all
-            # input via the strided loop). Mirrors the GLU single-stage clamp.
+
             while tgs > 1 and tgs > per_batch_out:
                 tgs //= 2
             _launch(
@@ -1947,13 +1668,11 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
             )
             return out
 
-        # Multi-stage path: stages 1+2 reduce over the FULL (2C, N) input.
         meanvar, num_tiles = self._multi_stage_meanvar(
             z_c, B, per_batch_in, per_batch_out
         )
         tgs3 = _pow2_tgs(max_threads)
-        # Stage 3 tiles the OUTPUT space. The chlast stage-3 kernel takes the
-        # OUTPUT channel count instead of the spatial size (one fewer arg).
+
         if suffix:
             _launch(
                 "apply_norm_glu_ls_resid_chlast",
@@ -1993,16 +1712,8 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
 
 
 class CUDAMyGroupNorm(CUDAGroupNorm):
-    """Replacement for ``unblend.transformer.MyGroupNorm`` on CUDA in FP16/BF16.
-
-    The original transposes ``(B, T, C) -> (B, C, T)``, runs ``GroupNorm``
-    with ``num_groups=1``, transposes back. Since ``num_groups=1`` is just
-    per-batch normalisation, we fold the operation onto ``(B, T*C)``
-    directly and skip the transposes — the channel-last (``_chlast``)
-    kernels broadcast the affine over the trailing ``C`` axis (index
-    ``i % C`` instead of channel-first's ``i / N``). Inherits the affine
-    cache, dispatch heuristic, and multi-stage reduction from
-    :class:`CUDAGroupNorm`; only the apply kernels differ.
+    """
+    Replacement for ``unblend.transformer.MyGroupNorm`` on CUDA in FP16/BF16.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -2012,16 +1723,12 @@ class CUDAMyGroupNorm(CUDAGroupNorm):
         :param x: Input tensor of shape ``(B, T, C)``
         :return: Normalized, affine-transformed tensor with the same shape as ``x``
         """
-        # FP32: replicate the original's transpose-then-GroupNorm contract via
-        # F.group_norm directly (affine params are FP32, so this matches).
+
         if x.dtype == torch.float32:
             x = x.transpose(1, 2)
             x = F.group_norm(x, 1, self.weight, self.bias, self.eps)
             return x.transpose(1, 2)
 
-        # Non-FP32 on a non-CUDA device, or an unsupported low-precision
-        # dtype — fall back via FP32 cast plus the transpose dance the
-        # original did. (The CUDA-LP path is handled below.)
         if not _is_cuda_lp(x):
             x_t = x.transpose(1, 2)
             return (
@@ -2080,18 +1787,8 @@ class CUDAMyGroupNorm(CUDAGroupNorm):
 
 
 class CUDAMultiheadAttention(nn.Module):
-    """Replacement for ``nn.MultiheadAttention`` on CUDA in FP16/BF16.
-
-    Q/K/V/output linear projections stay in the parameter dtype, and the
-    attention itself runs through ``F.scaled_dot_product_attention`` in that
-    same dtype. On CUDA the fused SDPA backends (flash attention, cuDNN,
-    memory-efficient) are already GEMM-optimal and keep activations in the
-    input dtype, so — unlike the MPS backend, where ``unblend.metal``
-    decomposes the attention into explicit matmuls to win — the fastest
-    correct strategy here is calling SDPA directly. The wrapper still saves
-    ``nn.MultiheadAttention``'s per-call Python/dispatch overhead and avoids
-    implicit FP32 upcasts at op boundaries. Masked/causal calls fall back to
-    the wrapped MHA.
+    """
+    Replacement for ``nn.MultiheadAttention`` on CUDA in FP16/BF16.
     """
 
     def __init__(self, mha: nn.MultiheadAttention) -> None:
@@ -2116,7 +1813,7 @@ class CUDAMultiheadAttention(nn.Module):
             self.v_proj_weight = mha.v_proj_weight
             self.in_proj_bias = mha.in_proj_bias
         self.out_proj = mha.out_proj
-        # Held for any path we don't optimise (masks, need_weights, etc.).
+
         self._fallback = mha
         self.train(mha.training)
 
@@ -2144,24 +1841,17 @@ class CUDAMultiheadAttention(nn.Module):
         """
         Run multihead attention, keeping projections in the input dtype on CUDA FP16/BF16.
 
-        Optimised only for the batch-first, packed-QKV, unmasked, non-weight-returning
-        case on CUDA in FP16/BF16; every other configuration defers to the wrapped MHA.
-
-        :param query: Query tensor of shape ``(B, Lq, embed_dim)`` (batch-first)
-        :param key: Key tensor of shape ``(B, Lk, embed_dim)``
-        :param value: Value tensor of shape ``(B, Lk, embed_dim)``
-        :param key_padding_mask: Optional key padding mask; presence forces the fallback path
-        :param need_weights: If ``True``, forces the fallback path (this wrapper returns no weights)
-        :param attn_mask: Optional attention mask; presence forces the fallback path
-        :param average_attn_weights: Forwarded to the fallback MHA when used
-        :param is_causal: If ``True``, forces the fallback path
-        :return: A ``(output, None)`` pair; the output has shape ``(B, Lq, embed_dim)``
+        :param query: Query tensor of shape ``(B, Lq, embed_dim)`` (batch-first).
+        :param key: Key tensor of shape ``(B, Lk, embed_dim)``.
+        :param value: Value tensor of shape ``(B, Lk, embed_dim)``.
+        :param key_padding_mask: Optional key padding mask; presence forces the fallback path.
+        :param need_weights: If ``True``, forces the fallback path (this wrapper retur...
+        :param attn_mask: Optional attention mask; presence forces the fallback path.
+        :param average_attn_weights: Forwarded to the fallback MHA when used.
+        :param is_causal: If ``True``, forces the fallback path.
+        :return: A ``(output, None)`` pair; the output has shape ``(B, Lq,...
         """
-        # Bail to the wrapped MHA for shapes/configs we don't optimise. Masks
-        # and is_causal go there too: nn.MultiheadAttention's mask contract
-        # (bool True = *dis*allowed, 3D (B*H, L, S) layout) is the opposite of
-        # F.scaled_dot_product_attention's, and the wrapped module is the only
-        # path that reproduces it exactly. Demucs itself never passes masks.
+
         if (
             self.training
             or need_weights
@@ -2191,9 +1881,6 @@ class CUDAMultiheadAttention(nn.Module):
         B = query.size(0)
         Lq = query.size(1)
 
-        # Projections in the input dtype (tensor-core GEMMs are fast). For
-        # self-attention the packed (B, L, 3E) QKV is contiguous after the
-        # linear; cross-attention does three separate linears.
         if is_self_attn:
             qkv = F.linear(query, self.in_proj_weight, self.in_proj_bias)
             q, k, v = qkv.chunk(3, dim=-1)
@@ -2217,10 +1904,6 @@ class CUDAMultiheadAttention(nn.Module):
         k = k.view(B, Lk, H, D).transpose(1, 2)
         v = v.view(B, Lk, H, D).transpose(1, 2)
 
-        # Fused SDPA picks flash / cuDNN / memory-efficient attention for
-        # these shapes; all accumulate in FP32 internally and never
-        # materialise the score matrix. (Masked/causal calls never reach
-        # here — they bailed to the wrapped MHA above.)
         out = F.scaled_dot_product_attention(q, k, v)
 
         out = out.transpose(1, 2).reshape(B, Lq, self.embed_dim)
@@ -2229,18 +1912,8 @@ class CUDAMultiheadAttention(nn.Module):
 
 
 class FusedDConvLayer(nn.Module):
-    """One DConv sub-layer (formerly an ``nn.Sequential`` of 7 ops) folded
-    into 4 calls: ``conv1 → fused_norm_gelu → conv2 → fused_norm_glu_ls_resid``.
-
-    The original layer was::
-
-        Conv1d(C, hidden) → GroupNorm → GELU → Conv1d(hidden, 2C)
-            → GroupNorm → GLU → LayerScale → +residual_x
-
-    We keep the two convs as PyTorch ops (cuBLAS/tensor-core GEMMs are
-    already fast) and fold every non-conv step into our two big fused CUDA
-    kernels. Saves ~5 intermediate tensor writes/reads per call. The
-    residual addition is absorbed into the second fusion.
+    """
+    One DConv sub-layer (formerly an ``nn.Sequential`` of 7 ops) folded into 4 calls: ``conv1 → fused_norm_gelu → conv2 →...
     """
 
     def __init__(
@@ -2254,11 +1927,11 @@ class FusedDConvLayer(nn.Module):
         """
         Build a fused DConv sub-layer from its constituent convs/norms/scale.
 
-        :param conv1: First pointwise convolution (``C -> hidden``)
-        :param norm1: GroupNorm following ``conv1``; fused with the GELU
-        :param conv2: Second pointwise convolution (``hidden -> 2C``)
-        :param norm2: GroupNorm following ``conv2``; fused into the envelope op
-        :param layer_scale_param: Per-channel LayerScale tensor of shape ``(C,)``
+        :param conv1: First pointwise convolution (``C -> hidden``).
+        :param norm1: GroupNorm following ``conv1``; fused with the GELU.
+        :param conv2: Second pointwise convolution (``hidden -> 2C``).
+        :param norm2: GroupNorm following ``conv2``; fused into the envelope op.
+        :param layer_scale_param: Per-channel LayerScale tensor of shape ``(C,)``.
         """
         super().__init__()
         self.conv1 = conv1
@@ -2273,16 +1946,10 @@ class FusedDConvLayer(nn.Module):
         """
         Build from the standard 7-op DConv ``nn.Sequential``.
 
-        We expect the canonical layout (``norm=True``, which is the HTDemucs
-        default). Anything else and the swap is skipped at the
-        apply_cuda_optimizations level.
-
-        :param seq: The 7-op DConv ``nn.Sequential`` to fold
-        :return: A new :class:`FusedDConvLayer` mirroring ``seq``
-        :raises ValueError: If ``seq`` does not have exactly 7 ops
-        :raises TypeError: If any op is not of the expected type for its slot
+        :param seq: The 7-op DConv ``nn.Sequential`` to fold.
+        :return: A new :class:`FusedDConvLayer` mirroring ``seq``.
         """
-        # Local import; ``LayerScale`` only ships with the transformer module.
+
         from ..transformer import LayerScale
 
         if len(seq) != 7:
@@ -2341,7 +2008,7 @@ class FusedDConv(nn.Module):
         :return: A new :class:`FusedDConv` with one fused layer per sequential
         :raises TypeError: If ``dconv`` is not a ``DConv`` instance
         """
-        # Local import to break the unblend.blocks <-> cuda cycle.
+
         from ..blocks import DConv
 
         if not isinstance(dconv, DConv):
@@ -2380,8 +2047,6 @@ class FusedHEncLayer(nn.Module):
         super().__init__()
         from ..blocks import DConv
 
-        # Carry forward the geometry/flags ``apply.py`` and the model's
-        # forward_core inspect on the layer instance.
         self.kernel_size = layer.kernel_size
         self.stride = layer.stride
         self.empty = layer.empty
@@ -2389,7 +2054,6 @@ class FusedHEncLayer(nn.Module):
         self.norm = layer.norm
         self.pad = layer.pad
 
-        # norm1 + gelu fusion (decided first: it gates conv-bias cancellation)
         if isinstance(layer.norm1, nn.GroupNorm) and layer.norm1.num_groups == 1:
             self.norm1 = FusedGroupNormGelu.from_groupnorm(layer.norm1)
             self._fused_gelu = True
@@ -2413,7 +2077,6 @@ class FusedHEncLayer(nn.Module):
             self.norm2 = None
             self._fused_glu = False
 
-        # DConv fusion
         if layer.dconv is not None and isinstance(layer.dconv, DConv):
             try:
                 self.dconv = FusedDConv.from_dconv(layer.dconv)
@@ -2446,16 +2109,10 @@ class FusedHEncLayer(nn.Module):
             assert inject.shape[-1] == y.shape[-1]
             if inject.dim() == 3 and y.dim() == 4:
                 inject = inject[:, :, None]
-        # If norm1 absorbs gelu we just call it; otherwise apply gelu by hand.
-        # When the fused kernel runs, the inject add happens inside the
-        # normalization launch (``gelu(norm(conv(x) + inject))``), saving a
-        # full-tensor round-trip.
+
         if self._fused_gelu:
             y = self.norm1(y, inject=inject)
         elif type(self.norm1) is nn.Identity and inject is not None:
-            # norm-free encoder layers: fuse ``gelu(conv(x) + inject)`` into
-            # one elementwise kernel instead of an add pass plus a GELU pass
-            # over the largest activations in the network.
             out = torch.empty_like(_kernel_arg(y))
             _launch(
                 "add_gelu",
@@ -2506,7 +2163,6 @@ class FusedHDecLayer(nn.Module):
         super().__init__()
         from ..blocks import DConv
 
-        # Carry-forward attributes
         self.pad = layer.pad
         self.last = layer.last
         self.freq = layer.freq
@@ -2518,7 +2174,7 @@ class FusedHDecLayer(nn.Module):
         self.context_freq = layer.context_freq
 
         self.conv_tr = layer.conv_tr
-        self.norm2 = layer.norm2  # left to be swapped to CUDAGroupNorm separately
+        self.norm2 = layer.norm2
         if layer.empty:
             return
 
@@ -2575,12 +2231,7 @@ class FusedHDecLayer(nn.Module):
         else:
             y = x
             assert skip is None
-        # Fuse the post-conv_tr ``gelu(norm2(...))`` into one kernel when GELU
-        # runs at all (the ``last`` flag decides) and norm2 is one of our
-        # GroupNorm replacements. Layers built with ``norm=False`` carry an
-        # Identity here instead — keep the explicit unfused path for them.
-        # GELU is elementwise, so activating before the crop below is
-        # order-equivalent.
+
         z_tr = self.conv_tr(y)
         if isinstance(self.norm2, CUDAGroupNorm):
             z = self.norm2(z_tr, gelu=not self.last)
@@ -2596,21 +2247,11 @@ class FusedHDecLayer(nn.Module):
         return z, y
 
 
-# ---------------------------------------------------------------------------
-# Public entrypoint
-# ---------------------------------------------------------------------------
-
-
 def fused_roformer_rotary(
     t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
     """
     Apply interleaved rotary rotation with one fused CUDA kernel.
-
-    Eager-only fast path for :meth:`roformer.RotaryEmbedding.rotate_queries_or_keys`:
-    replaces the seven-pass mul/sub/add/interleave chain with a single kernel
-    that accumulates in FP32. Falls back to the caller when unusable — the
-    caller gates on device/dtype/grad-mode; this only re-checks contiguity.
 
     :param t: Queries or keys ``[..., seq, dim]``.
     :param cos: Rotation cosine table ``[seq, dim // 2]``.
@@ -2658,12 +2299,6 @@ def has_swappable_modules(model: nn.Module) -> bool:
     """
     Whether :func:`apply_cuda_optimizations` would replace anything.
 
-    Checked before the pass so a model with no eligible modules does not pay
-    for extension compilation. Structural rather than per-architecture: any
-    model built from ``num_groups=1`` affine GroupNorms qualifies — HTDemucs,
-    SCNet's convolution modules and dual-path trunk — but not the RoFormers,
-    whose RMSNorm keeps PyTorch's fused native kernel on CUDA.
-
     :param model: Model to inspect.
     :return: ``True`` if at least one module would be swapped.
     """
@@ -2686,35 +2321,8 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
     """
     Replace memory-bound op chains with fused CUDA-kernel equivalents in-place.
 
-    Idempotent (safe to call multiple times) and only swaps modules whose
-    forward semantics we know how to preserve. If the CUDA extension fails
-    to compile, warns and returns without modifying the model.
-
-    Two passes:
-
-    1. **Layer-level fusion**: replace every ``HEncLayer`` / ``HDecLayer``
-       with a fused version that absorbs the ``gelu(norm1(...))`` and
-       ``glu(norm2(rewrite(...)))`` patterns into single kernel launches.
-       The fused layer also recursively replaces its inner ``DConv`` with
-       a :class:`FusedDConv` whose sub-layers fuse all 7 of the original
-       ``Conv → GroupNorm → GELU → Conv → GroupNorm → GLU → LayerScale``
-       ops down to two kernel launches plus the two convs.
-    2. **Module-level fallback swap** for everything not already covered:
-       remaining plain ``nn.GroupNorm`` (transformer) and ``MyGroupNorm``.
-
-    Unlike the Metal pass, ``nn.MultiheadAttention`` is deliberately NOT
-    swapped: PyTorch's CUDA MHA has a C++ inference fast path (packed-QKV
-    projection + fused SDPA) that beats decomposing it in Python, so
-    replacing it only adds overhead. :class:`CUDAMultiheadAttention` stays
-    available for callers that want it explicitly.
-
-    Two passes are needed because the layer fusion both *consumes* the
-    GroupNorms it fuses and *leaves behind* a few that the second pass
-    still needs to replace (e.g. ``HDecLayer.norm2``, transformer norms).
-
-    :param model: Model to mutate in place, swapping eligible submodules
-    :return: A mapping from swap kind to the number of modules replaced, for
-        diagnostic logging
+    :param model: Model to mutate in place, swapping eligible submodules.
+    :return: A mapping from swap kind to the number of modules replace...
     """
     from ..blocks import HDecLayer, HEncLayer
     from ..transformer import MyGroupNorm
@@ -2728,11 +2336,6 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
         "multi_head_attention": 0,
     }
 
-    # Eagerly build the extension before touching the model, so a broken
-    # toolchain surfaces here — where we can fall back wholesale to native
-    # PyTorch ops (slower but correct) — instead of mid-forward after
-    # modules were already swapped. The build is cached across processes,
-    # so on success the first forward hits warm caches.
     try:
         _get_extension()
     except Exception as exc:
@@ -2743,7 +2346,6 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
         )
         return counts
 
-    # Pass 1: layer-level fusion.
     def _walk_layers(mod: nn.Module) -> None:
         """
         Recursively replace ``HEncLayer``/``HDecLayer`` children with fused versions.
@@ -2756,7 +2358,7 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
                 try:
                     replacement = FusedHEncLayer(child)
                     counts["h_enc_layer"] += 1
-                    # Count nested DConv replacement too, for visibility.
+
                     if isinstance(getattr(replacement, "dconv", None), FusedDConv):
                         counts["fused_dconv"] += 1
                 except Exception as exc:
@@ -2790,8 +2392,6 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
 
     _walk_layers(model)
 
-    # Pass 2: replace remaining plain ops (transformer norms, MyGroupNorm,
-    # MultiheadAttention, and any GroupNorm a fused layer didn't absorb).
     def _walk_modules(mod: nn.Module) -> None:
         """
         Recursively swap remaining ``MyGroupNorm``/``GroupNorm``/``MultiheadAttention`` children.
@@ -2799,10 +2399,6 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
         :param mod: Module whose children are walked and swapped in place
         """
         for name, child in list(mod.named_children()):
-            # Don't descend into modules this pass already produced (on this
-            # or an earlier call): ``CUDAMultiheadAttention`` keeps the
-            # original MHA inside as ``_fallback``, which a repeat walk would
-            # otherwise re-wrap into a nested wrapper.
             if isinstance(
                 child, (CUDAGroupNorm, CUDAMyGroupNorm, CUDAMultiheadAttention)
             ):
@@ -2816,9 +2412,7 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
                 if child.num_groups == 1 and child.affine:
                     replacement = CUDAGroupNorm.from_groupnorm(child)
                     counts["group_norm"] += 1
-            # nn.MultiheadAttention is intentionally left alone on CUDA —
-            # see the docstring above. The count key is kept so callers can
-            # compare swap reports across backends.
+
             if replacement is not None:
                 params = list(child.parameters())
                 if params:

@@ -1,4 +1,6 @@
-"""Regression tests for the SCNet backend."""
+"""
+Regression tests for the SCNet backend.
+"""
 
 import pytest
 import torch
@@ -31,18 +33,24 @@ def _tiny(**overrides) -> dict:
 
 
 def test_scnet_registers_itself_as_a_backend() -> None:
-    """Importing the module is what makes ``scnet`` loadable by name."""
-    assert "scnet" in backends.single_checkpoint_backends()
+    """
+    Importing the module is what makes ``scnet`` loadable by name.
+    """
+    assert "scnet" in backends._BUILDERS
 
 
 def test_scnet_does_not_apply_demucs_track_normalization() -> None:
-    """SCNet defaults to raw input unless a checkpoint opts into normalization."""
+    """
+    SCNet defaults to raw input unless a checkpoint opts into normalization.
+    """
     model = SCNet(sources=["a", "b", "c", "d"], **_tiny())
     assert model.external_normalization is False
 
 
 def test_build_scnet_rejects_unknown_architecture() -> None:
-    """An unknown architecture fails loudly rather than silently defaulting."""
+    """
+    An unknown architecture fails loudly rather than silently defaulting.
+    """
     with pytest.raises(ValidationError, match="Unknown SCNet architecture"):
         build_scnet(
             "not_scnet",
@@ -54,7 +62,9 @@ def test_build_scnet_rejects_unknown_architecture() -> None:
 
 
 def test_configure_inference_rejects_mismatched_source_count() -> None:
-    """Source names must match the decoder's head count."""
+    """
+    Source names must match the decoder's head count.
+    """
     model = SCNet(sources=["drums", "bass", "other", "vocals"], **_tiny())
     with pytest.raises(ValidationError, match="emits 4 stems"):
         model.configure_inference(
@@ -63,7 +73,9 @@ def test_configure_inference_rejects_mismatched_source_count() -> None:
 
 
 def test_build_scnet_sets_the_inference_contract() -> None:
-    """The four members apply_model relies on are populated."""
+    """
+    The four members apply_model relies on are populated.
+    """
     sources = ["drums", "bass", "other", "vocals"]
     model = build_scnet(
         "scnet", _tiny(), sources=sources, samplerate=44100, segment_samples=88200
@@ -75,7 +87,9 @@ def test_build_scnet_sets_the_inference_contract() -> None:
 
 
 def test_forward_returns_one_waveform_per_stem() -> None:
-    """Output is ``(batch, stems, channels, samples)`` at the input length."""
+    """
+    Output is ``(batch, stems, channels, samples)`` at the input length.
+    """
     sources = ["drums", "bass", "other", "vocals"]
     model = build_scnet(
         "scnet", _tiny(), sources=sources, samplerate=44100, segment_samples=4096
@@ -87,7 +101,9 @@ def test_forward_returns_one_waveform_per_stem() -> None:
 
 
 def test_conv_module_requires_an_odd_kernel() -> None:
-    """An even kernel cannot be centre-padded, so it is rejected."""
+    """
+    An even kernel cannot be centre-padded, so it is rejected.
+    """
     with pytest.raises(ValidationError, match="must be odd"):
         SCNet(sources=["a", "b", "c", "d"], **_tiny(conv_kernel=4))
 
@@ -115,7 +131,9 @@ def test_onnx_safe_dft_matches_torch_fft(frames: int, inverse: bool) -> None:
 
 
 def test_compiled_core_hooks_round_trip() -> None:
-    """Enabling then disabling the compiled core restores the eager callable."""
+    """
+    Enabling then disabling the compiled core restores the eager callable.
+    """
     model = build_scnet(
         "scnet",
         _tiny(),
@@ -131,10 +149,10 @@ def test_compiled_core_hooks_round_trip() -> None:
     assert getattr(model.forward_core, "__func__", None) is not original
     assert model._fixed_batch_shape is True
 
-    backends.disable_compiled_core(model)
+    model.disable_compiled_core()
     assert model.forward_core.__func__ is original
     assert model._fixed_batch_shape is False
-    assert not hasattr(model, "_uncompiled_forward_core")
+    assert not hasattr(model, "_eager_core")
 
 
 def test_masked_variant_is_registered_and_distinct() -> None:
@@ -159,7 +177,9 @@ def test_masked_variant_is_registered_and_distinct() -> None:
 
 
 def test_masked_variant_forward_shape() -> None:
-    """The masking head still yields one waveform per stem."""
+    """
+    The masking head still yields one waveform per stem.
+    """
     from unblend.scnet import SCNetMasked
 
     sources = ["drums", "bass", "other", "vocals"]
@@ -214,7 +234,9 @@ def _write_local_model(tmp_path, name: str = "my_scnet") -> tuple:
 
 
 def test_extra_models_file_adds_a_local_checkpoint(tmp_path) -> None:
-    """A user-supplied file makes a local checkpoint loadable by name."""
+    """
+    A user-supplied file makes a local checkpoint loadable by name.
+    """
     from unblend.repo import ModelRepository
 
     models_file, _ = _write_local_model(tmp_path)
@@ -231,7 +253,9 @@ def test_extra_models_file_adds_a_local_checkpoint(tmp_path) -> None:
 
 
 def test_local_checkpoint_is_not_treated_as_managed_cache(tmp_path) -> None:
-    """Cache inspection/removal must never delete a user-owned model file."""
+    """
+    Cache inspection/removal must never delete a user-owned model file.
+    """
     from unblend.repo import ModelRepository
 
     models_file, weights = _write_local_model(tmp_path)
@@ -258,7 +282,9 @@ def test_extra_models_file_cannot_shadow_a_builtin(tmp_path) -> None:
 
 
 def test_local_checkpoint_digest_is_verified_when_supplied(tmp_path) -> None:
-    """A stated sha256 is enforced, so a swapped file fails loudly."""
+    """
+    A stated sha256 is enforced, so a swapped file fails loudly.
+    """
     import json
 
     from unblend.exceptions import ModelLoadingError
@@ -275,7 +301,9 @@ def test_local_checkpoint_digest_is_verified_when_supplied(tmp_path) -> None:
 
 
 def test_missing_local_checkpoint_is_reported_clearly(tmp_path) -> None:
-    """A path that does not exist names the file rather than failing obscurely."""
+    """
+    A path that does not exist names the file rather than failing obscurely.
+    """
 
     from unblend.exceptions import ModelLoadingError
     from unblend.repo import ModelRepository
@@ -339,7 +367,9 @@ def test_onnx_wrapper_reproduces_the_masked_forward() -> None:
 def test_scnet_export_uses_browser_io_and_records_both_segment_lengths(
     tmp_path,
 ) -> None:
-    """The exported graph advertises the exact contract consumed in JS."""
+    """
+    The exported graph advertises the exact contract consumed in JS.
+    """
     onnx = pytest.importorskip("onnx")
     pytest.importorskip("onnxscript")
 

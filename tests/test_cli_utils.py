@@ -1,4 +1,6 @@
-"""Unit tests for the path/formatting helpers in ``unblend.cli.utils``."""
+"""
+Unit tests for the path/formatting helpers in ``unblend.cli.utils``.
+"""
 
 from pathlib import Path
 
@@ -35,7 +37,9 @@ def test_format_output_path_substitutes_variables() -> None:
 
 
 def test_format_output_path_dot_components_keep_full_filename() -> None:
-    """Legal names whose stripped stem is '.'/'..' cannot escape a template."""
+    """
+    Legal names whose stripped stem is '.'/'..' cannot escape a template.
+    """
     assert format_output_path(
         "out/{track}/{stem}.{ext}", "m", Path("...wav"), "vocals", "wav"
     ) == Path("out/...wav/vocals.wav")

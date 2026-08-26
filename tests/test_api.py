@@ -9,9 +9,8 @@ from unblend import (
     SeparatedSources,
     __version__,
     get_version,
-    select_model,
 )
-from unblend.api import Separator
+from unblend.api import Separator, select_model
 from unblend.exceptions import LoadAudioError, ValidationError
 from unblend.roformer import BSRoformer, RotaryEmbedding
 
@@ -37,7 +36,9 @@ def _stub_separator(
 
 
 class _ProgressModel(torch.nn.Module):
-    """Tiny pointwise model for exercising ``Separator`` progress wiring."""
+    """
+    Tiny pointwise model for exercising ``Separator`` progress wiring.
+    """
 
     sources = ["one", "two"]
     samplerate = 100
@@ -163,7 +164,9 @@ def test_normalize_denormalize_roundtrip() -> None:
 
 
 def test_normalize_one_sample_is_finite_and_reversible() -> None:
-    """One-sample input avoids undefined sample-standard-deviation NaNs."""
+    """
+    One-sample input avoids undefined sample-standard-deviation NaNs.
+    """
     wav = torch.tensor([[1.0], [3.0]])
     normed, mean, std = Separator._normalize(wav)
     restored = normed * (1e-5 + std) + mean
@@ -175,13 +178,17 @@ def test_normalize_one_sample_is_finite_and_reversible() -> None:
 
 
 def test_separate_releases_mps_cache_when_dispatch_fails(monkeypatch) -> None:
-    """MPS cache cleanup runs once even when separation raises."""
+    """
+    MPS cache cleanup runs once even when separation raises.
+    """
     separator = _stub_separator()
     separator.device = "mps"
     released = []
 
     def fail_dispatch(*_args: object, **_kwargs: object) -> None:
-        """Raise a representative inference failure."""
+        """
+        Raise a representative inference failure.
+        """
         raise RuntimeError("inference failed")
 
     monkeypatch.setattr(separator, "_run_with_oom_backoff", fail_dispatch)
@@ -364,7 +371,9 @@ def test_compiled_roformer_batch_estimate_snaps_to_power_of_two(
 def test_cuda_constructor_restores_process_global_backend_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Successful CUDA setup cannot leak cuDNN/matmul policy to the host."""
+    """
+    Successful CUDA setup cannot leak cuDNN/matmul policy to the host.
+    """
 
     class FakeCudaModel(torch.nn.Module):
         sources = ["one"]
@@ -495,7 +504,7 @@ def test_compile_roformer_targets_transformer_core_without_state_drift(
         actual = model(audio)
 
     assert compile_modes == ["reduce-overhead"]
-    assert hasattr(model, "_uncompiled_run_transformers")
+    assert hasattr(model, "_eager_core")
     assert model._fixed_batch_shape is True
     assert set(model.state_dict()) == state_keys
     assert torch.equal(actual, expected)
@@ -510,7 +519,7 @@ def test_compile_roformer_targets_transformer_core_without_state_drift(
     separator.device = "cpu"
     monkeypatch.setattr(torch._dynamo, "reset", lambda: None)
     separator._teardown_compile_state()
-    assert not hasattr(model, "_uncompiled_run_transformers")
+    assert not hasattr(model, "_eager_core")
     assert model._fixed_batch_shape is False
 
 
@@ -565,7 +574,9 @@ def test_read_pcm16_wav_rejects_zero_sample_rate(
     import wave
 
     class _FakeWave:
-        """Pure stub for ``wave.open`` exercising the zero-rate edge."""
+        """
+        Pure stub for ``wave.open`` exercising the zero-rate edge.
+        """
 
         def __enter__(self) -> "_FakeWave":
             """
@@ -648,7 +659,9 @@ def test_to_tensor_rejects_non_tensor_waveform() -> None:
     "dtype", [torch.int16, torch.uint8, torch.bool, torch.complex64]
 )
 def test_to_tensor_rejects_non_floating_tuple_waveforms(dtype: torch.dtype) -> None:
-    """Tuple tensors must already be normalized real floating-point audio."""
+    """
+    Tuple tensors must already be normalized real floating-point audio.
+    """
     sep = _stub_separator()
     sep.sample_rate = 44100
     sep.audio_channels = 1
@@ -747,10 +760,14 @@ def test_separate_rejects_bool_numeric_params() -> None:
 def test_init_rejects_named_only_load_before_model_load(
     monkeypatch: pytest.MonkeyPatch, stem: str
 ) -> None:
-    """Named-model stem typos fail as ValidationError before get_model."""
+    """
+    Named-model stem typos fail as ValidationError before get_model.
+    """
 
     class FakeRepository:
-        """Registry stub whose downloader must never be reached."""
+        """
+        Registry stub whose downloader must never be reached.
+        """
 
         def list_models(self) -> dict[str, dict[str, object]]:
             return {"named": {"sources": ["vocals"]}}
@@ -764,7 +781,9 @@ def test_init_rejects_named_only_load_before_model_load(
 
 
 def test_init_rejects_direct_model_empty_only_load() -> None:
-    """Direct model instances apply the same empty-stem validation."""
+    """
+    Direct model instances apply the same empty-stem validation.
+    """
     with pytest.raises(ValidationError, match="not found"):
         Separator(
             model=_ProgressModel(),

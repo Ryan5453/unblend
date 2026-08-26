@@ -6,6 +6,7 @@
 
 
 import copy
+import json
 import math
 import os
 import tempfile
@@ -18,13 +19,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import httpx
+import yaml
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 from safetensors import SafetensorError
 from safetensors.torch import load_file
 
-# Importing the architecture modules is what registers their builders;
-# the repository dispatches through backends rather than naming them.
 from . import backends, scnet  # noqa: F401
 from .apply import (
     COMBINE_DEFAULT,
@@ -35,15 +35,25 @@ from .apply import (
     sole_contributor,
     validate_combine_weights,
 )
-from .config_io import load_mapping
 from .exceptions import ModelLoadingError, ValidationError
 from .htdemucs import HTDemucs
 
+
+def _load_mapping(path: Path) -> Any:
+    """
+    Parse a YAML or JSON file.
+
+    :param path: File to read.
+    :return: Parsed contents.
+    """
+    text = path.read_text()
+    if path.suffix == ".json":
+        return json.loads(text)
+    return yaml.safe_load(text)
+
+
 BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 
-# Prefix for download staging files in the cache dir. Shared by the writer
-# (``_download_verified_file``) and the sweeper (``sweep_stale_downloads``)
-# so the two can't silently drift apart.
 STAGING_PREFIX = ".unblend-download-"
 DOWNLOAD_DEADLINE_SECONDS = 2 * 60 * 60
 STAGING_STALE_SECONDS = DOWNLOAD_DEADLINE_SECONDS + 5 * 60
@@ -72,9 +82,6 @@ def _artifact_lock(cache_path: Path) -> Iterator[None]:
             f"Could not create/acquire model cache lock {lock_path}: {exc}"
         ) from exc
     try:
-        # Deliberately keep the caller's exception outside the acquisition
-        # handlers above: domain errors raised in the critical section must
-        # retain their original type and context.
         yield
     finally:
         lock.release()
@@ -188,16 +195,8 @@ def _validate_artifact(spec: object, label: str) -> None:
     """
     Check one weight artifact's registry entry before anything reads it.
 
-    Every backend describes its weights the same way: a Safetensors file named
-    either by a local ``path`` — a file the user already has, used where it
-    lies — or by an https ``url``, downloaded once into the content-addressed
-    cache and reused from then on. A download has to be verifiable, so remote
-    artifacts require an exact ``sha256`` and ``size_bytes``; for a local file
-    both are optional and enforced only when supplied.
-
-    :param spec: The candidate artifact entry.
-    :param label: Human-readable prefix for error messages.
-    :raises ModelLoadingError: If the entry is malformed or unverifiable.
+    :param spec: The candidate artifact entry. :param label: Human-readable
+        prefix for error messages.
     """
     if not isinstance(spec, dict):
         raise ModelLoadingError(f"{label} must be a dictionary.")
@@ -269,15 +268,10 @@ def _build_demucs_layer(state: dict, member: dict, label: str) -> HTDemucs:
     """
     Build one allowlisted HTDemucs from pickle-free weights.
 
-    Constructor configuration lives in trusted registry metadata; the artifact
-    contains tensors only. A malformed Safetensors file fails closed and never
-    falls back to a pickle loader.
-
-    :param state: Tensors read from the verified artifact.
-    :param member: Resolved member carrying architecture and config.
-    :param label: Human-readable prefix for error messages.
-    :return: Strictly weight-loaded HTDemucs model.
-    :raises ModelLoadingError: If construction or strict loading fails.
+    :param state: Tensors from the verified artifact. :param member:
+        Resolved member carrying architecture and config. :param label:
+        Human-readable prefix for error messages.
+    :return: Weight-loaded HTDemucs model.
     """
     if member.get("architecture") not in DEMUCS_ARCHITECTURES:
         raise ModelLoadingError(
@@ -291,14 +285,9 @@ def _build_demucs_layer(state: dict, member: dict, label: str) -> HTDemucs:
         raise ModelLoadingError(f"Failed to build {label}: {exc}") from exc
 
 
-#: The backend whose weights ship as a bag of per-source layers rather than a
-#: single checkpoint, and the architectures it builds. Special-cased because it
-#: predates the builder registry; every other family registers itself.
 DEMUCS_BACKEND = "demucs"
 DEMUCS_ARCHITECTURES = frozenset({"htdemucs"})
 
-#: Backend reported for an entry whose members are not all built by one family
-#: — an ensemble mixing, say, an HTDemucs with an SCNet.
 ENSEMBLE_BACKEND = "ensemble"
 
 
@@ -306,16 +295,10 @@ def _known_backends() -> frozenset[str]:
     """
     Backend names ``metadata.yaml`` may declare.
 
-    ``demucs`` is special-cased because its weights ship as a bag of layers
-    rather than one checkpoint; everything else registers a builder, so adding
-    an architecture does not require editing this module.
-
+    :param backend: Backend name.
     :return: The accepted backend names.
     """
-    return (
-        frozenset({DEMUCS_BACKEND, ENSEMBLE_BACKEND})
-        | backends.single_checkpoint_backends()
-    )
+    return frozenset({DEMUCS_BACKEND, ENSEMBLE_BACKEND}) | frozenset(backends._BUILDERS)
 
 
 def _architectures_for(backend: str) -> frozenset[str]:
@@ -327,7 +310,7 @@ def _architectures_for(backend: str) -> frozenset[str]:
     """
     if backend == DEMUCS_BACKEND:
         return DEMUCS_ARCHITECTURES
-    return backends.architectures(backend)
+    return backends._ARCHITECTURES.get(backend, frozenset())
 
 
 def _known_architectures() -> frozenset[str]:
@@ -345,16 +328,9 @@ def _backend_for(label: str, info: dict) -> str:
     """
     Resolve which backend builds a model, or one ensemble member.
 
-    ``backend`` names the loader family (how the weights are packaged) and
-    ``architecture`` the class within it. Since every architecture belongs to
-    exactly one family, naming the architecture is enough — entries and members
-    alike can leave the backend out.
-
-    :param label: Human-readable prefix for error messages.
-    :param info: A registry entry or a resolved member.
+    :param label: Human-readable prefix for error messages. :param info:
+        A registry entry or a resolved member.
     :return: The backend name.
-    :raises ModelLoadingError: If neither a known backend nor a known
-        architecture is named.
     """
     declared = info.get("backend")
     if declared is not None:
@@ -383,16 +359,9 @@ def _entry_member_specs(model_name: str, model_info: dict) -> list[dict]:
     """
     A model's member specs exactly as written, before inheritance.
 
-    An entry names its weights one of three ways: ``checkpoint`` for a single
-    model, ``members`` for an ensemble, or ``models`` — the Demucs bags'
-    original spelling, where each item *is* an artifact rather than a member
-    wrapping one.
-
-    :param model_name: Model name, for error messages.
-    :param model_info: The model's registry entry.
-    :return: The raw member specs, one per file the model loads.
-    :raises ModelLoadingError: If zero or several spellings are used, or the
-        list is empty or malformed.
+    :param model_name: Model name, for error messages. :param model_info:
+        The model's registry entry.
+    :return: The raw member specs.
     """
     present = [
         key
@@ -430,7 +399,7 @@ def _member_artifact(spec: dict) -> dict | None:
         return spec["checkpoint"]
     if "model" in spec:
         return None
-    # A Demucs layer is the artifact: ``{"format": ..., "remote": ...}``.
+
     return spec
 
 
@@ -438,21 +407,15 @@ def _embedded_member_fields(artifact: object) -> dict:
     """
     Registry fields a local Safetensors artifact records about itself.
 
-    ``unblend models import`` writes architecture, stems, geometry and config
-    into the file's header, which is covered by its hash — so a file can carry
-    its own description and an entry need only say where it is. Remote
-    artifacts are not consulted: there is nothing on disk to read yet.
-
     :param artifact: A member's artifact entry.
-    :return: The embedded fields, empty if there are none to read.
+    :return: The embedded fields, empty if none.
     """
     if not isinstance(artifact, dict):
         return {}
     path = _artifact_path(artifact)
     if path is None or not path.is_file():
         return {}
-    # Imported lazily: this is a cold path, and importer pulls in the
-    # architectures purely to verify them.
+
     from .importer import read_embedded_fields
 
     return read_embedded_fields(path)
@@ -480,18 +443,8 @@ def _validate_entry(model_name: str, model_info: object) -> dict:
     """
     Validate the parts of a registry entry that stand alone.
 
-    Everything that depends on the entry's members — their architectures, the
-    weight matrix's shape, whether a referenced model exists — is checked once
-    members are resolved, which needs the rest of the registry.
-
-    ``license`` is deliberately unchecked: it is a free-form label passed
-    through to ``models list`` and ``list_models``, not something Unblend can
-    meaningfully validate.
-
-    :param model_name: Model name.
-    :param model_info: The candidate entry.
+    :param model_name: Model name. :param model_info: The candidate entry.
     :return: The entry.
-    :raises ModelLoadingError: If the entry is malformed.
     """
     if not isinstance(model_name, str) or not model_name:
         raise ModelLoadingError("Every model name must be a non-empty string.")
@@ -597,8 +550,6 @@ def _validate_entry_combination(
                     f"{source!r}."
                 )
 
-    # These speak ValidationError; from the registry's side a bad mode or bad
-    # STFT geometry is just malformed metadata.
     try:
         canonical_combine(model_info.get("combine", COMBINE_DEFAULT))
         validate_combine_weights(model_info.get("combine", COMBINE_DEFAULT), weights)
@@ -634,7 +585,9 @@ def get_cache_dir() -> Path:
 
 
 class ModelRepository:
-    """Repository system for accessing models."""
+    """
+    Repository system for accessing models.
+    """
 
     def __init__(
         self,
@@ -656,8 +609,8 @@ class ModelRepository:
         self.metadata_path = metadata_path
 
         try:
-            self.metadata = load_mapping(Path(self.metadata_path))
-        except (OSError, ValueError) as exc:
+            self.metadata = _load_mapping(Path(self.metadata_path))
+        except (OSError, ValueError, json.JSONDecodeError, yaml.YAMLError) as exc:
             raise ModelLoadingError(
                 f"Could not read model metadata {self.metadata_path}: {exc}"
             ) from exc
@@ -673,10 +626,6 @@ class ModelRepository:
         if not self._models:
             raise ModelLoadingError("Model metadata must contain at least one model.")
 
-        # Validate what stands alone, then resolve every entry into members --
-        # which may reference other entries -- and validate those. Shipped and
-        # user-supplied entries go through exactly the same checks, so a
-        # malformed registry fails here rather than part-way through a download.
         self._models = {
             model_name: _validate_entry(model_name, model_info)
             for model_name, model_info in self._models.items()
@@ -688,8 +637,7 @@ class ModelRepository:
         for model_name, members in self._members.items():
             model_info = self._models[model_name]
             _validate_entry_combination(model_name, model_info, len(members))
-            # An entry's backend follows from its members: one family if they
-            # agree, ``ensemble`` if they don't.
+
             used = {member["backend"] for member in members}
             derived = used.pop() if len(used) == 1 else ENSEMBLE_BACKEND
             declared = model_info.get("backend")
@@ -702,11 +650,6 @@ class ModelRepository:
                 )
         self.metadata["models"] = self._models
 
-        # Index every remote artifact by the digest prefix that names its cache
-        # file; the full sha256 is what downloads and cache hits are verified
-        # against. Local artifacts are files the user already owns, so there is
-        # nothing to index. Two models naming the same artifact share one cache
-        # entry, which is what makes an ensemble of registered models free.
         self._layer_urls: dict[str, str] = {}
         self._layer_sha256: dict[str, str] = {}
         self._layer_sizes: dict[str, int] = {}
@@ -735,16 +678,9 @@ class ModelRepository:
         """
         Expand one entry into fully-specified members.
 
-        A member inherits anything it does not state from its entry, so a bag
-        of same-architecture layers stays terse while a heterogeneous ensemble
-        can spell each member out. A member may also name another registered
-        model, which is how an ensemble is built from models that already ship.
-
-        :param model_name: Model name.
-        :param resolving: Entries currently being resolved, for cycle detection.
+        :param model_name: Model name. :param resolving: Entries being resolved,
+            for cycle detection.
         :return: The resolved members, in load order.
-        :raises ModelLoadingError: If a member is malformed, references an
-            unknown or non-single model, or forms a reference cycle.
         """
         if model_name in self._members:
             return self._members[model_name]
@@ -782,16 +718,10 @@ class ModelRepository:
                     )
                 resolved.append(member)
                 continue
-            # A member that inherits the entry's architecture inherits its
-            # declared backend too, so "backend": "demucs" with a foreign
-            # architecture is reported as the mismatch it is rather than as a
-            # missing field. A member naming its own architecture derives its
-            # own backend, and an entry already marked as an ensemble has no
-            # single backend to pass down.
+
             declared_backend = model_info.get("backend")
             artifact = _member_artifact(spec)
-            # Precedence: what the member says, then the entry, then whatever
-            # the file itself records.
+
             embedded = _embedded_member_fields(artifact)
             resolved.append(
                 _validate_member(
@@ -828,14 +758,8 @@ class ModelRepository:
         """
         Overlay user-supplied model entries onto the shipped registry.
 
-        Entries are added, never substituted: a file that reuses a built-in
-        name is rejected rather than shadowing it, so dropping one in cannot
-        silently swap the weights out from under existing code.
-
         :param extra_models: Paths to overlay, or ``None`` to read
             ``UNBLEND_EXTRA_MODELS``.
-        :raises ModelLoadingError: If a file is unreadable, malformed, or
-            redefines a name that already exists.
         """
         if extra_models is None:
             raw = os.environ.get("UNBLEND_EXTRA_MODELS", "")
@@ -848,8 +772,8 @@ class ModelRepository:
         for entry in paths:
             path = Path(entry).expanduser()
             try:
-                payload = load_mapping(path)
-            except (OSError, ValueError) as exc:
+                payload = _load_mapping(path)
+            except (OSError, ValueError, json.JSONDecodeError, yaml.YAMLError) as exc:
                 raise ModelLoadingError(
                     f"Could not read extra models file {path}: {exc}"
                 ) from exc
@@ -881,9 +805,6 @@ class ModelRepository:
         """
         Content-addressed cache path for a single-checkpoint backend.
 
-        Shared by every backend registered in
-        :func:`backends.single_checkpoint_backends` (RoFormer, SCNet, …).
-
         :param model_info: The model's registry entry.
         :return: ``<cache dir>/<sha256[:16]>.safetensors``.
         """
@@ -891,15 +812,10 @@ class ModelRepository:
 
     def local_artifacts(self, name: str) -> list[Path]:
         """
-        Paths of the weight artifacts a model reads from disk rather than the
-        cache, in load order.
-
-        Empty for a model whose weights Unblend downloads. Callers use this to
-        report a user-supplied model's availability, which the cache
-        deliberately knows nothing about.
+        Paths of weight artifacts a model reads from disk.
 
         :param name: Model name.
-        :return: The declared local paths, which may or may not exist yet.
+        :return: The declared local paths.
         """
         info = self._models.get(name)
         if info is None:
@@ -928,17 +844,10 @@ class ModelRepository:
 
     def get_cache_info(self) -> dict[str, dict]:
         """
-        Get information about cached models, including partially-cached ones
-        (e.g. an interrupted multi-layer download).
+        Get information about cached models, including partially-cached ones.
 
-        Only artifacts Unblend downloaded are reported. A model whose weights
-        the user supplied as local files is absent: it occupies none of the
-        cache, and listing it here would make cache removal look authorized to
-        delete a file Unblend does not own. Callers that need such a model's
-        availability inspect its ``path`` entries directly.
-
-        :return: Dictionary mapping each model name with at least one cached
-            artifact to ``{"layers", "size_bytes", "total_layers", "complete"}``
+        :return: Mapping of model names to ``{"layers", "size_bytes",
+            "total_layers", "complete"}`` dicts.
         """
         cached_models = {}
 
@@ -951,8 +860,6 @@ class ModelRepository:
             if not remote:
                 continue
 
-            # Single stat per file — an exists()-then-stat() pair would race a
-            # concurrent removal.
             components = {}
             for spec in remote:
                 path = _artifact_cache_path(spec)
@@ -1010,30 +917,15 @@ class ModelRepository:
         total_layers: int = 1,
     ) -> Iterator[Path]:
         """
-        Yield a verified Safetensors path for one artifact, from wherever it
-        lives. Every backend loads its weights through here.
+        Yield a verified Safetensors path for one artifact.
 
-        A local ``path`` is read where it lies: there is nothing to download,
-        and copying a file the user already has into the cache would only
-        duplicate it. Its size and digest are still checked when metadata
-        declares them.
-
-        A remote ``url`` is downloaded once into the content-addressed cache
-        and reused by every later load, so pointing a model at a Hugging Face
-        URL costs one fetch rather than one per run. The per-artifact lock is
-        held for the body of the ``with`` block, so a concurrent
-        ``models remove`` cannot unlink the file while the caller is still
-        reading tensors out of it.
-
-        :param spec: The artifact entry (a Demucs layer or a ``checkpoint``).
+        :param spec: The artifact entry.
         :param label: Human-readable prefix for error messages.
-        :param progress_callback: Optional download-progress callback.
+        :param progress_callback: Optional progress callback.
         :param model_name: Model name for progress payloads.
-        :param layer_index: 1-based index of this artifact within the model.
-        :param total_layers: How many artifacts the model needs in total.
-        :return: Context manager yielding the verified artifact path.
-        :raises ModelLoadingError: If the artifact is missing, unreadable, or
-            fails verification.
+        :param layer_index: 1-based index within the model.
+        :param total_layers: How many artifacts the model needs.
+        :return: Context manager yielding the verified path.
         """
         local = _artifact_path(spec)
         if local is not None:
@@ -1062,8 +954,6 @@ class ModelRepository:
         cache_path = _artifact_cache_path(spec)
 
         with _artifact_lock(cache_path):
-            # Recheck only after taking the per-artifact lock: another process
-            # may have completed and promoted the artifact while we waited.
             cached = False
             if cache_path.exists():
                 try:
@@ -1071,7 +961,6 @@ class ModelRepository:
                     check_checksum(cache_path, expected)
                     cached = True
                 except OSError as exc:
-                    # A read failure is not corruption — keep the file.
                     raise ModelLoadingError(
                         f"Could not read cached artifact {cache_path}: {exc}"
                     ) from exc
@@ -1120,24 +1009,16 @@ class ModelRepository:
         total_layers: int = 1,
     ) -> None:
         """
-        Stream one artifact to the cache, verifying its SHA-256 before it
-        lands. Shared by every backend: a Demucs bag downloads one layer per
-        call, a single-checkpoint model exactly one.
-
-        The download is staged in a temp file inside the cache directory and
-        promoted with a single ``os.replace``, so a partial or corrupt
-        download can never appear at ``cache_path``.
+        Stream one artifact to the cache with SHA-256 verification.
 
         :param url: Source URL.
         :param cache_path: Destination path in the cache.
-        :param expected_sha256: Full 64-character digest to verify against.
-        :param expected_size: Exact artifact size from trusted metadata.
-        :param progress_callback: Optional callback (``layer_start`` /
-            ``layer_progress`` / ``layer_complete`` events).
+        :param expected_sha256: Digest to verify against.
+        :param expected_size: Exact artifact size.
+        :param progress_callback: Optional download-progress callback.
         :param model_name: Model name for progress payloads.
-        :param layer_index: 1-based index of this artifact within the model.
-        :param total_layers: How many artifacts the model needs in total.
-        :raises ModelLoadingError: On download or verification failure.
+        :param layer_index: 1-based index within the model.
+        :param total_layers: How many artifacts the model needs.
         """
         tmp_path: Path | None = None
         started = time.monotonic()
@@ -1200,7 +1081,7 @@ class ModelRepository:
                     f"Download from {url} ended at {downloaded} bytes; "
                     f"expected {expected_size}."
                 )
-            # Integrity gate before the file is visible in the cache.
+
             check_size(tmp_path, expected_size)
             check_checksum(tmp_path, expected_sha256)
             os.replace(tmp_path, cache_path)
@@ -1226,18 +1107,10 @@ class ModelRepository:
         self, name: str, only_load: str | None = None
     ) -> tuple[list[dict], list[list[float]] | None]:
         """
-        Resolve which members ``get_model`` needs, honouring the single-stem
-        shortcut.
+        Resolve which members get_model needs.
 
-        When exactly one member contributes to the isolated stem, every combine
-        mode reduces to that member's output — a mean of one, a median of one —
-        so only it is fetched and run, and the weights come back as ``None`` so
-        the caller builds it directly instead of a one-member ensemble.
-
-        :param name: Model name.
-        :param only_load: Stem to isolate, if any.
+        :param name: Model name. :param only_load: Stem to isolate, if any.
         :return: ``(members, weights)``.
-        :raises ModelLoadingError: If the model or stem is unknown.
         """
         if name not in self._models:
             raise ModelLoadingError(
@@ -1264,17 +1137,10 @@ class ModelRepository:
 
     def required_layers(self, name: str, only_load: str | None = None) -> list[str]:
         """
-        Return the cache keys of the artifacts ``get_model(name, only_load)``
-        would fetch. Useful for cache checks without touching the network.
+        Return cache keys for get_model artifacts.
 
-        Artifacts the entry points at a local file are omitted: they are read
-        where they lie and never enter the cache, so there is nothing for a
-        caller to check for.
-
-        :param name: Model name
-        :param only_load: Optional stem for the single-specialist optimisation
-        :return: List of artifact cache keys (cache files use Safetensors)
-        :raises ModelLoadingError: If the model is not found
+        :param name: Model name. :param only_load: Optional stem to isolate.
+        :return: List of artifact cache keys.
         """
         members, _ = self._select_members(name, only_load)
         return [
@@ -1303,16 +1169,9 @@ class ModelRepository:
         """
         Get a model by name, downloading whatever is not cached.
 
-        Every model is a list of members: one for a single checkpoint, several
-        for an ensemble. Each member's artifact is resolved the same way — read
-        in place if the entry names a local file, downloaded once into the cache
-        otherwise — and built by whichever backend owns its architecture.
-
-        :param name: Model name
-        :param only_load: If specified, load only the model specialized for this stem
-        :param progress_callback: Optional callback for download progress updates
-        :return: The requested model, or an ensemble of its members
-        :raises ModelLoadingError: If the model is not found or fails to load
+        :param name: Model name. :param only_load: Stem to isolate, if any.
+            :param progress_callback: Optional download-progress callback.
+        :return: The loaded model or ensemble.
         """
         members, weights = self._select_members(name, only_load)
         model_info = self._models[name]
@@ -1340,9 +1199,6 @@ class ModelRepository:
                 layer_index=index,
                 total_layers=total_layers,
             ) as path:
-                # Materialise the tensors while the artifact lock is held, so a
-                # concurrent ``models remove`` cannot unlink the file mid-read;
-                # construction happens after the lock is released.
                 state = _read_state(path)
             built.append(self._build_member(label, member, state))
             del state
@@ -1354,12 +1210,8 @@ class ModelRepository:
             total_layers=total_layers,
         )
 
-        # A metadata override can shorten, never enlarge, the configured
-        # training segment.
         segment = model_info.get("segment")
         if len(built) == 1:
-            # One member is its own output under every combine mode, so skip
-            # the ensemble wrapper entirely.
             model = built[0]
             if segment is not None:
                 model.max_allowed_segment = min(
@@ -1415,15 +1267,8 @@ class ModelRepository:
         """
         Remove a model's downloaded artifacts from the cache.
 
-        Local artifacts are left alone: they belong to the user, not to
-        Unblend's cache, so a model whose weights are all local reports
-        ``False`` rather than deleting anything.
-
-        :param name: Model name
-        :return: True if at least one cached artifact was removed, False if the
-            model is unknown or had nothing cached
-        :raises ModelLoadingError: If a cached artifact exists but can't be
-            removed (e.g. permissions)
+        :param name: Model name.
+        :return: True if any cached artifact was removed.
         """
         if name not in self._models:
             return False

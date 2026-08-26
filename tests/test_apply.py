@@ -1,4 +1,6 @@
-"""Unit tests for ``unblend.apply`` (chunk views, routing, shifts, progress)."""
+"""
+Unit tests for ``unblend.apply`` (chunk views, routing, shifts, progress).
+"""
 
 from types import SimpleNamespace
 
@@ -47,18 +49,13 @@ def test_should_restore_submodel_device_uncompiled_returns_true() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "marker", ["_uncompiled_forward_core", "_uncompiled_run_transformers"]
-)
-def test_should_restore_submodel_device_compiled_skips_restore(marker: str) -> None:
+def test_should_restore_submodel_device_compiled_skips_restore() -> None:
     """
-    Compiled HTDemucs and RoFormer sub-models stay on the inference device —
-    bouncing them off invalidates the CUDAGraphs capture.
-
-    :param marker: Family-specific attribute recording the eager callable.
+    Compiled sub-models stay on the inference device — bouncing them off
+    invalidates the CUDAGraphs capture.
     """
     sub = nn.Linear(1, 1)
-    setattr(sub, marker, lambda *_args, **_kwargs: None)
+    setattr(sub, "_eager_core", lambda *_args, **_kwargs: None)
     assert (
         _should_restore_submodel_device(sub, torch.device("cpu"), torch.device("cuda"))
         is False
@@ -155,7 +152,9 @@ class _DoublingModel(torch.nn.Module):
 
 
 def test_model_ensemble_rejects_zero_weight_total() -> None:
-    """A per-source zero weight total is rejected before inference."""
+    """
+    A per-source zero weight total is rejected before inference.
+    """
     with pytest.raises(ValidationError, match="non-zero total"):
         ModelEnsemble(
             [_DoublingModel(), _DoublingModel()],
@@ -164,7 +163,9 @@ def test_model_ensemble_rejects_zero_weight_total() -> None:
 
 
 def test_model_ensemble_revalidates_mutated_weights() -> None:
-    """Post-construction weight mutation cannot cause silent NaN output."""
+    """
+    Post-construction weight mutation cannot cause silent NaN output.
+    """
     ensemble = ModelEnsemble([_DoublingModel()])
     ensemble.weights[0][0] = 0.0
     with pytest.raises(ValidationError, match="non-zero total"):
@@ -180,13 +181,19 @@ def test_model_ensemble_revalidates_mutated_weights() -> None:
 
 
 def test_specialist_shortcut_requires_exclusive_stem_weight() -> None:
-    """A one-hot row cannot bypass another model contributing to that stem."""
+    """
+    A one-hot row cannot bypass another model contributing to that stem.
+    """
 
     class DifferentModel(_DoublingModel):
-        """Return distinguishable values for both sources."""
+        """
+        Return distinguishable values for both sources.
+        """
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            """Return ``3x`` and ``4x`` as the two sources."""
+            """
+            Return ``3x`` and ``4x`` as the two sources.
+            """
             return torch.stack([3 * x, 4 * x], dim=1)
 
     ensemble = ModelEnsemble(
@@ -203,7 +210,9 @@ def test_specialist_shortcut_requires_exclusive_stem_weight() -> None:
 
 
 def test_model_ensemble_propagates_contract_and_segment_cap() -> None:
-    """Raw-audio ensembles preserve normalization and finite segment limits."""
+    """
+    Raw-audio ensembles preserve normalization and finite segment limits.
+    """
     first = _DoublingModel()
     second = _DoublingModel()
     first.external_normalization = False
@@ -310,7 +319,9 @@ def test_isolated_member_is_normalized_like_the_full_ensemble() -> None:
 
 
 def test_htdemucs_valid_length_matches_rounded_apply_segment() -> None:
-    """Fractional seconds use the same sample conversion in validation/chunking."""
+    """
+    Fractional seconds use the same sample conversion in validation/chunking.
+    """
     from unblend.htdemucs import HTDemucs
 
     model = SimpleNamespace(max_allowed_segment=1.0001, samplerate=8000)
@@ -318,7 +329,9 @@ def test_htdemucs_valid_length_matches_rounded_apply_segment() -> None:
 
 
 def test_htdemucs_mask_without_cac_applies_real_mask() -> None:
-    """Non-CaC decoding applies a real mask while preserving mixture phase."""
+    """
+    Non-CaC decoding applies a real mask while preserving mixture phase.
+    """
     from unblend.htdemucs import HTDemucs
 
     model = object.__new__(HTDemucs)
@@ -333,7 +346,9 @@ def test_htdemucs_mask_without_cac_applies_real_mask() -> None:
 
 
 def test_htdemucs_mask_with_cac_decodes_complex_channels() -> None:
-    """CaC decoding still reconstructs adjacent real/imaginary channels."""
+    """
+    CaC decoding still reconstructs adjacent real/imaginary channels.
+    """
     from unblend.htdemucs import HTDemucs
 
     model = object.__new__(HTDemucs)
@@ -408,7 +423,9 @@ def test_apply_model_shifts_progress_single_monotonic_span() -> None:
 def test_ensemble_shifts_share_offsets_and_report_exact_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Different segment lengths still produce one exact, non-clamped span."""
+    """
+    Different segment lengths still produce one exact, non-clamped span.
+    """
 
     class ShortSegmentModel(_DoublingModel):
         max_allowed_segment = 0.6
@@ -815,7 +832,9 @@ def test_selection_modes_reject_non_binary_weights() -> None:
 
 
 def test_weighted_mean_still_accepts_real_weights() -> None:
-    """The blending default keeps its per-source weighted average."""
+    """
+    The blending default keeps its per-source weighted average.
+    """
     ensemble = ModelEnsemble(
         [_ScalingModel(1.0, 1.0), _ScalingModel(3.0, 3.0)],
         weights=[[3.0, 1.0], [1.0, 1.0]],
@@ -857,14 +876,18 @@ def test_isolate_stem_runs_one_member_under_every_mode(combine: str) -> None:
     calls: list[int] = []
 
     class Counting(_ScalingModel):
-        """Records that its forward ran."""
+        """
+        Records that its forward ran.
+        """
 
         def __init__(self, scale: float, tag: int) -> None:
             super().__init__(scale, scale)
             self.tag = tag
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            """Record the call, then scale as usual."""
+            """
+            Record the call, then scale as usual.
+            """
             calls.append(self.tag)
             return super().forward(x)
 
@@ -900,7 +923,9 @@ def test_spectral_combine_is_seamless_across_blocks() -> None:
 
 
 def test_unknown_combine_mode_is_rejected() -> None:
-    """An unimplemented mode fails at construction, naming the alternatives."""
+    """
+    An unimplemented mode fails at construction, naming the alternatives.
+    """
     with pytest.raises(ValidationError, match="Unknown ensemble combine mode"):
         ModelEnsemble([_ScalingModel(1.0, 1.0)], combine="telepathy")
 
@@ -914,7 +939,9 @@ def test_unknown_combine_mode_is_rejected() -> None:
     ],
 )
 def test_combine_params_are_validated(params: dict, expected: str) -> None:
-    """STFT geometry has to be usable before any audio is processed."""
+    """
+    STFT geometry has to be usable before any audio is processed.
+    """
     with pytest.raises(ValidationError, match=expected):
         ModelEnsemble(
             [_ScalingModel(1.0, 1.0)], combine="min_fft", combine_params=params
@@ -932,18 +959,24 @@ def test_compile_is_applied_to_every_ensemble_member() -> None:
     compiled: list[int] = []
 
     class Compilable(_OffsetModel):
-        """Records that its compiled core was swapped in and out."""
+        """
+        Records that its compiled core was swapped in and out.
+        """
 
         def __init__(self, tag: int, external_normalization: bool) -> None:
             super().__init__(external_normalization)
             self.tag = tag
 
         def enable_compiled_core(self) -> None:
-            """Stand in for swapping in the compiled hot path."""
+            """
+            Stand in for swapping in the compiled hot path.
+            """
             compiled.append(self.tag)
 
         def disable_compiled_core(self) -> None:
-            """Stand in for restoring the eager hot path."""
+            """
+            Stand in for restoring the eager hot path.
+            """
             compiled.remove(self.tag)
 
     ensemble = ModelEnsemble([Compilable(0, True), Compilable(1, False)])

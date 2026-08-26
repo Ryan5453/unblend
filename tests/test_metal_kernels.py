@@ -38,7 +38,9 @@ LP_DTYPES = [torch.float16, torch.bfloat16]
 
 
 def _inference_call(module: nn.Module, *args: torch.Tensor):
-    """Run a replacement through its shader-backed inference dispatch."""
+    """
+    Run a replacement through its shader-backed inference dispatch.
+    """
     with torch.inference_mode():
         return module(*args)
 
@@ -154,7 +156,9 @@ def test_metal_group_norm_matches_fallback(
 
 @mps_only
 def test_shader_modules_fall_back_when_autograd_is_enabled() -> None:
-    """Raw Metal kernels are bypassed whenever gradients are being recorded."""
+    """
+    Raw Metal kernels are bypassed whenever gradients are being recorded.
+    """
     mod = MetalGroupNorm(_make_gn(16)).to("mps")
     x = torch.randn(2, 16, 32, device="mps", dtype=torch.float16, requires_grad=True)
 
@@ -174,7 +178,9 @@ def test_shader_modules_fall_back_when_autograd_is_enabled() -> None:
 
 @mps_only
 def test_shader_modules_still_dispatch_during_inference(monkeypatch) -> None:
-    """The performance path remains active under Separator's inference mode."""
+    """
+    The performance path remains active under Separator's inference mode.
+    """
     import unblend.metal as metal_module
 
     calls: list[str] = []
@@ -192,7 +198,9 @@ def test_shader_modules_still_dispatch_during_inference(monkeypatch) -> None:
 
 @mps_only
 def test_shader_parameter_caches_refresh_after_optimizer_step() -> None:
-    """Warm inference caches never hide affine/LayerScale optimizer updates."""
+    """
+    Warm inference caches never hide affine/LayerScale optimizer updates.
+    """
     x = torch.randn(2, 16, 32, device="mps", dtype=torch.float16)
     mod = MetalGroupNorm(_make_gn(16)).to("mps").eval()
     _inference_call(mod, x)
@@ -589,7 +597,9 @@ def test_metal_multihead_attention_matches_reference(dtype: torch.dtype) -> None
 
 @mps_only
 def test_metal_multihead_attention_training_preserves_dropout() -> None:
-    """Training calls use native MHA so attention dropout is not omitted."""
+    """
+    Training calls use native MHA so attention dropout is not omitted.
+    """
     import copy
 
     mha = nn.MultiheadAttention(16, 4, dropout=1.0, batch_first=True).train()

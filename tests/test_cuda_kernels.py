@@ -38,7 +38,9 @@ LP_DTYPES = [torch.float16, torch.bfloat16]
 
 
 def _inference_call(module: nn.Module, *args: torch.Tensor):
-    """Run a replacement through its kernel-backed inference dispatch."""
+    """
+    Run a replacement through its kernel-backed inference dispatch.
+    """
     with torch.inference_mode():
         return module(*args)
 
@@ -163,7 +165,9 @@ def test_cuda_group_norm_matches_fallback(
 
 @cuda_only
 def test_kernel_modules_fall_back_when_autograd_is_enabled() -> None:
-    """Raw CUDA kernels are bypassed whenever gradients are being recorded."""
+    """
+    Raw CUDA kernels are bypassed whenever gradients are being recorded.
+    """
     mod = CUDAGroupNorm(_make_gn(16)).to(_device())
     x = torch.randn(
         2, 16, 32, device=_device(), dtype=torch.float16, requires_grad=True
@@ -185,7 +189,9 @@ def test_kernel_modules_fall_back_when_autograd_is_enabled() -> None:
 
 @cuda_only
 def test_kernel_modules_still_dispatch_during_inference(monkeypatch) -> None:
-    """The performance path remains active under Separator's inference mode."""
+    """
+    The performance path remains active under Separator's inference mode.
+    """
     import unblend.cuda as cuda_module
 
     calls: list[str] = []
@@ -203,7 +209,9 @@ def test_kernel_modules_still_dispatch_during_inference(monkeypatch) -> None:
 
 @cuda_only
 def test_kernel_parameter_caches_refresh_after_optimizer_step() -> None:
-    """Warm inference caches never hide affine/LayerScale optimizer updates."""
+    """
+    Warm inference caches never hide affine/LayerScale optimizer updates.
+    """
     x = torch.randn(2, 16, 32, device=_device(), dtype=torch.float16)
     mod = CUDAGroupNorm(_make_gn(16)).to(_device()).eval()
     _inference_call(mod, x)
@@ -831,7 +839,9 @@ def test_cuda_multihead_attention_matches_reference(dtype: torch.dtype) -> None:
 
 @cuda_only
 def test_cuda_multihead_attention_training_preserves_dropout() -> None:
-    """Training calls use native MHA so attention dropout is not omitted."""
+    """
+    Training calls use native MHA so attention dropout is not omitted.
+    """
     import copy
 
     mha = nn.MultiheadAttention(16, 4, dropout=1.0, batch_first=True).train()

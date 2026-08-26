@@ -160,7 +160,9 @@ def test_mps_manual_attention_matches_native_sdpa(
 
 @mps_only
 def test_mps_manual_attention_prescales_before_fp16_matmul() -> None:
-    """Large finite FP16 Q/K values do not overflow before attention scaling."""
+    """
+    Large finite FP16 Q/K values do not overflow before attention scaling.
+    """
     query = torch.full((1, 1, 4, 16), 100.0, device="mps", dtype=torch.float16)
     key = query.clone()
     value = torch.randn_like(query)

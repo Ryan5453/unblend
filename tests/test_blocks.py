@@ -1,4 +1,6 @@
-"""Focused regression tests for low-level spectrogram helpers."""
+"""
+Focused regression tests for low-level spectrogram helpers.
+"""
 
 import pytest
 import torch
@@ -8,7 +10,9 @@ from unblend.blocks import _istft_fold
 
 @pytest.mark.parametrize("win_length", [16, 12])
 def test_istft_fold_matches_torch_and_has_finite_backward(win_length: int) -> None:
-    """Custom iSTFT matches PyTorch while keeping input gradients finite."""
+    """
+    Custom iSTFT matches PyTorch while keeping input gradients finite.
+    """
     n_fft = 16
     hop_length = 4
     length = 36
@@ -55,7 +59,9 @@ def test_istft_fold_matches_torch_and_has_finite_backward(win_length: int) -> No
 
 
 def test_istft_fold_right_pads_extended_length() -> None:
-    """An explicit overlong reconstruction is padded to the requested size."""
+    """
+    An explicit overlong reconstruction is padded to the requested size.
+    """
     n_fft = 16
     hop_length = 4
     available_signal = torch.randn(1, 32)

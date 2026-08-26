@@ -697,9 +697,9 @@ def import_model_command(
     )
 
     if not register:
-        from ..config_io import dump_mapping
+        from ..importer import _dump_mapping
 
-        console.print(dump_mapping({"models": {name: entry}}, Path("entry.yaml")))
+        console.print(_dump_mapping({"models": {name: entry}}, Path("entry.yaml")))
         return
 
     target = (models_file or _default_models_file()).expanduser()

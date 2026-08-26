@@ -1,18 +1,13 @@
 # Copyright (c) 2023 Phil Wang (lucidrains/BS-RoFormer)
 # Copyright (c) 2024 Roman Solovyev (ZFTurbo/Music-Source-Separation-Training)
 # Copyright (c) 2025-present Ryan Fahey
-#
+
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-#
-# BS-RoFormer and Mel-Band RoFormer (Wang et al., ByteDance 2023,
-# arXiv:2309.02612 / 2310.01809), reimplemented in plain PyTorch from the
-# MIT-licensed reference lineage above. Community checkpoints are trained
-# against that lineage, so every module attribute name, ``nn.Sequential``
-# position, and parameter shape below is pinned to it — ``load_state_dict``
-# with ``strict=True`` must keep accepting those checkpoints verbatim.
-# Everything else (einops/beartype/rotary-embedding-torch/librosa
-# dependencies, the training-loss branches) is deliberately not carried over.
+
+"""
+RoFormer architectures for source separation.
+"""
 
 from __future__ import annotations
 
@@ -24,11 +19,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .backends import ASSModel
 from .exceptions import ValidationError
 
-# The standard 62-band split over the 1025 STFT bins of n_fft=2048, from the
-# BS-RoFormer reference implementation. Community checkpoints (including
-# BS-RoFormer-SW) train against exactly this layout.
 DEFAULT_FREQS_PER_BANDS: tuple[int, ...] = (
     *(2,) * 24,
     *(4,) * 12,
@@ -51,40 +44,19 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim))
-        # The current dynamo ONNX decomposition of ``aten.rms_norm`` drops an
-        # explicitly supplied 1e-12 epsilon, yielding Reciprocal(Sqrt(0)) for
-        # silent input. ``RoformerONNXWrapper`` enables the explicit formula
-        # below so silence remains finite without changing native inference.
+
         self.onnx_safe = False
 
     def forward(self, x: Tensor) -> Tensor:
         """
         Normalise ``x`` to unit RMS over the last axis and apply the gain.
 
-        ``F.normalize(x, dim=-1) * sqrt(dim) * gamma`` is algebraically exactly
-        ``x / sqrt(mean(x^2)) * gamma`` — i.e. RMS norm — so the fused
-        ``F.rms_norm`` primitive computes the identical result while
-        accumulating the mean-square in float32 internally (stable under fp16,
-        matching autocast semantics) in a single kernel. The manual path used
-        to materialise an fp32 upcast, the normalised tensor, two scaled
-        products, and an fp16 downcast — five tensor allocations per call, all
-        of which show up as ``aten::copy_``/``aten::to`` in the transformer hot
-        loop. MPS inference keeps its equivalent fused Metal reduction instead;
-        CUDA keeps ``F.rms_norm`` (already a fused single-kernel op there —
-        measured faster than the custom-CUDA variant, which stays available in
-        ``unblend.cuda`` for explicit use).
-
-        :param x: Input of shape ``[..., dim]``.
-        :return: Normalised tensor of the same shape and dtype.
+        :param x: Input of shape ``[..., dim]``. :return: Normalised tensor.
         """
         if self.onnx_safe:
             working = x.float()
             mean_square = working.square().mean(dim=-1, keepdim=True)
-            # Express the zero guard as Max instead of ``+ 1e-12``. Torch's
-            # ONNX optimizer currently drops an Add of that magnitude as a
-            # numeric no-op, recreating the divide-by-zero this path exists to
-            # prevent. Clamp is identical at zero and differs only for
-            # sub-1e-12 mean squares (far below useful audio precision).
+
             normalized = working * torch.rsqrt(mean_square.clamp_min(1e-12))
             return (normalized * self.gamma.float()).to(x.dtype)
         if x.device.type == "mps" and not torch.is_grad_enabled():
@@ -138,48 +110,20 @@ def _binary_sum(tensors: list[Tensor]) -> Tensor:
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         """
-        Rotary position embedding (RoPE, Su et al. 2021), matching the
-        ``rotary-embedding-torch`` package the reference models were trained
-        with: interleaved pair rotation with per-pair inverse frequencies.
+        Rotary position embedding (RoPE, Su et al.
 
-        ``freqs`` is an ``nn.Parameter`` (frozen) because the reference
-        package stores it that way — checkpoints therefore contain a
-        ``rotary_embed.freqs`` entry under every attention path, and the
-        parameter must exist here for ``strict=True`` loading.
-
-        :param dim: Rotation dimensionality (the per-head dimension).
-        :param theta: Base for the inverse-frequency spectrum.
+        :param dim: Per-head rotation dimensionality. :param theta: Inverse-frequency base.
         """
         super().__init__()
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
         self.freqs = nn.Parameter(freqs, requires_grad=False)
-        # Real-valued cos/sin tables materialised in the *working* dtype, so
-        # the eager rotation runs without upcasting q/k to fp32 and back
-        # (that up/downcast was, after the RMSNorm fusion, the single largest
-        # source of ``aten::to`` traffic in the transformer hot loop). Keyed
-        # by (seq_len, device, dtype). Chunked inference calls every attention
-        # block with the same one or two sequence lengths thousands of times,
-        # so caching the trig tables removes them from the hot loop entirely.
+
         self._cos_sin_cache: dict[
             tuple[int, torch.device, torch.dtype], tuple[Tensor, Tensor]
         ] = {}
-        # Per-instance kill switch for the fused CUDA rotary kernel. Defaults
-        # to True; ``Separator(custom_kernels=False)`` flips it off on every
-        # instance of a loaded model so forwards stay entirely on vanilla ops
-        # (SDR/benchmark baseline). Not a buffer — must not reach state dicts.
+
         self.use_fused_cuda_kernel = True
-        # Pre-bound cos/sin tables for the ``torch.compile`` path. Each rotary
-        # instance is shared across every block of a single axis (time OR
-        # frequency), so during inference it only ever sees one sequence
-        # length. ``prime_compiled`` binds that axis's table to these plain
-        # tensor attributes before capture, so the compiled trunk reads a
-        # frozen constant instead of doing a Python dict lookup keyed on
-        # ``(seq_len, device)`` inside every attention — that lookup is a
-        # non-GPU op that forced Inductor to split the CUDAGraph at every
-        # layer (25+ partitions, each with boundary copies that scaled with
-        # batch size, making compile slower than eager and burning ~19 GiB
-        # of graph pools). As frozen attributes the whole trunk captures as
-        # one graph.
+
         self._compiled_cos: Tensor | None = None
         self._compiled_sin: Tensor | None = None
 
@@ -187,19 +131,9 @@ class RotaryEmbedding(nn.Module):
         self, seq_len: int, device: torch.device, dtype: torch.dtype
     ) -> tuple[Tensor, Tensor]:
         """
-        ``(cos, sin)`` rotation tables of shape ``[seq_len, dim // 2]`` in the
-        requested working dtype.
+        ``(cos, sin)`` rotation tables of shape ``[seq_len, dim // 2]`` in the requested working dtype.
 
-        The angles are always built in float32 (trig has no half kernel and
-        the frequency spectrum spans several orders of magnitude), then cast
-        once to ``dtype`` and cached. Applying the rotation in the model dtype
-        removes the per-call fp32 upcast of q/k and the matching downcast —
-        two full-tensor copies per attention projection.
-
-        :param seq_len: Sequence length to build (or fetch) tables for.
-        :param device: Device the tables must live on.
-        :param dtype: Working dtype of the queries/keys.
-        :return: Cached ``(cos, sin)`` pair.
+        :param seq_len: Sequence length to build tables for. :param device: Device for the tables. :param dtype: Working dtype of queries/keys. :return: Cached ``(cos, sin)`` pair.
         """
         key = (seq_len, device, dtype)
         cached = self._cos_sin_cache.get(key)
@@ -216,13 +150,9 @@ class RotaryEmbedding(nn.Module):
         self, seq_len: int, device: torch.device, dtype: torch.dtype
     ) -> None:
         """
-        Bind this axis's rotation table to frozen attributes ahead of
-        ``torch.compile`` capture, so the compiled trunk reads a constant
-        instead of doing a Python dict lookup per attention.
+        Bind this axis's rotation table to frozen attributes ahead of ``torch.compile`` capture, so the compiled trunk reads a constant instead of doing a Python dict lookup per attention.
 
-        :param seq_len: The (single) sequence length this rotary sees.
-        :param device: Capture device.
-        :param dtype: Working dtype of the queries/keys.
+        :param seq_len: Sequence length to bind tables for. :param device: Capture device. :param dtype: Working dtype of queries/keys.
         """
         cos, sin = self._cos_sin(seq_len, device, dtype)
         self._compiled_cos = cos
@@ -260,24 +190,13 @@ class RotaryEmbedding(nn.Module):
         """
         Apply rotary rotation over the sequence axis of ``t``.
 
-        For an interleaved pair ``(x1, x2)`` and angle ``θ``, the complex
-        product ``(x1 + i·x2)·e^{iθ}`` is ``(x1·cosθ − x2·sinθ, x1·sinθ +
-        x2·cosθ)`` — the reference package's interleaved rotate-half, done in
-        the working dtype with no fp32 round-trip. The compiled path reads the
-        table pre-bound by ``prime_compiled`` (a frozen attribute) so no
-        Python dict lookup lands inside the captured graph.
-
-        :param t: Queries or keys of shape ``[..., seq, dim]``.
-        :return: Rotated tensor of the same shape and dtype.
+        :param t: Queries or keys of shape ``[..., seq, dim]``. :return: Rotated tensor.
         """
         if torch.compiler.is_compiling() and self._compiled_cos is not None:
             cos, sin = self._compiled_cos, self._compiled_sin
         else:
             cos, sin = self._cos_sin(t.shape[-2], t.device, t.dtype)
 
-        # Native-CUDA fast path: one fused kernel instead of seven
-        # elementwise passes. Eager inference only — the compiled trunk keeps
-        # its captured-table math above.
         if (
             t.device.type == "cuda"
             and self.use_fused_cuda_kernel
@@ -313,10 +232,7 @@ class FeedForward(nn.Module):
             nn.Linear(dim_inner, dim),
             nn.Dropout(dropout),
         )
-        # Set only by ``RoformerONNXWrapper``. The browser graph evaluates the
-        # expanded hidden features in independent groups, then sums their
-        # contributions to the second linear layer. This preserves the MLP
-        # exactly while avoiding a 200+ MiB intermediate tensor.
+
         self.onnx_hidden_chunk_size: int | None = None
 
     def forward(self, x: Tensor) -> Tensor:
@@ -370,22 +286,9 @@ def _scaled_dot_product_attention(
     """
     Run RoFormer self-attention with the fastest measured backend path.
 
-    PyTorch 2.10's fused MPS SDPA is about 32% slower than explicit
-    matmul/softmax/matmul at both RoFormer sequence shapes on an M2 Max.
-    Evaluation therefore uses the explicit path on MPS; training and other
-    devices retain native SDPA, including its dropout semantics.
-
-    :param query: Queries of shape ``[batch, heads, sequence, dim]``.
-    :param key: Keys with the same shape as ``query``.
-    :param value: Values with the same shape as ``query``.
-    :param scale: Query/key dot-product scale.
-    :param dropout: Training dropout probability.
-    :param training: Whether the containing attention module is training.
-    :return: Attention output with the same shape as ``query``.
+    :param query: Queries ``[batch, heads, sequence, dim]``. :param key: Keys matching ``query`` shape. :param value: Values matching ``query`` shape. :param scale: Dot-product scale. :param dropout: Dropout probability. :param training: Whether the module is training. :return: Attention output.
     """
     if query.device.type == "mps" and not training:
-        # Pre-scale Q so large finite FP16 values cannot overflow in an
-        # unscaled intermediate before the mathematically-required reduction.
         weights = (query * scale) @ key.transpose(-1, -2)
         return weights.softmax(dim=-1) @ value
     return F.scaled_dot_product_attention(
@@ -406,28 +309,11 @@ def _chunked_scaled_dot_product_attention(
     training: bool,
     query_chunk_size: int | None,
 ) -> Tensor:
-    """Run exact attention without materialising the full score matrix.
+    """
+    Run exact attention without materialising the full score matrix.
 
-    Splitting only the query axis preserves ordinary scaled dot-product
-    attention exactly: every query still attends to every key, while each
-    temporary score tensor is bounded by ``query_chunk_size * key_length``.
-    The browser ONNX export enables this path because production RoFormer
-    score tensors otherwise require 1.2--2.6 GB per layer and cannot fit in a
-    32-bit WebAssembly heap (or a typical WebGPU storage buffer).
-
-    Chunks are concatenated through a binary tree so every ONNX ``Concat`` has
-    at most two inputs. This matters on WebGPU implementations that expose the
-    specification-minimum number of storage-buffer bindings per shader stage.
-
-    :param query: Queries of shape ``[batch, heads, sequence, dim]``.
-    :param key: Keys with the same shape as ``query``.
-    :param value: Values with the same shape as ``query``.
-    :param scale: Query/key dot-product scale.
-    :param dropout: Attention dropout probability.
-    :param training: Whether the containing attention module is training.
-    :param query_chunk_size: Maximum query rows per score tensor, or ``None``
-        for the normal unchunked implementation.
-    :return: Attention output with the same shape as ``query``.
+    :param query: Queries ``[batch, heads, sequence, dim]``. :param key: Keys matching ``query`` shape. :param value: Values matching ``query`` shape. :param scale: Dot-product scale.
+    :param dropout: Attention dropout probability. :param training: Whether the module is training. :param query_chunk_size: Max query rows per score tensor. :return: Attention output.
     """
     if query_chunk_size is None or query.shape[-2] <= query_chunk_size:
         return _scaled_dot_product_attention(
@@ -467,15 +353,9 @@ class Attention(nn.Module):
         rotary_embed: RotaryEmbedding | None = None,
     ) -> None:
         """
-        Pre-norm multi-head self-attention with per-head sigmoid gating,
-        as used by both RoFormer variants.
+        Pre-norm multi-head self-attention with per-head sigmoid gating, as used by both RoFormer variants.
 
-        :param dim: Input/output feature dimension.
-        :param heads: Number of attention heads.
-        :param dim_head: Dimension per head.
-        :param dropout: Attention/projection dropout (inactive in eval mode).
-        :param rotary_embed: Shared rotary embedding module, or ``None`` to
-            skip position rotation.
+        :param dim: Feature dimension. :param heads: Number of heads. :param dim_head: Dimension per head. :param dropout: Attention/projection dropout. :param rotary_embed: Shared rotary embedding, or ``None``.
         """
         super().__init__()
         self.heads = heads
@@ -484,9 +364,7 @@ class Attention(nn.Module):
 
         self.rotary_embed = rotary_embed
         self.dropout = dropout
-        # Set only by ``RoformerONNXWrapper``. Native PyTorch inference keeps
-        # its faster fused attention path; browser exports trade a few more
-        # dispatches for bounded peak memory.
+
         self.onnx_query_chunk_size: int | None = None
         self.onnx_head_chunk_size: int | None = None
 
@@ -537,16 +415,7 @@ class Attention(nn.Module):
         """
         Run exact attention in independently projected head groups.
 
-        Each group slices the checkpoint's combined Q/K/V projection weights,
-        performs the same all-to-all attention, and immediately applies the
-        matching columns of the output projection. Summing those partial
-        projections is algebraically identical to concatenating every head
-        and applying one large linear layer, but no Q/K/V, attention-score, or
-        output-projection input buffer spans all heads at once.
-
-        :param x: Input of shape ``[batch, sequence, dim]``.
-        :param head_chunk_size: Number of heads to project per group.
-        :return: Attention output of the same shape as ``x``.
+        :param x: Input of shape ``[batch, sequence, dim]``. :param head_chunk_size: Heads projected per group. :return: Attention output of the same shape.
         """
         batch, seq, _ = x.shape
         x = self.norm(x)
@@ -613,14 +482,7 @@ class Attention(nn.Module):
         """
         Run gated multi-head attention over the sequence axis.
 
-        Browser exports additionally split attention heads into independent
-        projection groups. This bounds Q/K/V and output-projection buffers
-        without unrolling the much larger band/frame batch axes, complementing
-        query chunking's bound on attention scores while retaining useful GPU
-        parallelism.
-
-        :param x: Input of shape ``[batch, seq, dim]``.
-        :return: Output of the same shape.
+        :param x: Input of shape ``[batch, sequence, dim]``. :return: Attention output.
         """
         chunk_size = self.onnx_head_chunk_size
         if chunk_size is None or chunk_size >= self.heads:
@@ -649,17 +511,8 @@ class Transformer(nn.Module):
         """
         Stack of pre-norm attention + feed-forward blocks with residuals.
 
-        :param dim: Feature dimension.
-        :param depth: Number of attention/FF pairs.
-        :param dim_head: Dimension per attention head.
-        :param heads: Number of attention heads.
-        :param attn_dropout: Attention dropout probability.
-        :param ff_dropout: Feed-forward dropout probability.
-        :param ff_mult: Feed-forward hidden expansion factor.
-        :param norm_output: Whether to RMS-normalise the stack output
-            (``True`` in Mel-Band RoFormer; ``False`` in BS-RoFormer, which
-            applies a single shared ``final_norm`` instead).
-        :param rotary_embed: Shared rotary embedding for every block.
+        :param dim: Feature dimension. :param depth: Number of attention/FF pairs. :param dim_head: Dimension per head. :param heads: Number of heads.
+        :param attn_dropout: Attention dropout probability. :param ff_dropout: Feed-forward dropout probability. :param ff_mult: Feed-forward expansion factor. :param norm_output: Whether to RMS-normalise the output. :param rotary_embed: Shared rotary embedding for every block.
         """
         super().__init__()
         self.layers = nn.ModuleList([])
@@ -720,9 +573,6 @@ class BandSplit(nn.Module):
         outs = []
         start = 0
         for width, to_feature in zip(self.dim_inputs, self.to_features):
-            # A single Split with one output per band needs roughly 60 WebGPU
-            # storage-buffer bindings. Independent slices keep every dispatch
-            # narrow and work on devices exposing only the spec minimum.
             outs.append(to_feature(x[..., start : start + width]).unsqueeze(-2))
             start += width
         return _binary_concat(outs, dim=-2)
@@ -738,19 +588,7 @@ def MLP(
     """
     Build a Linear/activation MLP as a flat ``nn.Sequential``.
 
-    The two reference implementations interpret their ``depth`` argument
-    differently (BS-RoFormer builds ``depth`` Linears, Mel-Band builds
-    ``depth + 1``), so this helper takes the unambiguous hidden-layer count
-    and each caller translates. The Sequential indices (Linear at even
-    positions) are what checkpoint keys address — do not restructure.
-
-    :param dim_in: Input feature dimension.
-    :param dim_out: Output feature dimension.
-    :param dim_hidden: Hidden feature dimension (defaults to ``dim_in``).
-    :param hidden_layers: Number of hidden Linear layers between input and
-        output.
-    :param activation: Activation module class placed between Linears.
-    :return: The assembled ``nn.Sequential``.
+    :param dim_in: Input feature dimension. :param dim_out: Output feature dimension. :param dim_hidden: Hidden feature dimension (defaults to ``dim_in``). :param hidden_layers: Number of hidden layers. :param activation: Activation module class. :return: The assembled ``nn.Sequential``.
     """
     dim_hidden = dim_hidden or dim_in
     dims = (dim_in, *((dim_hidden,) * hidden_layers), dim_out)
@@ -773,18 +611,12 @@ class MaskEstimator(nn.Module):
         """
         Per-band MLP heads producing complex masks (via GLU) for one stem.
 
-        :param dim: Input feature dimension.
-        :param dim_inputs: Output width of each band (real/imag interleaved).
-        :param mlp_hidden_layers: Hidden Linear count per band MLP (see
-            ``MLP`` for the BS vs Mel-Band ``depth`` translation).
-        :param mlp_expansion_factor: Hidden width multiplier over ``dim``.
+        :param dim: Feature dimension. :param dim_inputs: Input width of each band. :param mlp_hidden_layers: Hidden layer count per band MLP. :param mlp_expansion_factor: Hidden width multiplier over ``dim``.
         """
         super().__init__()
         self.dim_inputs = dim_inputs
         self.to_freqs = nn.ModuleList([])
-        # ``RoformerONNXWrapper`` replaces GLU's two-output Split with two
-        # explicit slices. ORT-WebGPU's fp32 memory planner can otherwise
-        # resolve one Split output to a bogus zero-sized tensor at runtime.
+
         self.onnx_safe_glu = False
         dim_hidden = dim * mlp_expansion_factor
         for dim_in in dim_inputs:
@@ -809,8 +641,6 @@ class MaskEstimator(nn.Module):
         """
         outs = []
         for index, mlp in enumerate(self.to_freqs):
-            # Avoid exporting ``unbind`` as one wide multi-output Split for
-            # the same WebGPU binding-limit reason as ``BandSplit.forward``.
             band = x.select(dim=-2, index=index)
             if self.onnx_safe_glu:
                 projected = mlp[0](band)
@@ -825,19 +655,9 @@ class MaskEstimator(nn.Module):
 
 def _slaney_mel_filter_bank(sample_rate: int, n_fft: int, n_mels: int) -> Tensor:
     """
-    Slaney-style mel filter bank, replicating ``librosa.filters.mel`` with
-    default arguments (``htk=False``, ``norm="slaney"``, ``fmin=0``,
-    ``fmax=sample_rate / 2``) in float64.
+    Slaney-style mel filter bank, replicating ``librosa.filters.mel`` with default arguments (``htk=False``, ``norm="slaney"``, ``fmin=0``, ``fmax=sample_rate / 2``) in float64.
 
-    Mel-Band RoFormer derives its band layout from the *support pattern*
-    (nonzero positions) of this matrix; the reference implementation computes
-    it with librosa. Replicating the algorithm in float64 keeps the support
-    pattern bit-identical without carrying the librosa dependency.
-
-    :param sample_rate: Audio sample rate the model operates at.
-    :param n_fft: STFT size (the bank spans ``n_fft // 2 + 1`` bins).
-    :param n_mels: Number of mel bands.
-    :return: Filter bank of shape ``[n_mels, n_fft // 2 + 1]`` (float64).
+    :param sample_rate: Audio sample rate. :param n_fft: STFT size (bank spans ``n_fft // 2 + 1`` bins). :param n_mels: Number of mel bands. :return: Filter bank of shape ``[n_mels, n_fft // 2 + 1]``.
     """
 
     def hz_to_mel(freq: Tensor) -> Tensor:
@@ -895,29 +715,20 @@ def _slaney_mel_filter_bank(sample_rate: int, n_fft: int, n_mels: int) -> Tensor
     upper = ramps[2:] / fdiff[1:, None]
     weights = torch.clamp(torch.minimum(lower, upper), min=0.0)
 
-    # Slaney normalisation: scale each filter to constant energy per band.
     enorm = 2.0 / (mel_f[2 : n_mels + 2] - mel_f[:n_mels])
     weights = weights * enorm[:, None]
     return weights
 
 
-class _RoformerBase(nn.Module):
+class _RoformerBase(ASSModel):
     """
-    Shared inference plumbing for the two RoFormer variants: STFT/iSTFT
-    bookkeeping, the axial (time/frequency) transformer loop, and the
-    ``apply_model`` interface contract (``sources`` / ``samplerate`` /
-    ``max_allowed_segment`` attributes plus a ``[B, S, C, T]`` forward
-    output, optionally adding a mixture-minus-prediction complement stem
-    for single-stem checkpoints).
+    Shared base for RoFormer variants.
     """
 
-    # Separator consults this: RoFormer checkpoints are trained on raw
-    # (unnormalised) audio, so the Demucs-style outer mean/std normalisation
-    # must be skipped for them.
+    core_name = "_run_transformers"
+
     external_normalization = False
 
-    # Inference-interface attributes (set by ``configure_inference`` or the
-    # repository loader; class-level defaults keep bare constructions usable).
     sources: list[str]
     samplerate: int = 44100
     max_allowed_segment: float = 8.0
@@ -947,28 +758,8 @@ class _RoformerBase(nn.Module):
         """
         Build the transformer trunk and record the STFT configuration.
 
-        :param dim: Feature dimension.
-        :param depth: Number of (time, frequency) transformer pairs.
-        :param stereo: Whether the model consumes stereo audio.
-        :param num_stems: Number of mask-estimator heads.
-        :param time_transformer_depth: Blocks per time transformer.
-        :param freq_transformer_depth: Blocks per frequency transformer.
-        :param linear_transformer_depth: Optional linear-attention blocks —
-            unsupported (no shipped checkpoint uses them).
-        :param dim_head: Attention head dimension.
-        :param heads: Attention head count.
-        :param attn_dropout: Attention dropout probability.
-        :param ff_dropout: Feed-forward dropout probability.
-        :param norm_transformer_output: Per-transformer output norm flag
-            (the BS/Mel structural difference).
-        :param skip_connection: Sum every earlier block's output into each
-            block input (rarely used by community configs, but present).
-        :param stft_n_fft: STFT size.
-        :param stft_hop_length: STFT hop.
-        :param stft_win_length: STFT window length.
-        :param stft_normalized: Whether ``torch.stft`` normalises.
-        :param zero_dc: Zero the DC bin before the iSTFT.
-        :raises ValidationError: If ``linear_transformer_depth`` is nonzero.
+        :param dim: Feature dimension. :param depth: Number of (time, frequency) transformer pairs. :param stereo: Whether audio is stereo. :param num_stems: Number of mask-estimator heads. :param time_transformer_depth: Blocks per time transformer. :param freq_transformer_depth: Blocks per frequency transformer. :param linear_transformer_depth: Unsupported; must be 0. :param dim_head: Dimension per head. :param heads: Number of heads.
+        :param attn_dropout: Attention dropout probability. :param ff_dropout: Feed-forward dropout probability. :param norm_transformer_output: Whether to normalise transformer outputs. :param skip_connection: Sum earlier block outputs into each block. :param stft_n_fft: STFT size. :param stft_hop_length: STFT hop length. :param stft_win_length: STFT window length. :param stft_normalized: Whether ``torch.stft`` normalises. :param zero_dc: Zero the DC bin before the iSTFT.
         """
         if linear_transformer_depth != 0:
             raise ValidationError(
@@ -982,9 +773,6 @@ class _RoformerBase(nn.Module):
         self.skip_connection = skip_connection
         self.zero_dc = zero_dc
 
-        # One rotary embedding per axis, shared across every depth — the
-        # reference models are built this way, and checkpoints repeat the
-        # shared ``freqs`` under each attention path.
         time_rotary_embed = RotaryEmbedding(dim=dim_head)
         freq_rotary_embed = RotaryEmbedding(dim=dim_head)
 
@@ -1024,7 +812,6 @@ class _RoformerBase(nn.Module):
         )
         self.stft_win_length = stft_win_length
 
-        # Interface defaults; overridden per checkpoint by the loader.
         self.sources = [f"stem_{i}" for i in range(num_stems)]
         self.output_complement = False
 
@@ -1038,19 +825,7 @@ class _RoformerBase(nn.Module):
         """
         Attach the checkpoint-specific inference interface.
 
-        For single-stem checkpoints, passing two source names (e.g.
-        ``["vocals", "other"]``) enables the complement output: the second
-        stem is computed as ``mixture - prediction`` per chunk, which under
-        the linear overlap-add in ``apply_model`` equals the full-track
-        mixture-minus — the standard way these checkpoints produce their
-        second stem.
-
-        :param sources: Output stem names, in order.
-        :param samplerate: Sample rate the checkpoint was trained at.
-        :param segment_samples: Training chunk length in samples; becomes
-            ``max_allowed_segment`` (seconds) for the tiling in
-            ``apply_model``.
-        :raises ValidationError: If source count or numeric metadata is invalid.
+        :param sources: Output stem names, in order. :param samplerate: Sample rate the checkpoint was trained at. :param segment_samples: Training chunk length in samples.
         """
         if (
             isinstance(samplerate, bool)
@@ -1081,9 +856,7 @@ class _RoformerBase(nn.Module):
         self.sources = list(sources)
         self.samplerate = samplerate
         self.max_allowed_segment = segment_samples / samplerate
-        # Tiled inference in ``apply_model`` overlap-adds fixed-length chunks,
-        # so every forward must return exactly the input chunk length. Mel-Band
-        # reads this flag in its iSTFT; BS-RoFormer always matches input length.
+
         self.match_input_audio_length = True
 
     def _stft_window(self, device: torch.device) -> Tensor:
@@ -1095,22 +868,11 @@ class _RoformerBase(nn.Module):
         """
         return torch.hann_window(self.stft_win_length, device=device)
 
-    #: Compiled RoFormer throughput vs batch size is GPU-dependent, so the
-    #: calibrator sweeps candidates up to the VRAM ceiling rather than trusting
-    #: a single estimate — and it sweeps powers of two.
     prefers_power_of_two_batch = True
 
     def prefill_inference_caches(self) -> None:
         """
         Materialize the rotary tables before CUDAGraph compilation.
-
-        The two axial sequence lengths are fixed by the checkpoint's training
-        segment: STFT frames for the time axis and band count for the frequency
-        axis. Each rotary instance is shared across every block of one axis, so
-        it only ever sees a single sequence length during inference. Binding
-        that axis's table to frozen attributes via ``prime_compiled`` keeps a
-        Python dict lookup (a non-GPU op that otherwise splits the CUDAGraph at
-        every layer) out of the captured trunk.
         """
         segment_length = int(round(self.max_allowed_segment * self.samplerate))
         hop_length = int(self.stft_kwargs["hop_length"])
@@ -1129,31 +891,6 @@ class _RoformerBase(nn.Module):
                         continue
                     rotary.prime_compiled(sequence_lengths[axis], device, dtype)
                     seen.add(id(rotary))
-
-    def enable_compiled_core(self) -> None:
-        """
-        Compile the heavy axial transformer trunk.
-
-        STFT/iSTFT, complex mask reconstruction, and the small per-band heads
-        remain eager. This mirrors HTDemucs's core-only strategy while putting
-        the roughly 90% transformer hot path under Inductor/CUDAGraphs.
-        """
-        if not hasattr(self, "_uncompiled_run_transformers"):
-            self._uncompiled_run_transformers = self._run_transformers
-        self.prefill_inference_caches()
-        self._run_transformers = torch.compile(
-            self._uncompiled_run_transformers, mode="reduce-overhead"
-        )
-        self._fixed_batch_shape = True
-
-    def disable_compiled_core(self) -> None:
-        """
-        Restore the eager transformer trunk so a retry does not double-wrap it.
-        """
-        original = getattr(self, "_uncompiled_run_transformers", None)
-        if original is not None:
-            self._run_transformers = original
-            del self._uncompiled_run_transformers
 
     def _run_transformers(self, x: Tensor) -> Tensor:
         """
@@ -1183,14 +920,11 @@ class _RoformerBase(nn.Module):
 
     def _zero_dc_bin(self, stft: Tensor) -> Tensor:
         """
-        Zero the complex STFT's DC frequency bin through its real view.
-
-        MPS does not implement ``index_fill`` for complex tensors. The
-        equivalent operation on the trailing real/imaginary representation
-        works on CPU, CUDA, and MPS while keeping the STFT itself complex.
+        Zero the complex STFT's DC bin through its real view (MPS lacks
+        complex ``index_fill``).
 
         :param stft: Complex STFT ``[batch, frequencies, frames]``.
-        :return: STFT with frequency bin zero set to zero.
+        :return: STFT with the DC bin zeroed.
         """
         dc_index = torch.zeros(1, dtype=torch.long, device=stft.device)
         real_stft = torch.view_as_real(stft).index_fill(1, dc_index, 0.0)
@@ -1198,13 +932,9 @@ class _RoformerBase(nn.Module):
 
     def _finalize_output(self, recon: Tensor, mix: Tensor) -> Tensor:
         """
-        Normalise the reconstruction to the ``apply_model`` output contract,
-        adding the mixture-complement stem when configured.
+        Normalise the reconstruction to the ``apply_model`` output contract, adding the mixture-complement stem when configured.
 
-        :param recon: Per-stem reconstruction ``[batch, stems, channels, T]``.
-        :param mix: The input mixture ``[batch, channels, T_in]`` in the
-            model's working dtype.
-        :return: ``[batch, len(self.sources), channels, T]``.
+        :param recon: Per-stem reconstruction ``[batch, stems, channels, T]``. :param mix: Input mixture ``[batch, channels, T_in]``. :return: Stems with the mixture-complement stem appended when configured.
         """
         if self.output_complement:
             complement = mix[..., : recon.shape[-1]].unsqueeze(1) - recon
@@ -1252,36 +982,10 @@ class BSRoformer(_RoformerBase):
         skip_connection: bool = False,
     ) -> None:
         """
-        Band-Split RoFormer: fixed hand-designed frequency bands over the
-        full-resolution spectrogram.
+        Band-Split RoFormer: fixed hand-designed frequency bands over the full-resolution spectrogram.
 
-        Parameter names mirror the reference implementation so checkpoint
-        config dicts construct this class directly.
-
-        :param dim: Feature dimension.
-        :param depth: Number of (time, frequency) transformer pairs.
-        :param stereo: Whether the model consumes stereo audio.
-        :param num_stems: Number of mask-estimator heads.
-        :param time_transformer_depth: Blocks per time transformer.
-        :param freq_transformer_depth: Blocks per frequency transformer.
-        :param linear_transformer_depth: Unsupported; must be 0.
-        :param freqs_per_bands: STFT bins per band; must sum to
-            ``stft_n_fft // 2 + 1``.
-        :param dim_head: Attention head dimension.
-        :param heads: Attention head count.
-        :param attn_dropout: Attention dropout probability.
-        :param ff_dropout: Feed-forward dropout probability.
-        :param stft_n_fft: STFT size.
-        :param stft_hop_length: STFT hop.
-        :param stft_win_length: STFT window length.
-        :param stft_normalized: Whether ``torch.stft`` normalises.
-        :param zero_dc: Zero the DC bin before the iSTFT.
-        :param mask_estimator_depth: Reference ``depth`` for the mask MLPs
-            (builds ``depth`` Linears, i.e. ``depth - 1`` hidden layers).
-        :param mlp_expansion_factor: Mask-MLP hidden width multiplier.
-        :param skip_connection: Sum earlier block outputs into each block.
-        :raises ValidationError: If the band widths don't cover the STFT
-            bins exactly.
+        :param dim: Feature dimension. :param depth: Number of (time, frequency) transformer pairs. :param stereo: Whether audio is stereo. :param num_stems: Number of mask-estimator heads. :param time_transformer_depth: Blocks per time transformer. :param freq_transformer_depth: Blocks per frequency transformer. :param linear_transformer_depth: Unsupported; must be 0. :param freqs_per_bands: STFT bins per band; must sum to all bins. :param dim_head: Dimension per head. :param heads: Number of heads.
+        :param attn_dropout: Attention dropout probability. :param ff_dropout: Feed-forward dropout probability. :param stft_n_fft: STFT size. :param stft_hop_length: STFT hop length. :param stft_win_length: STFT window length. :param stft_normalized: Whether ``torch.stft`` normalises. :param zero_dc: Zero the DC bin before the iSTFT. :param mask_estimator_depth: Depth reference for the mask MLPs. :param mlp_expansion_factor: Mask-MLP hidden width multiplier. :param skip_connection: Sum earlier block outputs into each block.
         """
         super().__init__()
         self._init_common(
@@ -1324,7 +1028,6 @@ class BSRoformer(_RoformerBase):
                 MaskEstimator(
                     dim=dim,
                     dim_inputs=freqs_per_bands_with_complex,
-                    # Reference BS ``MLP`` builds ``depth`` Linear layers.
                     mlp_hidden_layers=mask_estimator_depth - 1,
                     mlp_expansion_factor=mlp_expansion_factor,
                 )
@@ -1344,9 +1047,6 @@ class BSRoformer(_RoformerBase):
         batch, channels, _ = raw_audio.shape
         device = raw_audio.device
 
-        # STFT runs in float32 regardless of model dtype: complex-half
-        # support is incomplete across backends, and the STFT is a
-        # negligible fraction of the compute.
         audio = raw_audio.float().reshape(batch * channels, -1)
         window = self._stft_window(device)
         stft_repr = torch.stft(
@@ -1355,15 +1055,12 @@ class BSRoformer(_RoformerBase):
         stft_repr = torch.view_as_real(stft_repr)
         n_freqs, n_frames = stft_repr.shape[-3], stft_repr.shape[-2]
 
-        # Interleave channels into frequency (f-major, channel-minor), the
-        # reference layout for band splitting: 'b s f t c -> b (f s) t c'.
         stft_repr = (
             stft_repr.view(batch, channels, n_freqs, n_frames, 2)
             .permute(0, 2, 1, 3, 4)
             .reshape(batch, n_freqs * channels, n_frames, 2)
         )
 
-        # 'b f t c -> b t (f c)'
         x = stft_repr.permute(0, 2, 1, 3).reshape(batch, n_frames, -1)
 
         x = x.type(self.band_split.to_features[0][1].weight.dtype)
@@ -1372,7 +1069,7 @@ class BSRoformer(_RoformerBase):
         x = self.final_norm(x)
 
         masks = torch.stack([head(x) for head in self.mask_estimators], dim=1)
-        # 'b n t (f c) -> b n f t c'
+
         masks = masks.view(batch, self.num_stems, n_frames, -1, 2).permute(
             0, 1, 3, 2, 4
         )
@@ -1381,7 +1078,6 @@ class BSRoformer(_RoformerBase):
         masks_complex = torch.view_as_complex(masks.float().contiguous())
         stft_out = stft_complex * masks_complex
 
-        # 'b n (f s) t -> (b n s) f t'
         stft_out = (
             stft_out.view(batch, self.num_stems, n_freqs, channels, n_frames)
             .permute(0, 1, 3, 2, 4)
@@ -1430,38 +1126,10 @@ class MelBandRoformer(_RoformerBase):
         match_input_audio_length: bool = False,
     ) -> None:
         """
-        Mel-Band RoFormer: overlapping frequency bands derived from a
-        Slaney mel filter bank instead of a hand-designed split.
+        Mel-Band RoFormer: overlapping frequency bands derived from a Slaney mel filter bank instead of a hand-designed split.
 
-        Parameter names mirror the reference implementation so checkpoint
-        config dicts construct this class directly.
-
-        :param dim: Feature dimension.
-        :param depth: Number of (time, frequency) transformer pairs.
-        :param stereo: Whether the model consumes stereo audio.
-        :param num_stems: Number of mask-estimator heads.
-        :param time_transformer_depth: Blocks per time transformer.
-        :param freq_transformer_depth: Blocks per frequency transformer.
-        :param linear_transformer_depth: Unsupported; must be 0.
-        :param num_bands: Number of mel bands.
-        :param dim_head: Attention head dimension.
-        :param heads: Attention head count.
-        :param attn_dropout: Attention dropout probability.
-        :param ff_dropout: Feed-forward dropout probability.
-        :param sample_rate: Sample rate used to place the mel bands.
-        :param stft_n_fft: STFT size.
-        :param stft_hop_length: STFT hop.
-        :param stft_win_length: STFT window length.
-        :param stft_normalized: Whether ``torch.stft`` normalises.
-        :param zero_dc: Zero the DC bin before the iSTFT.
-        :param mask_estimator_depth: Reference ``depth`` for the mask MLPs
-            (builds ``depth + 1`` Linears, i.e. ``depth`` hidden layers).
-        :param mlp_expansion_factor: Mask-MLP hidden width multiplier.
-        :param skip_connection: Sum earlier block outputs into each block.
-        :param match_input_audio_length: Pad the iSTFT output to the exact
-            input length (reference flag; shipped chunk sizes are
-            hop-divisible so the lengths already match).
-        :raises ValidationError: If a frequency bin is covered by no band.
+        :param dim: Feature dimension. :param depth: Number of (time, frequency) transformer pairs. :param stereo: Whether audio is stereo. :param num_stems: Number of mask-estimator heads. :param time_transformer_depth: Blocks per time transformer. :param freq_transformer_depth: Blocks per frequency transformer. :param linear_transformer_depth: Unsupported; must be 0. :param num_bands: Number of mel bands. :param dim_head: Dimension per head. :param heads: Number of heads. :param attn_dropout: Attention dropout probability.
+        :param ff_dropout: Feed-forward dropout probability. :param sample_rate: Sample rate used to place the mel bands. :param stft_n_fft: STFT size. :param stft_hop_length: STFT hop length. :param stft_win_length: STFT window length. :param stft_normalized: Whether ``torch.stft`` normalises. :param zero_dc: Zero the DC bin before the iSTFT. :param mask_estimator_depth: Depth reference for the mask MLPs. :param mlp_expansion_factor: Mask-MLP hidden width multiplier. :param skip_connection: Sum earlier block outputs into each block. :param match_input_audio_length: Pad the iSTFT output to the input audio length.
         """
         super().__init__()
         self._init_common(
@@ -1488,9 +1156,7 @@ class MelBandRoformer(_RoformerBase):
 
         n_freqs = stft_n_fft // 2 + 1
         mel_filter_bank = _slaney_mel_filter_bank(sample_rate, stft_n_fft, num_bands)
-        # Reference quirks, kept verbatim: force the DC bin into the first
-        # band and the Nyquist bin into the last (their filter weights round
-        # to zero on some platforms, which would leave bins uncovered).
+
         mel_filter_bank[0][0] = 1.0
         mel_filter_bank[-1, -1] = 1.0
 
@@ -1504,8 +1170,6 @@ class MelBandRoformer(_RoformerBase):
         repeated_freq_indices = torch.arange(n_freqs).repeat(num_bands, 1)
         freq_indices = repeated_freq_indices[freqs_per_band]
         if stereo:
-            # 'f -> (f s)' with per-channel offsets: bin index in the
-            # channel-interleaved frequency axis.
             freq_indices = (freq_indices[:, None] * 2 + torch.arange(2)).flatten()
 
         self.register_buffer("freq_indices", freq_indices, persistent=False)
@@ -1525,7 +1189,6 @@ class MelBandRoformer(_RoformerBase):
                 MaskEstimator(
                     dim=dim,
                     dim_inputs=freqs_per_bands_with_complex,
-                    # Reference Mel ``MLP`` builds ``depth + 1`` Linear layers.
                     mlp_hidden_layers=mask_estimator_depth,
                     mlp_expansion_factor=mlp_expansion_factor,
                 )
@@ -1554,16 +1217,14 @@ class MelBandRoformer(_RoformerBase):
         stft_repr = torch.view_as_real(stft_repr)
         n_freqs, n_frames = stft_repr.shape[-3], stft_repr.shape[-2]
 
-        # 'b s f t c -> b (f s) t c'
         stft_repr = (
             stft_repr.view(batch, channels, n_freqs, n_frames, 2)
             .permute(0, 2, 1, 3, 4)
             .reshape(batch, n_freqs * channels, n_frames, 2)
         )
 
-        # Gather the (overlapping) per-band bins in one indexed read.
         x = stft_repr.index_select(1, self.freq_indices)
-        # 'b f t c -> b t (f c)'
+
         x = x.permute(0, 2, 1, 3).reshape(batch, n_frames, -1)
 
         x = x.type(self.band_split.to_features[0][1].weight.dtype)
@@ -1571,16 +1232,12 @@ class MelBandRoformer(_RoformerBase):
         x = self._run_transformers(x)
 
         masks = torch.stack([head(x) for head in self.mask_estimators], dim=1)
-        # 'b n t (f c) -> b n f t c'
+
         masks = masks.view(batch, self.num_stems, n_frames, -1, 2).permute(
             0, 1, 3, 2, 4
         )
         masks = masks.float()
 
-        # Overlapping bands each predict a mask for their bins; scatter-add
-        # the per-band masks back onto the bin axis and divide by the number
-        # of covering bands. Scatter runs on the real view (works on every
-        # backend; complex scatter_add is CUDA/CPU-only).
         scatter_index = self.freq_indices.view(1, 1, -1, 1, 1).expand(
             batch, self.num_stems, -1, n_frames, 2
         )
@@ -1599,7 +1256,6 @@ class MelBandRoformer(_RoformerBase):
 
         stft_out = torch.view_as_complex(stft_repr).unsqueeze(1) * masks_averaged
 
-        # 'b n (f s) t -> (b n s) f t'
         stft_out = (
             stft_out.view(batch, self.num_stems, n_freqs, channels, n_frames)
             .permute(0, 1, 3, 2, 4)
@@ -1636,20 +1292,9 @@ def build_roformer(
     state: dict | None = None,
 ) -> _RoformerBase:
     """
-    Construct a RoFormer variant from registry metadata and (optionally)
-    load a checkpoint into it.
+    Construct a RoFormer variant from registry metadata and (optionally) load a checkpoint into it.
 
-    :param architecture: ``"bs_roformer"`` or ``"mel_band_roformer"``.
-    :param config: Constructor kwargs, as stored in ``metadata.yaml``
-        (mirrors the reference config-file ``model:`` section).
-    :param sources: Output stem names (see
-        ``_RoformerBase.configure_inference`` for the single-stem
-        complement convention).
-    :param samplerate: Sample rate the checkpoint operates at.
-    :param segment_samples: Training chunk length in samples.
-    :param state: Checkpoint state dict to load (strict), or ``None``.
-    :return: The constructed (and loaded) model in eval mode.
-    :raises ValidationError: For an unknown architecture name.
+    :param architecture: ``"bs_roformer"`` or ``"mel_band_roformer"``. :param config: Constructor kwargs from checkpoint metadata. :param sources: Output stem names, in order. :param samplerate: Sample rate the checkpoint operates at. :param segment_samples: Training chunk length in samples. :param state: Checkpoint state dict to load strictly, or ``None``. :return: The constructed model in eval mode.
     """
     klass = _ARCHITECTURES.get(architecture)
     if klass is None:

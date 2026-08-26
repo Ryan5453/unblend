@@ -28,7 +28,9 @@ _STEMS = ["drums", "bass", "other", "vocals"]
 
 
 class _Pickled:
-    """A plain object, to make a checkpoint that needs real unpickling."""
+    """
+    A plain object, to make a checkpoint that needs real unpickling.
+    """
 
 
 def _scnet_config() -> dict:
@@ -87,7 +89,9 @@ def _community_checkpoint(tmp_path: Path, masked: bool = True) -> tuple[Path, Pa
 
 
 def test_read_tensors_unwraps_a_training_container(tmp_path: Path) -> None:
-    """A Lightning-style checkpoint yields just the model's parameters."""
+    """
+    A Lightning-style checkpoint yields just the model's parameters.
+    """
     checkpoint, _ = _community_checkpoint(tmp_path)
 
     state = read_tensors(checkpoint)
@@ -113,7 +117,9 @@ def test_read_tensors_refuses_a_checkpoint_that_needs_unpickling(
 
 
 def test_strip_wrapper_prefix_needs_every_key_to_agree() -> None:
-    """A prefix only some keys carry is part of the model, not a wrapper."""
+    """
+    A prefix only some keys carry is part of the model, not a wrapper.
+    """
     mixed = {"model.a": torch.zeros(1), "encoder.b": torch.zeros(1)}
     assert strip_wrapper_prefix(mixed) == mixed
 
@@ -122,7 +128,9 @@ def test_strip_wrapper_prefix_needs_every_key_to_agree() -> None:
 
 
 def test_fields_from_config_translates_the_training_layout() -> None:
-    """The MSST layout maps onto registry fields mechanically."""
+    """
+    The MSST layout maps onto registry fields mechanically.
+    """
     fields = fields_from_config(
         {
             "audio": {"chunk_size": 485100, "sample_rate": 44100},
@@ -297,7 +305,9 @@ def test_a_mislabelled_architecture_is_caught_by_loading(tmp_path: Path) -> None
 
 
 def test_missing_fields_are_reported_together(tmp_path: Path) -> None:
-    """Without a config, the import says exactly what it still needs."""
+    """
+    Without a config, the import says exactly what it still needs.
+    """
     checkpoint, _ = _community_checkpoint(tmp_path)
 
     with pytest.raises(ValidationError, match="Missing sources, samplerate"):
@@ -331,7 +341,9 @@ def test_unrecognisable_weights_say_so(tmp_path: Path) -> None:
 
 
 def test_register_entry_refuses_to_overwrite(tmp_path: Path) -> None:
-    """Re-importing under a name already in the file is refused, not merged."""
+    """
+    Re-importing under a name already in the file is refused, not merged.
+    """
     models_file = tmp_path / "models.json"
     register_entry(models_file, "a", {"architecture": "scnet"})
     assert json.loads(models_file.read_text())["models"]["a"]
@@ -392,26 +404,25 @@ def test_a_yaml_models_file_registers_and_loads(tmp_path: Path) -> None:
 
 def test_config_files_use_the_parser_their_name_promises(tmp_path: Path) -> None:
     """
-    A ``.json`` file is read as JSON, not as YAML — YAML 1.1 is a near-superset
-    of JSON, not an exact one, so the file's own name decides.
+    A ``.json`` file is read as JSON, not as YAML.
     """
-    from unblend.config_io import dump_mapping, load_mapping
+
+    import yaml
+
+    from unblend.importer import _dump_mapping, _load_mapping
 
     payload = {"models": {"a": {"sources": ["vocals", "other"], "note": "x" * 200}}}
 
     as_yaml = tmp_path / "models.yaml"
-    as_yaml.write_text(dump_mapping(payload, as_yaml))
+    as_yaml.write_text(_dump_mapping(payload, as_yaml))
     as_json = tmp_path / "models.json"
-    as_json.write_text(dump_mapping(payload, as_json))
+    as_json.write_text(_dump_mapping(payload, as_json))
 
-    assert load_mapping(as_yaml) == payload
-    assert load_mapping(as_json) == payload
-    # Registry style: short lists inline, long prose folded so it reads.
-    assert "sources: [vocals, other]" in as_yaml.read_text()
-    assert "note: >-" in as_yaml.read_text()
+    assert _load_mapping(as_yaml) == payload
+    assert _load_mapping(as_json) == payload
     assert as_json.read_text().lstrip().startswith("{")
 
     broken = tmp_path / "broken.yaml"
     broken.write_text("models: [unclosed\n")
-    with pytest.raises(ValueError):
-        load_mapping(broken)
+    with pytest.raises((ValueError, yaml.YAMLError)):
+        _load_mapping(broken)

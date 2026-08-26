@@ -21,7 +21,9 @@ def test_repository_lists_expected_models() -> None:
 
 
 def test_every_demucs_layer_has_safe_artifact_and_config() -> None:
-    """Demucs entries construct allowlisted models from Safetensors only."""
+    """
+    Demucs entries construct allowlisted models from Safetensors only.
+    """
     for name, info in ModelRepository().list_models().items():
         if info.get("backend") != "demucs":
             continue

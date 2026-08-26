@@ -21,10 +21,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+from .backends import ASSModel
 from .blocks import center_trim
 from .exceptions import ValidationError
-from .htdemucs import HTDemucs
-from .roformer import _RoformerBase
 
 logger = logging.getLogger(__name__)
 
@@ -53,43 +52,22 @@ def _looks_like_cuda_oom(exc: BaseException) -> bool:
     )
 
 
-# Both backends satisfy the same inference contract used below — ``sources``,
-# ``samplerate``, ``audio_channels``, ``max_allowed_segment``, and a
-# ``[B, S, C, T]`` forward — so the chunking / overlap-add / tail-pooling
-# machinery is shared verbatim across Demucs and RoFormer.
-Model: TypeAlias = HTDemucs | _RoformerBase
+Model: TypeAlias = ASSModel
 
-
-#: Default way to combine an ensemble's members: the per-source weighted mean
-#: that Demucs bags have always used.
 COMBINE_DEFAULT = "weighted_mean"
 
-#: Modes that are the same operation under another project's name. Recipes are
-#: written in these vocabularies, so they are accepted verbatim rather than
-#: forcing a translation step.
 COMBINE_ALIASES: dict[str, str] = {
-    # MSST's weighted waveform average is exactly ``weighted_mean``.
     "avg_wave": COMBINE_DEFAULT,
-    # UVR's Min/Max Spec take the whole complex bin from whichever member has
-    # the smaller/larger magnitude, which is what min_fft/max_fft do. The two
-    # differ only in STFT geometry, which ``combine_params`` controls.
     "uvr_min_spec": "min_fft",
     "uvr_max_spec": "max_fft",
 }
 
-#: Modes that *select* among members per sample or per frequency bin instead of
-#: blending them. A real-valued weight has nowhere to apply in a min or a
-#: median, so these require a 0/1 participation mask. Upstream tools silently
-#: ignore weights here; rejecting them means a recipe never quietly does
-#: something other than what it says.
 COMBINE_SELECTION_MODES = frozenset(
     {"median_wave", "min_wave", "max_wave", "median_fft", "min_fft", "max_fft"}
 )
 
-#: Modes that work on the STFT rather than the waveform.
 COMBINE_SPECTRAL_MODES = frozenset({"avg_fft", "median_fft", "min_fft", "max_fft"})
 
-#: Every accepted ``combine`` value.
 COMBINE_MODES = (
     frozenset({COMBINE_DEFAULT})
     | COMBINE_SELECTION_MODES
@@ -97,7 +75,6 @@ COMBINE_MODES = (
     | frozenset(COMBINE_ALIASES)
 )
 
-#: STFT geometry for the spectral modes, matching MSST's ensemble script.
 DEFAULT_COMBINE_STFT: dict[str, int] = {"n_fft": 1024, "hop_length": 256}
 
 
@@ -166,27 +143,18 @@ def resolve_combine_params(params: dict | None) -> dict[str, int]:
     return resolved
 
 
-#: Floor keeping the reverse of the normalisation well-defined for silence.
-#: Must stay identical to ``Separator._normalize``.
 NORMALIZATION_EPSILON = 1e-5
 
 
 def normalization_stats(mix: Tensor) -> tuple[Tensor, Tensor]:
     """
-    Track-level mean and standard deviation, the way the Demucs lineage
-    normalises.
+    Track-level mean/std as in Demucs.
 
-    Mirrors ``Separator._normalize`` exactly — the same channel reduction and
-    the same Bessel correction — because a member normalised here must see what
-    it would have seen running alone.
-
-    :param mix: ``[batch, channels, samples]`` audio.
-    :return: ``(mean, std)``, one of each per batch entry.
+        :param mix: ``[batch, channels, samples]`` audio.
+        :return: ``(mean, std)`` per batch entry.
     """
     reference = mix.mean(dim=-2)
     mean = reference.mean(dim=-1)
-    # Preserve the training-time sample standard deviation for normal audio,
-    # but avoid the undefined one-sample Bessel correction.
     correction = 1 if reference.shape[-1] > 1 else 0
     std = reference.std(dim=-1, correction=correction)
     return mean, std
@@ -220,16 +188,11 @@ def _denormalize_sources(sources: Tensor, mean: Tensor, std: Tensor) -> Tensor:
 
 def sole_contributor(weights: list[list[float]], stem_index: int) -> int | None:
     """
-    The one member a stem's output depends on, when only one contributes.
+    Member that sole-contributes for a stem, if any.
 
-    Every combine mode collapses to the identity over a single member -- a mean
-    of one, a median of one, a min of one -- which is what lets
-    ``--isolate-stem vocals`` on a bag of specialists fetch and run a single
-    checkpoint whatever the mode is.
-
-    :param weights: Per-member, per-source weight matrix.
-    :param stem_index: Index of the stem within ``sources``.
-    :return: The member's index, or ``None`` if none or several contribute.
+        :param weights: Per-member, per-source weight matrix.
+        :param stem_index: Stem index.
+        :return: Member index or None.
     """
     contributors = [
         index
@@ -241,19 +204,11 @@ def sole_contributor(weights: list[list[float]], stem_index: int) -> int | None:
 
 def _select_by_magnitude(stacked: Tensor, mode: str) -> Tensor:
     """
-    Reduce over dim 0 by ranking values on magnitude.
+    Reduce over dim 0 by magnitude.
 
-    ``min``/``max`` keep the value with the smallest/largest absolute value,
-    sign and (for a spectrogram) phase included -- the convention MSST and UVR
-    both use. ``median`` ranks by magnitude and takes the middle value,
-    averaging the two middles for an even member count. Note that MSST's
-    ``median_fft`` instead inherits numpy's lexicographic ordering of complex
-    numbers, which ranks by real part first; ranking by magnitude is the
-    consistent reading and is what the other spectral modes do.
-
-    :param stacked: Real or complex tensor whose dim 0 indexes members.
-    :param mode: ``"min"``, ``"max"`` or ``"median"``.
-    :return: The reduced tensor, without dim 0.
+        :param stacked: Tensor whose dim 0 indexes members.
+        :param mode: ``"min"``, ``"max"`` or ``"median"``.
+        :return: Reduced tensor without dim 0.
     """
     magnitude = stacked.abs()
     count = stacked.shape[0]
@@ -327,20 +282,13 @@ def _reduce_spectral(
     parts: list[Tensor], mode: str, weights: list[float], stft: dict[str, int]
 ) -> Tensor:
     """
-    Combine one stem's per-member waveforms in the STFT domain.
+    Combine waveforms in STFT domain in blocks.
 
-    Done in blocks so peak memory tracks the block, not the track: a spectrogram
-    is several times the size of the waveform it came from, and a six-minute
-    track would otherwise need gigabytes per member. Blocks and their margins
-    are whole numbers of hops, so every frame lands exactly where a whole-track
-    transform would put it, and the margins are discarded so the modified
-    spectrum's edge effects never reach the output.
-
-    :param parts: One ``[B, C, T]`` tensor per contributing member.
-    :param mode: Canonical spectral mode.
-    :param weights: Per-member weights for this stem.
-    :param stft: ``{"n_fft", "hop_length"}`` geometry.
-    :return: The combined ``[B, C, T]`` waveform.
+        :param parts: One ``[B, C, T]`` per member.
+        :param mode: Canonical spectral mode.
+        :param weights: Per-member weights for this stem.
+        :param stft: ``{"n_fft", "hop_length"}`` geometry.
+        :return: Combined ``[B, C, T]`` waveform.
     """
     n_fft = stft["n_fft"]
     hop = stft["hop_length"]
@@ -355,8 +303,6 @@ def _reduce_spectral(
     start = 0
     while start < total:
         stop = min(start + block, total)
-        # Margins are whole hops and ``start`` is a whole number of blocks, so
-        # the frame grid is identical in every block.
         left = min(margin, start)
         right = min(margin, total - stop)
         length = left + (stop - start) + right
@@ -396,18 +342,13 @@ def combine_member_outputs(
     stft: dict[str, int],
 ) -> Tensor:
     """
-    Combine one mix's per-member outputs into a single result.
+    Combine per-member outputs into one result.
 
-    Contribution is per stem: a zero weight drops a member from that stem
-    entirely, so a stem with one contributor is copied through untouched
-    whatever the mode.
-
-    :param members: One ``[B, S, C, T]`` output per ensemble member.
-    :param weights: Per-member, per-source weight matrix.
-    :param mode: Canonical combine mode (never ``weighted_mean``, which is
-        accumulated in place as members finish).
-    :param stft: STFT geometry for the spectral modes.
-    :return: The combined ``[B, S, C, T]`` output.
+        :param members: One ``[B, S, C, T]`` per member.
+        :param weights: Per-member, per-source weight matrix.
+        :param mode: Canonical combine mode.
+        :param stft: STFT geometry.
+        :return: Combined ``[B, S, C, T]`` output.
     """
     combined = torch.empty_like(members[0])
     for stem in range(combined.shape[1]):
@@ -441,28 +382,16 @@ class ModelEnsemble(nn.Module):
         combine_params: dict | None = None,
     ) -> None:
         """
-        Represents a model ensemble with specific weights.
-        You should call ``apply_model`` rather than calling the forward directly
-        for optimal performance.
+        Ensemble of models with weights.
 
-        :param models: Ensemble members. They need not share an architecture,
-            but must agree on sources, sample rate, channel count, and the
-            external-normalization contract.
-        :param weights: List of per-model weight lists. If ``None``, assumed to
-            be all ones, otherwise a list of N lists (N number of models),
-            each containing S floats (S number of sources). For the selection
-            modes it is a 0/1 participation mask.
-        :param segment: Overrides the ``segment`` attribute of each model
-            (performed in-place, be careful if you reuse the models passed).
-        :param combine: How member outputs are combined; see ``COMBINE_MODES``.
-        :param combine_params: STFT geometry overrides for the spectral modes.
-        :raises ValidationError: If the mode is unknown, its weight contract is
-            violated, or the members disagree on the inference contract.
+            :param models: Ensemble members.
+            :param weights: Per-model weight lists, or None for ones.
+            :param segment: Override segment length.
+            :param combine: Combine mode.
+            :param combine_params: STFT geometry for spectral modes.
+            :raises ValidationError: If args invalid.
         """
         super().__init__()
-        # ``combine`` keeps the caller's spelling for display; ``combine_mode``
-        # is the implementation it resolves to, validated here so an unknown
-        # mode fails at construction rather than mid-separation.
         self.combine = combine
         self.combine_mode = canonical_combine(combine)
         self.combine_params = resolve_combine_params(combine_params)
@@ -480,11 +409,6 @@ class ModelEnsemble(nn.Module):
             )
 
         first = models[0]
-        # Members may disagree about normalisation: HTDemucs wants track-level
-        # normalised audio, the other architectures want it raw. When they do,
-        # the ensemble takes raw audio and each member that needs normalising
-        # gets it applied (and undone) around its own pass, so selection modes
-        # compare real audio rather than differently-scaled numbers.
         member_normalization = [
             bool(getattr(other, "external_normalization", True)) for other in models
         ]
@@ -518,8 +442,6 @@ class ModelEnsemble(nn.Module):
         self.samplerate = first.samplerate
         self.sources = first.sources
         self.external_normalization = normalization
-        #: Per member, whether it expects normalised audio. Consulted only when
-        #: the ensemble itself takes raw audio (i.e. members disagree).
         self.member_normalization = member_normalization
         self.models = nn.ModuleList(models)
 
@@ -552,25 +474,16 @@ class ModelEnsemble(nn.Module):
                     converted.append(value)
                 normalized_weights.append(converted)
 
-        # Copy caller-owned lists and validate through the same defensive path
-        # used before every inference (the public attribute remains mutable).
         self.weights = [list(row) for row in normalized_weights]
         self.validated_weight_totals()
 
     def set_combine(self, combine: str, combine_params: dict | None = None) -> None:
         """
-        Change how this ensemble combines its members.
+        Change ensemble combine mode.
 
-        Lets a caller try a mode against a registered ensemble without editing
-        metadata — ``unblend separate --combine min_fft`` is this. The mode and
-        its weight contract are revalidated, so an override cannot leave the
-        ensemble in a state its metadata would have been rejected for.
-
-        :param combine: Mode name, alias or canonical.
-        :param combine_params: STFT geometry overrides, or ``None`` to reset to
-            the defaults.
-        :raises ValidationError: If the mode is unknown or its weight contract
-            is violated by the current weights.
+            :param combine: Mode name.
+            :param combine_params: STFT geometry, or None.
+            :raises ValidationError: If mode invalid.
         """
         mode = canonical_combine(combine)
         validate_combine_weights(combine, self.weights)
@@ -710,10 +623,6 @@ class TensorChunk:
         pad_left = correct_start - start
         pad_right = end - correct_end
 
-        # Common case: target_length matches the chunk's natural length and the
-        # chunk lies fully inside the underlying tensor. Skip the F.pad call,
-        # which on MPS still allocates a fresh contiguous tensor even when the
-        # padding amount is (0, 0).
         if pad_left == 0 and pad_right == 0:
             out = self.tensor[..., correct_start:correct_end]
         else:
@@ -741,13 +650,6 @@ def tensor_chunk(tensor_or_chunk: Tensor | TensorChunk) -> TensorChunk:
 
 _SPLIT_WEIGHT_CACHE: dict[tuple[int, float, torch.device, torch.dtype], Tensor] = {}
 
-# Sizing for the GPU-resident accumulation fast path. The CUDA pipeline keeps
-# each mix and its overlap-add accumulators on the GPU when they fit within
-# this fraction of the currently-free VRAM (after a fixed reserve for the
-# active chunk batch + STFT scratch, which scale with chunk_batch_size, not
-# input length). Inputs too long for the budget fall back to the bounded
-# CPU-accumulation path, preserving the "GPU usage bounded by model +
-# active batch" property for arbitrarily long audio.
 _GPU_ACCUM_VRAM_FRACTION = 0.3
 _GPU_ACCUM_VRAM_RESERVE_BYTES = 2 * 1024**3
 
@@ -770,16 +672,11 @@ def _gpu_accum_budget_bytes(
     device: torch.device | str, forward_reserve_bytes: int | None = None
 ) -> int:
     """
-    VRAM budget (bytes) available for keeping mixes and overlap-add
-    accumulators resident on the GPU.
+    VRAM budget for GPU-resident mixes/accumulators.
 
-    :param device: CUDA device to query.
-    :param forward_reserve_bytes: Measured per-batch working set of the eager
-        forward (Separator plumbs ``model._forward_reserve_bytes``); the
-        reserve carved out of the budget is the larger of this and the flat
-        default, so batch-scaled eager activations (e.g. the iSTFT of a full
-        chunk batch) always have room. ``None`` keeps the flat default.
-    :return: Usable byte budget; 0 if free memory cannot be determined.
+        :param device: CUDA device.
+        :param forward_reserve_bytes: Per-batch working set reserve.
+        :return: Usable byte budget.
     """
     try:
         free_bytes, _total = torch.cuda.mem_get_info(
@@ -787,8 +684,6 @@ def _gpu_accum_budget_bytes(
         )
     except Exception:
         return 0
-    # Allocator-reserved-but-unallocated blocks are reusable by us on top of
-    # the driver-reported free memory.
     reserved_slack = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
         device
     )
@@ -801,18 +696,13 @@ def _gpu_accum_bytes_needed(
     batch_dim: int, n_sources: int, channels: int, length: int
 ) -> int:
     """
-    Bytes needed to keep one mix's GPU-resident state for the fast path:
-    the staged fp32 mix, the fp32 output accumulator, and the weight sum.
+    Bytes to keep one mix's GPU state resident.
 
-    Shared by ``_apply_model_multi_unshifted`` (per-mix gate) and
-    ``Separator`` (deciding whether to stage the waveform on the GPU up
-    front) so the two can't disagree about what fits.
-
-    :param batch_dim: Leading batch dimension of the mix.
-    :param n_sources: Number of output sources.
-    :param channels: Audio channels.
-    :param length: Mix length in samples.
-    :return: Estimated bytes of GPU memory required.
+        :param batch_dim: Batch dimension.
+        :param n_sources: Number of sources.
+        :param channels: Audio channels.
+        :param length: Mix length.
+        :return: Estimated bytes.
     """
     return (batch_dim * channels * (n_sources + 1) * length + length) * 4
 
@@ -888,27 +778,16 @@ def _should_restore_submodel_device(
     device: torch.device,
 ) -> bool:
     """
-    Whether the ensemble loop should move ``sub_model`` back to ``sub_device``.
+    Whether to move sub-model back to its original device.
 
-    Compiled sub-models keep a CUDAGraphs capture tied to their current
-    device; bouncing them off the inference device throws that capture away
-    and forces a re-compile on the next forward. Family-specific compile
-    setup records either ``_uncompiled_forward_core`` (HTDemucs) or
-    ``_uncompiled_run_transformers`` (RoFormer).
-
-    :param sub_model: The just-run ensemble member.
-    :param sub_device: Device the sub-model was on before the ensemble call,
-        or ``None`` if no parameters were present.
-    :param device: Inference device the ensemble call ran on.
-    :return: ``True`` to restore via ``.to(sub_device)``, ``False`` to leave
-        the sub-model where it is.
+        :param sub_model: Just-run member.
+        :param sub_device: Device before call.
+        :param device: Inference device.
+        :return: True to restore.
     """
     if sub_device is None or sub_device == device:
         return False
-    return not (
-        hasattr(sub_model, "_uncompiled_forward_core")
-        or hasattr(sub_model, "_uncompiled_run_transformers")
-    )
+    return not hasattr(sub_model, "_eager_core")
 
 
 def _run_ensemble_member(
@@ -920,19 +799,14 @@ def _run_ensemble_member(
     **kwargs: Any,
 ) -> list[Tensor]:
     """
-    Run one ensemble member, normalising around it if that is its contract.
+    Run one ensemble member with optional normalization.
 
-    An ensemble whose members disagree about normalisation takes raw audio, so
-    the members that want it normalised have it applied here and undone on
-    their output. Members are therefore combined in the input's own scale,
-    which is what the selection modes need to compare like with like.
-
-    :param sub_model: The member to run.
-    :param mixes: Staged input mixtures.
-    :param normalize: Whether this member needs normalisation applied here.
-    :param stats: Per-mix ``(mean, std)`` when any member needs them.
-    :param kwargs: Forwarded to :func:`apply_model_multi`.
-    :return: The member's per-mix estimates, in the input's scale.
+        :param sub_model: Member to run.
+        :param mixes: Input mixtures.
+        :param normalize: Whether member needs normalization.
+        :param stats: Per-mix ``(mean, std)``.
+        :param kwargs: Forwarded to ``apply_model_multi``.
+        :return: Per-mix estimates.
     """
     if not normalize:
         return apply_model_multi(sub_model, mixes, **kwargs)
@@ -961,46 +835,21 @@ def apply_model(
     oom_backoff_state: dict[str, int] | None = None,
 ) -> Tensor:
     """
-    Apply model to a given mixture, tiling into segments of the model's
-    training length (``model.max_allowed_segment * model.samplerate``).
+    Apply model to a mixture tiled into segments.
 
-    :param model: Model or ensemble to apply.
-    :param mix: Input mixture tensor or chunk.
-    :param device: Device for local computation; if ``None``, ``mix.device``.
-    :param shifts: If > 0, average over *shifts* random sub-second shifts.
-    :param overlap: Overlap ratio between consecutive segments.
-    :param transition_power: Exponent on the triangular crossfade weight.
-    :param progress_callback: Optional ``callback(event_type, data)``; events:
-        ``processing_start``, ``chunk_complete``, ``processing_complete``.
-        Payloads include aggregate totals and per-input chunk fields. For a
-        ``ModelEnsemble`` that runs all sub-models, reported totals are the
-        exact sum of each member's chunks, so progress advances monotonically
-        instead of restarting per sub-model.
-    :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
-        fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
-        whose weights select this stem with a clean one-hot (1.0/0.0) row,
-        skipping the others. The returned tensor still contains **all** of the
-        model's sources (the lone specialist produces them all — only the named
-        stem is high quality); it does *not* filter the output to one stem (use
-        ``SeparatedSources.isolate_stem`` for that). Silently has no effect when
-        the model is not such an ensemble or no sub-model matches one-hot.
-    :param chunk_batch_size: Chunks processed in parallel.
-    :param oom_backoff_state: Mutable ``{"chunk_batch_size": n}`` opting into
-        runtime CUDA-OOM halving for auto-sized eager runs (Separator
-        internal). Halvings persist in the dict for the caller; ``None``
-        disables backoff (OOM propagates).
-    :return: Separated sources tensor.
-    :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
-        device is invalid, out of range, or is CUDA/MPS without that backend
-        available, or if the overlap produces a non-positive segment stride.
+        :param model: Model or ensemble.
+        :param mix: Input mixture.
+        :param device: Device; defaults to ``mix.device``.
+        :param shifts: Shifts to average, or 0.
+        :param overlap: Overlap ratio.
+        :param transition_power: Crossfade exponent.
+        :param progress_callback: Progress callback.
+        :param use_only_stem: One-hot specialist shortcut.
+        :param chunk_batch_size: Chunks per forward.
+        :param oom_backoff_state: Mutable backoff dict or None.
+        :return: Separated sources tensor.
+        :raises ValidationError: If args invalid.
     """
-    # Single-mix separation is just the one-element case of the multi-mix
-    # path, so we delegate rather than keep a second copy of the chunking /
-    # bounded-GPU staging / tail-padding / shift-averaging / ensemble-
-    # weighting machinery. For a single mix the cross-mix tail pool degenerates
-    # to that mix's own tail batch, the random-shift offsets are drawn in the
-    # same order (one ``randint`` per shift round), and the result is moved
-    # back to ``mix.device`` identically — so output is unchanged.
     return apply_model_multi(
         model,
         [mix],
@@ -1030,64 +879,25 @@ def apply_model_multi(
     _shift_offsets: list[list[int]] | None = None,
 ) -> list[Tensor]:
     """
-    Apply model to multiple mixes simultaneously, pooling tail chunks across
-    mixes so every forward pass is exactly ``chunk_batch_size`` items.
+    Apply model to multiple mixes pooling tail chunks.
 
-    Each mix is chunked independently into segments of the model's training
-    length. Per-mix "full" batches (those that already fill ``chunk_batch_size``)
-    run as today. The leftover chunks across *all* mixes — which would each be
-    a sub-full tail batch under the single-mix path — are collected into a
-    global pool and drained in full-size batches. Outputs are routed back to
-    their source mix's accumulator. Compared with calling ``apply_model`` per
-    mix, this eliminates the per-mix tail-pad overhead which can be
-    significant on short audio with large ``chunk_batch_size``.
-
-    Same semantics as ``apply_model`` otherwise: shifts averaging applies
-    per-mix (each mix gets its own random offsets per shift round), and
-    ``ModelEnsemble`` is handled by running every sub-model with the same
-    pooling.
-
-    :param model: Model or ensemble to apply.
-    :param mixes: List of input mixtures (tensors or ``TensorChunk`` views),
-        each ``[batch, channels, samples]`` or ``[channels, samples]``.
-    :param device: Device for local computation; if ``None``, ``mixes[0].device``.
-    :param shifts: If > 0, average over ``shifts`` random sub-second shifts per mix.
-    :param overlap: Overlap ratio between consecutive segments.
-    :param transition_power: Exponent on the triangular crossfade weight.
-    :param progress_callback: Optional ``callback(event_type, data)``; events:
-        ``processing_start``, ``chunk_complete``, ``processing_complete``.
-        Chunk counts are summed across all mixes; start/complete payloads include
-        ``input_total_chunks``, while chunk events identify ``input_index`` and
-        that input's completed/total counts. For a ``ModelEnsemble`` that
-        runs all sub-models, the totals also span every sub-model
-        (the exact sum across members), so the progress bar advances
-        continuously rather than restarting once per sub-model.
-    :param use_only_stem: Performance optimisation for a ``ModelEnsemble`` of
-        fine-tuned specialists (e.g. ``htdemucs_ft``): run only the sub-model
-        whose weights select this stem with a clean one-hot (1.0/0.0) row,
-        skipping the others. The returned tensor still contains **all** of the
-        model's sources (the lone specialist produces them all — only the named
-        stem is high quality); it does *not* filter the output to one stem (use
-        ``SeparatedSources.isolate_stem`` for that). Silently has no effect when
-        the model is not such an ensemble or no sub-model matches one-hot.
-    :param chunk_batch_size: Chunks processed in parallel per forward pass.
-    :param oom_backoff_state: Mutable ``{"chunk_batch_size": n}`` opting into
-        runtime CUDA-OOM halving for auto-sized eager runs (Separator
-        internal); halvings persist in the dict for the caller. ``None``
-        disables backoff (OOM propagates).
-    :param _shift_offsets: Internal pre-drawn ensemble shift plan; callers
-        should leave this as ``None``.
-    :return: One separated-sources tensor per input mix, same shape as
-        ``apply_model`` would have produced.
-    :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
-        device is invalid, out of range, or is CUDA/MPS without that backend
-        available, or if the overlap produces a non-positive segment stride.
+        :param model: Model or ensemble.
+        :param mixes: List of input mixtures.
+        :param device: Device; defaults to ``mixes[0].device``.
+        :param shifts: Shifts per mix.
+        :param overlap: Overlap ratio.
+        :param transition_power: Crossfade exponent.
+        :param progress_callback: Progress callback.
+        :param use_only_stem: Specialist shortcut.
+        :param chunk_batch_size: Chunks per forward.
+        :param oom_backoff_state: Mutable backoff dict or None.
+        :param _shift_offsets: Internal pre-drawn offsets.
+        :return: One tensor per input mix.
+        :raises ValidationError: If args invalid.
     """
     if not 0.0 <= overlap < 1.0:
         raise ValidationError(f"overlap must be in [0, 1), got {overlap}")
 
-    # Validate an explicit device before the empty-input early return, so
-    # bad arguments raise regardless of input.
     if device is not None:
         try:
             device = torch.device(device)
@@ -1101,10 +911,6 @@ def apply_model_multi(
                     f"{torch.cuda.device_count()} CUDA device(s) are available."
                 )
             if device.index is None:
-                # An indexless "cuda" never compares equal to a tensor's
-                # "cuda:0", which would defeat every device comparison below
-                # (most visibly the progress-sync branch, which keys off
-                # tensors already living on ``accum_device``).
                 device = torch.device("cuda", torch.cuda.current_device())
         elif device.type == "mps" and not torch.backends.mps.is_available():
             raise ValidationError(
@@ -1115,15 +921,8 @@ def apply_model_multi(
         return []
 
     if device is None:
-        # A CUDA tensor's device is always indexed ("cuda:N"), so no
-        # normalization is needed on this path (and a CUDA tensor existing
-        # proves CUDA is available).
         device = mixes[0].device
 
-    # The pooled chunk batching below assumes one accumulator row per chunk,
-    # so a mix with batch dim > 1 is split into per-row mixes here and the
-    # outputs re-stacked afterwards (2-D mixes are lifted to batch 1). For
-    # the common batch-1 case this is a no-op passthrough.
     flat_mixes: list[Tensor | TensorChunk] = []
     spans: list[int] = []
     needs_restack = False
@@ -1169,9 +968,6 @@ def apply_model_multi(
             row += span
         return results
 
-    # Ensembles must reuse one set of random offsets across members. Besides
-    # making the shift trick coherent, this lets progress account for every
-    # member's exact (potentially different) segment length before work starts.
     if shifts and _shift_offsets is None:
         max_shift = int(0.5 * model.samplerate)
         _shift_offsets = [
@@ -1182,10 +978,6 @@ def apply_model_multi(
         totals = model.validated_weight_totals()
         combine = getattr(model, "combine_mode", COMBINE_DEFAULT)
 
-        # When members disagree about normalisation the ensemble takes raw
-        # audio, so whichever members want it normalised get it here — computed
-        # once from the same staged mixes ``Separator`` would have used, so a
-        # member sees exactly what it would running alone.
         member_normalization = list(
             getattr(model, "member_normalization", [False] * len(model.models))
         )
@@ -1199,10 +991,6 @@ def apply_model_multi(
             ]
             mix_stats = [normalization_stats(mix) for mix in materialized]
             mixes = materialized
-        # Specialisation shortcut: when only one member contributes to the stem
-        # being isolated, every combine mode reduces to that member's output,
-        # so run it alone. This is what makes single-stem extraction from a bag
-        # of specialists cost one member's inference instead of all of them.
         if use_only_stem:
             try:
                 stem_index = model.sources.index(use_only_stem)
@@ -1226,9 +1014,6 @@ def apply_model_multi(
                         _shift_offsets=_shift_offsets,
                     )
 
-        # Progress is one exact span even when members use different segment
-        # lengths. Totals are computed from the shared shift plan before the
-        # first model runs; child start/complete events are swallowed.
         sub_models_done = 0
         model_input_totals = [
             _planned_input_chunks(sub_model, mixes, shifts, overlap, _shift_offsets)
@@ -1281,10 +1066,6 @@ def apply_model_multi(
 
         sub_callback = ensemble_progress if progress_callback else None
 
-        # ``weighted_mean`` is linear, so it folds into a running accumulator
-        # and holds two tensors at a time. The selection and spectral modes are
-        # not: min, median and per-bin picks need every member's finished output
-        # side by side, so those buffer one output per member.
         results: list[Tensor] | None = None
         buffered: list[list[Tensor]] = []
         for member_index, (sub_model, model_weights) in enumerate(
@@ -1347,7 +1128,6 @@ def apply_model_multi(
             )
         return results
 
-    # Move/eval the model only when needed.
     first_param = next(model.parameters(), None)
     if first_param is not None and first_param.device != device:
         model.to(device)
@@ -1357,11 +1137,6 @@ def apply_model_multi(
 
     if shifts:
         max_shift = int(0.5 * model.samplerate)
-        # Pre-draw every round's offsets — same RNG draw order as drawing them
-        # round by round (round-major, one randint per mix) — so the exact
-        # chunk total across all rounds is known up front. Without this each
-        # round would emit its own processing_start/complete cycle and the
-        # progress bar would restart per shift.
         all_offsets = _shift_offsets
         if all_offsets is None:
             all_offsets = [
@@ -1372,9 +1147,6 @@ def apply_model_multi(
         ):
             raise RuntimeError("Internal shift-offset plan does not match inputs.")
 
-        # Same validation as the unshifted helper, but raised before any
-        # progress events fire — otherwise a doomed run emits a
-        # ``processing_start`` with ``total_chunks: 0`` first.
         segment_length = int(round(model.samplerate * model.max_allowed_segment))
         stride = int((1 - overlap) * segment_length)
         if stride < 1:
@@ -1385,7 +1157,6 @@ def apply_model_multi(
         inner_callback = progress_callback
         if progress_callback is not None:
             input_total_chunks = [0] * len(mixes)
-            # Mirrors ``range(0, length, stride)`` in the unshifted helper.
             for offsets_per_mix in all_offsets:
                 for mix_index, (mix, offset) in enumerate(zip(mixes, offsets_per_mix)):
                     shifted_length = mix.shape[-1] + max_shift - offset
@@ -1454,11 +1225,6 @@ def apply_model_multi(
             for i, (partial, offset) in enumerate(zip(partials, offsets_per_mix)):
                 trimmed = partial[..., max_shift - offset :]
                 trimmed = trimmed[..., : mixes[i].shape[-1]]
-                # Accumulate in-place to avoid a per-round full-output
-                # allocation. The first round clones because ``trimmed`` is a
-                # view into the (otherwise-discarded) round's partial, and a
-                # subsequent ``add_`` would mutate that backing storage rather
-                # than build an accumulator.
                 if accumulators[i] is None:
                     accumulators[i] = trimmed.clone()
                 else:
@@ -1499,32 +1265,19 @@ def _apply_model_multi_unshifted(
     oom_backoff_state: dict[str, int] | None = None,
 ) -> list[Tensor]:
     """
-    Multi-mix forward without shift averaging — pools tail chunks across
-    mixes so every forward pass has exactly ``chunk_batch_size`` items.
+    Multi-mix forward without shift averaging.
 
-    Internal helper for ``apply_model_multi``. Each mix's full-size batches
-    are processed first; whatever's left across all mixes is collected into
-    a single pool and drained as full-size batches (with a final tail-pad
-    on the last drain batch if needed).
-
-    :param model: Model to run on each chunk.
-    :param mixes: Input mixes as tensors or ``TensorChunk`` views.
-    :param device: Inference device.
-    :param overlap: Overlap between segments, used to derive the chunk stride.
-    :param transition_power: Exponent for the triangular overlap-add weighting.
-    :param chunk_batch_size: Number of chunks per forward pass.
-    :param progress_callback: Optional aggregate/per-input progress callback.
-    :param oom_backoff_state: Mutable ``{"chunk_batch_size": n}`` opting into
-        runtime CUDA-OOM halving for auto-sized eager runs (Separator
-        internal); halvings persist in the dict for the caller. ``None``
-        disables backoff (OOM propagates).
-    :return: One separated-sources tensor per input mix, in input order.
-    :raises ValidationError: If ``overlap`` produces a non-positive segment
-        stride (range validation happens in ``apply_model_multi``).
+        :param model: Model to run.
+        :param mixes: Input mixes.
+        :param device: Inference device.
+        :param overlap: Overlap ratio.
+        :param transition_power: Crossfade exponent.
+        :param chunk_batch_size: Chunks per forward.
+        :param progress_callback: Progress callback.
+        :param oom_backoff_state: Backoff dict or None.
+        :return: One tensor per input.
+        :raises ValidationError: If stride invalid.
     """
-    # The accum-device comparisons below need an indexed CUDA device;
-    # apply_model_multi (the only caller) normalizes it (and rejects "cuda"
-    # when CUDA is unavailable, so normalization always happened).
     assert device.type != "cuda" or device.index is not None
     segment = model.max_allowed_segment
     assert segment > 0.0
@@ -1534,11 +1287,6 @@ def _apply_model_multi_unshifted(
         raise ValidationError(
             f"split overlap {overlap} produces an invalid stride for segment length {segment_length}"
         )
-    # CUDA path: accumulate on the GPU when every mix's accumulators fit the
-    # VRAM budget (single D2H at the end, no per-batch CPU round-trip);
-    # otherwise fall back to CPU accumulation with per-batch staging, which
-    # bounds GPU usage by ``model + active_batch`` for arbitrarily long audio.
-    # MPS/CPU accumulate on ``device`` as before (unified memory on MPS).
     is_cuda = str(device).startswith("cuda")
     if is_cuda:
         bytes_needed = 0
@@ -1553,8 +1301,6 @@ def _apply_model_multi_unshifted(
                 mix_length,
             )
             if isinstance(mix, TensorChunk) and inner.shape[-1] > mix_length:
-                # The GPU-resident path stages the chunk's entire backing
-                # tensor, not just the viewed span — budget the difference.
                 bytes_needed += (
                     batch_dim * inner.shape[-2] * (inner.shape[-1] - mix_length) * 4
                 )
@@ -1567,10 +1313,6 @@ def _apply_model_multi_unshifted(
     weight = _split_weight(
         segment_length, transition_power, accum_device, torch.float32
     )
-    # CUDAGraphs capture (Separator's compile path) requires every forward to
-    # have the captured batch shape, so sub-full tail batches are zero-padded
-    # up to ``chunk_batch_size``. Eager execution has no such constraint, and
-    # padding would just burn forward compute on zero chunks.
     fixed_batch_shape = bool(getattr(model, "_fixed_batch_shape", False))
 
     chunk_valid_length: int = segment_length
@@ -1581,10 +1323,6 @@ def _apply_model_multi_unshifted(
     input_total_chunks: list[int] = []
 
     for mix_idx, mix in enumerate(mixes):
-        # GPU-resident path moves each mix to the inference device once and
-        # slices chunks there; the bounded CPU path keeps the mix on CPU and
-        # stages each batch instead. MPS/CPU always move once (unified memory
-        # on MPS = essentially free).
         if isinstance(mix, TensorChunk):
             length = mix.length
             channels = mix.tensor.shape[-2]
@@ -1635,8 +1373,6 @@ def _apply_model_multi_unshifted(
         for offset, chunk in chunks_for_mix[n_full:]:
             tail_pool.append((mix_idx, offset, chunk))
 
-    # Progress is reported across every mix's chunks (for a single mix this is
-    # just that mix's chunk count, matching the old single-mix ``apply_model``).
     total_chunks = len(full_pool) + len(tail_pool)
     completed_chunks = 0
     input_completed_chunks = [0] * len(mixes)
@@ -1668,10 +1404,6 @@ def _apply_model_multi_unshifted(
         )
         n_actual = padded.shape[0]
         if n_actual < chunk_batch_size and fixed_batch_shape:
-            # CUDAGraphs replay (Separator's compile path) requires the
-            # captured batch shape, so tails pad all the way up. Eager models
-            # run tails at their natural size to avoid forward compute on zero
-            # chunks; host applications retain control of global cuDNN policy.
             pad_count = chunk_batch_size - n_actual
             zero_pad = padded.new_zeros((pad_count, *padded.shape[1:]))
             padded = torch.cat([padded, zero_pad], dim=0)
@@ -1685,33 +1417,17 @@ def _apply_model_multi_unshifted(
         if batch_out.device != accum_device:
             batch_out = batch_out.to(accum_device)
         elif progress_callback is not None and is_cuda:
-            # The GPU-resident path has no host sync per batch (that's the
-            # point), so without this the per-chunk events below would fire
-            # at kernel-enqueue time — racing ahead of the actual compute and
-            # rendering progress meaningless. Sync only when someone is
-            # watching; unobserved runs keep the free-running pipeline.
             torch.cuda.synchronize(device)
 
-        # Phase 1 — prepare disposable views before any accumulator commit.
-        # ``batch_out`` is not used again, so weighting its trimmed views in
-        # place avoids retaining a second full batch of materialized products.
-        # Any failure still occurs before commits, preserving whole-batch retry.
         contributions: list[tuple[int, int, Tensor, Tensor]] = []
         for i, (mix_idx, offset, chunk) in enumerate(batch_items):
             chunk_out = center_trim(batch_out[i : i + 1], chunk.length)
             chunk_length = chunk_out.shape[-1]
             w = weight[:chunk_length]
-            # ``batch_out`` was created in inference mode; in-place mutation
-            # of an inference tensor is permitted only inside the same mode.
             with torch.inference_mode():
                 chunk_out.mul_(w)
             contributions.append((mix_idx, offset, chunk_out, w))
 
-        # Phase 2 — pure in-place adds into preallocated accumulators: no
-        # allocation, so this phase cannot OOM partway through. Progress
-        # payloads are returned rather than emitted here: a user callback
-        # raising an OOM-shaped error inside the retry boundary would
-        # otherwise re-run a batch whose commits already landed.
         pending_events: list[dict[str, int]] = []
         for mix_idx, offset, weighted, w in contributions:
             state = mix_states[mix_idx]
@@ -1780,19 +1496,12 @@ def _apply_model_multi_unshifted(
                     torch.mps.empty_cache()
                 continue
             idx += len(batch)
-            # Outside the try: a raising progress callback propagates as the
-            # caller's own error instead of masquerading as a batch OOM.
             if progress_callback:
                 for payload in pending_events:
                     progress_callback("chunk_complete", payload)
 
-    # Full-size batches first — blocks were built at the original
-    # ``chunk_batch_size``, so no padding is needed even if backoff later
-    # shrinks the slice size.
     _drain(full_pool)
 
-    # Drain the cross-mix tail pool. The final batch tail-pads if the pool's
-    # length isn't a clean multiple of ``chunk_batch_size``.
     _drain(tail_pool)
 
     if progress_callback:

@@ -112,7 +112,9 @@ def test_check_checksum_passes_clean_file(tmp_path: Path) -> None:
 
 
 def test_check_size_rejects_wrong_length(tmp_path: Path) -> None:
-    """Trusted artifact sizes are enforced independently of checksums."""
+    """
+    Trusted artifact sizes are enforced independently of checksums.
+    """
     path = tmp_path / "blob.bin"
     path.write_bytes(b"1234")
     check_size(path, 4)
@@ -123,25 +125,37 @@ def test_check_size_rejects_wrong_length(tmp_path: Path) -> None:
 def test_demucs_download_rejects_wrong_content_length(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A declared size mismatch fails before model bytes are streamed."""
+    """
+    A declared size mismatch fails before model bytes are streamed.
+    """
 
     class Response:
-        """Minimal streaming response with a bad declared length."""
+        """
+        Minimal streaming response with a bad declared length.
+        """
 
         headers = {"content-length": "5"}
 
         def __enter__(self):
-            """Enter the fake response context."""
+            """
+            Enter the fake response context.
+            """
             return self
 
         def __exit__(self, *_args: object) -> None:
-            """Leave the fake response context."""
+            """
+            Leave the fake response context.
+            """
 
         def raise_for_status(self) -> None:
-            """Represent a successful HTTP status."""
+            """
+            Represent a successful HTTP status.
+            """
 
         def iter_bytes(self, chunk_size: int):
-            """Yield no bytes because the header should reject first."""
+            """
+            Yield no bytes because the header should reject first.
+            """
             del chunk_size
             return iter(())
 
@@ -159,25 +173,37 @@ def test_demucs_download_rejects_wrong_content_length(
 def test_roformer_download_rejects_chunked_size_overrun(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A chunked response cannot exceed metadata's expected artifact size."""
+    """
+    A chunked response cannot exceed metadata's expected artifact size.
+    """
 
     class Response:
-        """Minimal chunked response that lies by omitting Content-Length."""
+        """
+        Minimal chunked response that lies by omitting Content-Length.
+        """
 
         headers: dict[str, str] = {}
 
         def __enter__(self):
-            """Enter the fake response context."""
+            """
+            Enter the fake response context.
+            """
             return self
 
         def __exit__(self, *_args: object) -> None:
-            """Leave the fake response context."""
+            """
+            Leave the fake response context.
+            """
 
         def raise_for_status(self) -> None:
-            """Represent a successful HTTP status."""
+            """
+            Represent a successful HTTP status.
+            """
 
         def iter_bytes(self, chunk_size: int):
-            """Yield five bytes against a four-byte limit."""
+            """
+            Yield five bytes against a four-byte limit.
+            """
             del chunk_size
             return iter((b"123", b"45"))
 
@@ -240,7 +266,9 @@ def test_repository_rejects_missing_models_top_key(tmp_path: Path) -> None:
 def test_repository_rejects_malformed_containers(
     tmp_path: Path, metadata: object
 ) -> None:
-    """Malformed custom metadata always raises the package error type."""
+    """
+    Malformed custom metadata always raises the package error type.
+    """
     path = tmp_path / "metadata.json"
     path.write_text(json.dumps(metadata))
     with pytest.raises(ModelLoadingError):
@@ -248,7 +276,9 @@ def test_repository_rejects_malformed_containers(
 
 
 def test_repository_rejects_empty_demucs_layers(tmp_path: Path) -> None:
-    """A Demucs entry must contain at least one Safetensors artifact."""
+    """
+    A Demucs entry must contain at least one Safetensors artifact.
+    """
     bad = _good_metadata()
     bad["models"]["fakemodel"]["models"] = []
     with pytest.raises(ModelLoadingError, match="non-empty layer"):
@@ -256,7 +286,9 @@ def test_repository_rejects_empty_demucs_layers(tmp_path: Path) -> None:
 
 
 def test_repository_rejects_malformed_roformer_fields(tmp_path: Path) -> None:
-    """RoFormer architecture/config fields are validated before download."""
+    """
+    RoFormer architecture/config fields are validated before download.
+    """
     bad = {
         "models": {
             "bad": {
@@ -278,7 +310,9 @@ def test_repository_rejects_malformed_roformer_fields(tmp_path: Path) -> None:
 def test_repository_wraps_missing_roformer_geometry(
     tmp_path: Path, missing: str
 ) -> None:
-    """Missing required geometry raises ModelLoadingError, never raw KeyError."""
+    """
+    Missing required geometry raises ModelLoadingError, never raw KeyError.
+    """
     entry = {
         "backend": "roformer",
         "architecture": "bs_roformer",
@@ -450,7 +484,9 @@ def test_get_model_redownloads_corrupt_cached_layer(
 def test_repository_instances_coordinate_one_artifact_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two repository instances recheck under one cross-process file lock."""
+    """
+    Two repository instances recheck under one cross-process file lock.
+    """
     cache = tmp_path / "cache"
     monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache)
     monkeypatch.setattr("unblend.repo.check_checksum", lambda *_args: None)
@@ -464,7 +500,9 @@ def test_repository_instances_coordinate_one_artifact_download(
     calls_lock = threading.Lock()
 
     def fake_download(self: ModelRepository, **kwargs: object) -> None:
-        """Populate the cache slowly enough for the other thread to wait."""
+        """
+        Populate the cache slowly enough for the other thread to wait.
+        """
         nonlocal calls
         del self
         with calls_lock:
@@ -501,7 +539,9 @@ def test_repository_instances_coordinate_one_artifact_download(
 
 
 def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
-    """Repository cannot skip another layer that contributes to the stem."""
+    """
+    Repository cannot skip another layer that contributes to the stem.
+    """
     metadata = _good_metadata()
     metadata["models"]["fakemodel"]["models"].append(
         {
@@ -526,7 +566,9 @@ def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
 def test_get_model_rejects_only_load_before_cache_or_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stem: str
 ) -> None:
-    """Direct repository callers fail fast for invalid or empty stems."""
+    """
+    Direct repository callers fail fast for invalid or empty stems.
+    """
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
     monkeypatch.setattr(
         repo,
@@ -542,7 +584,9 @@ def test_get_model_rejects_only_load_before_cache_or_network(
 def test_artifact_lock_wraps_acquisition_filesystem_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Lock-path failures become stable repository-domain errors."""
+    """
+    Lock-path failures become stable repository-domain errors.
+    """
     from unblend import repo as repo_module
 
     class BrokenLock:
@@ -562,7 +606,9 @@ def test_artifact_lock_wraps_acquisition_filesystem_error(
 def test_roformer_materializes_state_while_cache_lock_is_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A concurrent remove cannot unlink a checkpoint during load_file."""
+    """
+    A concurrent remove cannot unlink a checkpoint during load_file.
+    """
     from contextlib import contextmanager
 
     from unblend import repo as repo_module
@@ -650,7 +696,9 @@ def test_get_cache_dir_env_override(
 def test_get_cache_dir_legacy_fallback_and_precedence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The old variable warns, while the new name silently wins."""
+    """
+    The old variable warns, while the new name silently wins.
+    """
     legacy = tmp_path / "legacy"
     current = tmp_path / "current"
     monkeypatch.delenv("UNBLEND_CACHE_DIR", raising=False)
@@ -707,7 +755,9 @@ def test_get_cache_info_reports_partial_models(
 def test_sweep_stale_downloads_removes_staging_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only expired staging files are swept; active files are preserved."""
+    """
+    Only expired staging files are swept; active files are preserved.
+    """
     cache = tmp_path / "cache"
     cache.mkdir()
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(cache))
@@ -813,92 +863,10 @@ def test_get_model_preserves_cache_on_read_failures(
         assert excinfo.value is exc
 
 
-def test_load_model_accepts_upstream_demucs_pickles(tmp_path) -> None:
-    """
-    Explicit legacy loading temporarily installs the historical upstream
-    module alias and restores ``sys.modules`` afterward. Registered models do
-    not use this compatibility path.
-    """
-    import torch
-
-    from unblend.htdemucs import HTDemucs
-    from unblend.states import _legacy_demucs_aliases, load_model
-
-    kwargs = dict(
-        sources=["a", "b"],
-        samplerate=8000,
-        segment=1.0,
-        nfft=512,
-        depth=2,
-        channels=16,
-        t_layers=1,
-    )
-    model = HTDemucs(**kwargs)
-
-    # Re-point the class's pickle identity at the upstream module path so the
-    # saved bytes are byte-authentic to a real upstream checkpoint.
-    original_module = HTDemucs.__module__
-    HTDemucs.__module__ = "demucs.htdemucs"
-    try:
-        package = {
-            "klass": HTDemucs,
-            "args": (),
-            "kwargs": kwargs,
-            "state": model.state_dict(),
-        }
-        path = tmp_path / "upstream_style.th"
-        with _legacy_demucs_aliases():
-            torch.save(package, path)
-    finally:
-        HTDemucs.__module__ = original_module
-
-    previous_demucs = sys.modules.get("demucs")
-    loaded = load_model(path)
-    assert isinstance(loaded, HTDemucs)
-    assert loaded.sources == ["a", "b"]
-    assert sys.modules.get("demucs") is previous_demucs
-
-
-def test_legacy_alias_context_serializes_concurrent_loads() -> None:
-    """Concurrent legacy loads cannot restore aliases out of order."""
-    from unblend.states import _legacy_demucs_aliases
-
-    previous_demucs = sys.modules.get("demucs")
-    previous_htdemucs = sys.modules.get("demucs.htdemucs")
-    entered = threading.Event()
-    release = threading.Event()
-    second_done = threading.Event()
-
-    def first() -> None:
-        """Hold the alias context while the second thread attempts entry."""
-        with _legacy_demucs_aliases():
-            entered.set()
-            release.wait(timeout=5)
-
-    def second() -> None:
-        """Enter only after the first context has restored its aliases."""
-        entered.wait(timeout=5)
-        with _legacy_demucs_aliases():
-            assert "demucs.htdemucs" in sys.modules
-        second_done.set()
-
-    first_thread = threading.Thread(target=first)
-    second_thread = threading.Thread(target=second)
-    first_thread.start()
-    assert entered.wait(timeout=5)
-    second_thread.start()
-    assert not second_done.wait(timeout=0.05)
-    release.set()
-    first_thread.join(timeout=5)
-    second_thread.join(timeout=5)
-
-    assert second_done.is_set()
-    assert sys.modules.get("demucs") is previous_demucs
-    assert sys.modules.get("demucs.htdemucs") is previous_htdemucs
-
-
 def test_normal_import_does_not_install_demucs_aliases() -> None:
-    """Ordinary package import coexists with a separately installed Demucs."""
+    """
+    Ordinary package import coexists with a separately installed Demucs.
+    """
     result = subprocess.run(
         [
             sys.executable,
@@ -917,7 +885,9 @@ def test_normal_import_does_not_install_demucs_aliases() -> None:
 def test_registered_layer_loads_safetensors_without_pickle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Registered weights build strictly without calling ``torch.load``."""
+    """
+    Registered weights build strictly without calling ``torch.load``.
+    """
     import torch
     from safetensors.torch import save_file
 
@@ -1124,7 +1094,9 @@ def test_demucs_layer_from_a_url_is_fetched_once_then_cached(
     def fake_download(
         self: ModelRepository, *, url: str, cache_path: Path, **_: object
     ) -> None:
-        """Stand in for the network by promoting known-good bytes."""
+        """
+        Stand in for the network by promoting known-good bytes.
+        """
         del self
         downloads.append(url)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1186,7 +1158,9 @@ def test_mixed_local_and_remote_layers_only_account_for_the_download(
 
 
 def test_entry_without_a_known_architecture_is_rejected(tmp_path: Path) -> None:
-    """An entry naming neither a backend nor a known architecture fails."""
+    """
+    An entry naming neither a backend nor a known architecture fails.
+    """
     bad = {
         "models": {
             "mystery": {
@@ -1205,7 +1179,9 @@ def test_entry_without_a_known_architecture_is_rejected(tmp_path: Path) -> None:
 
 
 def test_backend_cannot_build_a_foreign_architecture(tmp_path: Path) -> None:
-    """A backend/architecture pair from different families is rejected."""
+    """
+    A backend/architecture pair from different families is rejected.
+    """
     bad = _good_metadata()
     bad["models"]["fakemodel"]["architecture"] = "scnet"
     with pytest.raises(ModelLoadingError, match="cannot build"):
@@ -1268,7 +1244,9 @@ def test_single_checkpoint_entries_are_validated_at_construction(
 def test_artifact_source_rules_are_enforced(
     tmp_path: Path, checkpoint: dict, expected: str
 ) -> None:
-    """Every artifact is one Safetensors file, named locally or over https."""
+    """
+    Every artifact is one Safetensors file, named locally or over https.
+    """
     bad = {
         "models": {
             "custom_scnet": {
@@ -1492,13 +1470,17 @@ def test_ensemble_can_mix_architectures(
 def test_bad_member_references_are_rejected(
     tmp_path: Path, entries: dict, expected: str
 ) -> None:
-    """A member reference must name a real, single, non-recursive model."""
+    """
+    A member reference must name a real, single, non-recursive model.
+    """
     with pytest.raises(ModelLoadingError, match=expected):
         ModelRepository(metadata_path=_write_metadata(tmp_path, {"models": entries}))
 
 
 def test_reference_to_an_ensemble_is_rejected(tmp_path: Path) -> None:
-    """Members must be single models: nesting ensembles is not supported."""
+    """
+    Members must be single models: nesting ensembles is not supported.
+    """
     weights, config = _tiny_demucs_layer(tmp_path)
     metadata = {
         "models": {
@@ -1518,7 +1500,9 @@ def test_reference_to_an_ensemble_is_rejected(tmp_path: Path) -> None:
 
 
 def test_referenced_member_must_emit_the_same_stems(tmp_path: Path) -> None:
-    """Members have to agree on stem names and order, so mismatches fail early."""
+    """
+    Members have to agree on stem names and order, so mismatches fail early.
+    """
     weights, config = _tiny_demucs_layer(tmp_path)
     metadata = {
         "models": {
@@ -1534,7 +1518,9 @@ def test_referenced_member_must_emit_the_same_stems(tmp_path: Path) -> None:
 
 
 def test_entry_must_name_its_weights_exactly_once(tmp_path: Path) -> None:
-    """``checkpoint``, ``members`` and ``models`` are mutually exclusive."""
+    """
+    ``checkpoint``, ``members`` and ``models`` are mutually exclusive.
+    """
     weights, config = _tiny_demucs_layer(tmp_path)
     entry = _local_htdemucs_entry(weights, config)
     entry["members"] = [{"checkpoint": entry["checkpoint"]}]

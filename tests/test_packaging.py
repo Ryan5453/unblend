@@ -1,15 +1,31 @@
-"""Offline packaging and Cog configuration consistency checks."""
+"""
+Offline packaging and Cog configuration consistency checks.
+"""
 
 import re
 from pathlib import Path
 
-from unblend.config_io import load_mapping
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _load_mapping(path: Path):
+    """
+    Minimal loader for tests.
+    """
+    import json
+
+    text = path.read_text()
+    if path.suffix == ".json":
+        return json.loads(text)
+    return yaml.safe_load(text)
+
+
 def test_cog_uses_fully_locked_uv_export() -> None:
-    """Cog installs the checked-in, fully pinned export of ``uv.lock``."""
+    """
+    Cog installs the checked-in, fully pinned export of ``uv.lock``.
+    """
     cog = (ROOT / "cog.yaml").read_text()
     assert 'python_requirements: "requirements-cog.txt"' in cog
     assert not (ROOT / "requirements.txt").exists()
@@ -118,7 +134,7 @@ def test_cog_model_url_matches_metadata() -> None:
     assert match, "cog.yaml no longer bakes the htdemucs Safetensors layer"
     baked_filename, baked_url = match.groups()
 
-    registry = load_mapping(ROOT / "unblend" / "metadata.yaml")
+    registry = _load_mapping(ROOT / "unblend" / "metadata.yaml")
     layers = registry["models"]["htdemucs"]["models"]
     assert len(layers) == 1, "cog.yaml bakes exactly one layer but htdemucs has more"
 

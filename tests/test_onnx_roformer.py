@@ -143,7 +143,9 @@ def test_mel_averaging_matrix_shape_and_normalisation() -> None:
 
 
 def test_chunked_attention_matches_full_attention() -> None:
-    """Query chunking preserves exact all-to-all attention semantics."""
+    """
+    Query chunking preserves exact all-to-all attention semantics.
+    """
     torch.manual_seed(0)
     query = torch.randn(2, 3, 73, 8)
     key = torch.randn(2, 3, 73, 8)
@@ -163,7 +165,9 @@ def test_chunked_attention_matches_full_attention() -> None:
 
 
 def test_head_chunked_attention_matches_full_module() -> None:
-    """Head-group projections preserve the trained attention operation."""
+    """
+    Head-group projections preserve the trained attention operation.
+    """
     torch.manual_seed(0)
     module = Attention(dim=16, heads=4, dim_head=8).eval()
     x = torch.randn(5, 73, 16)
@@ -176,7 +180,9 @@ def test_head_chunked_attention_matches_full_module() -> None:
 
 
 def test_hidden_chunked_feedforward_matches_full_module() -> None:
-    """Feature-group MLP projections sum to the ordinary second linear."""
+    """
+    Feature-group MLP projections sum to the ordinary second linear.
+    """
     torch.manual_seed(0)
     module = FeedForward(dim=16, mult=4).eval()
     x = torch.randn(5, 73, 16)
@@ -188,7 +194,9 @@ def test_hidden_chunked_feedforward_matches_full_module() -> None:
 
 
 def test_sliced_glu_matches_native_mask_estimator() -> None:
-    """Explicit GLU slices preserve mask-head output without ONNX Split."""
+    """
+    Explicit GLU slices preserve mask-head output without ONNX Split.
+    """
     torch.manual_seed(0)
     module = MaskEstimator(
         dim=16,
@@ -204,7 +212,9 @@ def test_sliced_glu_matches_native_mask_estimator() -> None:
 
 
 def test_export_wrapper_enables_bounded_attention() -> None:
-    """Every attention and RMSNorm block receives its browser-safe path."""
+    """
+    Every attention and RMSNorm block receives its browser-safe path.
+    """
     model = _bs()
     RoformerONNXWrapper(
         model,
@@ -315,7 +325,9 @@ def test_export_and_onnxruntime_parity(builder, tmp_path) -> None:
 
 @pytest.mark.parametrize("builder", [_bs, _mel], ids=["bs", "mel"])
 def test_static_browser_export_chunks_large_buffers(builder, tmp_path) -> None:
-    """The static browser graph's head/MLP chunking preserves ORT parity."""
+    """
+    The static browser graph's head/MLP chunking preserves ORT parity.
+    """
     pytest.importorskip("onnx")
     pytest.importorskip("onnxscript")
     ort = pytest.importorskip("onnxruntime")

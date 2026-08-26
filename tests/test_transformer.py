@@ -1,4 +1,6 @@
-"""Regression tests for documented transformer construction options."""
+"""
+Regression tests for documented transformer construction options.
+"""
 
 import pytest
 import torch
@@ -23,7 +25,9 @@ from unblend.transformer import (
 def test_transformer_input_norm_truth_table(
     norm_in: bool, norm_in_group: bool, expected: type[torch.nn.Module]
 ) -> None:
-    """Group input normalization only selects the norm used when enabled."""
+    """
+    Group input normalization only selects the norm used when enabled.
+    """
     model = CrossTransformerEncoder(
         dim=16,
         num_heads=4,
@@ -40,7 +44,9 @@ def test_transformer_input_norm_truth_table(
     [MyTransformerEncoderLayer, CrossTransformerEncoderLayer],
 )
 def test_transformer_layer_propagates_dtype(layer_type) -> None:
-    """Attention, normalization, and layer-scale parameters honor dtype."""
+    """
+    Attention, normalization, and layer-scale parameters honor dtype.
+    """
     layer = layer_type(
         d_model=16,
         nhead=4,

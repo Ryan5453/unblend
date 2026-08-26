@@ -1,4 +1,6 @@
-"""Network-free lifecycle tests for the Cog request coalescer."""
+"""
+Network-free lifecycle tests for the Cog request coalescer.
+"""
 
 import asyncio
 import gc
@@ -11,19 +13,27 @@ from typing import IO
 
 
 class _BaseModel:
-    """Small Cog ``BaseModel`` stand-in used only during module import."""
+    """
+    Small Cog ``BaseModel`` stand-in used only during module import.
+    """
 
     def __init__(self, **values: object) -> None:
-        """Store arbitrary output fields like Cog/Pydantic would."""
+        """
+        Store arbitrary output fields like Cog/Pydantic would.
+        """
         self.__dict__.update(values)
 
 
 class _BasePredictor:
-    """Cog ``BasePredictor`` stand-in."""
+    """
+    Cog ``BasePredictor`` stand-in.
+    """
 
 
 def _input(**kwargs: object) -> object:
-    """Return the declared default for a Cog input placeholder."""
+    """
+    Return the declared default for a Cog input placeholder.
+    """
     return kwargs.get("default")
 
 
@@ -48,7 +58,9 @@ _SPEC.loader.exec_module(_PREDICTOR_MODULE)
 
 
 class _FakeSeparator:
-    """Pointwise separator stand-in recording batch calls."""
+    """
+    Pointwise separator stand-in recording batch calls.
+    """
 
     chunk_batch_size = 4
     # Mirrors the real Separator's attribute surface, which setup()'s
@@ -68,11 +80,15 @@ class _FakeSeparator:
     _per_chunk_steady_bytes = None
 
     def __init__(self) -> None:
-        """Initialize the call log."""
+        """
+        Initialize the call log.
+        """
         self.calls: list[object] = []
 
     def separate(self, audio: object, **_kwargs: object) -> object:
-        """Return one marker per list input, or one marker for a scalar."""
+        """
+        Return one marker per list input, or one marker for a scalar.
+        """
         self.calls.append(audio)
         if isinstance(audio, list):
             return [f"result:{path.name}" for path in audio]
@@ -84,7 +100,9 @@ class _FakeSeparator:
 
 
 def _predictor(separator: _FakeSeparator, window: float = 0.0):
-    """Build a predictor with setup's coalescer state but no model loading."""
+    """
+    Build a predictor with setup's coalescer state but no model loading.
+    """
     predictor = object.__new__(_PREDICTOR_MODULE.Predictor)
     predictor.separators = {"htdemucs": separator}
     predictor._queues = {}
@@ -94,7 +112,9 @@ def _predictor(separator: _FakeSeparator, window: float = 0.0):
 
 
 def _request(name: str):
-    """Create a request while an asyncio loop is running."""
+    """
+    Create a request while an asyncio loop is running.
+    """
     return _PREDICTOR_MODULE._Request(
         audio_path=Path(f"/{name}"),
         model_name="htdemucs",
@@ -105,7 +125,9 @@ def _request(name: str):
 
 
 def test_same_key_requests_batch_and_worker_retires() -> None:
-    """Compatible requests share one call and leave no permanent registry."""
+    """
+    Compatible requests share one call and leave no permanent registry.
+    """
 
     async def scenario() -> None:
         separator = _FakeSeparator()
@@ -131,7 +153,9 @@ def test_same_key_requests_batch_and_worker_retires() -> None:
 
 
 def test_many_distinct_keys_do_not_accumulate_workers() -> None:
-    """Sequential client-controlled parameter keys are retired after use."""
+    """
+    Sequential client-controlled parameter keys are retired after use.
+    """
 
     async def scenario() -> None:
         separator = _FakeSeparator()
@@ -150,7 +174,9 @@ def test_many_distinct_keys_do_not_accumulate_workers() -> None:
 
 
 def test_worker_initialization_failure_resolves_request_and_retires() -> None:
-    """A missing separator cannot strand a future before guarded processing."""
+    """
+    A missing separator cannot strand a future before guarded processing.
+    """
 
     async def scenario() -> None:
         predictor = _predictor(_FakeSeparator())
@@ -173,24 +199,34 @@ def test_worker_initialization_failure_resolves_request_and_retires() -> None:
 
 
 def test_completed_batch_is_released_before_next_inference() -> None:
-    """The worker frame does not retain prior result tensors across batches."""
+    """
+    The worker frame does not retain prior result tensors across batches.
+    """
 
     class Payload:
-        """Weak-referenceable stand-in for a separated tensor bundle."""
+        """
+        Weak-referenceable stand-in for a separated tensor bundle.
+        """
 
     class LifetimeSeparator(_FakeSeparator):
-        """Assert the first result is collectible before the second call."""
+        """
+        Assert the first result is collectible before the second call.
+        """
 
         chunk_batch_size = 1
 
         def __init__(self) -> None:
-            """Initialize result-lifetime tracking."""
+            """
+            Initialize result-lifetime tracking.
+            """
             super().__init__()
             self.first_ref: weakref.ReferenceType[Payload] | None = None
             self.call_count = 0
 
         def separate(self, audio: object, **_kwargs: object) -> object:
-            """Return payloads and check collection on the second batch."""
+            """
+            Return payloads and check collection on the second batch.
+            """
             if not isinstance(audio, list):
                 return Payload()
             self.call_count += 1
@@ -212,7 +248,9 @@ def test_completed_batch_is_released_before_next_inference() -> None:
         predictor._enqueue_request(key, first)
 
         async def consume_first(future: asyncio.Future) -> None:
-            """Consume and release the first future's result."""
+            """
+            Consume and release the first future's result.
+            """
             result = await future
             assert isinstance(result, Payload)
 
@@ -231,13 +269,19 @@ def test_completed_batch_is_released_before_next_inference() -> None:
 
 
 def test_failed_batch_falls_back_per_request_and_retires() -> None:
-    """One invalid input does not strand neighbors or retain its worker."""
+    """
+    One invalid input does not strand neighbors or retain its worker.
+    """
 
     class PartiallyFailingSeparator(_FakeSeparator):
-        """Fail lists and one named scalar request."""
+        """
+        Fail lists and one named scalar request.
+        """
 
         def separate(self, audio: object, **kwargs: object) -> object:
-            """Force fallback, then fail only ``bad.wav``."""
+            """
+            Force fallback, then fail only ``bad.wav``.
+            """
             if isinstance(audio, list):
                 raise RuntimeError("batch failed")
             if audio.name == "bad.wav":
@@ -295,7 +339,9 @@ def test_setup_rejects_cpu_fallback(monkeypatch) -> None:
 
 
 def test_setup_allows_cpu_when_opted_in(monkeypatch) -> None:
-    """``UNBLEND_ALLOW_CPU=1`` keeps the image runnable on a GPU-less host."""
+    """
+    ``UNBLEND_ALLOW_CPU=1`` keeps the image runnable on a GPU-less host.
+    """
     monkeypatch.setenv("UNBLEND_ALLOW_CPU", "1")
     monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(
@@ -372,7 +418,9 @@ def test_setup_survives_a_failing_warmup(monkeypatch) -> None:
 
     class _ExplodingSeparator(_FakeSeparator):
         def separate(self, audio: object, **kwargs: object) -> object:
-            """Fail the way a shape/OOM error would during capture."""
+            """
+            Fail the way a shape/OOM error would during capture.
+            """
             raise RuntimeError("CUDA error during graph capture")
 
     monkeypatch.setattr(

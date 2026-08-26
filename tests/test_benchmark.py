@@ -1,4 +1,6 @@
-"""Regression checks for the isolated upstream benchmark worker."""
+"""
+Regression checks for the isolated upstream benchmark worker.
+"""
 
 import ast
 import threading
@@ -11,7 +13,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _worker_template() -> str:
-    """Read the upstream worker template without importing benchmark.py."""
+    """
+    Read the upstream worker template without importing benchmark.py.
+    """
     tree = ast.parse((ROOT / "benchmark.py").read_text())
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
@@ -25,7 +29,9 @@ def _worker_template() -> str:
 
 
 def test_upstream_worker_imports_upstream_demucs() -> None:
-    """The isolated worker must import the package installed in its venv."""
+    """
+    The isolated worker must import the package installed in its venv.
+    """
     template = _worker_template()
     assert "from demucs.api import Separator" in template
     assert "from unblend.api import Separator" not in template
@@ -33,7 +39,9 @@ def test_upstream_worker_imports_upstream_demucs() -> None:
 
 
 def test_upstream_venv_path_is_digest_contained(tmp_path, monkeypatch) -> None:
-    """A hostile Git ref never becomes a filesystem path component."""
+    """
+    A hostile Git ref never becomes a filesystem path component.
+    """
     root = tmp_path / "upstream-envs"
     monkeypatch.setattr(benchmark, "UPSTREAM_VENV_ROOT", root)
 
@@ -51,7 +59,9 @@ def test_upstream_venv_path_is_digest_contained(tmp_path, monkeypatch) -> None:
 
 
 def test_upstream_venv_provisioning_is_serialized(tmp_path, monkeypatch) -> None:
-    """Concurrent callers build one environment under the sibling file lock."""
+    """
+    Concurrent callers build one environment under the sibling file lock.
+    """
     root = tmp_path / "upstream-envs"
     monkeypatch.setattr(benchmark, "UPSTREAM_VENV_ROOT", root)
     calls = 0
@@ -96,7 +106,9 @@ def test_upstream_venv_provisioning_is_serialized(tmp_path, monkeypatch) -> None
 
 
 def test_upstream_payload_and_worker_propagate_track_seed(tmp_path) -> None:
-    """Every upstream track gets the same stable seed the worker reports."""
+    """
+    Every upstream track gets the same stable seed the worker reports.
+    """
     tracks = [
         benchmark.BenchmarkTrack(
             name="Track A",

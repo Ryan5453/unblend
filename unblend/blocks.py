@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 from copy import deepcopy
 from typing import Callable
 
@@ -97,20 +98,18 @@ def _istft_fold(
     length: int | None,
 ) -> Tensor:
     """
-    Custom centered, normalized=True iSTFT that bypasses ``torch.istft``'s
-    NOLA check (which calls ``.item()`` and forces a device→host sync on
-    MPS — see PyTorch issue #94718).
+    Custom iSTFT bypassing torch.istft NOLA check.
 
-    :param z: Complex spectrogram of shape ``[B, freqs, frames]``.
+    :param z: Complex spectrogram ``[B, freqs, frames]``.
     :param n_fft: FFT size.
     :param hop_length: Hop length between frames.
-    :param win_length: Window length (must be ``<= n_fft``).
-    :param window: Window tensor of length ``win_length``.
+    :param win_length: Window length (must be <= n_fft).
+    :param window: Window tensor of length win_length.
     :param length: Optional output length to trim/pad to.
     :return: Reconstructed signal of shape ``[B, L]``.
     """
     n_frames = z.shape[-1]
-    frames = torch.fft.irfft(z, n=n_fft, dim=1)  # [B, n_fft, n_frames]
+    frames = torch.fft.irfft(z, n=n_fft, dim=1)
 
     if win_length < n_fft:
         pad_total = n_fft - win_length
@@ -141,9 +140,7 @@ def _istft_fold(
         .squeeze(-1)
         .squeeze(1)
     )
-    # Center-crop before division. The full folded Hann envelope has exact
-    # zeros at discarded endpoints; dividing first gives finite visible output
-    # but poisons backward with hidden 0/0 gradients.
+
     start = n_fft // 2
     if length is None:
         stop = max(start, output_length - n_fft // 2)
@@ -180,7 +177,6 @@ def ispectro(
     win_length = n_fft // (1 + pad)
 
     if z.device.type == "mps":
-        # Avoid torch.istft's NOLA-check host sync on MPS (issue #94718).
         x = _istft_fold(
             z,
             n_fft=n_fft,
@@ -238,9 +234,6 @@ def rescale_module(module: nn.Module, reference: float) -> None:
 class DConv(nn.Module):
     """
     New residual branches in each encoder layer.
-    This alternates dilated convolutions.
-    Also before entering each residual branch, dimension is projected on a smaller subspace,
-    e.g. of dim `channels // compress`.
     """
 
     def __init__(
@@ -256,13 +249,13 @@ class DConv(nn.Module):
         """
         Initialize DConv residual branch.
 
-        :param channels: Input/output channels for residual branch
-        :param compress: Amount of channel compression inside the branch
-        :param depth: Number of layers in the residual branch
-        :param init: Initial scale for LayerNorm
-        :param norm: Use GroupNorm
-        :param gelu: Use GELU activation
-        :param kernel: Kernel size for the (dilated) convolutions
+        :param channels: Input/output channels for residual branch.
+        :param compress: Channel compression inside the branch.
+        :param depth: Number of layers in the branch.
+        :param init: Initial scale for LayerNorm.
+        :param norm: Use GroupNorm.
+        :param gelu: Use GELU activation.
+        :param kernel: Kernel size for the dilated convolutions.
         """
 
         super().__init__()
@@ -270,10 +263,7 @@ class DConv(nn.Module):
         self.channels = channels
         self.compress = compress
         self.depth = abs(depth)
-        # The sign of `depth` selects dilation: a positive depth dilates
-        # (2**d per layer), a negative depth uses |depth| layers with no
-        # dilation. (Vestigial upstream convention; the shipped configs all
-        # pass positive depths.)
+
         dilate = depth > 0
 
         norm_fn: Callable[[int], nn.Module]
@@ -343,9 +333,7 @@ def pad1d(
             paddings = (padding_left - extra_pad_left, padding_right - extra_pad_right)
             x = functional.pad(x, (extra_pad_left, extra_pad_right))
     out = functional.pad(x, paddings, mode, value)
-    # Shape-only check kept; the prior elementwise `(out[...] == x0).all()`
-    # assertion forced a host-side sync on every STFT call inside the chunk
-    # loop, with no functional benefit on a well-tested PyTorch primitive.
+
     assert out.shape[-1] == length + padding_left + padding_right
     return out
 
@@ -375,7 +363,7 @@ class ScaledEmbedding(nn.Module):
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         if smooth:
             weight = torch.cumsum(self.embedding.weight.data, dim=0)
-            # when summing gaussian, overscale raises as sqrt(n), so we nornalize by that.
+
             weight = (
                 weight / torch.arange(1, num_embeddings + 1).to(weight).sqrt()[:, None]
             )
@@ -423,19 +411,19 @@ class HEncLayer(nn.Module):
         """
         Encoder layer used by both time and frequency branches.
 
-        :param chin: Number of input channels
-        :param chout: Number of output channels
-        :param kernel_size: Kernel size for the convolution
-        :param stride: Stride for the convolution
-        :param norm_groups: Number of groups for group norm
-        :param empty: If True, only use the first conv (for branch merging)
-        :param freq: If True, operate on frequencies (use Conv2d)
-        :param dconv: If True, insert DConv residual branches
-        :param norm: If True, use GroupNorm
-        :param context: Context size for the 1x1 conv
-        :param dconv_kw: Keyword arguments for the DConv class
-        :param pad: If True, pad input so output size = input size / stride
-        :param rewrite: If True, add 1x1 conv at the end of the layer
+        :param chin: Number of input channels.
+        :param chout: Number of output channels.
+        :param kernel_size: Kernel size for the convolution.
+        :param stride: Stride for the convolution.
+        :param norm_groups: Groups for group norm.
+        :param empty: Only use the first conv (branch merging).
+        :param freq: Operate on frequencies (use Conv2d).
+        :param dconv: Insert DConv residual branches.
+        :param norm: Use GroupNorm.
+        :param context: Context size for the 1x1 conv.
+        :param dconv_kw: Keyword arguments for DConv.
+        :param pad: Pad input so output size = input size / stride.
+        :param rewrite: Add 1x1 conv at end of layer.
         """
         super().__init__()
         dconv_kw = dconv_kw or {}
@@ -513,12 +501,7 @@ class HEncLayer(nn.Module):
 
 class MultiWrap(nn.Module):
     """
-    Takes one layer and replicate it N times. each replica will act
-    on a frequency band. All is done so that if the N replica have the same weights,
-    then this is exactly equivalent to applying the original module on all frequencies.
-
-    This is a bit over-engineered to avoid edge artifacts when splitting
-    the frequency bands, but it is possible the naive implementation would work as well...
+    Replicates a layer across frequency bands.
     """
 
     def __init__(
@@ -644,21 +627,21 @@ class HDecLayer(nn.Module):
         """
         Decoder layer, mirror of HEncLayer.
 
-        :param chin: Number of input channels
-        :param chout: Number of output channels
-        :param last: If True, this is the last layer (skip final activation)
-        :param kernel_size: Kernel size for the transposed convolution
-        :param stride: Stride for the transposed convolution
-        :param norm_groups: Number of groups for group norm
-        :param empty: If True, only use the transposed conv
-        :param freq: If True, operate on frequencies (use Conv2d)
-        :param dconv: If True, insert DConv residual branches
-        :param norm: If True, use GroupNorm
-        :param context: Context size for the 1x1 conv
-        :param dconv_kw: Keyword arguments for the DConv class
-        :param pad: If True, trim padding from output
-        :param context_freq: If True, apply context along frequency axis
-        :param rewrite: If True, add 1x1 conv at the start of the layer
+        :param chin: Number of input channels.
+        :param chout: Number of output channels.
+        :param last: Last layer (skip final activation).
+        :param kernel_size: Kernel size for the transposed convolution.
+        :param stride: Stride for the transposed convolution.
+        :param norm_groups: Groups for group norm.
+        :param empty: Only use the transposed conv.
+        :param freq: Operate on frequencies (use Conv2d).
+        :param dconv: Insert DConv residual branches.
+        :param norm: Use GroupNorm.
+        :param context: Context size for the 1x1 conv.
+        :param dconv_kw: Keyword arguments for DConv.
+        :param pad: Trim padding from output.
+        :param context_freq: Apply context along frequency axis.
+        :param rewrite: Add 1x1 conv at start of layer.
         """
         super().__init__()
         dconv_kw = dconv_kw or {}

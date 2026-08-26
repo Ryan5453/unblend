@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 import torch
 import torchaudio
 from torch import Tensor
@@ -24,25 +25,12 @@ def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
     if src_channels == channels:
         pass
     elif channels == 1:
-        # Case 1:
-        # The caller asked 1-channel audio, but the stream have multiple
-        # channels, downmix all channels.
         wav = wav.mean(dim=-2, keepdim=True)
     elif src_channels == 1:
-        # Case 2:
-        # The caller asked for multiple channels, but the input file have
-        # one single channel, replicate the audio over all channels.
-        # ``.contiguous()`` materialises the broadcast: ``expand`` returns a
-        # stride-0 view, which breaks downstream ops that require a contiguous
-        # last dim.
         wav = wav.expand(*shape, channels, length).contiguous()
     elif src_channels >= channels:
-        # Case 3:
-        # The caller asked for multiple channels, and the input file have
-        # more channels than requested. In that case return the first channels.
         wav = wav[..., :channels, :]
     else:
-        # Case 4: What is a reasonable choice here?
         raise ValidationError(
             "The audio file has less channels than requested but is not mono."
         )

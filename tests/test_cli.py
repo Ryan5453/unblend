@@ -77,7 +77,9 @@ def test_models_download_accepts_roformer_metadata(
     import unblend.cli.models as models_cli
 
     class DownloadedModel:
-        """Minimal model returned by the network-free repository stub."""
+        """
+        Minimal model returned by the network-free repository stub.
+        """
 
         sources = ["vocals", "other"]
 
@@ -122,7 +124,9 @@ def test_ensure_model_available_downloads_uncached_single_checkpoint_backend(
     import unblend.cli.models as models_cli
 
     class DownloadedModel:
-        """Minimal model returned by the network-free repository stub."""
+        """
+        Minimal model returned by the network-free repository stub.
+        """
 
         sources = ["vocals", "other"]
 
@@ -334,7 +338,9 @@ def test_separate_unsupported_format_fails_before_separation(tmp_path: Path) -> 
 
 
 class _StubSeparator:
-    """Stands in for Separator so the path pre-checks run without a model."""
+    """
+    Stands in for Separator so the path pre-checks run without a model.
+    """
 
     class _Model:
         sources = ["drums", "bass", "other", "vocals"]
@@ -438,7 +444,9 @@ def test_separate_case_aliasing_paths_fail_before_separation(
 def test_separate_unicode_aliasing_paths_fail_before_separation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """NFC-equivalent output names are rejected before inference."""
+    """
+    NFC-equivalent output names are rejected before inference.
+    """
     _stub_model_loading(monkeypatch)
     (tmp_path / "d1").mkdir()
     (tmp_path / "d2").mkdir()
@@ -463,7 +471,9 @@ def test_separate_unicode_aliasing_paths_fail_before_separation(
 def test_separate_symlink_loop_output_fails_cleanly_before_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Path-resolution failures are reported as CLI errors, not tracebacks."""
+    """
+    Path-resolution failures are reported as CLI errors, not tracebacks.
+    """
     _stub_model_loading(monkeypatch)
     audio = tmp_path / "song.wav"
     AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(audio)

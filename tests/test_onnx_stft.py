@@ -26,7 +26,9 @@ from unblend.onnx import (
 
 
 def test_atomic_onnx_output_preserves_destination_on_failure(tmp_path) -> None:
-    """A failed export removes staging bytes and leaves prior output intact."""
+    """
+    A failed export removes staging bytes and leaves prior output intact.
+    """
     destination = tmp_path / "model.onnx"
     destination.write_bytes(b"previous")
     with pytest.raises(RuntimeError, match="export failed"):
@@ -40,7 +42,9 @@ def test_atomic_onnx_output_preserves_destination_on_failure(tmp_path) -> None:
 
 
 def test_atomic_onnx_output_replaces_symlink_not_target(tmp_path) -> None:
-    """Atomic publication replaces a symlink entry without following it."""
+    """
+    Atomic publication replaces a symlink entry without following it.
+    """
     target = tmp_path / "target.onnx"
     target.write_bytes(b"target")
     destination = tmp_path / "model.onnx"
@@ -57,7 +61,9 @@ def test_atomic_onnx_output_replaces_symlink_not_target(tmp_path) -> None:
 def test_atomic_onnx_output_rejects_and_cleans_external_data(
     tmp_path, filename: str
 ) -> None:
-    """Sidecar detection treats legal output metacharacters literally."""
+    """
+    Sidecar detection treats legal output metacharacters literally.
+    """
     destination = tmp_path / filename
     destination.write_bytes(b"previous")
     staging_stem = ""
@@ -78,7 +84,9 @@ def test_atomic_onnx_output_rejects_and_cleans_external_data(
 def test_ht_export_failure_preserves_existing_destination(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The HTDemucs export path publishes only after checker validation."""
+    """
+    The HTDemucs export path publishes only after checker validation.
+    """
     onnx = pytest.importorskip("onnx")
     model = HTDemucs(
         sources=["a", "b"],
@@ -92,7 +100,9 @@ def test_ht_export_failure_preserves_existing_destination(
     ).eval()
 
     class FakeRepository:
-        """Return the tiny local model without cache or network access."""
+        """
+        Return the tiny local model without cache or network access.
+        """
 
         def get_model(self, _name: str) -> HTDemucs:
             return model

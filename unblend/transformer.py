@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-# First author is Simon Rouard.
+
 
 import math
 import random
@@ -32,9 +32,9 @@ def create_sin_embedding(
     :param max_period: Maximum period for sinusoidal encoding
     :return: Positional embedding tensor of shape (length, 1, dim)
     """
-    # We aim for TBC format
+
     assert dim % 2 == 0
-    # Force FP32 for numerical stability — exponentiation of max_period overflows in FP16
+
     with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
         pos = shift + torch.arange(length, device=device, dtype=torch.float32).view(
             -1, 1, 1
@@ -62,23 +62,22 @@ def create_2d_sin_embedding(
     """
     Create 2D sinusoidal positional embedding.
 
-    :param d_model: Dimension of the model (must be divisible by 4)
-    :param height: Height of the positions
-    :param width: Width of the positions
-    :param device: Device to create tensor on
-    :param max_period: Maximum period for sinusoidal encoding
-    :return: Positional embedding tensor of shape (1, d_model, height, width)
-    :raises ValueError: If d_model is not divisible by 4
+    :param d_model: Embedding dimension (must be divisible by 4).
+    :param height: Height of the positions.
+    :param width: Width of the positions.
+    :param device: Device to create tensor on.
+    :param max_period: Maximum period for sinusoidal encoding.
+    :return: Positional embedding of shape (1, d_model, height, width).
     """
     if d_model % 4 != 0:
         raise ValueError(
             "Cannot use sin/cos positional encoding with "
             "odd dimension (got dim={:d})".format(d_model)
         )
-    # Force FP32 for numerical stability — exp/sin/cos of large values overflow in FP16
+
     with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
         pe = torch.zeros(d_model, height, width, dtype=torch.float32, device=device)
-        # Each dimension use half of d_model
+
         d_model = int(d_model / 2)
         div_term = torch.exp(
             torch.arange(0.0, d_model, 2, dtype=torch.float32, device=device)
@@ -122,24 +121,22 @@ def create_sin_embedding_cape(
     max_period: float = 10000.0,
 ) -> torch.Tensor:
     """
-    Create sinusoidal CAPE positional embedding. The training-time CAPE
-    augmentation (global/local shifts, scaling) was removed with the rest of
-    the training code; this is the inference (un-augmented) variant only.
+    Create sinusoidal CAPE positional embedding.
 
-    :param length: Sequence length
-    :param dim: Embedding dimension (must be even)
-    :param batch_size: Batch size
-    :param mean_normalize: Whether to mean-normalize positions
-    :param device: Device to create tensor on
-    :param max_period: Maximum period for sinusoidal encoding
-    :return: Positional embedding tensor of shape (length, batch_size, dim)
+    :param length: Sequence length.
+    :param dim: Embedding dimension (must be even).
+    :param batch_size: Batch size.
+    :param mean_normalize: Mean-normalize positions.
+    :param device: Device to create tensor on.
+    :param max_period: Maximum period for sinusoidal encoding.
+    :return: Positional embedding of shape (length, batch_size, dim).
     """
-    # We aim for TBC format
+
     assert dim % 2 == 0
-    # Force FP32 for numerical stability
+
     with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
         pos = torch.arange(length, dtype=torch.float32).view(-1, 1, 1)
-        pos = pos.repeat(1, batch_size, 1)  # (length, batch_size, 1)
+        pos = pos.repeat(1, batch_size, 1)
         if mean_normalize:
             pos -= torch.nanmean(pos, dim=0, keepdim=True)
 
@@ -271,20 +268,20 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
         """
         Transformer encoder layer with optional group norm, layer scale, and norm_out.
 
-        :param d_model: Model dimension
-        :param nhead: Number of attention heads
-        :param dim_feedforward: Feedforward hidden dimension
-        :param dropout: Dropout rate
-        :param activation: Activation function
-        :param group_norm: Number of groups for group norm (0 to disable)
-        :param norm_first: If True, apply norm before attention/FF blocks
-        :param norm_out: If True and norm_first, apply output normalization
-        :param layer_norm_eps: Epsilon for layer normalization
-        :param layer_scale: If True, use LayerScale on residual outputs
-        :param init_values: Initial values for LayerScale
-        :param device: Device for parameters
-        :param dtype: Data type for parameters
-        :param batch_first: If True, input is (B, T, C) instead of (T, B, C)
+        :param d_model: Model dimension.
+        :param nhead: Number of attention heads.
+        :param dim_feedforward: Feedforward hidden dimension.
+        :param dropout: Dropout rate.
+        :param activation: Activation function.
+        :param group_norm: Group count for group norm (0 to disable).
+        :param norm_first: Apply norm before attention/FF blocks.
+        :param norm_out: With norm_first, apply output normalization.
+        :param layer_norm_eps: Epsilon for layer normalization.
+        :param layer_scale: Use LayerScale on residual outputs.
+        :param init_values: Initial values for LayerScale.
+        :param device: Device for parameters.
+        :param dtype: Data type for parameters.
+        :param batch_first: Input is (B, T, C) instead of (T, B, C).
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
@@ -380,20 +377,20 @@ class CrossTransformerEncoderLayer(nn.Module):
         """
         Cross-attention transformer encoder layer with optional group norm and layer scale.
 
-        :param d_model: Model dimension
-        :param nhead: Number of attention heads
-        :param dim_feedforward: Feedforward hidden dimension
-        :param dropout: Dropout rate
-        :param activation: Activation function or string name
-        :param layer_norm_eps: Epsilon for layer normalization
-        :param layer_scale: If True, use LayerScale on residual outputs
-        :param init_values: Initial values for LayerScale
-        :param norm_first: If True, apply norm before attention/FF blocks
-        :param group_norm: If True, use group norm instead of layer norm
-        :param norm_out: If True and norm_first, apply output normalization
-        :param device: Device for parameters
-        :param dtype: Data type for parameters
-        :param batch_first: If True, input is (B, T, C) instead of (T, B, C)
+        :param d_model: Model dimension.
+        :param nhead: Number of attention heads.
+        :param dim_feedforward: Feedforward hidden dimension.
+        :param dropout: Dropout rate.
+        :param activation: Activation function or string name.
+        :param layer_norm_eps: Epsilon for layer normalization.
+        :param layer_scale: Use LayerScale on residual outputs.
+        :param init_values: Initial values for LayerScale.
+        :param norm_first: Apply norm before attention/FF blocks.
+        :param group_norm: Use group norm instead of layer norm.
+        :param norm_out: With norm_first, apply output normalization.
+        :param device: Device for parameters.
+        :param dtype: Data type for parameters.
+        :param batch_first: Input is (B, T, C) instead of (T, B, C).
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -406,7 +403,7 @@ class CrossTransformerEncoderLayer(nn.Module):
             batch_first=batch_first,
             **factory_kwargs,
         )
-        # Implementation of Feedforward model
+
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
@@ -452,7 +449,6 @@ class CrossTransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        # Legacy string support for activation function.
         if isinstance(activation, str):
             self.activation = self._get_activation_fn(activation)
         else:
@@ -520,9 +516,6 @@ class CrossTransformerEncoderLayer(nn.Module):
         raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
 
 
-# ----------------- MULTI-BLOCKS MODELS: -----------------------
-
-
 class CrossTransformerEncoder(nn.Module):
     def __init__(
         self,
@@ -553,29 +546,29 @@ class CrossTransformerEncoder(nn.Module):
         """
         Cross-transformer encoder alternating self-attention and cross-attention layers.
 
-        :param dim: Model dimension
-        :param emb: Positional embedding type ("sin", "cape", or "scaled")
-        :param hidden_scale: Feedforward hidden dim multiplier
-        :param num_heads: Number of attention heads
-        :param num_layers: Number of transformer layers
-        :param cross_first: If True, start with cross-attention layer
-        :param dropout: Dropout rate
-        :param max_positions: Maximum sequence length for scaled embeddings
-        :param norm_in: If True, apply LayerNorm to inputs
-        :param norm_in_group: If True, use GroupNorm for input normalization
-        :param group_norm: Number of groups for group norm (0 to disable)
-        :param norm_first: If True, apply norm before attention/FF blocks
-        :param norm_out: If True and norm_first, apply output normalization
-        :param max_period: Maximum period for sinusoidal encoding
-        :param weight_decay: Weight decay for optimizer
-        :param lr: Learning rate override (None to use default)
-        :param layer_scale: If True, use LayerScale on residual outputs
-        :param gelu: If True, use GELU activation; otherwise ReLU
-        :param sin_random_shift: Maximum random shift for sinusoidal embeddings
-        :param weight_pos_embed: Weight for positional embedding contribution
-        :param cape_mean_normalize: Whether to mean-normalize CAPE positions
-        :param cape_augment: Whether to augment CAPE positions
-        :param cape_glob_loc_scale: CAPE global/local scale parameters
+        :param dim: Model dimension.
+        :param emb: Positional embedding type ("sin", "cape", or "scaled").
+        :param hidden_scale: Feedforward hidden dim multiplier.
+        :param num_heads: Number of attention heads.
+        :param num_layers: Number of transformer layers.
+        :param cross_first: Start with cross-attention layer.
+        :param dropout: Dropout rate.
+        :param max_positions: Max sequence length for scaled embeddings.
+        :param norm_in: Apply LayerNorm to inputs.
+        :param norm_in_group: Use GroupNorm for input normalization.
+        :param group_norm: Group count for group norm (0 to disable).
+        :param norm_first: Apply norm before attention/FF blocks.
+        :param norm_out: With norm_first, apply output normalization.
+        :param max_period: Maximum period for sinusoidal encoding.
+        :param weight_decay: Weight decay for optimizer.
+        :param lr: Learning rate override (None for default).
+        :param layer_scale: Use LayerScale on residual outputs.
+        :param gelu: Use GELU activation; otherwise ReLU.
+        :param sin_random_shift: Max random shift for sinusoidal embeddings.
+        :param weight_pos_embed: Weight for positional embedding contribution.
+        :param cape_mean_normalize: Mean-normalize CAPE positions.
+        :param cape_augment: Augment CAPE positions.
+        :param cape_glob_loc_scale: CAPE global/local scale parameters.
         """
         super().__init__()
         assert dim % num_heads == 0
@@ -583,8 +576,7 @@ class CrossTransformerEncoder(nn.Module):
         hidden_dim = int(dim * hidden_scale)
 
         self.num_layers = num_layers
-        # classic parity = 1 means that if idx%2 == 1 there is a
-        # classical encoder else there is a cross encoder
+
         self.classic_parity = 1 if cross_first else 0
         self.emb = emb
         self.max_period = max_period
@@ -614,9 +606,8 @@ class CrossTransformerEncoder(nn.Module):
             self.norm_in = nn.LayerNorm(dim)
             self.norm_in_t = nn.LayerNorm(dim)
 
-        # spectrogram layers
         self.layers = nn.ModuleList()
-        # temporal layers
+
         self.layers_t = nn.ModuleList()
 
         kwargs_common = {
@@ -642,7 +633,6 @@ class CrossTransformerEncoder(nn.Module):
 
                 self.layers_t.append(CrossTransformerEncoderLayer(**kwargs_common))
 
-        # Positional embedding caches keyed by shape/device/dtype.
         self._pos_emb_2d_cache: dict[
             tuple[int, int, int, torch.device, torch.dtype], torch.Tensor
         ] = {}
@@ -654,8 +644,7 @@ class CrossTransformerEncoder(nn.Module):
         self, C: int, Fr: int, T1: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         """
-        Return the 2D sin positional embedding pre-permuted to
-        ``(1, T1*Fr, C)``, memoised by ``(C, Fr, T1, device, dtype)``.
+        Return cached 2D positional embedding.
 
         :param C: Channel dimension.
         :param Fr: Frequency dimension.
@@ -676,11 +665,7 @@ class CrossTransformerEncoder(nn.Module):
         self, T2: int, C: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor | None:
         """
-        Return the 1D sin positional embedding pre-permuted to
-        ``(1, T2, C)``, memoised by ``(T2, C, device, dtype)``. Only the
-        deterministic ``sin`` mode without random shift is safe to cache;
-        every other mode returns ``None`` so the caller falls back to
-        recomputing per call.
+        Return cached 1D positional embedding.
 
         :param T2: Sequence length (time dimension).
         :param C: Channel dimension.
@@ -712,19 +697,19 @@ class CrossTransformerEncoder(nn.Module):
         """
         B, C, Fr, T1 = x.shape
         pos_emb_2d = self._cached_pos_emb_2d(C, Fr, T1, x.device, x.dtype)
-        x = x.permute(0, 3, 2, 1).reshape(B, T1 * Fr, C)  # "b c fr t1 -> b (t1 fr) c"
+        x = x.permute(0, 3, 2, 1).reshape(B, T1 * Fr, C)
         x = self.norm_in(x)
         x = x + self.weight_pos_embed * pos_emb_2d
 
         B, C, T2 = xt.shape
-        xt = xt.permute(0, 2, 1)  # "b c t2 -> b t2 c"
+        xt = xt.permute(0, 2, 1)
         cached_t = self._cached_pos_emb_t(T2, C, x.device, xt.dtype)
         if cached_t is not None:
             xt = self.norm_in_t(xt)
             xt = xt + self.weight_pos_embed * cached_t
         else:
             pos_emb = self._get_pos_embedding(T2, B, C, x.device)
-            pos_emb = pos_emb.permute(1, 0, 2)  # "t2 b c -> b t2 c"
+            pos_emb = pos_emb.permute(1, 0, 2)
             xt = self.norm_in_t(xt)
             xt = xt + self.weight_pos_embed * pos_emb.to(xt.dtype)
 
@@ -737,8 +722,8 @@ class CrossTransformerEncoder(nn.Module):
                 x = self.layers[idx](x, xt)
                 xt = self.layers_t[idx](xt, old_x)
 
-        x = x.reshape(B, T1, Fr, C).permute(0, 3, 2, 1)  # "b (t1 fr) c -> b c fr t1"
-        xt = xt.permute(0, 2, 1)  # "b t2 c -> b c t2"
+        x = x.reshape(B, T1, Fr, C).permute(0, 3, 2, 1)
+        xt = xt.permute(0, 2, 1)
         return x, xt
 
     def _get_pos_embedding(

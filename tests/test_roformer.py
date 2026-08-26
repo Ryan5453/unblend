@@ -71,7 +71,9 @@ def _mel(**overrides):
 def test_configure_inference_rejects_invalid_geometry(
     samplerate: object, segment_samples: object
 ) -> None:
-    """Sample rate and training segment must be positive integer counts."""
+    """
+    Sample rate and training segment must be positive integer counts.
+    """
     model = _bs()
     with pytest.raises(ValidationError):
         model.configure_inference(
@@ -362,7 +364,9 @@ def test_build_roformer_loads_state() -> None:
 
 
 def test_rotary_cache_is_invalidated_by_dtype_transform() -> None:
-    """A warmed module converted to half matches a freshly converted module."""
+    """
+    A warmed module converted to half matches a freshly converted module.
+    """
     from unblend.roformer import RotaryEmbedding
 
     warmed = RotaryEmbedding(dim=16)

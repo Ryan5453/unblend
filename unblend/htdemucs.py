@@ -12,6 +12,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .backends import ASSModel
 from .blocks import (
     HDecLayer,
     HEncLayer,
@@ -23,76 +24,42 @@ from .blocks import (
     spectro,
 )
 from .exceptions import ValidationError
-from .model_utils import capture_init
 from .transformer import CrossTransformerEncoder
 
 
-class HTDemucs(nn.Module):
+class HTDemucs(ASSModel):
     """
-    Spectrogram and hybrid Demucs model.
-    The spectrogram model has the same structure as Demucs, except the first few layers are over the
-    frequency axis, until there is only 1 frequency, and then it moves to time convolutions.
-    Frequency layers can still access information across time steps thanks to the DConv residual.
-
-    Hybrid model have a parallel time branch. At some layer, the time branch has the same stride
-    as the frequency branch and then the two are combined. The opposite happens in the decoder.
-
-    Models can either use naive iSTFT from masking, Wiener filtering ([Ulhih et al. 2017]),
-    or complex as channels (CaC) [Choi et al. 2020]. Wiener filtering is based on
-    Open Unmix implementation [Stoter et al. 2019].
-
-    The loss is always on the temporal domain, by backpropagating through the above
-    output methods and iSTFT. This allows to define hybrid models nicely. However, this breaks
-    a bit Wiener filtering, as doing more iteration at test time will change the spectrogram
-    contribution, without changing the one from the waveform, which will lead to worse performance.
-    I tried using the residual option in OpenUnmix Wiener implementation, but it didn't improve.
-    CaC on the other hand provides similar performance for hybrid, and works naturally with
-    hybrid models.
-
-    This model also uses frequency embeddings are used to improve efficiency on convolutions
-    over the freq. axis, following [Isik et al. 2020] (https://arxiv.org/pdf/2008.04470.pdf).
-
-    Unlike classic Demucs, there is no resampling here, and normalization is always applied.
+    Hybrid spectrogram/waveform Demucs.
     """
 
-    @capture_init
     def __init__(
         self,
         sources: list[str],
-        # Channels
         audio_channels: int = 2,
         channels: int = 48,
         channels_time: int | None = None,
         growth: int = 2,
-        # STFT
         nfft: int = 4096,
         cac: bool = True,
-        # Main structure
         depth: int = 4,
         rewrite: bool = True,
-        # Frequency branch
         multi_freqs: list[int] | None = None,
         multi_freqs_depth: int = 3,
         freq_emb: float = 0.2,
         emb_scale: int = 10,
         emb_smooth: bool = True,
-        # Convolutions
         kernel_size: int = 8,
         time_stride: int = 2,
         stride: int = 4,
         context: int = 1,
         context_enc: int = 0,
-        # Normalization
         norm_starts: int = 4,
         norm_groups: int = 4,
-        # DConv residual branch
         dconv_mode: int = 1,
         dconv_depth: int = 2,
         dconv_comp: int = 8,
         dconv_init: float = 1e-3,
-        # Before the Transformer
         bottom_channels: int = 0,
-        # Transformer
         t_layers: int = 5,
         t_emb: str = "sin",
         t_hidden_scale: float = 4.0,
@@ -112,70 +79,67 @@ class HTDemucs(nn.Module):
         t_weight_pos_embed: float = 1.0,
         t_sin_random_shift: int = 0,
         t_cape_mean_normalize: bool = True,
-        t_cape_augment: bool = False,  # Always False for inference
+        t_cape_augment: bool = False,
         t_cape_glob_loc_scale: list[float] = [5000.0, 1.0, 1.4],
-        # ------ Particuliar parameters
         t_cross_first: bool = False,
-        # Weight init
         rescale: float = 0.1,
-        # Metadata
         samplerate: int = 44100,
         segment: int = 10,
     ) -> None:
         """
-        Initialize the HTDemucs model.
+        Initialize the model.
 
-        :param sources: List of source names
-        :param audio_channels: Input/output audio channels
-        :param channels: Initial number of hidden channels
-        :param channels_time: If not None, use a different channels value for the time branch
-        :param growth: Factor to increase hidden channels by at each layer
-        :param nfft: Number of FFT bins
-        :param cac: Use complex as channels (complex numbers become 2 channels each)
-        :param depth: Number of layers in the encoder and decoder
-        :param rewrite: Add 1x1 convolution to each layer
-        :param multi_freqs: Frequency ratios for splitting bands with MultiWrap
-        :param multi_freqs_depth: How many outermost layers to wrap with MultiWrap
-        :param freq_emb: Frequency embedding weight after first freq layer (0 to disable)
-        :param emb_scale: Equivalent to scaling the embedding learning rate
-        :param emb_smooth: Initialize embedding smoothly with respect to frequencies
-        :param kernel_size: Kernel size for encoder and decoder layers
-        :param time_stride: Stride for the final time layer after the merge
-        :param stride: Stride for encoder and decoder layers
-        :param context: Context for 1x1 conv in the decoder
-        :param context_enc: Context for 1x1 conv in the encoder
-        :param norm_starts: Layer at which group norm starts being used
-        :param norm_groups: Number of groups for group norm
-        :param dconv_mode: 1: dconv in encoder only, 2: decoder only, 3: both
-        :param dconv_depth: Depth of residual DConv branch
-        :param dconv_comp: Compression of DConv branch
-        :param dconv_init: Initial scale for the DConv branch LayerScale
-        :param bottom_channels: If >0, adds a 1x1 Conv before and after the transformer
-        :param t_layers: Number of transformer layers in each branch
-        :param t_emb: Positional embedding type ("sin", "cape", or "scaled")
-        :param t_hidden_scale: Hidden scale of the transformer feedforward layers
-        :param t_heads: Number of transformer attention heads
-        :param t_dropout: Dropout rate in the transformer
-        :param t_max_positions: Max positions for "scaled" positional embedding
-        :param t_norm_in: Norm before adding positional embedding
-        :param t_norm_in_group: If True with t_norm_in, use GroupNorm over all timesteps
-        :param t_group_norm: If True, encoder layer norms use GroupNorm over all timesteps
-        :param t_norm_first: If True, norm before attention and FFN
-        :param t_norm_out: If True, GroupNorm at the end of each layer
-        :param t_max_period: Denominator in the sinusoidal embedding expression
-        :param t_weight_decay: Weight decay for the transformer
-        :param t_lr: Specific learning rate for the transformer
-        :param t_layer_scale: Enable Layer Scale for the transformer
-        :param t_gelu: Use GeLU activations if True, ReLU otherwise
-        :param t_weight_pos_embed: Weighting of the positional embedding
-        :param t_sin_random_shift: Random shift for sinusoidal embedding
-        :param t_cape_mean_normalize: CAPE positional embedding normalization
-        :param t_cape_augment: CAPE augmentation (True for training, False for inference)
-        :param t_cape_glob_loc_scale: CAPE parameters (list of 3 floats)
-        :param t_cross_first: If True, cross attention is the first transformer layer
-        :param rescale: Weight rescaling trick factor
-        :param samplerate: Audio sample rate in Hz
-        :param segment: Training segment length in seconds
+        :param sources: Output stem names.
+        :param audio_channels: Input/output audio channels.
+        :param channels: Initial hidden channels.
+        :param channels_time: Separate channel count for the time branch.
+        :param growth: Channel growth per layer.
+        :param nfft: STFT size.
+        :param cac: Complex-as-channels output decoding.
+        :param depth: Encoder/decoder depth.
+        :param rewrite: Add a 1x1 conv rewrite to each layer.
+        :param multi_freqs: Frequency band ratios for MultiWrap.
+        :param multi_freqs_depth: Outer layers wrapped with MultiWrap.
+        :param freq_emb: Frequency embedding weight (0 disables).
+        :param emb_scale: Embedding scale (learning-rate equivalent).
+        :param emb_smooth: Initialize the embedding smoothly over frequency.
+        :param kernel_size: Encoder/decoder kernel size.
+        :param time_stride: Stride of the final time layer after the merge.
+        :param stride: Encoder/decoder stride.
+        :param context: 1x1 conv context in the decoder.
+        :param context_enc: 1x1 conv context in the encoder.
+        :param norm_starts: Layer index where GroupNorm starts.
+        :param norm_groups: GroupNorm group count.
+        :param dconv_mode: 1 encoder DConv, 2 decoder, 3 both.
+        :param dconv_depth: DConv residual branch depth.
+        :param dconv_comp: DConv branch channel compression.
+        :param dconv_init: Initial LayerScale value for DConv.
+        :param bottom_channels: 1x1 conv bottleneck width before the transformer.
+        :param t_layers: Transformer layers per branch.
+        :param t_emb: Positional embedding type ("sin", "cape", "scaled").
+        :param t_hidden_scale: Transformer FFN hidden multiplier.
+        :param t_heads: Attention heads.
+        :param t_dropout: Transformer dropout.
+        :param t_max_positions: Max positions for "scaled" embeddings.
+        :param t_norm_in: Normalize before positional embedding.
+        :param t_norm_in_group: Use GroupNorm for the input norm.
+        :param t_group_norm: Encoder layers use GroupNorm over all timesteps.
+        :param t_norm_first: Pre-norm transformer layout.
+        :param t_norm_out: Normalize each layer output.
+        :param t_max_period: Sinusoidal embedding period.
+        :param t_weight_decay: Transformer weight decay (training only).
+        :param t_lr: Transformer learning rate (training only).
+        :param t_layer_scale: Enable LayerScale.
+        :param t_gelu: GELU activation, else ReLU.
+        :param t_weight_pos_embed: Positional embedding weight.
+        :param t_sin_random_shift: Random shift of the sinusoidal embedding.
+        :param t_cape_mean_normalize: CAPE position normalization.
+        :param t_cape_augment: CAPE augmentation (always False at inference).
+        :param t_cape_glob_loc_scale: CAPE scale parameters.
+        :param t_cross_first: Cross-attention first in each layer pair.
+        :param rescale: Conv weight rescale factor (0 disables).
+        :param samplerate: Audio sample rate in Hz.
+        :param segment: Training segment length in seconds.
         """
         super().__init__()
         self.cac = cac
@@ -192,12 +156,6 @@ class HTDemucs(nn.Module):
         self.nfft = nfft
         self.hop_length = nfft // 4
         self.freq_emb = None
-        # Contract with ``apply_model``: when True, every forward must run at
-        # exactly ``chunk_batch_size`` (sub-full tail batches get zero-padded
-        # up). Set by ``Separator``'s torch.compile path, whose CUDAGraphs
-        # capture replays a single batch shape; eager models keep it False and
-        # run tails at their natural size.
-        self._fixed_batch_shape = False
 
         self.encoder = nn.ModuleList()
         self.decoder = nn.ModuleList()
@@ -206,7 +164,7 @@ class HTDemucs(nn.Module):
         self.tdecoder = nn.ModuleList()
 
         chin = audio_channels
-        chin_z = chin  # number of channels for the freq branch
+        chin_z = chin
         if self.cac:
             chin_z *= 2
         chout = channels_time or channels
@@ -377,13 +335,6 @@ class HTDemucs(nn.Module):
         hl = self.hop_length
         nfft = self.nfft
 
-        # We re-pad the signal in order to keep the property
-        # that the size of the output is exactly the size of the input
-        # divided by the stride (here hop_length), when divisible.
-        # This is achieved by padding by 1/4th of the kernel size (here nfft).
-        # which is not supported by torch.stft.
-        # Having all convolution operations follow this convention allow to easily
-        # align the time and frequency branches later on.
         assert hl == nfft // 4
         le = int(math.ceil(x.shape[-1] / hl))
         pad = hl // 2 * 3
@@ -418,8 +369,7 @@ class HTDemucs(nn.Module):
         :param z: Complex spectrogram tensor
         :return: Magnitude or CaC-reshaped tensor
         """
-        # return the magnitude of the spectrogram, except when cac is True,
-        # in which case we just move the complex dimension to the channel one.
+
         if self.cac:
             B, C, Fr, T = z.shape
             m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
@@ -437,12 +387,8 @@ class HTDemucs(nn.Module):
         :return: Complex spectrogram tensor
         """
         if not self.cac:
-            # The decoder predicts a real magnitude mask. Preserve the
-            # mixture phase by applying it to the original complex STFT.
             return z[:, None] * m
 
-        # With CaC, ``m`` is the complete source spectrogram encoded as
-        # adjacent real/imaginary feature channels and ``z`` is unused.
         B, S, _C, Fr, T = m.shape
         out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
         return torch.view_as_complex(out.contiguous())
@@ -455,9 +401,7 @@ class HTDemucs(nn.Module):
         :return: Training length for consistent segment processing
         :raises ValidationError: If length exceeds the training length
         """
-        # Keep the training-length contract identical to apply.py's chunk
-        # conversion. A fractional product that rounds up must not create a
-        # chunk one sample longer than this validator accepts.
+
         training_length = int(round(self.max_allowed_segment * self.samplerate))
         if training_length < length:
             raise ValidationError(
@@ -509,17 +453,7 @@ class HTDemucs(nn.Module):
 
     def prefill_inference_caches(self) -> None:
         """
-        Eagerly populate the positional/frequency-embedding caches via a
-        single dummy ``forward_core`` pass.
-
-        ``mode="reduce-overhead"`` wraps the graph in CUDAGraphs, which reuses
-        internal allocation slots across replays. If the first call into the
-        compiled ``forward_core`` is also what fills these caches, the cached
-        tensors end up pointing into CUDAGraphs-managed memory that gets
-        overwritten on the next replay (see ``_cached_freq_emb`` below and the
-        transformer's ``_cached_pos_emb_*``). Running one eager pass first
-        anchors each cached embedding in the regular allocator so CUDAGraphs
-        treats it as a stable external input.
+        Eagerly populate caches.
         """
         training_length = int(self.max_allowed_segment * self.samplerate)
         model_dtype = next(self.parameters()).dtype
@@ -549,38 +483,6 @@ class HTDemucs(nn.Module):
                 xt = xt.to(model_dtype)
 
             self.forward_core(x, xt)
-
-    def enable_compiled_core(self) -> None:
-        """
-        Compile only the heavy neural network core.
-
-        Avoids pulling STFT/iSTFT into TorchInductor — those are a poor fit for
-        Inductor and significantly inflate compile time without helping
-        steady-state throughput.
-        """
-        # Snapshot the original forward_core once so the calibration retry loop
-        # can re-call this safely without nesting torch.compile wrappers
-        # (compiling an already-compiled function breaks dynamo).
-        if not hasattr(self, "_uncompiled_forward_core"):
-            self._uncompiled_forward_core = self.forward_core
-        # Caches must be populated BEFORE compile — see prefill_inference_caches.
-        self.prefill_inference_caches()
-        self.forward_core = torch.compile(
-            self._uncompiled_forward_core, mode="reduce-overhead"
-        )
-        # CUDAGraphs replay requires the captured batch shape, so apply_model
-        # must zero-pad sub-full tail batches up to chunk_batch_size for this
-        # model (eager models run tails at their natural size instead).
-        self._fixed_batch_shape = True
-
-    def disable_compiled_core(self) -> None:
-        """
-        Restore the eager ``forward_core`` so a retry does not double-wrap it.
-        """
-        original = getattr(self, "_uncompiled_forward_core", None)
-        if original is not None:
-            self.forward_core = original
-            del self._uncompiled_forward_core
 
     def forward_core(
         self, x: torch.Tensor, xt: torch.Tensor
@@ -682,10 +584,7 @@ class HTDemucs(nn.Module):
             x = x.to(model_dtype)
             xt = xt.to(model_dtype)
             x, xt = self.forward_core(x, xt)
-            # No explicit ``.float()`` here. The next op multiplies by FP32
-            # ``std``/``mean`` tensors, which promotes the low-precision
-            # output to FP32 in a single fused kernel — strictly fewer device
-            # copies than an explicit cast followed by a same-dtype mul.
+
         else:
             x, xt = self.forward_core(x, xt)
 

@@ -27,9 +27,8 @@ from .api import (
     default_device,
     default_dtype,
     get_version,
-    select_model,
 )
-from .apply import Model, ModelEnsemble, apply_model, apply_model_multi
+from .apply import Model, ModelEnsemble
 from .exceptions import (
     DemucsError,
     LoadAudioError,
@@ -46,12 +45,9 @@ __all__ = [
     "ModelRepository",
     "Model",
     "ModelEnsemble",
-    "apply_model",
-    "apply_model_multi",
     "default_device",
     "default_dtype",
     "get_version",
-    "select_model",
     "UnblendError",
     "DemucsError",
     "LoadAudioError",

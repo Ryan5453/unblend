@@ -1,24 +1,10 @@
 # Copyright (c) 2025-present Ryan Fahey
-#
+
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
 """
-SCNet: Sparse Compression Network for Music Source Separation.
-
-Reference: Tong et al., https://arxiv.org/abs/2401.13276
-
-A third architecture family alongside HTDemucs and the RoFormers, and unrelated
-to both. Where a RoFormer splits the spectrum into bands and runs axial
-attention over them, SCNet splits into three bands and applies a *different
-compression ratio to each* — dense modelling where the signal lives, aggressive
-compression where it does not — then runs either a dual-path LSTM or
-transformer trunk over the compressed representation.
-
-Module and parameter names are deliberately identical to the reference
-implementation (``SDlayer``, ``conv_modules``, ``globalconv``, ``convtrs``,
-``dp_modules``, …), including its capitalisation, so published checkpoints load
-strictly without a key-rename table.
+SCNet architecture for source separation.
 """
 
 from __future__ import annotations
@@ -31,11 +17,14 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import backends
+from .backends import ASSModel
 from .exceptions import ValidationError
 
 
 class Swish(nn.Module):
-    """SiLU written as ``x * sigmoid(x)``, matching the reference."""
+    """
+    SiLU written as ``x * sigmoid(x)``, matching the reference.
+    """
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -132,13 +121,8 @@ class FusionLayer(nn.Module):
         :return: Fused tensor of the same shape as ``x``.
         """
         if skip is not None:
-            # Out-of-place: the reference mutates in place, which is unsafe
-            # when the input aliases a view under inference_mode.
             x = x + skip
-        # This convolves ``cat([x, x])``, which folds algebraically to a
-        # half-width convolution — but profiling puts the whole decoder under
-        # 2% of runtime (the dual-path LSTM trunk is 81-90%), so the fold was
-        # not worth losing bit-exactness with the reference implementation.
+
         x = x.repeat(1, 2, 1, 1)
         x = self.conv(x)
         return F.glu(x, dim=1)
@@ -262,8 +246,7 @@ class SUlayer(nn.Module):
         outputs: list[Tensor] = []
         for index, (convtr, (start, end)) in enumerate(zip(self.convtrs, splits)):
             out = convtr(x[:, :, start:end, :])
-            # Trim symmetrically: the transposed convolution overshoots by a
-            # stride-dependent amount that is not generally even.
+
             distance = abs(origin_lengths[index] - out.shape[2]) // 2
             outputs.append(out[:, :, distance : distance + origin_lengths[index], :])
         return torch.cat(outputs, dim=2)
@@ -286,12 +269,7 @@ class SDblock(nn.Module):
         """
         One encoder stage: sparse down-sample, per-band convolution, global mix.
 
-        :param channels_in: Input channels.
-        :param channels_out: Output channels.
-        :param band_configs: Band split configuration.
-        :param conv_config: ``compress``/``kernel`` for the convolution modules.
-        :param depths: Residual depth for the low/mid/high band respectively.
-        :param kernel_size: Kernel for the global convolution; must be odd.
+        :param channels_in: Input channels. :param channels_out: Output channels. :param band_configs: Per-band ``SR``/``stride``/``kernel`` settings. :param conv_config: ``compress``/``kernel`` for the convolution modules. :param depths: Residual depth per band. :param kernel_size: Global convolution kernel size; must be odd.
         """
         super().__init__()
         band_configs = band_configs or {}
@@ -314,8 +292,7 @@ class SDblock(nn.Module):
             frequency lengths, and pre-convolution band lengths.
         """
         bands, original_lengths = self.SDlayer(x)
-        # Each band is folded into the batch so the 1-D convolution module runs
-        # per frequency bin, then unfolded back.
+
         bands = [
             F.gelu(
                 conv(band.permute(0, 2, 1, 3).reshape(-1, band.shape[1], band.shape[3]))
@@ -344,12 +321,7 @@ class FeatureConversion(nn.Module):
         super().__init__()
         self.inverse = inverse
         self.channels = channels
-        # ``torch.fft.irfft`` lowers to an ONNX ``DFT`` node carrying both
-        # ``inverse`` and ``onesided``, which the spec forbids and onnxruntime
-        # rejects at load. ``SCNetONNXWrapper`` flips this on to take the
-        # explicit real-valued DFT below instead: algebraically the same
-        # transform expressed as two matmuls, so exports stay valid while
-        # native inference keeps using the fast fused kernels.
+
         self.onnx_safe = False
         self._dft_cache: dict[tuple[int, torch.device, torch.dtype], tuple] = {}
 
@@ -370,14 +342,7 @@ class FeatureConversion(nn.Module):
             return cached
 
         bins = frames // 2 + 1
-        # Reduce k*t modulo `frames` in exact integer arithmetic before forming
-        # the angle. Multiplying the raw indices gives values in the tens of
-        # thousands, which needs float64 to phase-resolve; folding them into
-        # one period first keeps the angle below 2*pi so float32 is ample.
-        # That matters beyond tidiness: `frames` is dynamic, so the exporter
-        # traces this arithmetic into the graph rather than folding it to a
-        # constant, and a float64 subgraph is unrunnable on onnxruntime-web's
-        # WebGPU backend.
+
         k = torch.arange(bins, device=device).unsqueeze(1)
         t = torch.arange(frames, device=device).unsqueeze(0)
         phase = torch.remainder(k * t, frames).to(torch.float32)
@@ -385,14 +350,11 @@ class FeatureConversion(nn.Module):
         scale = 1.0 / math.sqrt(frames)
 
         if self.inverse:
-            # Hermitian reconstruction: every bin except DC (and Nyquist, when
-            # the length is even) stands in for a conjugate pair, so it is
-            # counted twice.
             weights = torch.full((bins, 1), 2.0, device=device, dtype=torch.float32)
             weights[0] = 1.0
             if frames % 2 == 0:
                 weights[-1] = 1.0
-            # Contracts over bins: ``[..., bins] @ [bins, frames]``.
+
             cos_basis = weights * angle.cos() * scale
             sin_basis = -weights * angle.sin() * scale
         else:
@@ -410,11 +372,7 @@ class FeatureConversion(nn.Module):
         :param x: Input of shape ``[batch, channels, freq, time]``.
         :return: Transformed tensor.
         """
-        # The transform runs in float32 regardless of the model's dtype: cuFFT
-        # rejects bfloat16 outright, and half-precision FFTs lose accuracy on
-        # long frame axes. The result is cast back so the next LSTM sees its
-        # own parameter dtype — without this, a half-precision model fails with
-        # "mixed dtype: expect parameter to have scalar type Float".
+
         dtype = x.dtype
         x = x.float()
         if self.inverse:
@@ -454,13 +412,7 @@ class DualPathRNN(nn.Module):
         self.d_model = d_model
         self.hidden_size = d_model * expand
         self.bidirectional = bidirectional
-        # batch_first=False on purpose. cuDNN's native layout is
-        # [seq, batch, feature]; with batch_first=True PyTorch transposes both
-        # the input and the output around every call. Profiling puts this
-        # trunk at 81-90% of total runtime, so those four extra copies per
-        # layer are worth avoiding — the tensors are reshaped into the native
-        # layout directly below. The flag does not affect parameter names or
-        # shapes, so checkpoints are unaffected.
+
         self.lstm_layers = nn.ModuleList(
             [
                 nn.LSTM(
@@ -487,9 +439,6 @@ class DualPathRNN(nn.Module):
         """
         batch, channels, freq, time = x.shape
 
-        # Frequency path: sequence over freq bins, one sequence per (batch,
-        # time) pair. Built as [freq, batch * time, channels] so cuDNN gets its
-        # native layout with no internal transpose.
         original = x
         y = self.norm_layers[0](x)
         y = y.permute(2, 0, 3, 1).reshape(freq, batch * time, channels)
@@ -498,7 +447,6 @@ class DualPathRNN(nn.Module):
         y = y.view(freq, batch, time, channels).permute(1, 3, 0, 2)
         x = y + original
 
-        # Time path: sequence over frames, one sequence per (batch, freq) pair.
         original = x
         y = self.norm_layers[1](x)
         y = y.permute(3, 0, 2, 1).reshape(time, batch * freq, channels)
@@ -553,18 +501,7 @@ def stft_padding(samples: int, hop_length: int) -> int:
     """
     Trailing zeros needed before SCNet's STFT.
 
-    The trunk applies a real FFT across the time axis, which needs an even
-    frame count, so the input is padded up to a hop boundary and then by one
-    more hop if that landed on an odd count.
-
-    An ONNX consumer has to reproduce this exactly: the exported graph is
-    traced at the padded frame count and will reject a spectrogram computed
-    from unpadded audio. Trim ``padding`` samples off the end after the inverse
-    transform.
-
-    :param samples: Length of the input audio in samples.
-    :param hop_length: STFT hop length.
-    :return: Number of samples to append.
+    :param samples: Length of the input audio in samples. :param hop_length: STFT hop length. :return: Number of samples to append.
     """
     padding = hop_length - samples % hop_length
     if (samples + padding) // hop_length % 2 == 0:
@@ -572,16 +509,11 @@ def stft_padding(samples: int, hop_length: int) -> int:
     return padding
 
 
-class SCNet(nn.Module):
+class SCNet(ASSModel):
     """
     Sparse Compression Network.
-
-    Constructor defaults mirror the reference so a published config maps onto
-    it directly.
     """
 
-    # Most published SCNet configs disable track-level normalization. The two
-    # starrytong checkpoints opt in through the constructor instead.
     external_normalization = False
 
     def __init__(
@@ -606,23 +538,8 @@ class SCNet(nn.Module):
         """
         Sparse Compression Network.
 
-        :param sources: Output stem names.
-        :param audio_channels: Input/output audio channels.
-        :param dims: Channel width per encoder stage.
-        :param nfft: STFT size.
-        :param hop_size: STFT hop.
-        :param win_size: STFT window length.
-        :param normalized: Whether the STFT is normalised.
-        :param band_SR: Proportion of the spectrum in each band.
-        :param band_stride: Down-sample ratio per band.
-        :param band_kernel: Down-sample kernel per band.
-        :param conv_depths: Residual depth per band.
-        :param compress: Channel compression inside convolution modules.
-        :param conv_kernel: Convolution module kernel size.
-        :param num_dplayer: Number of dual-path layers.
-        :param expand: LSTM hidden expansion factor.
-        :param external_normalization: Whether the caller applies track-level
-            mean/std normalization around inference.
+        :param sources: Output stem names. :param audio_channels: Input/output audio channels. :param dims: Channel width per encoder stage. :param nfft: STFT size. :param hop_size: STFT hop length. :param win_size: STFT window length. :param normalized: Whether the STFT is normalised. :param band_SR: Proportion of the spectrum in each band.
+        :param band_stride: Down-sample ratio per band. :param band_kernel: Down-sample kernel per band. :param conv_depths: Residual depth per band. :param compress: Channel compression inside convolution modules. :param conv_kernel: Convolution module kernel size. :param num_dplayer: Number of dual-path layers. :param expand: LSTM hidden expansion factor. :param external_normalization: Whether the caller applies track-level normalisation.
         """
         super().__init__()
         sources = list(sources) if sources else ["drums", "bass", "other", "vocals"]
@@ -655,8 +572,6 @@ class SCNet(nn.Module):
             "normalized": normalized,
         }
 
-        # Inference interface (see configure_inference); class-level defaults
-        # keep a bare construction usable.
         self.samplerate = 44100
         self.max_allowed_segment = 11.0
 
@@ -714,26 +629,15 @@ class SCNet(nn.Module):
         """
         Arguments for the boundary transforms.
 
-        Plain SCNet applies **no window** — the reference passes none, so
-        adding one would silently change the result. The masked variant
-        overrides this to supply its Hann window.
-
-        :param device: Device the transform runs on.
-        :return: Keyword arguments for ``torch.stft``/``torch.istft``.
+        :param device: Device the transform runs on. :return: Keyword arguments for ``torch.stft``/``torch.istft``.
         """
         return dict(self.stft_config)
 
     def forward_core(self, x: Tensor) -> Tensor:
         """
-        Encoder, dual-path trunk, and decoder — everything between the
-        transforms.
+        Encoder, dual-path trunk, and decoder — everything between the transforms.
 
-        Kept separate from :meth:`forward` for the same reason HTDemucs and the
-        RoFormers do it: STFT/iSTFT are a poor Inductor target and inflate
-        compile time without improving steady-state throughput.
-
-        :param x: Packed spectrogram ``[batch, channels, freq, time]``.
-        :return: Decoded tensor before the inverse transform.
+        :param x: Packed spectrogram ``[batch, channels, freq, time]``. :return: Decoded tensor before the inverse transform.
         """
         save_skip: deque[Tensor] = deque()
         save_lengths: deque[list[int]] = deque()
@@ -765,9 +669,7 @@ class SCNet(nn.Module):
         mix = F.pad(mix, (0, padding))
 
         length = mix.shape[-1]
-        # cuFFT has no bfloat16 kernel and half-precision STFT is needlessly
-        # lossy, so the transforms stay float32 and only the trunk runs in the
-        # model's dtype.
+
         x = mix.float().reshape(-1, length)
         x = torch.stft(x, **self._stft_kwargs(x.device), return_complex=True)
         x = torch.view_as_real(x)
@@ -789,36 +691,10 @@ class SCNet(nn.Module):
         x = x.reshape(batch, len(self.sources), self.audio_channels, -1)
         return x[:, :, :, :-padding]
 
-    def enable_compiled_core(self) -> None:
-        """
-        Compile the encoder/trunk/decoder, leaving the transforms eager.
-        """
-        if not hasattr(self, "_uncompiled_forward_core"):
-            self._uncompiled_forward_core = self.forward_core
-        self.forward_core = torch.compile(
-            self._uncompiled_forward_core, mode="reduce-overhead"
-        )
-        self._fixed_batch_shape = True
-
-    def disable_compiled_core(self) -> None:
-        """
-        Restore the eager core so a retry does not double-wrap it.
-        """
-        original = getattr(self, "_uncompiled_forward_core", None)
-        if original is not None:
-            self.forward_core = original
-            del self._uncompiled_forward_core
-
 
 class SCNetMasked(SCNet):
     """
-    SCNet variant that predicts a complex mask instead of the spectrogram.
-
-    Three additions over the plain network: a learned positional embedding over
-    frequency, a Hann-windowed STFT (the plain variant uses none), and a small
-    convolutional head whose tanh output multiplies the repeated mixture. The
-    ``scnet_small`` checkpoint uses this variant; ``scnet_xl_wide_v5`` uses the
-    plain network.
+    SCNet variant that predicts a complex mask.
     """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -833,8 +709,7 @@ class SCNetMasked(SCNet):
         self.max_f = int(self.stft_config["n_fft"]) // 2 + 1
         self.pos_embed_f = nn.Parameter(torch.zeros(1, self.embed_dim, self.max_f, 1))
         nn.init.trunc_normal_(self.pos_embed_f, std=0.02)
-        # Not persistent: the window is derived from n_fft, and the published
-        # checkpoints do not carry it.
+
         self.register_buffer(
             "window",
             torch.hann_window(int(self.stft_config["n_fft"]), periodic=True),
@@ -872,7 +747,7 @@ class SCNetMasked(SCNet):
         mix = F.pad(mix, (0, padding))
 
         length = mix.shape[-1]
-        # See SCNet.forward: transforms stay float32.
+
         x = mix.float().reshape(-1, length)
         x = torch.stft(x, **self._stft_kwargs(x.device), return_complex=True)
         x = torch.view_as_real(x)
@@ -933,14 +808,7 @@ def build_scnet(
     """
     Construct an SCNet variant from registry metadata and load a checkpoint.
 
-    :param architecture: Registered SCNet architecture name.
-    :param config: Constructor kwargs, as stored in ``metadata.yaml``.
-    :param sources: Output stem names.
-    :param samplerate: Sample rate the checkpoint operates at.
-    :param segment_samples: Training chunk length in samples.
-    :param state: Checkpoint state dict to load (strict), or ``None``.
-    :return: The constructed (and loaded) model in eval mode.
-    :raises ValidationError: For an unknown architecture name.
+    :param architecture: Registered SCNet architecture name. :param config: Constructor kwargs from checkpoint metadata. :param sources: Output stem names. :param samplerate: Sample rate the checkpoint operates at. :param segment_samples: Training chunk length in samples. :param state: Checkpoint state dict to load strictly, or ``None``. :return: The constructed model in eval mode.
     """
     klass = _ARCHITECTURES.get(architecture)
     if klass is None:

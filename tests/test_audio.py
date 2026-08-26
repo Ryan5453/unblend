@@ -1,4 +1,6 @@
-"""Unit tests for the pure tensor helpers in ``unblend.audio``."""
+"""
+Unit tests for the pure tensor helpers in ``unblend.audio``.
+"""
 
 import pytest
 import torch

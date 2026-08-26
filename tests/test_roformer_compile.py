@@ -1,4 +1,6 @@
-"""CUDA ``torch.compile`` coverage for both RoFormer architectures."""
+"""
+CUDA ``torch.compile`` coverage for both RoFormer architectures.
+"""
 
 from typing import Callable
 
