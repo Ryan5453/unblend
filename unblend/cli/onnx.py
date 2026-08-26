@@ -60,7 +60,7 @@ def export_onnx_command(
     """
     Export a model (HTDemucs, RoFormer, or SCNet) to the ONNX format.
 
-    This is an internal developer tool for creating ONNX models for deployment.
+    See onnx.md for the full export contract.
 
     :param model: Model name to export
     :param output: Output ONNX file path (defaults to {model}_fp16.onnx or

@@ -253,13 +253,8 @@ def get_cache_dir() -> Path:
 ```
 
 This returns the model cache directory (created on first download).
-`UNBLEND_CACHE_DIR` relocates it and takes precedence. During the package rename,
-`DEMUCS_CACHE_DIR` remains a deprecated fallback and emits a deprecation warning;
-the default is `~/.unblend/models`. Values are tilde-expanded and resolved.
-
-Old `~/.demucs/models/*.th` pickle checkpoints are intentionally **not** reused:
-unblend downloads verified Safetensors artifacts into the new cache. After
-confirming unblend's models are cached, the old `.th` cache may be removed.
+`UNBLEND_CACHE_DIR` relocates it; the default is `~/.unblend/models`. Values are
+tilde-expanded and resolved.
 
 ## Progress Callbacks
 
@@ -394,7 +389,7 @@ Returns the inference dtype `dtype="auto"` picks for a device (`torch.float16` o
 
 All raised exceptions derive from `UnblendError`:
 
-- `UnblendError` — base class for everything raised by `unblend`. Also importable as `DemucsError` (a backward-compatible alias).
+- `UnblendError` — base class for everything raised by `unblend`.
 - `ValidationError` — invalid argument (bad device, bad dtype, unknown stem, out-of-range parameter).
 - `ModelLoadingError` — model not found, metadata malformed, sha256 mismatch, download failure.
 - `LoadAudioError` — input audio could not be decoded.

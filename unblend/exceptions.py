@@ -37,8 +37,3 @@ class ValidationError(UnblendError, ValueError):
     """
 
     pass
-
-
-# Backwards-compatible alias for the pre-rename name (when the package was
-# ``demucs``). Kept so existing callers that catch ``DemucsError`` keep working.
-DemucsError = UnblendError

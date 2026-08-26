@@ -11,7 +11,6 @@ import math
 import os
 import tempfile
 import time
-import warnings
 from contextlib import contextmanager
 from hashlib import sha256
 from numbers import Real
@@ -562,25 +561,13 @@ def get_cache_dir() -> Path:
     """
     Get the cache directory for downloaded models.
 
-    ``UNBLEND_CACHE_DIR`` takes precedence. The former
-    ``DEMUCS_CACHE_DIR`` name remains a deprecated fallback so renamed CLI
-    aliases do not silently download into a different filesystem. Without
-    either variable, the cache defaults to ``~/.unblend/models``.
+    ``UNBLEND_CACHE_DIR`` overrides; defaults to ``~/.unblend/models``.
 
     :return: Path to the cache directory
     """
     override = os.environ.get("UNBLEND_CACHE_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    legacy_override = os.environ.get("DEMUCS_CACHE_DIR")
-    if legacy_override:
-        warnings.warn(
-            "DEMUCS_CACHE_DIR is deprecated; use UNBLEND_CACHE_DIR instead. "
-            "Legacy .th cache artifacts are not reused by unblend.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return Path(legacy_override).expanduser().resolve()
     return Path.home() / ".unblend" / "models"
 
 

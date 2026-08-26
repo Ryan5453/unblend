@@ -30,7 +30,6 @@ from .api import (
 )
 from .apply import Model, ModelEnsemble
 from .exceptions import (
-    DemucsError,
     LoadAudioError,
     ModelLoadingError,
     UnblendError,
@@ -49,7 +48,6 @@ __all__ = [
     "default_dtype",
     "get_version",
     "UnblendError",
-    "DemucsError",
     "LoadAudioError",
     "ModelLoadingError",
     "ValidationError",

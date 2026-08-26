@@ -99,5 +99,3 @@ extend-select = ["I"]
 
 [project.scripts]
 unblend = "unblend.cli:main"
-demucs = "unblend.cli:main" # Compatibility alias for the former package name
-demucs-inference = "unblend.cli:main" # Secondary alias kept for compatibility with existing scripts

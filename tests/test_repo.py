@@ -11,7 +11,6 @@ import subprocess
 import sys
 import threading
 import time
-import warnings
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -691,26 +690,6 @@ def test_get_cache_dir_env_override(
 
     monkeypatch.setenv("UNBLEND_CACHE_DIR", "~/some-demucs-cache")
     assert get_cache_dir() == Path.home() / "some-demucs-cache"
-
-
-def test_get_cache_dir_legacy_fallback_and_precedence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    The old variable warns, while the new name silently wins.
-    """
-    legacy = tmp_path / "legacy"
-    current = tmp_path / "current"
-    monkeypatch.delenv("UNBLEND_CACHE_DIR", raising=False)
-    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(legacy))
-    with pytest.warns(DeprecationWarning, match="UNBLEND_CACHE_DIR"):
-        assert get_cache_dir() == legacy
-
-    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(current))
-    with warnings.catch_warnings(record=True) as warnings_seen:
-        warnings.simplefilter("always")
-        assert get_cache_dir() == current
-    assert not warnings_seen
 
 
 def test_get_cache_info_reports_partial_models(

@@ -78,8 +78,7 @@ def build_app() -> typer.Typer:
 
     app.command(
         name="export-onnx",
-        hidden=True,
-        help="Export a model to ONNX (internal developer tool).",
+        help="Export a model (HTDemucs, RoFormer, or SCNet) to the ONNX format.",
     )(export_onnx_command)
 
     return app

@@ -24,13 +24,17 @@ const REVISIONS = {
 };
 
 test('browser SCNet catalog matches the Python registry', () => {
-    const metadata = JSON.parse(
-        readFileSync(new URL('../../../unblend/metadata.json', import.meta.url), 'utf8')
-    );
-    const pythonModels = Object.entries(metadata.models)
-        .filter(([, info]) => info.backend === 'scnet')
-        .map(([name]) => name)
-        .sort();
+    // The Python registry is YAML; scan it for model entries declaring
+    // `backend: scnet` rather than pulling in a YAML parser.
+    const yaml = readFileSync(new URL('../../../unblend/metadata.yaml', import.meta.url), 'utf8');
+    let current = null;
+    const pythonModels = [];
+    for (const line of yaml.split('\n')) {
+        const name = line.match(/^  ([A-Za-z0-9_]+):\s*$/);
+        if (name) current = name[1];
+        if (current && /^    backend: scnet\s*$/.test(line)) pythonModels.push(current);
+    }
+    pythonModels.sort();
     const browserModels = Object.entries(MODEL_CONFIGS)
         .filter(([, info]) => info.family === 'scnet')
         .map(([name]) => name)
