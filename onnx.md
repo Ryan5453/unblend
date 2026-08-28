@@ -2,25 +2,44 @@
 
 Unblend can export its models to ONNX for deployment in browsers, mobile apps, or other runtimes. This is how the [un/blend web app](https://demucs.app) runs separation in-browser.
 
-The CLI exports any single-checkpoint model, including your own: names resolve through the same registry as `separate`, so an entry in your `UNBLEND_EXTRA_MODELS` file exports exactly like a shipped one, and every `architecture` Unblend accepts belongs to one of the three families below. Multi-checkpoint entries — the `htdemucs_ft` bag, the two ensembles — have no single graph to trace and are rejected up front, before anything downloads.
+The CLI can export any single-checkpoint model (ensambles are not currently supported) like this:
 
 ```bash
-# FP32, written to htdemucs_fp32.onnx
-unblend export-onnx --model htdemucs
-
-# Weight-only FP16, roughly half the size, near-identical output
-unblend export-onnx --model bs_roformer_sw --fp16
+$ unblend export-onnx --model htdemucs
 ```
 
 | Flag | Meaning |
 |---|---|
 | `-m/--model` | Model name (default `htdemucs`) |
 | `-o/--output` | Output path (default `{model}_fp32.onnx`, `_fp16` with `--fp16`, `_static` with `--static-batch`) |
-| `--fp16` | Store weights as fp16; compute and IO stay fp32 |
+| `--fp16` | Halve the weight size (see [Precision](#precision)) |
 | `--opset` | Opset version (raised to 18 for RoFormer and SCNet) |
 | `--static-batch` | Trace a fixed batch of 1 instead of a dynamic batch axis |
 
-`--fp16` is weight-only: the trained weights are rounded to fp16 so downloads are roughly half the size, but every operation still computes in fp32. This matters for browser runtimes, where pure-fp16 accumulation in Conv/MatMul kernels produces audible quantization noise; keeping compute in fp32 sidesteps that with no measurable quality loss.
+## Precision
+
+Exports are fp32 unless you pass `--fp16`, whatever precision you normally run inference at. Every export records which one you got under the `precision` metadata key.
+
+Three things get called "precision" here, and they move independently:
+
+- **Compute.** Every model in the registry was trained in fp32 and every architecture builds its modules in fp32. Nothing here is natively fp16.
+- **Storage.** The HTDemucs checkpoints (`htdemucs`, `htdemucs_ft`, `htdemucs_6s`) ship fp16 on disk; the RoFormer and SCNet checkpoints ship fp32.
+- **Runtime.** The PyTorch path picks fp16 on MPS and on CUDA with tensor cores, fp32 on CPU. That choice never reaches the ONNX graph.
+
+The fp16 HTDemucs checkpoints are upstream's decision, not ours. Demucs' `serialize_model` defaults to `half=True`, so Defossez rounded the weights to fp16 once at release to halve the download; loading widens them back to fp32 because the module is fp32. Unblend preserves the checkpoint exactly and does the same widening. The practical consequence is that HTDemucs weights are fp32 containers holding fp16-precision values, which is why a 84 MB checkpoint exports to a 168 MB fp32 graph with the zero bits written out in full.
+
+So `--fp16` costs nothing for HTDemucs: the round trip is bit-exact against the checkpoint, and it only stops padding values that were already fp16. For RoFormer and SCNet it does discard real precision.
+
+What `--fp16` does to the graph also depends on the family:
+
+| Family | Weights | Compute | IO |
+|---|---|---|---|
+| HTDemucs, SCNet | fp16 | fp32 | fp32 |
+| RoFormer | fp16 | fp16 | fp32 |
+
+HTDemucs and SCNet get a weight-only rewrite: fp16 initializers with a `Cast` back to fp32 in front of every Conv, ConvTranspose, MatMul, Gemm, and recurrent op. Downloads halve, arithmetic is untouched. This matters for browser runtimes, where fp16 accumulation in Conv/MatMul kernels produces audible quantization noise; keeping compute in fp32 sidesteps that with no measurable quality loss.
+
+RoFormer instead goes through `onnxconverter-common`'s float16 converter and computes in fp16, keeping only the graph inputs and outputs fp32. Its attention trunk tolerates that where the convolutional stacks do not, and the numerically sensitive ops (`Clip`, `Cos`, `Reciprocal`, `ReduceMean`, `Sin`, `Softmax`, `Sqrt`) are blocked from conversion and stay fp32. This needs the `onnx` extra installed.
 
 ## Shared contract
 

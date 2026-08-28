@@ -1,4 +1,4 @@
-# Unblend
+# <img src="web/app/public/favicon.svg" width="30"> Unblend
 
 Unblend is a music source separation inference library designed to be blazing fast and easy-to-use.
 It implements one consistent API across the four supported model architectures: HTDemucs, BS-RoFormer, Mel-Band RoFormer, and SCNet.
@@ -44,14 +44,9 @@ Note: Unblend does not specify a specific PyTorch wheel. This means that GPUs wi
 After installing Unblend, you can use it like the following:
 
 ```bash
-# View separation options
-unblend separate --help
-
-# Separate one audio file
-unblend separate audio_file.mp3
-
-# Separate multiple audio files
-unblend separate audio_file_1.mp3 audio_file_2.mp3
+$ unblend --help
+$ unblend separate audio_file.mp3
+$ unblend separate audio_file_1.mp3 audio_file_2.mp3
 ```
 
 ## API Usage
