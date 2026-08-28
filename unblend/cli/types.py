@@ -24,3 +24,9 @@ class Precision(str, Enum):
     fp32 = "fp32"
     fp16 = "fp16"
     bf16 = "bf16"
+
+
+class ExportPrecision(str, Enum):
+    native = "native"
+    fp32 = "fp32"
+    fp16 = "fp16"

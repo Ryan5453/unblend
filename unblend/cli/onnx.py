@@ -10,6 +10,7 @@ import typer
 from rich.markup import escape
 
 from ..onnx import export_to_onnx
+from .types import ExportPrecision
 from .utils import console
 
 
@@ -27,8 +28,8 @@ def export_onnx_command(
         typer.Option(
             "-o",
             "--output",
-            help="Output ONNX file path (defaults to {model}_fp16.onnx or "
-            "{model}_fp32.onnx depending on --fp16)",
+            help="Output ONNX file path (defaults to {model}_{precision}.onnx, "
+            "with the resolved precision for --precision native)",
         ),
     ] = None,
     opset: Annotated[
@@ -37,14 +38,17 @@ def export_onnx_command(
             help="ONNX opset version (raised to 18 for RoFormer models)",
         ),
     ] = 17,
-    fp16: Annotated[
-        bool,
+    precision: Annotated[
+        ExportPrecision,
         typer.Option(
-            "--fp16",
-            help="Store weights as float16 (weight-only; compute and IO stay fp32). "
-            "Roughly halves file size; output is near-identical to fp32.",
+            "--precision",
+            help="Weight storage precision. native follows the checkpoint, which "
+            "is fp16 for HTDemucs (losslessly, since upstream shipped it that "
+            "way) and fp32 for RoFormer and SCNet. fp16 roughly halves file "
+            "size: weight-only for HTDemucs and SCNet, mixed precision for "
+            "RoFormer. See onnx.md.",
         ),
-    ] = False,
+    ] = ExportPrecision.native,
     static_batch: Annotated[
         bool,
         typer.Option(
@@ -62,28 +66,22 @@ def export_onnx_command(
     See onnx.md for the full export contract.
 
     :param model: Model name to export
-    :param output: Output ONNX file path (defaults to {model}_fp16.onnx or
-        {model}_fp32.onnx depending on --fp16)
+    :param output: Output ONNX file path (defaults to
+        {model}_{precision}.onnx)
     :param opset: ONNX opset version
-    :param fp16: Store weights as float16 (weight-only; compute and IO stay fp32)
+    :param precision: Weight storage precision; native follows the checkpoint
     :param static_batch: Trace with a fixed batch=1 instead of a dynamic batch
         axis (see ``export_to_onnx`` for details)
     """
-    if output is not None:
-        output_path = output
-    else:
-        suffix = "_fp16" if fp16 else "_fp32"
-        static_suffix = "_static" if static_batch else ""
-        output_path = f"{model}{suffix}{static_suffix}.onnx"
-
     try:
-        export_to_onnx(
+        written = export_to_onnx(
             model_name=model,
-            output_path=output_path,
+            output_path=output,
             opset_version=opset,
-            fp16=fp16,
+            precision=precision.value,
             static_batch=static_batch,
         )
+        console.print(f"Exported [green]{escape(written)}[/green]")
     except ValueError as e:
         console.print(f"[red]Error:[/red] {escape(str(e))}")
         raise typer.Exit(1)

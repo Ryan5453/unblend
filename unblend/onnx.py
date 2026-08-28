@@ -377,6 +377,65 @@ def compute_stft_for_export(
     return real, imag
 
 
+_EXPORT_PRECISIONS = ("native", "fp16", "fp32")
+
+# Families whose fp16 export converts compute as well as storage. Everything
+# else gets the weight-only rewrite, keeping arithmetic in fp32.
+_MIXED_PRECISION_FAMILIES = frozenset({"roformer"})
+
+
+def _validate_export_precision(precision: str) -> None:
+    """
+    Reject an unknown ``precision`` before any download happens.
+
+    :param precision: Caller's choice.
+    :raises ValueError: If it is not one of ``_EXPORT_PRECISIONS``.
+    """
+    if precision not in _EXPORT_PRECISIONS:
+        raise ValueError(
+            f"Invalid precision {precision!r}. Choose one of "
+            f"{', '.join(_EXPORT_PRECISIONS)}."
+        )
+
+
+def _weights_are_fp16_exact(model: nn.Module) -> bool:
+    """
+    Whether every float weight survives a round trip through fp16.
+
+    This is what ``precision="native"`` keys off, rather than the
+    checkpoint's storage dtype: it tests losslessness directly instead of a
+    proxy for it, so it stays correct whatever format upstream ships. The
+    HTDemucs checkpoints answer True because Demucs' ``serialize_model``
+    rounded them to fp16 at release and loading merely widens them back;
+    the RoFormer and SCNet checkpoints are genuinely fp32 and answer False
+    on one of the first tensors checked.
+
+    :param model: Model whose ``state_dict`` is inspected.
+    :return: True when fp16 storage discards nothing.
+    """
+    for tensor in model.state_dict().values():
+        if not tensor.is_floating_point():
+            continue
+        if not torch.equal(tensor, tensor.half().float()):
+            return False
+    return True
+
+
+def _resolve_export_precision(precision: str, model: nn.Module) -> bool:
+    """
+    Resolve a validated ``precision`` choice to a storage decision.
+
+    :param precision: One of ``_EXPORT_PRECISIONS``.
+    :param model: Model being exported, inspected only for ``"native"``.
+    :return: True to store weights as fp16.
+    """
+    if precision == "fp16":
+        return True
+    if precision == "fp32":
+        return False
+    return _weights_are_fp16_exact(model)
+
+
 def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
     """
     Rewrite ONNX weights as float16.
@@ -767,7 +826,8 @@ def _export_metadata(
     :param segment_samples: Samples the graph expects per call.
     :param stft: STFT geometry, with the ``torch.stft`` keyword names.
     :param stft_window: Analysis window, ``"hann"`` or ``"none"``.
-    :param fp16: Whether weights were stored as fp16.
+    :param fp16: Whether weights were stored as fp16. Whether that also
+        converts arithmetic follows from ``family``.
     :param static_batch: Whether the batch axis was traced fixed at 1.
     :param license_label: Registry license label, embedded when set.
     :return: String key/value pairs for ``_add_metadata``.
@@ -777,6 +837,10 @@ def _export_metadata(
         "sample_rate": str(model.samplerate),
         "audio_channels": str(model.audio_channels),
         "precision": "fp16" if fp16 else "fp32",
+        "weight_precision": "fp16" if fp16 else "fp32",
+        "compute_precision": "fp16"
+        if fp16 and family in _MIXED_PRECISION_FAMILIES
+        else "fp32",
         "model_family": family,
         "architecture": architecture,
         "segment_samples": str(segment_samples),
@@ -1049,21 +1113,27 @@ def export_to_onnx(
     model_name: str = "htdemucs",
     output_path: str | None = None,
     opset_version: int = 17,
-    fp16: bool = False,
+    precision: str = "native",
     static_batch: bool = False,
 ) -> str:
     """
     Export model to ONNX.
 
+    ``precision="native"`` stores weights at whatever precision the
+    checkpoint actually carries, which is fp16 for the HTDemucs family and
+    fp32 for RoFormer and SCNet. ``"fp16"`` and ``"fp32"`` force the choice.
+    Note that fp16 storage means weight-only fp16 for HTDemucs and SCNet but
+    mixed precision for RoFormer; see onnx.md.
+
     :param model_name: Name of the model to export. :param output_path: Path to
-        save the ONNX model (defaults to ``{model_name}.onnx``).
+        save the ONNX model (defaults to ``{model_name}_{precision}.onnx``,
+        with ``_static`` appended under ``static_batch``).
     :param opset_version: ONNX opset version (raised to 18 for RoFormer and
-        SCNet). :param fp16: Use weight-only (HTDemucs) or mixed precision
-        (RoFormer). :param static_batch: Trace with fixed batch=1; browser
-        deployment only.
+        SCNet). :param precision: ``"native"``, ``"fp16"``, or ``"fp32"``.
+        :param static_batch: Trace with fixed batch=1; browser deployment only.
     :return: Path to the exported ONNX model.
-    :raises ValueError: If the model is unknown, holds several checkpoints, or
-        is not one of the exportable architectures.
+    :raises ValueError: If precision is unknown, or the model is unknown, holds
+        several checkpoints, or is not one of the exportable architectures.
     """
     try:
         import onnx
@@ -1073,14 +1143,20 @@ def export_to_onnx(
             "Install it with: uv pip install unblend[onnx]"
         )
 
-    if output_path is None:
-        output_path = f"{model_name}.onnx"
+    _validate_export_precision(precision)
 
     repo = ModelRepository()
     models = repo.list_models()
     _reject_multi_checkpoint(models, model_name)
     model = repo.get_model(model_name)
     model_info = models.get(model_name, {})
+
+    fp16 = _resolve_export_precision(precision, model)
+
+    if output_path is None:
+        static_suffix = "_static" if static_batch else ""
+        stored = "fp16" if fp16 else "fp32"
+        output_path = f"{model_name}_{stored}{static_suffix}.onnx"
 
     for family, exporter in _EXPORTERS.items():
         if isinstance(model, family):

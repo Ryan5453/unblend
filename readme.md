@@ -1,7 +1,7 @@
 # <img src="web/app/public/favicon.svg" width="30"> Unblend
 
 Unblend is a music source separation inference library designed to be blazing fast and easy-to-use.
-It implements one consistent API across the four supported model architectures: HTDemucs, BS-RoFormer, Mel-Band RoFormer, and SCNet.
+It implements one consistent API across four supported model architectures: HTDemucs, BS-RoFormer, Mel-Band RoFormer, and SCNet.
 
 ## Installation
 
