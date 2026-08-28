@@ -29,11 +29,9 @@ class ModelLoadingError(UnblendError):
     pass
 
 
-class ValidationError(UnblendError, ValueError):
+class ValidationError(UnblendError):
     """
     Exception raised when a parameter value is invalid.
-
-    Also a ``ValueError`` so callers catching the builtin keep working.
     """
 
     pass

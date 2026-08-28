@@ -46,7 +46,6 @@ def _good_metadata() -> dict:
     return {
         "models": {
             "fakemodel": {
-                "backend": "demucs",
                 "architecture": "htdemucs",
                 "sources": sources,
                 "config": {
@@ -58,14 +57,12 @@ def _good_metadata() -> dict:
                     "channels": 16,
                     "t_layers": 1,
                 },
-                "models": [
-                    {
-                        "format": "safetensors",
-                        "remote": "https://example.invalid/abcd.safetensors",
-                        "sha256": FIRST_SHA,
-                        "size_bytes": 1024,
-                    }
-                ],
+                "checkpoint": {
+                    "format": "safetensors",
+                    "url": "https://example.invalid/abcd.safetensors",
+                    "sha256": FIRST_SHA,
+                    "size_bytes": 1024,
+                },
             }
         }
     }
@@ -225,7 +222,7 @@ def test_repository_rejects_short_sha256(tmp_path: Path) -> None:
     :param tmp_path: pytest temporary directory fixture
     """
     bad = _good_metadata()
-    bad["models"]["fakemodel"]["models"][0]["sha256"] = "a" * 8
+    bad["models"]["fakemodel"]["checkpoint"]["sha256"] = "a" * 8
     with pytest.raises(ModelLoadingError, match="sha256"):
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
@@ -257,7 +254,7 @@ def test_repository_rejects_missing_models_top_key(tmp_path: Path) -> None:
     "metadata",
     [
         [],
-        {"models": []},
+        {"members": []},
         {"models": {"bad": []}},
         {"models": {"bad": {"backend": "unknown", "sources": ["x"]}}},
     ],
@@ -279,8 +276,10 @@ def test_repository_rejects_empty_demucs_layers(tmp_path: Path) -> None:
     A Demucs entry must contain at least one Safetensors artifact.
     """
     bad = _good_metadata()
-    bad["models"]["fakemodel"]["models"] = []
-    with pytest.raises(ModelLoadingError, match="non-empty layer"):
+    entry = bad["models"]["fakemodel"]
+    del entry["checkpoint"]
+    entry["members"] = []
+    with pytest.raises(ModelLoadingError, match="at least two members"):
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
@@ -291,7 +290,6 @@ def test_repository_rejects_malformed_roformer_fields(tmp_path: Path) -> None:
     bad = {
         "models": {
             "bad": {
-                "backend": "roformer",
                 "architecture": ["bs_roformer"],
                 "config": [],
                 "sources": ["vocals"],
@@ -313,7 +311,6 @@ def test_repository_wraps_missing_roformer_geometry(
     Missing required geometry raises ModelLoadingError, never raw KeyError.
     """
     entry = {
-        "backend": "roformer",
         "architecture": "bs_roformer",
         "config": {"dim": 16},
         "sources": ["vocals"],
@@ -340,7 +337,12 @@ def test_repository_accepts_well_formed_metadata(tmp_path: Path) -> None:
     :param tmp_path: pytest temporary directory fixture
     """
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
-    assert repo.list_models() == _good_metadata()["models"]
+    expected = _good_metadata()["models"]
+    listed = repo.list_models()
+    assert set(listed) == set(expected)
+    # ``backend`` is derived from ``architecture`` and added to the entry;
+    # nothing else about a well-formed entry is rewritten.
+    assert listed["fakemodel"] == {**expected["fakemodel"], "backend": "demucs"}
 
 
 def test_get_cache_info_empty_cache(tmp_path: Path, monkeypatch: object) -> None:
@@ -542,14 +544,16 @@ def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
     Repository cannot skip another layer that contributes to the stem.
     """
     metadata = _good_metadata()
-    metadata["models"]["fakemodel"]["models"].append(
+    entry = metadata["models"]["fakemodel"]
+    entry["members"] = [
+        entry.pop("checkpoint"),
         {
             "format": "safetensors",
-            "remote": "https://example.invalid/ef.safetensors",
+            "url": "https://example.invalid/ef.safetensors",
             "sha256": SECOND_SHA,
             "size_bytes": 2,
-        }
-    )
+        },
+    ]
     metadata["models"]["fakemodel"]["weights"] = [
         [1.0, 0.0, 0.0, 0.0],
         [1.0, 1.0, 1.0, 1.0],
@@ -618,7 +622,6 @@ def test_roformer_materializes_state_while_cache_lock_is_held(
     metadata = {
         "models": {
             "tiny": {
-                "backend": "roformer",
                 "architecture": "bs_roformer",
                 "sources": ["vocals", "other"],
                 "samplerate": 8000,
@@ -706,14 +709,16 @@ def test_get_cache_info_reports_partial_models(
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(cache))
 
     metadata = _good_metadata()
-    metadata["models"]["fakemodel"]["models"].append(
+    entry = metadata["models"]["fakemodel"]
+    entry["members"] = [
+        entry.pop("checkpoint"),
         {
             "format": "safetensors",
-            "remote": "https://example.invalid/ef.safetensors",
+            "url": "https://example.invalid/ef.safetensors",
             "sha256": SECOND_SHA,
             "size_bytes": 2,
-        }
-    )
+        },
+    ]
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
 
     assert repo.get_cache_info() == {}
@@ -764,8 +769,8 @@ def test_list_models_returns_copies() -> None:
     repo = ModelRepository()
     listed = repo.list_models()
     name = next(iter(listed))
-    listed[name]["models"] = []
-    assert repo.list_models()[name]["models"], "internal metadata was mutated"
+    listed[name]["checkpoint"] = {}
+    assert repo.list_models()[name]["checkpoint"], "internal metadata was mutated"
 
 
 @pytest.mark.parametrize(
@@ -901,18 +906,15 @@ def test_registered_layer_loads_safetensors_without_pickle(
     metadata = {
         "models": {
             "tiny": {
-                "backend": "demucs",
                 "architecture": "htdemucs",
                 "sources": ["a", "b"],
                 "config": config,
-                "models": [
-                    {
-                        "format": "safetensors",
-                        "remote": "https://example.invalid/layer.safetensors",
-                        "sha256": digest,
-                        "size_bytes": packed.stat().st_size,
-                    }
-                ],
+                "checkpoint": {
+                    "format": "safetensors",
+                    "url": "https://example.invalid/layer.safetensors",
+                    "sha256": digest,
+                    "size_bytes": packed.stat().st_size,
+                },
             }
         }
     }
@@ -1015,7 +1017,7 @@ def test_demucs_model_loads_from_a_local_file(
             "license": "my own terms",
             "sources": config["sources"],
             "config": config,
-            "models": [{"format": "safetensors", "path": str(weights)}],
+            "checkpoint": {"format": "safetensors", "path": str(weights)},
         },
     )
 
@@ -1057,14 +1059,12 @@ def test_demucs_layer_from_a_url_is_fetched_once_then_cached(
             "architecture": "htdemucs",
             "sources": config["sources"],
             "config": config,
-            "models": [
-                {
-                    "format": "safetensors",
-                    "url": url,
-                    "sha256": digest,
-                    "size_bytes": len(payload),
-                }
-            ],
+            "checkpoint": {
+                "format": "safetensors",
+                "url": url,
+                "sha256": digest,
+                "size_bytes": len(payload),
+            },
         },
     )
 
@@ -1118,7 +1118,7 @@ def test_mixed_local_and_remote_layers_only_account_for_the_download(
             "architecture": "htdemucs",
             "sources": config["sources"],
             "config": config,
-            "models": [
+            "members": [
                 {"format": "safetensors", "path": str(weights)},
                 {
                     "format": "safetensors",
@@ -1157,13 +1157,42 @@ def test_entry_without_a_known_architecture_is_rejected(tmp_path: Path) -> None:
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
-def test_backend_cannot_build_a_foreign_architecture(tmp_path: Path) -> None:
+def test_declared_backend_is_rejected(tmp_path: Path) -> None:
     """
-    A backend/architecture pair from different families is rejected.
+    ``backend`` is derived from ``architecture``, never declared.
+
+    Accepting it too would mean two sources of truth that can disagree.
     """
     bad = _good_metadata()
-    bad["models"]["fakemodel"]["architecture"] = "scnet"
-    with pytest.raises(ModelLoadingError, match="cannot build"):
+    bad["models"]["fakemodel"]["backend"] = "demucs"
+    with pytest.raises(ModelLoadingError, match="no longer exists"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
+
+
+def test_declared_backend_is_rejected_on_a_member(tmp_path: Path) -> None:
+    """
+    The same rule applies inside a member spec.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    bad = _good_metadata()
+    entry = bad["models"]["fakemodel"]
+    artifact = entry.pop("checkpoint")
+    entry["members"] = [{"backend": "demucs", **artifact}, dict(artifact)]
+    with pytest.raises(ModelLoadingError, match="no longer exists"):
+        ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
+
+
+def test_remote_artifact_spelling_is_rejected(tmp_path: Path) -> None:
+    """
+    ``url`` is the only spelling; the old ``remote`` key names nothing.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    bad = _good_metadata()
+    layer = bad["models"]["fakemodel"]["checkpoint"]
+    layer["remote"] = layer.pop("url")
+    with pytest.raises(ModelLoadingError, match="local path or an https url"):
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
@@ -1433,13 +1462,18 @@ def test_ensemble_can_mix_architectures(
     "entries, expected",
     [
         (
-            {"a": {"sources": ["x"], "members": [{"model": "nope"}]}},
+            {
+                "a": {
+                    "sources": ["x"],
+                    "members": [{"model": "nope"}, {"model": "nope"}],
+                }
+            },
             "references unknown model",
         ),
         (
             {
-                "a": {"sources": ["x"], "members": [{"model": "b"}]},
-                "b": {"sources": ["x"], "members": [{"model": "a"}]},
+                "a": {"sources": ["x"], "members": [{"model": "b"}, {"model": "b"}]},
+                "b": {"sources": ["x"], "members": [{"model": "a"}, {"model": "a"}]},
             },
             "reference cycle",
         ),
@@ -1488,7 +1522,7 @@ def test_referenced_member_must_emit_the_same_stems(tmp_path: Path) -> None:
             "base": _local_htdemucs_entry(weights, config),
             "pair": {
                 "sources": list(reversed(config["sources"])),
-                "members": [{"model": "base"}],
+                "members": [{"model": "base"}, {"model": "base"}],
             },
         }
     }
@@ -1498,7 +1532,7 @@ def test_referenced_member_must_emit_the_same_stems(tmp_path: Path) -> None:
 
 def test_entry_must_name_its_weights_exactly_once(tmp_path: Path) -> None:
     """
-    ``checkpoint``, ``members`` and ``models`` are mutually exclusive.
+    ``checkpoint`` and ``members`` are mutually exclusive.
     """
     weights, config = _tiny_demucs_layer(tmp_path)
     entry = _local_htdemucs_entry(weights, config)

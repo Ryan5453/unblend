@@ -31,17 +31,14 @@ def _model_layer_count(info: dict) -> int:
     """
     Return the number of weight files a model is built from.
 
-    An ensemble lists them under ``members`` (or ``models``, the Demucs bags'
-    original spelling); anything else is a single checkpoint.
+    A multi-checkpoint entry lists them under ``members``; a single-checkpoint
+    entry has one ``checkpoint``.
 
     :param info: One model's registry metadata.
     :return: Number of checkpoint files used by the model.
     """
-    for key in ("members", "models"):
-        members = info.get(key)
-        if isinstance(members, list):
-            return len(members)
-    return 1
+    members = info.get("members")
+    return len(members) if isinstance(members, list) else 1
 
 
 def list_models_command() -> None:

@@ -7,6 +7,8 @@ The Python API is primarily comprised of two classes: `Separator` and `Separated
 The `Separator` class is a high level representation of an audio source separation model. When you want to separate an audio file into its constituent stems, you will first need to create an instance of the `Separator` class which will load the model into memory for use.
 
 ```python
+from unblend import Separator 
+
 separator = Separator(
     model: str | Model | ModelEnsemble = "htdemucs",
     device: str | None = None,
@@ -21,10 +23,10 @@ A `Separator` takes the following parameters:
 
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. If left as `None` (the default), unblend auto-selects the best available backend at construction time. Pass `"cpu"`, `"cuda"`, or `"mps"` to force one.
-- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft). This is a **performance optimization** (smaller download and memory footprint) — it does **not** filter the output to one stem; the result still contains all of the model's sources, with only the named stem at full quality. Use `SeparatedSources.isolate_stem` to actually isolate a stem.
-- `dtype` - Inference precision. The default `"auto"` uses FP16 on CUDA GPUs with tensor cores (compute capability ≥ 7.0) and on MPS; CPU and older CUDA GPUs use FP32. HTDemucs and RoFormer FP16 both measure SDR-equal to FP32. RoFormer gains are 2.2–2.4× on a V100 and 1.06–1.07× on an M2 Max after the MPS attention/RMSNorm optimizations (10 full MUSDB18-HQ tracks). Pass `torch.float16` or `torch.bfloat16` explicitly to force reduced precision (CUDA/MPS only; CPU is rejected), or `None` / `torch.float32` to force FP32. On MPS, custom Metal kernels accelerate normalization; BF16 works but measured ~27% slower than FP16 for HTDemucs.
-- `compile` - Optional, if `True`, applies `torch.compile` (Inductor/CUDAGraphs) to the architecture's heavy neural-network core on CUDA: `forward_core` for HTDemucs and the axial transformer trunk for BS-/Mel-Band RoFormer. STFT/iSTFT and reconstruction remain eager. On a V100 FP16 compile measured 1.50× for SW and 1.34× for Kim on a 76-second track. Compilation adds initialization latency and a persistent CUDAGraph private memory pool; ensemble members each capture their own pool, which can be much larger than `torch.cuda.max_memory_allocated` reports. Auto-sized runs halve/recapture on OOM. MPS and CPU remain eager. The Python API is explicit (`compile=False`); the CLI defaults to cache-free workload-aware auto mode, with `--compile` / `--no-compile` overrides.
-- `chunk_batch_size` - Optional explicit chunks-per-forward batch size, bypassing auto-detection. Auto (`None`, the default) sizes from measured memory and degrades instead of dying: eager runs halve and retry the failed batch (sticky down to 1), while compiled runs tear down and recapture at half (bounded at 4 recaptures per request). An explicit value is respected exactly—no halving, OOM raises—and under compile fixes the captured shape, so per-call overrides are rejected.
+- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to ensembles like htdemucs_ft). This is a performance optimization (smaller download and memory footprint), it does not filter the output to one stem - use `SeparatedSources.isolate_stem` to actually isolate a stem.
+- `dtype` - Inference precision. The default `"auto"` uses FP16 on CUDA GPUs with tensor cores (compute capability ≥ 7.0) and on MPS; CPU and older CUDA GPUs use FP32.
+- `compile` - Optional, if `True`, compiles the model's neural-network core on CUDA — roughly 1.3–1.5× in FP16, at the cost of startup time and extra held VRAM, so it pays off on long jobs. CPU and MPS ignore it. The CLI decides per workload instead, with `--compile` / `--no-compile` to force either way.
+- `chunk_batch_size` - Optional, how many segments to run per forward pass. The default (`None`) sizes it from available memory and backs off if that proves too large; an explicit value is used exactly as given, and OOM raises.
 
 ### Attributes
 
@@ -35,9 +37,9 @@ After construction, the following attributes are available on a `Separator` inst
 - `model` - The loaded model instance (`Model | ModelEnsemble`).
 - `audio_channels` - Number of audio channels the model expects (`int`).
 - `sample_rate` - Sample rate the model operates at (`int`).
-- `chunk_batch_size` - Number of segments processed per forward call. On CUDA this is auto-detected from a warmed batch-1 eager memory/timing probe plus `mem_get_info`. Eager sizes to fill VRAM; a compiled HTDemucs capture-verifies that size and halves on OOM. A compiled RoFormer instead *sweeps* candidate batch sizes at capture time (compiling and timing each, keeping the fastest per-chunk throughput), because the compile-optimal batch is GPU-dependent — small on V100's memory-efficient attention, where larger compiled batches measure slower, and just as small but now faster-than-eager on flash-attention GPUs. The CLI reuses the timing for its auto-compile decision. On MPS it is sized from the unified-memory budget (8 / 4 / 2 as `torch.mps.recommended_max_memory()` crosses 20 / 10 GB); CPU defaults to 1.
+- `chunk_batch_size` - Number of segments processed per forward call (`int`). Measured per device at construction unless you passed an explicit value.
 
-If you enable `compile=True`, warmup happens automatically at the end of `__init__` (via a zero-tensor pass through `Separator.separate`, so the CUDAGraph captured is the same one real requests reuse). You can call `separator.warmup()` again later to re-prime if needed; the method takes no arguments because tail-padding inside `apply_model` guarantees a single batch shape per session.
+If you enable `compile=True`, warmup happens automatically at the end of `__init__`. Call `separator.warmup()` to re-prime later if needed; it takes no arguments because tail-padding leaves exactly one batch shape per session.
 
 ```python
 separator.warmup()  # no args — there's exactly one batch shape after tail-padding
@@ -62,17 +64,17 @@ def separate(
 
 When separating audio, you have the ability to specify the following parameters:
 
-- `audio` - The audio to separate. **Polymorphic input**: a single `(Tensor, sample_rate)` tuple / file path / raw bytes returns a single `SeparatedSources`. Tuple tensors must be real floating-point audio already normalized to the expected amplitude range; integer PCM, boolean, and complex tensors are rejected rather than silently reinterpreted. Passing a `list` of inputs returns `list[SeparatedSources]` and pools tail chunks across inputs (so every forward pass runs at full `chunk_batch_size`, no wasted slots). Useful when serving many short clips concurrently — see `apply_model_multi` in `unblend/apply.py`.
-- `shifts` - The number of random shifts for equivariant stabilization. In simple terms, this is a technique to make the model more robust to small changes in the audio, such as small shifts in time or pitch. More shifts mean generally higher quality separation but also longer processing time. Must be an integer in `[1, 20]`.
+- `audio` - The audio to separate. A single `(Tensor, sample_rate)` tuple, file path, or raw bytes returns one `SeparatedSources`; a `list` of those returns `list[SeparatedSources]` and is the efficient way to serve many short clips at once. Tuple tensors must be floating-point audio already at the usual amplitude range — integer PCM, boolean, and complex tensors are rejected rather than silently reinterpreted.
+- `shifts` - How many randomly time-shifted passes to average, which stabilizes the output at the cost of proportionally more compute. Must be an integer in `[1, 20]`.
 - `split_overlap` - The overlap between consecutive segments. Must be in the range `[0.0, 1.0)`. Higher values smooth segment boundaries at the cost of more compute per track.
 - `seed` - Optional random seed for reproducible shift-based inference. With list input, per-input shift offsets advance from this seed in sequence — outputs are reproducible across runs at the same seed, but a list call with `seed=N` does NOT produce bit-identical outputs to N separate single-file calls with `seed=N`. Setting this also reseeds the process-global `random` and `torch` RNGs as a side effect, affecting other code in the host process.
 - `progress_callback` - A callback function receiving aggregate and per-input progress for both single and list input. List-input events remain one monotonic global stream while identifying the input advanced by each completed chunk. View the [Progress Callbacks](#progress-callbacks) section for more information.
-- `use_only_stem` - If specified, perform the separation using only the specialized model for this stem (a `ModelEnsemble` of fine-tuned specialists like `htdemucs_ft`). Like `only_load`, this is a **performance optimization** and does **not** filter the output to one stem — the result still contains all of the model's sources, with only the named stem at full quality. Use `SeparatedSources.isolate_stem` to actually isolate a stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
-- `chunk_batch_size` - Override the auto-detected `chunk_batch_size` for this call without persisting it. Pass `None` (default) to use `self.chunk_batch_size`.
+- `use_only_stem` - Run only the specialist member for this stem, in an ensemble like `htdemucs_ft`. Like `only_load` this is a **performance optimization**, not a filter — every source is still returned, with only the named one at full quality. Prefer `only_load` when you know the stem before constructing the `Separator`.
+- `chunk_batch_size` - Override the auto-detected `chunk_batch_size` for this call without persisting it. Pass `None` (default) to use `self.chunk_batch_size`. A compiled separator captures one fixed batch shape, so per-call overrides are rejected there — pass it to `Separator(...)` instead.
 
 The model's training segment length (`max_allowed_segment * samplerate`, e.g. 7.8s for HTDemucs) is used internally for every chunk; it isn't a knob because there's no useful range — shorter chunks get padded back up to that length before inference (so they're strictly slower without quality benefit) and longer chunks would extrapolate the cross-transformer's positional embeddings past their training range (degrading quality).
 
-**Bounded GPU memory.** On CUDA, the input waveform and output accumulators stay GPU-resident when they fit a conservative fraction of the *currently free* VRAM (~30 % after a reserve of at least 2 GiB, grown to cover the measured per-batch forward working set) — the normal case for songs, where the whole separation then runs on-GPU with a single GPU→CPU transfer at the end. Inputs too long for that budget (think hours of audio) automatically fall back to CPU accumulation with per-batch GPU→CPU transfers, which bounds VRAM usage by `model + cudagraph_pool + active_batch` regardless of audio length — a 10-hour file uses the same VRAM as a 6-minute one, just with the old per-batch transfer cost. On MPS (unified memory) the accumulator always stays on-device.
+**Bounded GPU memory.** VRAM use does not grow with audio length. Songs keep their accumulators on the GPU and pay one transfer at the end; inputs too long for the free-VRAM budget fall back to CPU accumulation with per-batch transfers, so a 10-hour file needs the same VRAM as a 6-minute one and simply runs a little slower. On MPS the accumulator always stays on-device.
 
 **WAV fast path.** Plain 16-bit PCM WAV inputs (file path or bytes) are decoded with a direct header parse + `int16`→`float32` conversion, roughly 2x faster than and sample-exact with the torchcodec/FFmpeg path. Every other format and codec — and any malformed WAV — transparently falls back to torchcodec, so this only affects decode speed, never output.
 
@@ -194,7 +196,7 @@ def get_model(self, name: str, only_load: str | None = None, progress_callback: 
 When using the `get_model` method, the following parameters are available:
 
 - `name` - The name of the model to load.
-- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
+- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to multi-member entries like htdemucs_ft).
 - `progress_callback` - Optional, a callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
 
 This will return either a `Model` or `ModelEnsemble` instance corresponding to the given model name.
@@ -214,8 +216,8 @@ This returns deep copies of the registered metadata as a tagged union. Inspect
         "backend": "demucs",
         "architecture": "htdemucs",
         "sources": list,  # Stem names, in output order
-        "models": list,   # Safetensors layer entries: remote, checksum, sha256, size_bytes
-        "weights": list | None,  # Bag-of-models mixing weights when present
+        "checkpoint": {"url": str, "sha256": str, "size_bytes": int},
+        "weights": list | None,  # Mixing weights, for a multi-member entry
         "config": dict,
     },
     "bs_roformer_sw": {
@@ -329,7 +331,7 @@ Returns the version string (e.g. `"1.0.0"`).
 ### Models
 
 - `Model` — base `nn.Module` returned by `ModelRepository.get_model` for a single-layer model (e.g. plain `htdemucs`). Has `.sources` (stem names), `.samplerate`, `.audio_channels`.
-- `ModelEnsemble` — `nn.Module` returned for bag-of-models like `htdemucs_ft`. Holds `.models` (list[Model]), `.weights` (per-source mixing rows), and the shared `.sources` / `.samplerate` / `.audio_channels`.
+- `ModelEnsemble` — `nn.Module` returned for multi-member entries like `htdemucs_ft`. Holds `.models` (list[Model]), `.weights` (per-source mixing rows), and the shared `.sources` / `.samplerate` / `.audio_channels`.
 
 ### Lower-level apply
 
@@ -447,17 +449,19 @@ unblend separate --model my_scnet track.wav
 | `samplerate` | Sample rate the weights operate at. |
 | `segment_samples` | Training chunk length, in samples. |
 | `config` | Constructor kwargs for the architecture — the upstream config file's `model:` section, verbatim. |
-| `checkpoint` | Where the weights are (see below), for a single-model entry. |
-| `members` | For an ensemble: one entry per member instead of `checkpoint` (see below). `models` is the same thing under the Demucs bags' original spelling, where each item is an artifact rather than a member wrapping one. |
+| `checkpoint` | Where the weights are (see below). Exactly one set of weights. |
+| `members` | Two or more members instead of a `checkpoint` (see below) — an ensemble, or a bag of same-architecture checkpoints. |
 | `license` | Free-form label, passed through to `models list` and `list_models` untouched. Unblend does not interpret it. |
 | `weights` | For an ensemble: one row per member, one column per source. Defaults to all ones. |
 | `combine`, `combine_params` | For an ensemble: how member outputs are combined (see below). |
 | `segment` | Optional: shortens (never enlarges) the configured training segment. |
 
-`backend` — the loader family — is derived from `architecture` and only worth
-setting if you like the redundancy. Every architecture belongs to exactly one
-family: `htdemucs` to `demucs`, the two RoFormers to `roformer`, the two SCNets
-to `scnet`.
+An entry names its weights exactly once: `checkpoint` for one set, `members`
+for two or more. There is no `backend` field — the loader family is derived
+from `architecture`, and declaring it is an error rather than a second source
+of truth that can disagree. Every architecture belongs to exactly one family:
+`htdemucs` to `demucs`, the two RoFormers to `roformer`, the two SCNets to
+`scnet`. `list_models` reports the derived value back to you.
 
 ### Where the weights come from
 
@@ -484,9 +488,9 @@ size_bytes: 219000000
   every later run. A download has to be verifiable, so `sha256` and
   `size_bytes` are required — the file is checked before it is promoted into the
   cache, and again on each load.
-- A Demucs entry lists one such artifact per layer under `models`, and may mix
-  local and remote layers. Its `config` must declare the same `sources` as the
-  entry.
+- A multi-checkpoint entry lists one such artifact per member under `members`,
+  and may mix local and remote ones. A Demucs entry's `config` must declare the
+  same `sources` as the entry.
 
 ### Ensembles
 

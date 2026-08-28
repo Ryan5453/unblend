@@ -107,6 +107,9 @@ def test_ht_export_failure_preserves_existing_destination(
         def get_model(self, _name: str) -> HTDemucs:
             return model
 
+        def list_models(self) -> dict[str, dict]:
+            return {"tiny": {"checkpoint": {}}}
+
     def fake_export(*_args: object, **_kwargs: object) -> None:
         path = _args[2]
         value = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])

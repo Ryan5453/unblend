@@ -23,13 +23,13 @@
   Local files are read where they lie; URLs are downloaded once into the model
   cache and reused, so a model hosted on Hugging Face costs one fetch rather
   than one per run. See "Custom models" in the [Python API](api.md) docs.
-- Registry entries may name only their `architecture`; the backend that builds
-  it is derived. `backend` remains accepted.
+- Registry entries name only their `architecture`; the backend that builds it
+  is derived. There is no `backend` field — declaring one is an error, so the
+  loader family can never disagree with the architecture.
 - Ensembles are backend-neutral: any entry can declare `members`, each with its
   own architecture, config and artifact, or naming another registered model to
-  reuse it. The Demucs bags' `models` spelling still works and is unchanged.
-  Members sharing a checkpoint share its cache file, so an ensemble built from
-  registered models downloads nothing new.
+  reuse it. Members sharing a checkpoint share its cache file, so an ensemble
+  built from registered models downloads nothing new.
 - Ensemble combining modes (`combine`): `weighted_mean` (default, also spelled
   `avg_wave`), `median_wave`, `min_wave`, `max_wave`, `avg_fft`, `median_fft`,
   `min_fft`, `max_fft`, plus `uvr_min_spec`/`uvr_max_spec` as UVR's names for
@@ -70,6 +70,27 @@
 
 ### Changed
 
+- A registry entry names its weights exactly once: `checkpoint` for a single
+  set, `members` for two or more. The Demucs bags' `models` spelling is gone,
+  as is the one-member `members` list — `members` now always means several.
+- An artifact's URL is spelled `url`. The `remote` spelling is gone, along with
+  the path-relative-to-Meta's-CDN form it allowed; every shipped checkpoint is
+  served from Hugging Face over an absolute https URL and always was.
+- Every ONNX export embeds the same metadata keys, whatever the architecture:
+  unprefixed names, JSON `sources`, and `"true"`/`"false"` booleans. HTDemucs
+  exports gain the `segment_samples`, `stft_*` and `license` keys they never
+  carried, so one reader handles any Unblend export.
+- `export-onnx` rejects multi-checkpoint entries (the `htdemucs_ft` bag, the
+  ensembles) from the registry entry, before downloading anything, and names
+  an ensemble's members so they can be exported individually. It used to
+  download every checkpoint and then fail.
+- `--static-batch` works for HTDemucs, not just RoFormer and SCNet.
+- Removed code with no caller: the unused `CUDAMultiheadAttention` wrapper
+  (CUDA deliberately leaves `nn.MultiheadAttention` to PyTorch's own fast
+  path), the transformer's training-only `weight_decay`/`lr` attributes and
+  the `t_weight_decay`/`t_lr` config keys that fed them, and a dead
+  `METADATA_PATH` constant. `ValidationError` is no longer also a
+  `ValueError`.
 - Single-checkpoint backends (RoFormer, SCNet) now download, cache-report,
   and remove through one generic path instead of a RoFormer-only special case.
 - Every backend resolves, verifies, caches, and removes its weights through

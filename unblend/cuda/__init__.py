@@ -1786,131 +1786,6 @@ class CUDAMyGroupNorm(CUDAGroupNorm):
         return out.view_as(x)
 
 
-class CUDAMultiheadAttention(nn.Module):
-    """
-    Replacement for ``nn.MultiheadAttention`` on CUDA in FP16/BF16.
-    """
-
-    def __init__(self, mha: nn.MultiheadAttention) -> None:
-        """
-        Wrap an ``nn.MultiheadAttention``, sharing its projection params and keeping it as fallback.
-
-        :param mha: Source multihead attention whose weights are reused and which
-            handles any path this wrapper does not optimise
-        """
-        super().__init__()
-        self.embed_dim = mha.embed_dim
-        self.num_heads = mha.num_heads
-        self.head_dim = mha.embed_dim // mha.num_heads
-        self.batch_first = mha.batch_first
-        self._packed_qkv = mha.in_proj_weight is not None
-        if self._packed_qkv:
-            self.in_proj_weight = mha.in_proj_weight
-            self.in_proj_bias = mha.in_proj_bias
-        else:
-            self.q_proj_weight = mha.q_proj_weight
-            self.k_proj_weight = mha.k_proj_weight
-            self.v_proj_weight = mha.v_proj_weight
-            self.in_proj_bias = mha.in_proj_bias
-        self.out_proj = mha.out_proj
-
-        self._fallback = mha
-        self.train(mha.training)
-
-    @classmethod
-    def from_mha(cls, mha: nn.MultiheadAttention) -> "CUDAMultiheadAttention":
-        """
-        Build a :class:`CUDAMultiheadAttention` from an existing multihead attention.
-
-        :param mha: Source ``nn.MultiheadAttention`` to wrap
-        :return: A new :class:`CUDAMultiheadAttention` mirroring ``mha``
-        """
-        return cls(mha)
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
-        need_weights: bool = True,
-        attn_mask: torch.Tensor | None = None,
-        average_attn_weights: bool = True,
-        is_causal: bool = False,
-    ) -> tuple[torch.Tensor, None]:
-        """
-        Run multihead attention, keeping projections in the input dtype on CUDA FP16/BF16.
-
-        :param query: Query tensor of shape ``(B, Lq, embed_dim)`` (batch-first).
-        :param key: Key tensor of shape ``(B, Lk, embed_dim)``.
-        :param value: Value tensor of shape ``(B, Lk, embed_dim)``.
-        :param key_padding_mask: Optional key padding mask; presence forces the fallback path.
-        :param need_weights: If ``True``, forces the fallback path (this wrapper retur...
-        :param attn_mask: Optional attention mask; presence forces the fallback path.
-        :param average_attn_weights: Forwarded to the fallback MHA when used.
-        :param is_causal: If ``True``, forces the fallback path.
-        :return: A ``(output, None)`` pair; the output has shape ``(B, Lq,...
-        """
-
-        if (
-            self.training
-            or need_weights
-            or key_padding_mask is not None
-            or attn_mask is not None
-            or is_causal
-            or not self.batch_first
-            or not self._packed_qkv
-            or query.device.type != "cuda"
-            or query.dtype not in _LP_DTYPES
-        ):
-            return self._fallback(
-                query,
-                key,
-                value,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                attn_mask=attn_mask,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-
-        is_self_attn = query is key and key is value
-        E = self.embed_dim
-        H = self.num_heads
-        D = self.head_dim
-        B = query.size(0)
-        Lq = query.size(1)
-
-        if is_self_attn:
-            qkv = F.linear(query, self.in_proj_weight, self.in_proj_bias)
-            q, k, v = qkv.chunk(3, dim=-1)
-            Lk = Lq
-        else:
-            wq = self.in_proj_weight[:E]
-            wk = self.in_proj_weight[E : 2 * E]
-            wv = self.in_proj_weight[2 * E :]
-            if self.in_proj_bias is not None:
-                bq = self.in_proj_bias[:E]
-                bk = self.in_proj_bias[E : 2 * E]
-                bv = self.in_proj_bias[2 * E :]
-            else:
-                bq = bk = bv = None
-            q = F.linear(query, wq, bq)
-            k = F.linear(key, wk, bk)
-            v = F.linear(value, wv, bv)
-            Lk = k.size(1)
-
-        q = q.view(B, Lq, H, D).transpose(1, 2)
-        k = k.view(B, Lk, H, D).transpose(1, 2)
-        v = v.view(B, Lk, H, D).transpose(1, 2)
-
-        out = F.scaled_dot_product_attention(q, k, v)
-
-        out = out.transpose(1, 2).reshape(B, Lq, self.embed_dim)
-        out = self.out_proj(out)
-        return out, None
-
-
 class FusedDConvLayer(nn.Module):
     """
     One DConv sub-layer (formerly an ``nn.Sequential`` of 7 ops) folded into 4 calls: ``conv1 → fused_norm_gelu → conv2 →...
@@ -2333,7 +2208,6 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
         "fused_dconv": 0,
         "group_norm": 0,
         "my_group_norm": 0,
-        "multi_head_attention": 0,
     }
 
     try:
@@ -2394,14 +2268,12 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
 
     def _walk_modules(mod: nn.Module) -> None:
         """
-        Recursively swap remaining ``MyGroupNorm``/``GroupNorm``/``MultiheadAttention`` children.
+        Recursively swap remaining ``MyGroupNorm``/``GroupNorm`` children.
 
         :param mod: Module whose children are walked and swapped in place
         """
         for name, child in list(mod.named_children()):
-            if isinstance(
-                child, (CUDAGroupNorm, CUDAMyGroupNorm, CUDAMultiheadAttention)
-            ):
+            if isinstance(child, (CUDAGroupNorm, CUDAMyGroupNorm)):
                 continue
             replacement: nn.Module | None = None
             if isinstance(child, MyGroupNorm):
@@ -2432,7 +2304,6 @@ __all__ = [
     "has_swappable_modules",
     "cuda_rms_norm",
     "CUDAMyGroupNorm",
-    "CUDAMultiheadAttention",
     "FusedGroupNormGelu",
     "FusedGroupNormGlu",
     "FusedNormGluLayerScaleResid",

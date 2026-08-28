@@ -533,8 +533,6 @@ class CrossTransformerEncoder(nn.Module):
         norm_first: bool = False,
         norm_out: bool = False,
         max_period: float = 10000.0,
-        weight_decay: float = 0.0,
-        lr: float | None = None,
         layer_scale: bool = False,
         gelu: bool = True,
         sin_random_shift: int = 0,
@@ -560,8 +558,6 @@ class CrossTransformerEncoder(nn.Module):
         :param norm_first: Apply norm before attention/FF blocks.
         :param norm_out: With norm_first, apply output normalization.
         :param max_period: Maximum period for sinusoidal encoding.
-        :param weight_decay: Weight decay for optimizer.
-        :param lr: Learning rate override (None for default).
         :param layer_scale: Use LayerScale on residual outputs.
         :param gelu: Use GELU activation; otherwise ReLU.
         :param sin_random_shift: Max random shift for sinusoidal embeddings.
@@ -580,7 +576,6 @@ class CrossTransformerEncoder(nn.Module):
         self.classic_parity = 1 if cross_first else 0
         self.emb = emb
         self.max_period = max_period
-        self.weight_decay = weight_decay
         self.weight_pos_embed = weight_pos_embed
         self.sin_random_shift = sin_random_shift
         if emb == "cape":
@@ -589,8 +584,6 @@ class CrossTransformerEncoder(nn.Module):
             self.cape_glob_loc_scale = cape_glob_loc_scale
         if emb == "scaled":
             self.position_embeddings = ScaledEmbedding(max_positions, dim, scale=0.2)
-
-        self.lr = lr
 
         activation: Any = F.gelu if gelu else F.relu
 

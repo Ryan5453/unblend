@@ -214,7 +214,6 @@ def _write_local_model(tmp_path, name: str = "my_scnet") -> tuple:
                 "version": 1,
                 "models": {
                     name: {
-                        "backend": "scnet",
                         "architecture": "scnet",
                         "license": "unknown",
                         "sources": ["drums", "bass", "other", "vocals"],
@@ -404,8 +403,9 @@ def test_scnet_export_uses_browser_io_and_records_both_segment_lengths(
         "out_spec_imag",
     ]
     metadata = {item.key: item.value for item in exported.metadata_props}
-    assert metadata["unblend.logical_segment_samples"] == str(segment)
-    assert metadata["unblend.segment_samples"] == str(
+    assert metadata["logical_segment_samples"] == str(segment)
+    assert metadata["segment_samples"] == str(
         segment + stft_padding(segment, model.hop_length)
     )
-    assert metadata["unblend.stft_window"] == "hann"
+    assert metadata["stft_window"] == "hann"
+    assert not [key for key in metadata if key.startswith("unblend.")]

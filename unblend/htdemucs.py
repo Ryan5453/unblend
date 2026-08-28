@@ -72,8 +72,6 @@ class HTDemucs(ASSModel):
         t_norm_first: bool = True,
         t_norm_out: bool = True,
         t_max_period: float = 10000.0,
-        t_weight_decay: float = 0.0,
-        t_lr: float | None = None,
         t_layer_scale: bool = True,
         t_gelu: bool = True,
         t_weight_pos_embed: float = 1.0,
@@ -127,8 +125,6 @@ class HTDemucs(ASSModel):
         :param t_norm_first: Pre-norm transformer layout.
         :param t_norm_out: Normalize each layer output.
         :param t_max_period: Sinusoidal embedding period.
-        :param t_weight_decay: Transformer weight decay (training only).
-        :param t_lr: Transformer learning rate (training only).
         :param t_layer_scale: Enable LayerScale.
         :param t_gelu: GELU activation, else ReLU.
         :param t_weight_pos_embed: Positional embedding weight.
@@ -312,8 +308,6 @@ class HTDemucs(ASSModel):
                 norm_first=t_norm_first,
                 norm_out=t_norm_out,
                 max_period=t_max_period,
-                weight_decay=t_weight_decay,
-                lr=t_lr,
                 layer_scale=t_layer_scale,
                 gelu=t_gelu,
                 sin_random_shift=t_sin_random_shift,

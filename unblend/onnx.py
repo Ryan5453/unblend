@@ -743,6 +743,55 @@ def _add_metadata(onnx_model: "onnx.ModelProto", metadata: dict[str, str]) -> No
         entry.value = value
 
 
+def _export_metadata(
+    model: nn.Module,
+    *,
+    family: str,
+    architecture: str,
+    segment_samples: int,
+    stft: dict,
+    stft_window: str,
+    fp16: bool,
+    static_batch: bool,
+    license_label: str | None,
+) -> dict[str, str]:
+    """
+    Build the metadata every export embeds, in the one shared spelling.
+
+    Keys are unprefixed, ``sources`` is JSON, and booleans are ``"true"``
+    or ``"false"``, so a consumer reads any Unblend export the same way.
+
+    :param model: Model being exported.
+    :param family: Loader family (``demucs``, ``roformer``, ``scnet``).
+    :param architecture: Registry architecture name.
+    :param segment_samples: Samples the graph expects per call.
+    :param stft: STFT geometry, with the ``torch.stft`` keyword names.
+    :param stft_window: Analysis window, ``"hann"`` or ``"none"``.
+    :param fp16: Whether weights were stored as fp16.
+    :param static_batch: Whether the batch axis was traced fixed at 1.
+    :param license_label: Registry license label, embedded when set.
+    :return: String key/value pairs for ``_add_metadata``.
+    """
+    metadata = {
+        "sources": json.dumps(list(model.sources)),
+        "sample_rate": str(model.samplerate),
+        "audio_channels": str(model.audio_channels),
+        "precision": "fp16" if fp16 else "fp32",
+        "model_family": family,
+        "architecture": architecture,
+        "segment_samples": str(segment_samples),
+        "stft_n_fft": str(int(stft["n_fft"])),
+        "stft_hop_length": str(int(stft["hop_length"])),
+        "stft_win_length": str(int(stft["win_length"])),
+        "stft_normalized": "true" if stft["normalized"] else "false",
+        "stft_window": stft_window,
+        "batch_mode": "static" if static_batch else "dynamic",
+    }
+    if license_label:
+        metadata["license"] = license_label
+    return metadata
+
+
 def _export_roformer_to_onnx(
     model: _RoformerBase,
     output_path: str,
@@ -814,24 +863,19 @@ def _export_roformer_to_onnx(
         architecture = (
             "mel_band_roformer" if isinstance(model, MelBandRoformer) else "bs_roformer"
         )
-        metadata = {
-            "sources": json.dumps(model.sources),
-            "sample_rate": str(model.samplerate),
-            "audio_channels": str(model.audio_channels),
-            "precision": "fp16" if fp16 else "fp32",
-            "model_family": "roformer",
-            "architecture": architecture,
-            "num_stems": str(model.num_stems),
-            "output_complement": "true" if model.output_complement else "false",
-            "segment_samples": str(segment_samples),
-            "stft_n_fft": str(stft["n_fft"]),
-            "stft_hop_length": str(stft["hop_length"]),
-            "stft_win_length": str(stft["win_length"]),
-            "stft_normalized": "true" if stft["normalized"] else "false",
-            "batch_mode": "static" if static_batch else "dynamic",
-        }
-        if license_label:
-            metadata["license"] = license_label
+        metadata = _export_metadata(
+            model,
+            family="roformer",
+            architecture=architecture,
+            segment_samples=segment_samples,
+            stft=stft,
+            stft_window="hann",
+            fp16=fp16,
+            static_batch=static_batch,
+            license_label=license_label,
+        )
+        metadata["num_stems"] = str(model.num_stems)
+        metadata["output_complement"] = "true" if model.output_complement else "false"
         _add_metadata(onnx_model, metadata)
 
         onnx.checker.check_model(onnx_model)
@@ -922,25 +966,24 @@ def _export_scnet_to_onnx(
         onnx_model = onnx.load(staging)
         if fp16:
             _convert_weights_to_fp16(onnx_model)
-        _add_metadata(
-            onnx_model,
-            {
-                "unblend.architecture": _scnet_architecture(model),
-                "unblend.sources": ",".join(model.sources),
-                "unblend.samplerate": str(model.samplerate),
-                "unblend.segment_samples": str(segment + padding),
-                "unblend.logical_segment_samples": str(segment),
-                "unblend.stft_n_fft": str(model.stft_config["n_fft"]),
-                "unblend.stft_hop_length": str(model.stft_config["hop_length"]),
-                "unblend.stft_win_length": str(model.stft_config["win_length"]),
-                "unblend.stft_normalized": str(bool(model.stft_config["normalized"])),
-                "unblend.stft_window": ("hann" if hasattr(model, "window") else "none"),
-                "unblend.external_normalization": str(
-                    bool(model.external_normalization)
-                ),
-                "unblend.license": str(license_label),
-            },
+        window = "hann" if hasattr(model, "window") else "none"
+        metadata = _export_metadata(
+            model,
+            family="scnet",
+            architecture=_scnet_architecture(model),
+            segment_samples=segment + padding,
+            stft=model.stft_config,
+            stft_window=window,
+            fp16=fp16,
+            static_batch=static_batch,
+            license_label=license_label,
         )
+        metadata["logical_segment_samples"] = str(segment)
+        metadata["stft_pad_samples"] = str(padding)
+        metadata["external_normalization"] = (
+            "true" if model.external_normalization else "false"
+        )
+        _add_metadata(onnx_model, metadata)
         onnx.save(onnx_model, staging)
     return output_path
 
@@ -962,6 +1005,46 @@ register_exporter(_RoformerBase, _export_roformer_to_onnx)
 register_exporter(SCNet, _export_scnet_to_onnx)
 
 
+def _reject_multi_checkpoint(models: dict[str, dict], model_name: str) -> None:
+    """
+    Reject entries that hold more than one checkpoint, before any download.
+
+    ONNX export traces one graph per checkpoint, so a Demucs bag or an
+    ensemble has nothing single to trace. Checking the registry entry first
+    means the failure costs a lookup instead of a full weight download.
+
+    :param models: Registry entries, as ``ModelRepository.list_models``
+        returns them.
+    :param model_name: Name being exported.
+    :raises ValueError: If the name is unknown or holds several checkpoints.
+    """
+    info = models.get(model_name)
+    if info is None:
+        raise ValueError(
+            f"Could not find a model with name {model_name}. "
+            f"Available models: {', '.join(models)}"
+        )
+
+    specs = info.get("members") or []
+    if len(specs) < 2:
+        return
+
+    referenced = [
+        spec["model"]
+        for spec in specs
+        if isinstance(spec, dict) and isinstance(spec.get("model"), str)
+    ]
+    hint = (
+        f" Export its members separately: {', '.join(referenced)}."
+        if len(referenced) == len(specs)
+        else ""
+    )
+    raise ValueError(
+        f"Model {model_name} holds {len(specs)} checkpoints; ONNX export traces "
+        f"a single graph and cannot represent a bag or an ensemble.{hint}"
+    )
+
+
 def export_to_onnx(
     model_name: str = "htdemucs",
     output_path: str | None = None,
@@ -977,8 +1060,10 @@ def export_to_onnx(
     :param opset_version: ONNX opset version (raised to 18 for RoFormer and
         SCNet). :param fp16: Use weight-only (HTDemucs) or mixed precision
         (RoFormer). :param static_batch: Trace with fixed batch=1; browser
-        deployment only, ignored for HTDemucs.
+        deployment only.
     :return: Path to the exported ONNX model.
+    :raises ValueError: If the model is unknown, holds several checkpoints, or
+        is not one of the exportable architectures.
     """
     try:
         import onnx
@@ -992,11 +1077,13 @@ def export_to_onnx(
         output_path = f"{model_name}.onnx"
 
     repo = ModelRepository()
+    models = repo.list_models()
+    _reject_multi_checkpoint(models, model_name)
     model = repo.get_model(model_name)
+    model_info = models.get(model_name, {})
 
     for family, exporter in _EXPORTERS.items():
         if isinstance(model, family):
-            model_info = repo.list_models().get(model_name, {})
             return exporter(
                 model,
                 output_path,
@@ -1005,12 +1092,6 @@ def export_to_onnx(
                 license_label=model_info.get("license"),
                 static_batch=static_batch,
             )
-
-    if static_batch:
-        raise ValueError(
-            "static_batch is only supported for RoFormer and SCNet models; HTDemucs "
-            "export always uses the legacy exporter's dynamic batch axis."
-        )
 
     if not isinstance(model, HTDemucs):
         raise ValueError(
@@ -1047,7 +1128,9 @@ def export_to_onnx(
             staging_path,
             input_names=["spec_real", "spec_imag", "audio"],
             output_names=["out_spec_real", "out_spec_imag", "out_wave"],
-            dynamic_axes={
+            dynamic_axes=None
+            if static_batch
+            else {
                 "spec_real": {0: "batch"},
                 "spec_imag": {0: "batch"},
                 "audio": {0: "batch"},
@@ -1065,15 +1148,27 @@ def export_to_onnx(
         if fp16:
             _convert_weights_to_fp16(onnx_model)
 
-        _add_metadata(
-            onnx_model,
-            {
-                "sources": json.dumps(model.sources),
-                "sample_rate": str(model.samplerate),
-                "audio_channels": str(model.audio_channels),
-                "precision": "fp16" if fp16 else "fp32",
+        metadata = _export_metadata(
+            model,
+            family="demucs",
+            architecture="htdemucs",
+            segment_samples=segment_samples,
+            stft={
+                "n_fft": nfft,
+                "hop_length": hop_length,
+                "win_length": nfft,
+                "normalized": True,
             },
+            stft_window="hann",
+            fp16=fp16,
+            static_batch=static_batch,
+            license_label=model_info.get("license"),
         )
+        # Demucs-only STFT trimming: pre-pad, then drop two frames per side
+        # and the top frequency bin. See onnx.md.
+        metadata["stft_pad_samples"] = str(hop_length // 2 * 3)
+        metadata["stft_frame_trim"] = "2"
+        _add_metadata(onnx_model, metadata)
 
         onnx.checker.check_model(onnx_model)
         onnx.save(onnx_model, staging_path)

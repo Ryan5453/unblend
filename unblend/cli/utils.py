@@ -13,8 +13,6 @@ from rich.markup import escape
 
 console = Console()
 
-METADATA_PATH = Path(__file__).parent.parent / "metadata.yaml"
-
 
 def format_file_size(size_bytes: int) -> str:
     """

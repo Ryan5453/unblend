@@ -976,12 +976,10 @@ def apply_model_multi(
 
     if isinstance(model, ModelEnsemble):
         totals = model.validated_weight_totals()
-        combine = getattr(model, "combine_mode", COMBINE_DEFAULT)
+        combine = model.combine_mode
 
-        member_normalization = list(
-            getattr(model, "member_normalization", [False] * len(model.models))
-        )
-        if getattr(model, "external_normalization", True):
+        member_normalization = list(model.member_normalization)
+        if model.external_normalization:
             member_normalization = [False] * len(model.models)
         mix_stats: list[tuple[Tensor, Tensor]] | None = None
         if any(member_normalization):

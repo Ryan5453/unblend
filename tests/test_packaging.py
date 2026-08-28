@@ -135,24 +135,10 @@ def test_cog_model_url_matches_metadata() -> None:
     baked_filename, baked_url = match.groups()
 
     registry = _load_mapping(ROOT / "unblend" / "metadata.yaml")
-    layers = registry["models"]["htdemucs"]["models"]
-    assert len(layers) == 1, "cog.yaml bakes exactly one layer but htdemucs has more"
+    entry = registry["models"]["htdemucs"]
+    assert "members" not in entry, "cog.yaml bakes one file but htdemucs has more"
 
-    # Absolute remotes are used verbatim; relative ones resolve against the
-    # Meta CDN — mirror unblend.repo's URL construction.
-    remote = layers[0]["remote"]
-    if "://" in remote:
-        expected_url = remote
-    else:
-        base = re.search(
-            r'^BASE_CDN_URL = "([^"]+)"',
-            (ROOT / "unblend" / "repo.py").read_text(),
-            re.MULTILINE,
-        )
-        assert base, "BASE_CDN_URL not found in unblend/repo.py"
-        expected_url = f"{base.group(1)}/{remote}"
-
-    assert baked_url == expected_url
-    assert baked_filename == f"{layers[0]['sha256'][:16]}.safetensors"
-    assert f"--max-filesize {layers[0]['size_bytes']}" in cog
-    assert layers[0]["sha256"] in cog
+    assert baked_url == entry["checkpoint"]["url"]
+    assert baked_filename == f"{entry['checkpoint']['sha256'][:16]}.safetensors"
+    assert f"--max-filesize {entry['checkpoint']['size_bytes']}" in cog
+    assert entry["checkpoint"]["sha256"] in cog

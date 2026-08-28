@@ -186,7 +186,7 @@ def test_ensure_model_available_downloads_uncached_single_checkpoint_backend(
             "architecture": "htdemucs",
             "sources": ["vocals", "other"],
             "config": {"sources": ["vocals", "other"]},
-            "models": [{"format": "safetensors", "path": str(path)}],
+            "checkpoint": {"format": "safetensors", "path": str(path)},
         },
     ],
     ids=["single-checkpoint", "demucs-layer"],
@@ -670,7 +670,7 @@ def test_models_remove_all_sweeps_partial_and_temp_files(
     """
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path))
     # One layer of the multi-layer ensemble = a genuinely partial cache.
-    layer = ModelRepository().list_models()["htdemucs_ft"]["models"][0]
+    layer = ModelRepository().list_models()["htdemucs_ft"]["members"][0]
     partial_layer = tmp_path / f"{layer['sha256'][:16]}.safetensors"
     stale_tmp = tmp_path / f"{STAGING_PREFIX}q1w2e3.tmp"
     partial_layer.write_bytes(b"x")

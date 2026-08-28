@@ -29,11 +29,11 @@ def test_every_demucs_layer_has_safe_artifact_and_config() -> None:
             continue
         assert info["architecture"] == "htdemucs"
         assert info["config"]["sources"] == info["sources"]
-        layers = info.get("models")
-        assert layers, f"{name} has no layers"
+        layers = info.get("members") or [info.get("checkpoint")]
+        assert all(layers), f"{name} has no weights"
         for layer in layers:
             assert layer["format"] == "safetensors"
-            assert layer["remote"].endswith(".safetensors")
+            assert layer["url"].endswith(".safetensors")
             assert len(layer["sha256"]) == 64
             assert layer["size_bytes"] > 0
 

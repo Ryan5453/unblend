@@ -279,7 +279,6 @@ def test_repository_loads_roformer_from_cache(tmp_path, monkeypatch) -> None:
     metadata = {
         "models": {
             "test_bs": {
-                "backend": "roformer",
                 "architecture": "bs_roformer",
                 "license": "MIT",
                 "sources": ["vocals", "other"],

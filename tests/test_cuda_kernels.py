@@ -20,7 +20,6 @@ import torch.nn.functional as F
 
 from unblend.cuda import (
     CUDAGroupNorm,
-    CUDAMultiheadAttention,
     CUDAMyGroupNorm,
     FusedGroupNormGelu,
     FusedGroupNormGlu,
@@ -800,136 +799,6 @@ def test_cuda_my_group_norm_matches_fallback(
 
 
 @cuda_only
-@pytest.mark.parametrize("dtype", LP_DTYPES)
-def test_cuda_multihead_attention_matches_reference(dtype: torch.dtype) -> None:
-    """
-    ``CUDAMultiheadAttention``'s SDPA path matches ``nn.MultiheadAttention``.
-
-    Self-attention, batch_first, ``need_weights=False`` — the configuration the
-    wrapper optimises — on CUDA in FP16/BF16, against the FP32 CPU reference.
-
-    :param dtype: dtype under test
-    """
-    import copy
-
-    torch.manual_seed(0)
-    mha = nn.MultiheadAttention(64, 4, batch_first=True).eval()
-    x = torch.randn(2, 50, 64)
-
-    with torch.no_grad():
-        ref, _ = mha(x, x, x, need_weights=False)
-
-    # Deep-copy before wrapping: the wrapper shares parameter storage with the
-    # source MHA, so moving it to CUDA would otherwise also move the reference.
-    wrapped = CUDAMultiheadAttention.from_mha(copy.deepcopy(mha))
-    wrapped = wrapped.to(device=_device(), dtype=dtype).eval()
-
-    with torch.no_grad():
-        out, weights = wrapped(
-            x.to(_device(), dtype),
-            x.to(_device(), dtype),
-            x.to(_device(), dtype),
-            need_weights=False,
-        )
-
-    assert weights is None
-    assert out.dtype == dtype
-    torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
-
-
-@cuda_only
-def test_cuda_multihead_attention_training_preserves_dropout() -> None:
-    """
-    Training calls use native MHA so attention dropout is not omitted.
-    """
-    import copy
-
-    mha = nn.MultiheadAttention(16, 4, dropout=1.0, batch_first=True).train()
-    wrapped = CUDAMultiheadAttention.from_mha(copy.deepcopy(mha)).to(
-        device=_device(), dtype=torch.float16
-    )
-    assert wrapped.training
-    x = torch.randn(2, 7, 16, device=_device(), dtype=torch.float16)
-
-    # Spy on the wrapped module to assert the routing itself: training calls
-    # must reach the fallback MHA. We don't assert on the native outcome —
-    # backends disagree on dropout=1.0 (some raise NotImplementedError, the
-    # flash kernels raise RuntimeError about p_dropout < 1) and that behavior
-    # belongs to nn.MultiheadAttention, not this wrapper.
-    calls: list[int] = []
-    original_forward = wrapped._fallback.forward
-
-    def spying_forward(*args: torch.Tensor, **kwargs: object):
-        calls.append(1)
-        return original_forward(*args, **kwargs)
-
-    wrapped._fallback.forward = spying_forward
-    with torch.no_grad():
-        try:
-            wrapped(x, x, x, need_weights=False)
-        except (RuntimeError, NotImplementedError):
-            pass  # native rejection of p=1.0 is fine; routing is the contract
-    assert calls, "training call did not route to the wrapped MHA"
-
-
-@cuda_only
-@pytest.mark.parametrize("dtype", LP_DTYPES)
-@pytest.mark.parametrize("mask_kind", ["bool", "float", "causal"])
-def test_cuda_multihead_attention_masked_matches_reference(
-    dtype: torch.dtype, mask_kind: str
-) -> None:
-    """
-    Masked / causal calls route to the wrapped MHA and keep its semantics.
-
-    ``nn.MultiheadAttention``'s mask contract (bool ``True`` = disallowed)
-    is the opposite of ``F.scaled_dot_product_attention``'s, so these must
-    go through the fallback, not a hand-rolled SDPA call.
-
-    :param dtype: dtype under test
-    :param mask_kind: attention-mask flavour under test
-    """
-    import copy
-
-    torch.manual_seed(0)
-    mha = nn.MultiheadAttention(64, 4, batch_first=True).eval()
-    x = torch.randn(2, 50, 64)
-    if mask_kind == "bool":
-        mask = torch.zeros(50, 50, dtype=torch.bool)
-        mask[:, ::5] = True  # True = NOT allowed to attend
-        kwargs: dict = dict(attn_mask=mask)
-    elif mask_kind == "float":
-        mask = torch.zeros(50, 50)
-        mask[:, ::5] = float("-inf")
-        kwargs = dict(attn_mask=mask)
-    else:
-        mask = torch.triu(torch.ones(50, 50, dtype=torch.bool), diagonal=1)
-        kwargs = dict(attn_mask=mask, is_causal=True)
-
-    with torch.no_grad():
-        ref, _ = mha(x, x, x, need_weights=False, **kwargs)
-
-    wrapped = CUDAMultiheadAttention.from_mha(copy.deepcopy(mha))
-    wrapped = wrapped.to(device=_device(), dtype=dtype).eval()
-    dev_kwargs = {
-        k: (v.to(_device(), dtype) if k == "attn_mask" and mask_kind == "float" else v)
-        for k, v in kwargs.items()
-    }
-    if "attn_mask" in dev_kwargs and mask_kind != "float":
-        dev_kwargs["attn_mask"] = dev_kwargs["attn_mask"].to(_device())
-
-    with torch.no_grad():
-        out, _ = wrapped(
-            x.to(_device(), dtype),
-            x.to(_device(), dtype),
-            x.to(_device(), dtype),
-            need_weights=False,
-            **dev_kwargs,
-        )
-
-    torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
-
-
-@cuda_only
 def test_apply_cuda_optimizations_idempotent() -> None:
     """
     A second ``apply_cuda_optimizations`` call swaps nothing.
@@ -949,7 +818,7 @@ def test_apply_cuda_optimizations_idempotent() -> None:
     first = apply_cuda_optimizations(model)
     assert first["group_norm"] == 1
     assert first["my_group_norm"] == 1
-    assert first["multi_head_attention"] == 0
+    assert "multi_head_attention" not in first
     assert type(model.attn) is nn.MultiheadAttention
 
     second = apply_cuda_optimizations(model)

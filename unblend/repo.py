@@ -51,8 +51,6 @@ def _load_mapping(path: Path) -> Any:
     return yaml.safe_load(text)
 
 
-BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
-
 STAGING_PREFIX = ".unblend-download-"
 DOWNLOAD_DEADLINE_SECONDS = 2 * 60 * 60
 STAGING_STALE_SECONDS = DOWNLOAD_DEADLINE_SECONDS + 5 * 60
@@ -151,20 +149,13 @@ def _artifact_url(spec: dict) -> str | None:
     """
     The URL an artifact is downloaded from, if it is remote.
 
-    ``url`` is the canonical spelling. ``remote`` is the shipped Demucs
-    layers' historical spelling and may be a path relative to Meta's CDN,
-    which is where those weights have always lived.
-
-    :param spec: An artifact entry (a Demucs layer or a ``checkpoint``).
+    :param spec: An artifact entry (a member's weights, or a ``checkpoint``).
     :return: An absolute URL, or ``None`` for a local artifact.
     """
     url = spec.get("url")
-    if isinstance(url, str) and url:
-        return url
-    remote = spec.get("remote")
-    if not isinstance(remote, str) or not remote:
+    if not isinstance(url, str) or not url:
         return None
-    return remote if "://" in remote else f"{BASE_CDN_URL}/{remote}"
+    return url
 
 
 def _artifact_cache_key(spec: dict) -> str:
@@ -280,7 +271,14 @@ def _build_demucs_layer(state: dict, member: dict, label: str) -> HTDemucs:
         model = HTDemucs(**dict(member["config"]))
         model.load_state_dict(state, strict=True)
         return model
-    except (KeyError, TypeError, RuntimeError, SafetensorError, ValueError) as exc:
+    except (
+        KeyError,
+        TypeError,
+        RuntimeError,
+        SafetensorError,
+        ValueError,
+        ValidationError,
+    ) as exc:
         raise ModelLoadingError(f"Failed to build {label}: {exc}") from exc
 
 
@@ -323,6 +321,21 @@ def _known_architectures() -> frozenset[str]:
     )
 
 
+def _reject_declared_backend(label: str, info: dict) -> None:
+    """
+    Reject a ``backend`` field: the loader family is derived, never declared.
+
+    :param label: Human-readable prefix for error messages.
+    :param info: A registry entry or a raw member spec.
+    :raises ModelLoadingError: If the mapping declares a backend.
+    """
+    if isinstance(info, dict) and "backend" in info:
+        raise ModelLoadingError(
+            f"{label} declares a 'backend'; that field no longer exists. The "
+            "loader family is derived from 'architecture' — remove it."
+        )
+
+
 def _backend_for(label: str, info: dict) -> str:
     """
     Resolve which backend builds a model, or one ensemble member.
@@ -331,12 +344,6 @@ def _backend_for(label: str, info: dict) -> str:
         A registry entry or a resolved member.
     :return: The backend name.
     """
-    declared = info.get("backend")
-    if declared is not None:
-        if declared not in _known_backends():
-            raise ModelLoadingError(f"{label} has unknown backend {declared!r}.")
-        return declared
-
     architecture = info.get("architecture")
     derived = None
     if isinstance(architecture, str):
@@ -363,25 +370,24 @@ def _entry_member_specs(model_name: str, model_info: dict) -> list[dict]:
     :return: The raw member specs.
     """
     present = [
-        key
-        for key in ("checkpoint", "members", "models")
-        if model_info.get(key) is not None
+        key for key in ("checkpoint", "members") if model_info.get(key) is not None
     ]
     if len(present) != 1:
         raise ModelLoadingError(
-            f"Model {model_name} must declare exactly one of 'checkpoint', "
-            f"'members' or 'models'; found {present or ['none']}."
+            f"Model {model_name} must declare exactly one of 'checkpoint' or "
+            f"'members'; found {present or ['none']}."
         )
     if present[0] == "checkpoint":
         return [{"checkpoint": model_info["checkpoint"]}]
-    raw = model_info[present[0]]
-    noun = "layer" if present[0] == "models" else "member"
+    raw = model_info["members"]
     if not (
-        isinstance(raw, list) and raw and all(isinstance(item, dict) for item in raw)
+        isinstance(raw, list)
+        and len(raw) > 1
+        and all(isinstance(item, dict) for item in raw)
     ):
         raise ModelLoadingError(
-            f"Model {model_name} must declare a non-empty {noun} list "
-            f"under {present[0]!r}."
+            f"Model {model_name} must declare at least two members under "
+            "'members'; a single set of weights is a 'checkpoint'."
         )
     return raw
 
@@ -449,6 +455,7 @@ def _validate_entry(model_name: str, model_info: object) -> dict:
         raise ModelLoadingError("Every model name must be a non-empty string.")
     if not isinstance(model_info, dict):
         raise ModelLoadingError(f"Model {model_name} metadata must be a dictionary.")
+    _reject_declared_backend(f"Model {model_name}", model_info)
 
     sources = model_info.get("sources")
     if not (
@@ -627,14 +634,7 @@ class ModelRepository:
 
             used = {member["backend"] for member in members}
             derived = used.pop() if len(used) == 1 else ENSEMBLE_BACKEND
-            declared = model_info.get("backend")
-            if declared is None:
-                self._models[model_name] = {**model_info, "backend": derived}
-            elif declared != derived:
-                raise ModelLoadingError(
-                    f"Model {model_name} declares backend {declared!r} but its "
-                    f"members are built by {derived!r}."
-                )
+            self._models[model_name] = {**model_info, "backend": derived}
         self.metadata["models"] = self._models
 
         self._layer_urls: dict[str, str] = {}
@@ -706,7 +706,7 @@ class ModelRepository:
                 resolved.append(member)
                 continue
 
-            declared_backend = model_info.get("backend")
+            _reject_declared_backend(label, spec)
             artifact = _member_artifact(spec)
 
             embedded = _embedded_member_fields(artifact)
@@ -714,12 +714,6 @@ class ModelRepository:
                 _validate_member(
                     label,
                     {
-                        "backend": (
-                            declared_backend
-                            if "architecture" not in spec
-                            and declared_backend != ENSEMBLE_BACKEND
-                            else None
-                        ),
                         "architecture": _member_field(
                             "architecture", spec, model_info, embedded
                         ),
