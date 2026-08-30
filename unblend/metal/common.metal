@@ -127,3 +127,43 @@ inline void gn_reduce_finalize(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
+
+// ---------------------------------------------------------------------------
+// Channel-walk fallback for the apply loops
+// ---------------------------------------------------------------------------
+//
+// The vector paths in the apply kernels need the affine index to be constant
+// across each SCALAR4_T, i.e. N % 4 == 0 for the channel-first layout. When
+// that fails the kernels used to fall back to a flat grid-stride loop that
+// recomputed ``c = i / N`` and ``sp = i % N`` for every element -- two 32-bit
+// integer divides (a multi-instruction sequence on Apple GPUs) per element,
+// and for the GLU kernels the ``c * N + sp`` it rebuilt from them was just
+// ``i`` again.
+//
+// Walking the tile one channel at a time removes all of that: the affine
+// parameters are loaded once per channel and the element index is the loop
+// variable. Within a channel the elements are contiguous, so the bulk can
+// still be vectorized even though N is not a multiple of 4 -- a scalar head
+// brings the cursor to a 4-element boundary, a SCALAR4_T body covers the
+// middle, and a scalar tail finishes the channel.
+//
+// Measured on an M2 Max (apply_norm_glu_ls_resid, 3x96x85995): 1.21x from the
+// channel walk alone, 1.42x with the vectorized body.
+
+// Bounds of channel ``c``'s slice of the tile range ``[lo, end)``:
+//   hi   - end of this channel's slice
+//   head - first 4-element-aligned index at or after ``lo``, clamped to ``hi``
+//   vend - end of the 4-element-aligned body
+#define GN_CHANNEL_BOUNDS(lo, end, N, c, hi, head, vend)  \
+    const uint hi   = min((end), ((c) + 1u) * (N));       \
+    const uint head = min(hi, ((lo) + 3u) & ~3u);         \
+    const uint vend = head + (((hi - head) >> 2) << 2)
+
+// Whether the vectorized body is safe for a per-batch stride of ``per_b``
+// elements. Every buffer the apply kernels touch is indexed as
+// ``batch_base + i`` with ``batch_base`` a multiple of the per-batch stride,
+// so a 4-aligned ``i`` only yields a 4-aligned absolute offset -- and hence a
+// legally aligned SCALAR4_T access -- when that stride is itself a multiple
+// of 4. Without this guard a shape like C=6, N=85995 (per-batch stride
+// 515970) would cast an odd element offset to SCALAR4_T* and read garbage.
+#define GN_CHANNEL_VECTORIZABLE(per_b) (((per_b) & 3u) == 0u)

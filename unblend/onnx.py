@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from .blocks import pad1d, spectro
 from .htdemucs import HTDemucs
-from .repo import ModelRepository
+from .repo import ModelRepository, artifact_storage_dtype
 from .roformer import (
     Attention,
     FeedForward,
@@ -377,10 +377,25 @@ def compute_stft_for_export(
     return real, imag
 
 
-_EXPORT_PRECISIONS = ("native", "fp16", "fp32")
+# Weight storage precisions the exporter can write. These labels are the
+# ``--precision`` values, the ONNX metadata spelling, and the export filename
+# suffix. "native" resolves to whatever the checkpoint's header declares.
+_STORAGE_DTYPES: dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp8_e5m2": torch.float8_e5m2,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
+_STORAGE_LABELS: dict[torch.dtype, str] = {
+    dt: name for name, dt in _STORAGE_DTYPES.items()
+}
+
+_EXPORT_PRECISIONS = ("native", *_STORAGE_DTYPES)
 
 # Families whose fp16 export converts compute as well as storage. Everything
-# else gets the weight-only rewrite, keeping arithmetic in fp32.
+# else gets the weight-only rewrite, keeping arithmetic in fp32. Only fp16 has
+# a mixed-precision converter, so narrower storage falls back to weight-only.
 _MIXED_PRECISION_FAMILIES = frozenset({"roformer"})
 
 
@@ -398,52 +413,77 @@ def _validate_export_precision(precision: str) -> None:
         )
 
 
-def _weights_are_fp16_exact(model: nn.Module) -> bool:
+def _resolve_export_precision(precision: str, model_info: dict) -> torch.dtype:
     """
-    Whether every float weight survives a round trip through fp16.
+    Resolve a validated ``precision`` choice to a weight storage dtype.
 
-    This is what ``precision="native"`` keys off, rather than the
-    checkpoint's storage dtype: it tests losslessness directly instead of a
-    proxy for it, so it stays correct whatever format upstream ships. The
-    HTDemucs checkpoints answer True because Demucs' ``serialize_model``
-    rounded them to fp16 at release and loading merely widens them back;
-    the RoFormer and SCNet checkpoints are genuinely fp32 and answer False
-    on one of the first tensors checked.
-
-    :param model: Model whose ``state_dict`` is inspected.
-    :return: True when fp16 storage discards nothing.
-    """
-    for tensor in model.state_dict().values():
-        if not tensor.is_floating_point():
-            continue
-        if not torch.equal(tensor, tensor.half().float()):
-            return False
-    return True
-
-
-def _resolve_export_precision(precision: str, model: nn.Module) -> bool:
-    """
-    Resolve a validated ``precision`` choice to a storage decision.
+    ``"native"`` is the dtype the checkpoint declares in its Safetensors
+    header: fp16 for HTDemucs, because Demucs' ``serialize_model`` rounded
+    those weights at release and loading merely widens them back, and fp32 for
+    RoFormer and SCNet. A checkpoint saved at fp8 exports at fp8.
 
     :param precision: One of ``_EXPORT_PRECISIONS``.
-    :param model: Model being exported, inspected only for ``"native"``.
-    :return: True to store weights as fp16.
+    :param model_info: Registry entry, read only for ``"native"``.
+    :return: Dtype to store weights at; fp32 means no conversion.
     """
-    if precision == "fp16":
-        return True
-    if precision == "fp32":
-        return False
-    return _weights_are_fp16_exact(model)
+    if precision != "native":
+        return _STORAGE_DTYPES[precision]
+    declared = artifact_storage_dtype(model_info["checkpoint"])
+    if declared is None or declared not in _STORAGE_LABELS:
+        # Unreadable header, or a width ONNX cannot express: fp32 is the only
+        # choice that cannot silently lose anything.
+        return torch.float32
+    return declared
 
 
-def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
+# Storage dtype -> (numpy dtype factory, ONNX elem type, minimum opset). The
+# fp8 types only exist from opset 19, so exporting to them raises the graph's
+# opset rather than emitting a model no runtime will load.
+def _onnx_storage_spec(dtype: torch.dtype) -> tuple[object, int, int]:
     """
-    Rewrite ONNX weights as float16.
+    Resolve a torch storage dtype to its ONNX representation.
 
-    :param onnx_model: Loaded ONNX model; modified in place.
+    :param dtype: Reduced-precision storage dtype.
+    :return: ``(numpy dtype, TensorProto elem type, minimum opset)``.
+    :raises ValueError: If ONNX has no representation for the dtype.
     """
     import numpy as np
+    from onnx import TensorProto
+
+    if dtype is torch.float16:
+        return np.float16, TensorProto.FLOAT16, 1
+    try:
+        import ml_dtypes
+    except ImportError:
+        raise ImportError(
+            "ml_dtypes is required to export weights narrower than fp16. "
+            "Install unblend with the 'onnx' extra."
+        ) from None
+    table: dict[torch.dtype, tuple[object, int, int]] = {
+        torch.bfloat16: (ml_dtypes.bfloat16, TensorProto.BFLOAT16, 1),
+        torch.float8_e4m3fn: (ml_dtypes.float8_e4m3fn, TensorProto.FLOAT8E4M3FN, 19),
+        torch.float8_e5m2: (ml_dtypes.float8_e5m2, TensorProto.FLOAT8E5M2, 19),
+    }
+    if dtype not in table:
+        raise ValueError(f"No ONNX storage representation for {dtype}.")
+    return table[dtype]
+
+
+def _convert_weight_storage(onnx_model: "onnx.ModelProto", dtype: torch.dtype) -> None:
+    """
+    Rewrite ONNX weight initializers at a narrower storage dtype.
+
+    Arithmetic is untouched: each converted initializer is followed by a
+    ``Cast`` back to fp32, so only the stored bytes shrink. This is the
+    weight-only path used by every family except RoFormer at fp16.
+
+    :param onnx_model: Loaded ONNX model; modified in place.
+    :param dtype: Storage dtype for the weights.
+    """
     from onnx import TensorProto, helper, numpy_helper
+
+    np_dtype, elem_type, min_opset = _onnx_storage_spec(dtype)
+    suffix = "_" + _STORAGE_LABELS[dtype]
 
     weight_op_inputs = {
         "Conv": (1, 2),
@@ -507,13 +547,15 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
             and init.name not in existing_outputs
             and init.name not in existing_inputs
         ):
-            arr = numpy_helper.to_array(init).astype(np.float16)
-            fp16_name = init.name + "_fp16"
-            new_inits.append(numpy_helper.from_array(arr, name=fp16_name))
+            arr = numpy_helper.to_array(init).astype(np_dtype)
+            stored_name = init.name + suffix
+            stored = numpy_helper.from_array(arr, name=stored_name)
+            stored.data_type = elem_type
+            new_inits.append(stored)
             new_cast_nodes.append(
                 helper.make_node(
                     "Cast",
-                    inputs=[fp16_name],
+                    inputs=[stored_name],
                     outputs=[init.name],
                     to=TensorProto.FLOAT,
                     name=init.name + "_cast_to_fp32",
@@ -524,9 +566,9 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
 
     if not new_cast_nodes:
         raise RuntimeError(
-            "fp16 export requested but no fp32 weight initializers were "
-            "converted — the exporter's op/initializer layout likely "
-            "changed. Refusing to write a model mislabeled as fp16."
+            f"{_STORAGE_LABELS[dtype]} export requested but no fp32 weight "
+            "initializers were converted — the exporter's op/initializer "
+            "layout likely changed. Refusing to write a mislabeled model."
         )
 
     onnx_model.graph.ClearField("initializer")
@@ -535,6 +577,13 @@ def _convert_weights_to_fp16(onnx_model: "onnx.ModelProto") -> None:
     original_nodes = list(onnx_model.graph.node)
     onnx_model.graph.ClearField("node")
     onnx_model.graph.node.extend(new_cast_nodes + original_nodes)
+
+    if min_opset > 1:
+        for opset in onnx_model.opset_import:
+            if opset.domain in ("", "ai.onnx"):
+                opset.version = max(opset.version, min_opset)
+        # fp8 tensor types require IR version 9 or newer.
+        onnx_model.ir_version = max(onnx_model.ir_version, 9)
 
 
 def _convert_roformer_to_fp16(onnx_model: "onnx.ModelProto") -> None:
@@ -810,7 +859,7 @@ def _export_metadata(
     segment_samples: int,
     stft: dict,
     stft_window: str,
-    fp16: bool,
+    storage: torch.dtype,
     static_batch: bool,
     license_label: str | None,
 ) -> dict[str, str]:
@@ -826,7 +875,7 @@ def _export_metadata(
     :param segment_samples: Samples the graph expects per call.
     :param stft: STFT geometry, with the ``torch.stft`` keyword names.
     :param stft_window: Analysis window, ``"hann"`` or ``"none"``.
-    :param fp16: Whether weights were stored as fp16. Whether that also
+    :param storage: Dtype the weights were stored at. Whether that also
         converts arithmetic follows from ``family``.
     :param static_batch: Whether the batch axis was traced fixed at 1.
     :param license_label: Registry license label, embedded when set.
@@ -836,10 +885,10 @@ def _export_metadata(
         "sources": json.dumps(list(model.sources)),
         "sample_rate": str(model.samplerate),
         "audio_channels": str(model.audio_channels),
-        "precision": "fp16" if fp16 else "fp32",
-        "weight_precision": "fp16" if fp16 else "fp32",
+        "precision": _STORAGE_LABELS[storage],
+        "weight_precision": _STORAGE_LABELS[storage],
         "compute_precision": "fp16"
-        if fp16 and family in _MIXED_PRECISION_FAMILIES
+        if storage is torch.float16 and family in _MIXED_PRECISION_FAMILIES
         else "fp32",
         "model_family": family,
         "architecture": architecture,
@@ -861,7 +910,7 @@ def _export_roformer_to_onnx(
     output_path: str,
     *,
     opset_version: int,
-    fp16: bool,
+    storage: torch.dtype,
     license_label: str | None = None,
     static_batch: bool = False,
 ) -> str:
@@ -870,7 +919,8 @@ def _export_roformer_to_onnx(
 
     :param model: The model to export. :param output_path: Path to save the
         ONNX model. :param opset_version: Requested opset; clamped up to 18.
-        :param fp16: Use browser-oriented mixed precision. :param license_label:
+        :param storage: Weight storage dtype; fp16 selects the browser-oriented
+        mixed-precision path. :param license_label:
         License to embed in metadata. :param static_batch: Trace with fixed
         batch=1 instead of dynamic batch.
     :return: Path to the exported ONNX model.
@@ -921,8 +971,10 @@ def _export_roformer_to_onnx(
 
         _materialize_nonlast_broadcast_muls(onnx_model)
         _materialize_matmul_rank_mismatch(onnx_model)
-        if fp16:
+        if storage is torch.float16:
             _convert_roformer_to_fp16(onnx_model)
+        elif storage is not torch.float32:
+            _convert_weight_storage(onnx_model, storage)
 
         architecture = (
             "mel_band_roformer" if isinstance(model, MelBandRoformer) else "bs_roformer"
@@ -934,7 +986,7 @@ def _export_roformer_to_onnx(
             segment_samples=segment_samples,
             stft=stft,
             stft_window="hann",
-            fp16=fp16,
+            storage=storage,
             static_batch=static_batch,
             license_label=license_label,
         )
@@ -968,7 +1020,7 @@ def _export_scnet_to_onnx(
     output_path: str,
     *,
     opset_version: int,
-    fp16: bool,
+    storage: torch.dtype,
     license_label: str | None,
     static_batch: bool,
 ) -> str:
@@ -978,7 +1030,7 @@ def _export_scnet_to_onnx(
     :param model: The SCNet to export.
     :param output_path: Path to save the ONNX model.
     :param opset_version: Requested opset; raised to 18.
-    :param fp16: Convert weights to fp16.
+    :param storage: Weight storage dtype.
     :param license_label: License recorded in metadata.
     :param static_batch: Trace with fixed batch of 1.
     :return: Path to the exported ONNX model.
@@ -1028,8 +1080,8 @@ def _export_scnet_to_onnx(
         )
         program.save(staging)
         onnx_model = onnx.load(staging)
-        if fp16:
-            _convert_weights_to_fp16(onnx_model)
+        if storage is not torch.float32:
+            _convert_weight_storage(onnx_model, storage)
         window = "hann" if hasattr(model, "window") else "none"
         metadata = _export_metadata(
             model,
@@ -1038,7 +1090,7 @@ def _export_scnet_to_onnx(
             segment_samples=segment + padding,
             stft=model.stft_config,
             stft_window=window,
-            fp16=fp16,
+            storage=storage,
             static_batch=static_batch,
             license_label=license_label,
         )
@@ -1151,12 +1203,11 @@ def export_to_onnx(
     model = repo.get_model(model_name)
     model_info = models.get(model_name, {})
 
-    fp16 = _resolve_export_precision(precision, model)
+    storage = _resolve_export_precision(precision, model_info)
 
     if output_path is None:
         static_suffix = "_static" if static_batch else ""
-        stored = "fp16" if fp16 else "fp32"
-        output_path = f"{model_name}_{stored}{static_suffix}.onnx"
+        output_path = f"{model_name}_{_STORAGE_LABELS[storage]}{static_suffix}.onnx"
 
     for family, exporter in _EXPORTERS.items():
         if isinstance(model, family):
@@ -1164,7 +1215,7 @@ def export_to_onnx(
                 model,
                 output_path,
                 opset_version=opset_version,
-                fp16=fp16,
+                storage=storage,
                 license_label=model_info.get("license"),
                 static_batch=static_batch,
             )
@@ -1221,8 +1272,8 @@ def export_to_onnx(
 
         onnx_model = onnx.load(staging_path)
 
-        if fp16:
-            _convert_weights_to_fp16(onnx_model)
+        if storage is not torch.float32:
+            _convert_weight_storage(onnx_model, storage)
 
         metadata = _export_metadata(
             model,
@@ -1236,7 +1287,7 @@ def export_to_onnx(
                 "normalized": True,
             },
             stft_window="hann",
-            fp16=fp16,
+            storage=storage,
             static_batch=static_batch,
             license_label=model_info.get("license"),
         )

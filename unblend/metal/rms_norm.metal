@@ -1,14 +1,23 @@
 // RoFormer RMSNorm over the contiguous last dimension.
 //
-// One threadgroup handles one row. Inputs and affine weights may be FP32,
-// FP16, or BF16, but the sum-of-squares reduction and affine arithmetic stay
-// in FP32 to match ``RMSNorm.forward``. The Python side injects SCALAR_T.
-
-#include <metal_stdlib>
-using namespace metal;
+// One SIMDGROUP handles one row, so the sum-of-squares reduction is a single
+// ``simd_sum`` with no threadgroup barriers and no threadgroup memory. (The
+// previous shape — one 256-thread threadgroup per row reducing through a
+// shared-memory tree — spent log2(tgs) barriers and 4 KB of threadgroup
+// memory per row to reduce as little as one element per thread, which capped
+// occupancy and left the kernel at ~3% of memory bandwidth.)
+//
+// A threadgroup packs ``tgs / 32`` simdgroups and therefore normalizes that
+// many rows; the host launches ceil(rows / rows_per_tg) threadgroups and the
+// kernel bounds-checks the tail.
+//
+// Inputs and affine weights may be FP32, FP16, or BF16, but the reduction and
+// affine arithmetic stay in FP32 to match ``RMSNorm.forward``. The Python side
+// injects SCALAR_T / SCALAR4_T.
 
 #ifndef SCALAR_T
 #define SCALAR_T half
+#define SCALAR4_T half4
 #endif
 
 kernel void rms_norm(
@@ -17,42 +26,56 @@ kernel void rms_norm(
     device const SCALAR_T* gamma [[buffer(2)]],
     constant uint&         dim   [[buffer(3)]],
     constant float&        scale [[buffer(4)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    constant uint&         rows  [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tgs  [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint MAX_TGS = 1024;
-    threadgroup float shared_sqsum[MAX_TGS];
+    // Whole simdgroups take the same branch, so returning here never strands
+    // a lane inside the simd_sum below.
+    const uint row = tg * (tgs >> 5) + sid;
+    if (row >= rows) {
+        return;
+    }
 
     const ulong base = (ulong)row * dim;
-    float local_sqsum = 0.0f;
-    for (uint i = tid; i < dim; i += tgs) {
-        const float value = float(in_[base + i]);
-        local_sqsum += value * value;
-    }
-    shared_sqsum[tid] = local_sqsum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const SCALAR_T* x_row = in_ + base;
+    device SCALAR_T*       o_row = out + base;
 
-    for (uint stride = tgs >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sqsum[tid] += shared_sqsum[tid + stride];
+    if ((dim & 3u) == 0u) {
+        // dim % 4 == 0 makes every row base a multiple of 4 elements, so the
+        // vector casts stay naturally aligned.
+        device const SCALAR4_T* x4 = (device const SCALAR4_T*)x_row;
+        device SCALAR4_T*       o4 = (device SCALAR4_T*)o_row;
+        device const SCALAR4_T* g4 = (device const SCALAR4_T*)gamma;
+        const uint nv = dim >> 2;
+
+        float local_sqsum = 0.0f;
+        for (uint i = lane; i < nv; i += 32) {
+            const float4 v = float4(x4[i]);
+            local_sqsum += dot(v, v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    threadgroup float multiplier;
-    if (tid == 0) {
         // F.normalize divides by max(L2 norm, 1e-12), then RoFormer
         // multiplies by sqrt(dim). Keep that exact convention rather than
         // introducing the additive epsilon used by other RMSNorm variants.
-        const float norm = sqrt(shared_sqsum[0]);
-        multiplier = scale / max(norm, 1.0e-12f);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float multiplier =
+            scale / max(sqrt(simd_sum(local_sqsum)), 1.0e-12f);
 
-    for (uint i = tid; i < dim; i += tgs) {
-        const float value = float(in_[base + i]);
-        const float gain = float(gamma[i]);
-        out[base + i] = SCALAR_T(value * multiplier * gain);
+        for (uint i = lane; i < nv; i += 32) {
+            o4[i] = SCALAR4_T(float4(x4[i]) * multiplier * float4(g4[i]));
+        }
+    } else {
+        float local_sqsum = 0.0f;
+        for (uint i = lane; i < dim; i += 32) {
+            const float value = float(x_row[i]);
+            local_sqsum += value * value;
+        }
+        const float multiplier =
+            scale / max(sqrt(simd_sum(local_sqsum)), 1.0e-12f);
+
+        for (uint i = lane; i < dim; i += 32) {
+            o_row[i] = SCALAR_T(float(x_row[i]) * multiplier * float(gamma[i]));
+        }
     }
 }

@@ -2,6 +2,8 @@
 Regression tests for the SCNet backend.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -388,7 +390,7 @@ def test_scnet_export_uses_browser_io_and_records_both_segment_lengths(
         model,
         path,
         opset_version=18,
-        fp16=False,
+        storage=torch.float32,
         license_label="unlicensed",
         static_batch=True,
     )
@@ -409,3 +411,54 @@ def test_scnet_export_uses_browser_io_and_records_both_segment_lengths(
     )
     assert metadata["stft_window"] == "hann"
     assert not [key for key in metadata if key.startswith("unblend.")]
+
+
+def test_scnet_export_stores_weights_at_any_registered_precision(tmp_path) -> None:
+    """
+    The weight-only rewrite is dtype-agnostic, down to fp8.
+
+    Storage narrows while arithmetic stays fp32, the graph's opset is raised
+    when the dtype demands it, and onnxruntime still loads the result.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+    ort = pytest.importorskip("onnxruntime")
+
+    from unblend.onnx import _export_scnet_to_onnx
+    from unblend.scnet import SCNetMasked
+
+    sources = ["drums", "bass", "other", "vocals"]
+    model = SCNetMasked(sources=sources, **_tiny())
+    model.configure_inference(sources=sources, samplerate=44100, segment_samples=4096)
+
+    sizes = {}
+    for label, dtype in (
+        ("fp32", torch.float32),
+        ("fp16", torch.float16),
+        ("fp8_e4m3", torch.float8_e4m3fn),
+    ):
+        path = str(tmp_path / f"scnet_{label}.onnx")
+        _export_scnet_to_onnx(
+            model,
+            path,
+            opset_version=18,
+            storage=dtype,
+            license_label="unlicensed",
+            static_batch=True,
+        )
+        exported = onnx.load(path)
+        metadata = {p.key: p.value for p in exported.metadata_props}
+        assert metadata["weight_precision"] == label
+        # SCNet is not a mixed-precision family, so arithmetic never narrows.
+        assert metadata["compute_precision"] == "fp32"
+        opset = next(
+            o.version for o in exported.opset_import if o.domain in ("", "ai.onnx")
+        )
+        assert opset >= (19 if dtype is torch.float8_e4m3fn else 18)
+        onnx.checker.check_model(exported)
+        ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        sizes[label] = os.path.getsize(path)
+
+    assert sizes["fp8_e4m3"] < sizes["fp16"] < sizes["fp32"]

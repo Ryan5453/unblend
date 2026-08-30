@@ -109,3 +109,62 @@ def test_read_pcm16_wav_rejects_non_wav(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "notwav.mp3"
     path.write_bytes(b"\x00" * 64)
     assert Separator._read_pcm16_wav(path) is None
+
+
+def test_checkpoint_at_any_precision_loads_into_fp32_modules() -> None:
+    """
+    Storage precision is independent of compute: an fp8 state dict loads.
+
+    Modules are built in fp32 and ``load_state_dict`` widens on the way in, so
+    a model trained at a precision unblend cannot compute in still runs here —
+    the same mechanism that already carries the fp16 HTDemucs checkpoint.
+    """
+    module = torch.nn.Sequential(torch.nn.Conv1d(4, 4, 3), torch.nn.LSTM(4, 4))
+    for dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        state = {
+            key: value.to(dtype) if value.is_floating_point() else value
+            for key, value in module.state_dict().items()
+        }
+        module.load_state_dict(state, strict=True)
+        assert next(module.parameters()).dtype is torch.float32
+
+
+def test_reduced_precision_error_separates_storage_from_compute() -> None:
+    """
+    A dtype we cannot compute in says so without implying storage is limited.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        Separator(device="cpu", dtype=torch.float8_e4m3fn)
+    assert "stored at, which may be anything" in str(excinfo.value)
+
+
+def test_export_native_precision_follows_the_checkpoint_header() -> None:
+    """
+    "native" is the dtype the Safetensors header declares, not an inference.
+
+    HTDemucs ships fp16 because upstream rounded it at release; the RoFormer
+    and SCNet checkpoints are genuinely fp32.
+    """
+    from unblend.onnx import _resolve_export_precision
+    from unblend.repo import ModelRepository
+
+    models = ModelRepository().list_models()
+    for name, expected in (
+        ("htdemucs", torch.float16),
+        ("htdemucs_6s", torch.float16),
+        ("scnet_small", torch.float32),
+        ("bs_roformer_anvuew", torch.float32),
+    ):
+        assert _resolve_export_precision("native", models[name]) is expected
+
+
+def test_export_precision_falls_back_to_fp32_when_header_is_unreadable() -> None:
+    """
+    A missing or unreadable checkpoint exports at full width, not a guess.
+    """
+    from unblend.onnx import _resolve_export_precision
+
+    absent = {"checkpoint": {"path": "/nonexistent/model.safetensors"}}
+    assert _resolve_export_precision("native", absent) is torch.float32
+    # A spec naming neither a local path nor a digest has nothing to inspect.
+    assert _resolve_export_precision("native", {"checkpoint": {}}) is torch.float32

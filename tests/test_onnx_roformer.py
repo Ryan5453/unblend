@@ -261,7 +261,7 @@ def test_export_and_onnxruntime_parity(builder, tmp_path) -> None:
         segment_samples=SR,  # 1s segments keep the traced graph small
     )
     path = str(tmp_path / "model.onnx")
-    _export_roformer_to_onnx(model, path, opset_version=17, fp16=False)
+    _export_roformer_to_onnx(model, path, opset_version=17, storage=torch.float32)
 
     stft = model.stft_kwargs
     audio = torch.randn(2, 2, SR)
@@ -346,7 +346,7 @@ def test_static_browser_export_chunks_large_buffers(builder, tmp_path) -> None:
         model,
         path,
         opset_version=18,
-        fp16=False,
+        storage=torch.float32,
         static_batch=True,
     )
 
@@ -392,8 +392,8 @@ def test_fp16_export_uses_mixed_precision(tmp_path) -> None:
 
     fp32_path = str(tmp_path / "m32.onnx")
     fp16_path = str(tmp_path / "m16.onnx")
-    _export_roformer_to_onnx(model, fp32_path, opset_version=18, fp16=False)
-    _export_roformer_to_onnx(model, fp16_path, opset_version=18, fp16=True)
+    _export_roformer_to_onnx(model, fp32_path, opset_version=18, storage=torch.float32)
+    _export_roformer_to_onnx(model, fp16_path, opset_version=18, storage=torch.float16)
 
     assert os.path.getsize(fp16_path) < 0.75 * os.path.getsize(fp32_path)
     fp16_model = onnx.load(fp16_path)

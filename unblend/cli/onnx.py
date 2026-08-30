@@ -42,11 +42,12 @@ def export_onnx_command(
         ExportPrecision,
         typer.Option(
             "--precision",
-            help="Weight storage precision. native follows the checkpoint, which "
-            "is fp16 for HTDemucs (losslessly, since upstream shipped it that "
-            "way) and fp32 for RoFormer and SCNet. fp16 roughly halves file "
-            "size: weight-only for HTDemucs and SCNet, mixed precision for "
-            "RoFormer. See onnx.md.",
+            help="Weight storage precision, independent of compute precision. "
+            "native resolves to the narrowest precision the checkpoint's own "
+            "weights survive losslessly: fp16 for HTDemucs (upstream shipped "
+            "it that way) and fp32 for RoFormer and SCNet. Narrower settings "
+            "shrink the file and keep arithmetic in fp32, except fp16 on "
+            "RoFormer, which uses mixed precision. See onnx.md.",
         ),
     ] = ExportPrecision.native,
     static_batch: Annotated[

@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import httpx
+import torch
 import yaml
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
-from safetensors import SafetensorError
+from safetensors import SafetensorError, safe_open
 from safetensors.torch import load_file
 
 from . import backends, scnet  # noqa: F401
@@ -143,6 +144,49 @@ def _artifact_path(spec: dict) -> Path | None:
     if not isinstance(local, str) or not local:
         return None
     return Path(local).expanduser()
+
+
+# Safetensors dtype strings for the float widths a checkpoint may carry.
+_SAFETENSORS_DTYPES: dict[str, torch.dtype] = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E4M3": torch.float8_e4m3fn,
+}
+
+
+def artifact_storage_dtype(spec: dict) -> torch.dtype | None:
+    """
+    The float dtype an artifact stores its weights at, read from its header.
+
+    Safetensors declares a dtype per tensor, so this reports the widest float
+    dtype present: that is what the file actually needs to be round-tripped
+    without loss. Reading the header is a lookup rather than a scan over every
+    weight, and it reports what the checkpoint *is* rather than inferring a
+    bound from its values.
+
+    :param spec: An artifact entry (a Demucs layer or a ``checkpoint``).
+    :return: The widest float dtype declared, or ``None`` if the file is
+        absent, unreadable, or holds no float tensors.
+    """
+    path = _artifact_path(spec)
+    if path is None:
+        # A remote artifact is cached under its digest; without one there is
+        # no file to inspect.
+        if "sha256" not in spec:
+            return None
+        path = _artifact_cache_path(spec)
+    try:
+        with safe_open(path, framework="pt") as handle:
+            declared = {handle.get_slice(key).get_dtype() for key in handle.keys()}
+    except (OSError, SafetensorError):
+        return None
+    found = [dtype for name, dtype in _SAFETENSORS_DTYPES.items() if name in declared]
+    if not found:
+        return None
+    return max(found, key=lambda dtype: dtype.itemsize)
 
 
 def _artifact_url(spec: dict) -> str | None:

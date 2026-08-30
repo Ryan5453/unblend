@@ -53,8 +53,16 @@ _KERNEL_SOURCES: dict[str, str] = {
     "norm_glu_ls_resid": "dconv_envelope.metal",
     "apply_norm_glu_ls_resid": "dconv_envelope.metal",
     "rms_norm": "rms_norm.metal",
+    "roformer_rotary": "rotary.metal",
+    "roformer_rotary_v1": "rotary.metal",
+    "roformer_rotary_v2": "rotary.metal",
 }
-_HTDEMUCS_KERNELS = tuple(name for name in _KERNEL_SOURCES if name != "rms_norm")
+_ROFORMER_KERNELS = frozenset(
+    ("rms_norm", "roformer_rotary", "roformer_rotary_v1", "roformer_rotary_v2")
+)
+_HTDEMUCS_KERNELS = tuple(
+    name for name in _KERNEL_SOURCES if name not in _ROFORMER_KERNELS
+)
 
 _compiled_libraries: dict[tuple[str, torch.dtype], Any] = {}
 _compiled_kernels: dict[tuple[str, torch.dtype], Any] = {}
@@ -66,6 +74,10 @@ _DTYPE_TO_METAL: dict[torch.dtype, str] = {
 }
 
 _LP_DTYPES = frozenset((torch.float16, torch.bfloat16))
+# Mirrors MAX_DIMS in the rotary kernel's mixed-radix walk.
+_ROTARY_MAX_DIMS = 8
+_ROTARY_MAX_THREADS = 1 << 22
+_rotary_layout_cache: dict[tuple, torch.Tensor] = {}
 _RMS_DTYPES = frozenset(_DTYPE_TO_METAL)
 
 
@@ -152,19 +164,132 @@ def metal_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.
     out = torch.empty_like(x_contig)
 
     kernel = _get_kernel("rms_norm", x.dtype)
+    # One simdgroup (32 lanes) per row, so a threadgroup covers tgs // 32 rows.
+    # Shrink the threadgroup when there are too few rows to fill it rather than
+    # launching simdgroups that would immediately return.
     tgs = _pow2_tgs(kernel.max_threads_per_threadgroup)
-    while tgs > dim:
+    while tgs > 32 and (tgs // 32) > rows:
         tgs //= 2
+    rows_per_tg = max(1, tgs // 32)
+    num_tg = (rows + rows_per_tg - 1) // rows_per_tg
     kernel(
         out,
         x_contig,
         gamma_contig,
         dim,
         float(scale),
-        threads=rows * tgs,
+        rows,
+        threads=num_tg * tgs,
         group_size=tgs,
     )
     return out.view_as(x)
+
+
+def _rotary_layout(t: torch.Tensor) -> torch.Tensor:
+    """
+    Pack ``t``'s sizes and strides into the int64 buffer the rotary kernel walks.
+
+    Cached on the shape/stride pair: rotary sees only a handful of distinct
+    layouts per model, and rebuilding a tiny MPS tensor per call would cost
+    more than the kernel saves.
+
+    :param t: Tensor whose layout the kernel should follow
+    :return: 1-D int64 MPS tensor holding ``sizes`` followed by ``strides``
+    """
+    key = (tuple(t.shape), tuple(t.stride()), t.device)
+    cached = _rotary_layout_cache.get(key)
+    if cached is None:
+        cached = torch.tensor(
+            list(t.shape) + list(t.stride()), dtype=torch.int64, device=t.device
+        )
+        _rotary_layout_cache[key] = cached
+    return cached
+
+
+def _rotary_vec_width(t: torch.Tensor, half_dim: int) -> int:
+    """
+    Widest SCALAR4_T-unit count per thread the rotary kernel may use on ``t``.
+
+    The vector forms cast ``x + addr`` to ``SCALAR4_T*``, so every offset the
+    mixed-radix walk can produce must be 4-element aligned: that means the
+    tensor's own storage offset, the sequence stride, and every leading stride.
+    ``half_dim % (2 * nv)`` keeps a row an exact number of units.
+
+    :param t: The tensor the kernel will read
+    :param half_dim: ``dim // 2``
+    :return: 2 or 1 for the vector kernels, or 0 if only the scalar form is safe
+    """
+    if t.storage_offset() % 4:
+        return 0
+    strides = t.stride()
+    # stride(-1) is 1 (checked by the caller); the walk touches every other one.
+    if any(st % 4 for st in strides[:-1]):
+        return 0
+    for nv in (2, 1):
+        if half_dim % (2 * nv) == 0:
+            return nv
+    return 0
+
+
+def metal_rotary(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Apply RoFormer's interleaved rotary rotation with one fused MPS kernel.
+
+    Reads ``t`` in place through its strides, so the ``[B, H, S, Dh]``
+    transposed views attention hands over need no contiguous copy. Bit-identical
+    to the eager formulation it replaces. Falls back to eager for layouts the
+    kernel does not cover.
+
+    :param t: Queries or keys of shape ``[..., seq, dim]``, last dim contiguous
+    :param cos: Rotation cosine table of shape ``[seq, dim // 2]``
+    :param sin: Rotation sine table of shape ``[seq, dim // 2]``
+    :return: Rotated tensor with the same shape and dtype as ``t``
+    """
+    dim = t.shape[-1] if t.dim() else 0
+    if (
+        t.device.type != "mps"
+        or t.dtype not in _LP_DTYPES
+        or torch.is_grad_enabled()
+        or t.numel() == 0
+        or t.dim() < 2
+        or t.dim() > _ROTARY_MAX_DIMS
+        or dim % 2 != 0
+        or t.stride(-1) != 1
+        or cos.dtype != t.dtype
+        or sin.dtype != t.dtype
+    ):
+        x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
+        return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(
+            -2
+        )
+
+    half_dim = dim // 2
+    nv = _rotary_vec_width(t, half_dim)
+    # Each thread handles 4*nv elements in the vector forms, 2 in the scalar one.
+    name = f"roformer_rotary_v{nv}" if nv else "roformer_rotary"
+    units = t.numel() // (4 * nv) if nv else t.numel() // 2
+
+    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    kernel = _get_kernel(name, t.dtype)
+    tgs = _pow2_tgs(kernel.max_threads_per_threadgroup)
+    # Grid-stride over a grid sized to the machine rather than one thread per
+    # unit: the coordinate decomposition is per-thread work we would otherwise
+    # repeat tens of millions of times.
+    threads = max(tgs, (min(units, _ROTARY_MAX_THREADS) // tgs) * tgs)
+    kernel(
+        out,
+        t,
+        cos.contiguous(),
+        sin.contiguous(),
+        _rotary_layout(t),
+        t.dim(),
+        half_dim,
+        cos.shape[0],
+        units,
+        threads=threads,
+        group_size=tgs,
+    )
+    return out
 
 
 class MetalGroupNorm(nn.Module):
@@ -1341,6 +1466,7 @@ def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
 __all__ = [
     "MetalGroupNorm",
     "metal_rms_norm",
+    "metal_rotary",
     "MetalMyGroupNorm",
     "MetalMultiheadAttention",
     "FusedGroupNormGelu",

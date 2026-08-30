@@ -79,6 +79,42 @@ _BUILDERS: dict[str, "Callable[..., ASSModel]"] = {}
 _ARCHITECTURES: dict[str, frozenset[str]] = {}
 
 
+class CustomKernelModule(nn.Module):
+    """
+    Base for modules that carry a hand-written CUDA/Metal fast path.
+
+    Subclasses check ``self.use_custom_kernels`` before dispatching to a kernel
+    and fall back to stock PyTorch ops when it is cleared, so
+    :func:`disable_custom_kernels` can put a whole model back on the reference
+    path. That is what ``Separator(custom_kernels=False)`` and
+    ``UNBLEND_CUSTOM_KERNELS=0`` do, and it is the supported way to tell
+    whether a kernel is responsible for a numerical difference.
+    """
+
+    def __init__(self) -> None:
+        """
+        Enable this module's custom-kernel fast path by default.
+        """
+        super().__init__()
+        self.use_custom_kernels: bool = True
+
+
+def disable_custom_kernels(model: nn.Module) -> int:
+    """
+    Turn off the custom-kernel fast path on every module that has one.
+
+    :param model: Model to walk; any :class:`CustomKernelModule` in it is
+        switched to its reference implementation.
+    :return: Number of modules switched off.
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, CustomKernelModule):
+            module.use_custom_kernels = False
+            count += 1
+    return count
+
+
 def register_backend(
     name: str,
     builder: "Callable[..., ASSModel]",

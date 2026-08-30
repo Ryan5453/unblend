@@ -32,6 +32,7 @@ from .apply import (
     apply_model_multi,
 )
 from .audio import convert_audio, prevent_clip
+from .backends import disable_custom_kernels
 from .exceptions import (
     LoadAudioError,
     ModelLoadingError,
@@ -594,7 +595,10 @@ class Separator:
         if dtype is not None:
             if dtype not in (torch.float16, torch.bfloat16):
                 raise ValidationError(
-                    f"Invalid dtype '{dtype}'. Only torch.float16 and torch.bfloat16 are supported."
+                    f"Invalid dtype '{dtype}'. Only torch.float16 and torch.bfloat16 "
+                    "are supported for compute. This is separate from the precision a "
+                    "checkpoint is stored at, which may be anything and is widened "
+                    "on load."
                 )
             if device == "cpu":
                 raise ValidationError(
@@ -683,11 +687,7 @@ class Separator:
                     self.model.to(dtype=self.dtype)
 
             if not use_custom_kernels:
-                from .roformer import RotaryEmbedding
-
-                for module in self.model.modules():
-                    if isinstance(module, RotaryEmbedding):
-                        module.use_fused_cuda_kernel = False
+                disable_custom_kernels(self.model)
 
             if (
                 use_custom_kernels

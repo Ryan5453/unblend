@@ -27,6 +27,7 @@ from unblend.metal import (
     MetalMyGroupNorm,
     apply_metal_optimizations,
     metal_rms_norm,
+    metal_rotary,
 )
 
 mps_only = pytest.mark.skipif(
@@ -91,6 +92,213 @@ def test_metal_rms_norm_matches_fp32_reference(
     torch.testing.assert_close(out, ref, **tolerance)
 
 
+def _eager_rotary(
+    t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """
+    The unfused rotary formulation ``metal_rotary`` replaces.
+
+    :param t: Queries or keys ``[..., seq, dim]``
+    :param cos: Cosine table ``[seq, dim // 2]``
+    :param sin: Sine table ``[seq, dim // 2]``
+    :return: Rotated tensor
+    """
+    x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
+    return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
+
+
+@mps_only
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+@pytest.mark.parametrize(
+    "shape,transposed",
+    [
+        # Real attention layouts: [B, S, H, Dh] transposed to [B, H, S, Dh], so
+        # the kernel reads strided. Dh = 64 selects the 16-byte vector form.
+        ((4, 8, 37, 64), True),
+        ((37, 8, 5, 64), True),
+        ((3, 4, 17, 32), True),  # still the widest vector form
+        ((3, 4, 17, 20), True),  # P = 10: only the 8-byte vector form fits
+        ((3, 4, 17, 6), True),  # P = 3: scalar form
+        ((5, 3, 9, 2), True),  # P = 1: scalar form
+        ((4, 8, 16, 64), False),  # already contiguous
+        ((5, 7, 32), False),  # 3-D
+        ((9, 16), False),  # 2-D, no leading dims to walk
+    ],
+)
+def test_metal_rotary_is_bit_identical_to_eager(
+    dtype: torch.dtype, shape: tuple[int, ...], transposed: bool
+) -> None:
+    """
+    The fused rotary kernel reproduces the eager op exactly, bit for bit.
+
+    The kernel rounds every intermediate back to ``dtype`` the way eager
+    TensorIterator does, so this is an equality check rather than a tolerance
+    check -- any drift means the rounding order diverged. Shapes cover all
+    three kernel forms (16-byte vector, 8-byte vector, scalar) and both
+    strided and contiguous inputs.
+
+    :param dtype: Storage dtype under test.
+    :param shape: Input shape; when ``transposed`` it is the post-transpose one.
+    :param transposed: Build a non-contiguous ``[B, H, S, Dh]`` view.
+    """
+    if transposed:
+        b, h, seq, head_dim = shape
+        t = torch.randn(b, seq, h, head_dim, device="mps", dtype=dtype).transpose(1, 2)
+    else:
+        t = torch.randn(*shape, device="mps", dtype=dtype)
+
+    seq_len, dim = t.shape[-2], t.shape[-1]
+    cos = torch.randn(seq_len, dim // 2, device="mps", dtype=dtype)
+    sin = torch.randn(seq_len, dim // 2, device="mps", dtype=dtype)
+
+    with torch.inference_mode():
+        out = metal_rotary(t, cos, sin)
+
+    assert torch.equal(out, _eager_rotary(t, cos, sin))
+    assert out.is_contiguous()
+
+
+@mps_only
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+def test_metal_rotary_handles_unaligned_storage_offset(dtype: torch.dtype) -> None:
+    """
+    A storage offset that breaks 4-element alignment falls back, still exactly.
+
+    The vector forms cast the input pointer to ``SCALAR4_T*``; an odd storage
+    offset makes that illegal, so the dispatcher must drop to the scalar form
+    rather than reading misaligned.
+
+    :param dtype: Storage dtype under test.
+    """
+    b, h, seq, head_dim = 4, 8, 16, 64
+    flat = torch.randn(b * seq * h * head_dim + 2, device="mps", dtype=dtype)
+    t = flat[1 : 1 + b * seq * h * head_dim].view(b, seq, h, head_dim).transpose(1, 2)
+    assert t.storage_offset() % 4 != 0
+
+    cos = torch.randn(seq, head_dim // 2, device="mps", dtype=dtype)
+    sin = torch.randn(seq, head_dim // 2, device="mps", dtype=dtype)
+    with torch.inference_mode():
+        out = metal_rotary(t, cos, sin)
+    assert torch.equal(out, _eager_rotary(t, cos, sin))
+
+
+@mps_only
+def test_metal_rotary_falls_back_when_last_dim_is_strided() -> None:
+    """
+    A non-unit last-dim stride is outside the kernel's contract; use eager.
+    """
+    base = torch.randn(2, 4, 8, 128, device="mps", dtype=torch.float16)
+    t = base[..., ::2]  # stride(-1) == 2
+    assert t.stride(-1) != 1
+    cos = torch.randn(8, 32, device="mps", dtype=torch.float16)
+    sin = torch.randn(8, 32, device="mps", dtype=torch.float16)
+    with torch.inference_mode():
+        out = metal_rotary(t, cos, sin)
+    assert torch.equal(out, _eager_rotary(t, cos, sin))
+
+
+@mps_only
+def test_rotary_embedding_dispatches_to_metal_kernel(monkeypatch) -> None:
+    """
+    ``RotaryEmbedding`` routes MPS low-precision inference through the kernel,
+    and ``use_custom_kernels = False`` puts it back on the eager path.
+    """
+    from unblend import metal as metal_mod
+    from unblend.roformer import RotaryEmbedding
+
+    rope = RotaryEmbedding(64).to("mps")
+    t = torch.randn(2, 6, 16, 64, device="mps", dtype=torch.float16).transpose(1, 2)
+
+    calls = []
+    original = metal_mod.metal_rotary
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(metal_mod, "metal_rotary", counting)
+
+    with torch.inference_mode():
+        fused = rope.rotate_queries_or_keys(t)
+    assert calls, "expected the Metal rotary kernel to be used"
+
+    rope.use_custom_kernels = False
+    with torch.inference_mode():
+        eager = rope.rotate_queries_or_keys(t)
+    assert len(calls) == 1, "flag should disable the fused path"
+    assert torch.equal(fused, eager)
+
+
+@mps_only
+def test_rms_norm_respects_custom_kernels_flag(monkeypatch) -> None:
+    """
+    ``RMSNorm`` routes MPS inference through the kernel, and
+    ``use_custom_kernels = False`` puts it back on stock ``F.rms_norm``.
+
+    Regression test: this module used to call the Metal kernel unconditionally,
+    so ``custom_kernels=False`` left the RoFormer path partly accelerated and
+    could not be used to rule the kernels out when debugging.
+    """
+    from unblend import metal as metal_mod
+    from unblend.roformer import RMSNorm
+
+    norm = RMSNorm(64).to("mps")
+    x = torch.randn(3, 12, 64, device="mps", dtype=torch.float16)
+
+    calls = []
+    original = metal_mod.metal_rms_norm
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(metal_mod, "metal_rms_norm", counting)
+
+    with torch.inference_mode():
+        fused = norm(x)
+    assert calls, "expected the Metal RMSNorm kernel to be used"
+
+    norm.use_custom_kernels = False
+    with torch.inference_mode():
+        stock = norm(x)
+    assert len(calls) == 1, "flag should disable the fused path"
+    # Different implementations of the same maths, so compare within dtype
+    # tolerance rather than bit for bit.
+    torch.testing.assert_close(fused.float(), stock.float(), **_tol(torch.float16))
+
+
+@pytest.mark.parametrize("factory", ["rms_norm", "rotary"])
+def test_disable_custom_kernels_switches_fused_modules(factory: str) -> None:
+    """
+    ``disable_custom_kernels`` finds fused-path modules by type and clears them.
+
+    Membership is inheritance from ``CustomKernelModule``, so a new fused
+    module is covered the moment it subclasses -- there is no attribute name to
+    keep in sync. Runs anywhere: this is wiring, not a kernel test.
+
+    :param factory: Which fused-path module to nest in the model.
+    """
+    from unblend.backends import CustomKernelModule, disable_custom_kernels
+    from unblend.roformer import RMSNorm, RotaryEmbedding
+
+    inner = RMSNorm(64) if factory == "rms_norm" else RotaryEmbedding(64)
+    assert isinstance(inner, CustomKernelModule)
+    model = nn.Sequential(nn.Linear(8, 8), nn.Sequential(inner))
+
+    assert inner.use_custom_kernels is True
+    assert disable_custom_kernels(model) == 1
+    assert inner.use_custom_kernels is False
+
+
+def test_disable_custom_kernels_ignores_plain_modules() -> None:
+    """
+    A model with no fused-path modules is left untouched and reports zero.
+    """
+    from unblend.backends import disable_custom_kernels
+
+    assert disable_custom_kernels(nn.Sequential(nn.Linear(4, 4), nn.GELU())) == 0
+
+
 def _make_gn(channels: int) -> nn.GroupNorm:
     """
     Build a ``num_groups=1`` affine GroupNorm with non-trivial affine params.
@@ -125,7 +333,9 @@ def _make_ls(channels: int) -> torch.Tensor:
         (4, 64, 8, 16),
         (130, 48, 336),  # single-stage via B >= _SINGLE_STAGE_MIN_BATCH
         (2, 48, 4096),  # multi-stage via small B + medium per-batch
-        (2, 49, 101),  # odd N: scalar (non-vectorized) apply path
+        (2, 49, 101),  # odd N, C*N odd: fully scalar channel-walk fallback
+        (2, 4, 101),  # odd N, C*N % 4 == 0: vectorized head/body/tail walk
+        (2, 8, 4097),  # same, multi-stage tiling
     ],
 )
 def test_metal_group_norm_matches_fallback(
@@ -310,9 +520,13 @@ def test_metal_group_norm_large_dc_offset(
         (2, 48, 100),
         (4, 64, 8, 16),
         # Edge shapes: odd channel counts (fine with num_groups=1) and
-        # spatial sizes that don't divide the threadgroup size.
+        # spatial sizes that don't divide the threadgroup size. The first two
+        # leave the channel walk fully scalar (C*N is odd); the last two have
+        # C*N % 4 == 0 so its vectorized body runs behind a scalar head/tail.
         (2, 49, 101),
         (3, 97, 1023),
+        (2, 4, 101),
+        (3, 8, 4097),
     ],
 )
 def test_fused_group_norm_gelu_matches_fallback(
@@ -395,6 +609,9 @@ def test_fused_group_norm_gelu_multi_stage(dtype: torch.dtype) -> None:
     [
         (2, 96, 100),
         (4, 128, 8, 16),
+        # Odd N with (C/2)*N % 4 == 0, so the channel walk vectorizes its body
+        # via the scalar head/tail; the shapes below leave it fully scalar.
+        (2, 8, 101),
         # Edge shapes: GLU needs an even input channel count, but the halves
         # can be odd (2*49, 2*97); spatial sizes don't divide the threadgroup
         # size.
@@ -457,8 +674,11 @@ def test_fused_group_norm_glu_multi_stage(dtype: torch.dtype) -> None:
     [
         (2, 96, 100),
         # Edge shape: odd half-channel count and a spatial size that doesn't
-        # divide the threadgroup size.
+        # divide the threadgroup size -- leaves the channel walk fully scalar.
         (3, 98, 101),
+        # Odd N but (C/2)*N % 4 == 0, so the channel walk vectorizes its body.
+        (2, 8, 101),
+        (3, 48, 4297),  # same, at the multi-stage htdemucs-like DConv shape
     ],
 )
 def test_fused_norm_glu_ls_resid_matches_reference(

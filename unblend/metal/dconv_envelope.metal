@@ -65,20 +65,35 @@ kernel void norm_glu_ls_resid(
             o4[i] = SCALAR4_T(a * sig * ls + float4(r4[i]));
         }
     } else {
-        for (uint i = tid; i < total_out; i += tgs) {
-            uint c  = i / N;
-            uint sp = i % N;
-            uint idx_a = c       * N + sp;
-            uint idx_b = (c + C) * N + sp;
-            float wa = float(nweight[c]);
-            float ba = float(nbias[c]);
-            float wb = float(nweight[c + C]);
-            float bb = float(nbias[c + C]);
-            float a = (float(z_b[idx_a]) - mean) * scale * wa + ba;
-            float b_val = (float(z_b[idx_b]) - mean) * scale * wb + bb;
-            float sig = 1.0f / (1.0f + exp(-b_val));
-            float ls = float(layer_scale[c]);
-            o_b[i] = SCALAR_T(a * sig * ls + float(r_b[i]));
+        // N % 4 != 0: walk the output channel by channel (see common.metal).
+        // In output space the flat index IS idx_a and idx_b sits C*N past it,
+        // so the old per-element ``i / N`` and ``i % N`` divides both go away.
+        //
+        // Unlike the multi-stage twin below, this fallback deliberately stays
+        // scalar. This kernel is the most register-hungry in the folder (three
+        // data buffers plus layer_scale), and adding the vectorized head/body/
+        // tail here costs the N % 4 == 0 fast path above ~4% -- which is the
+        // path htdemucs actually takes (N=336), while the single-stage
+        // fallback never sees the large odd-N shapes (those have a big enough
+        // per-batch count to be routed to the multi-stage path).
+        const uint boff = C * N;
+        uint c  = 0u;
+        uint lo = 0u;
+        while (lo < total_out) {
+            const uint hi = min(total_out, (c + 1u) * N);
+            const float wa = float(nweight[c]);
+            const float ba = float(nbias[c]);
+            const float wb = float(nweight[c + C]);
+            const float bb = float(nbias[c + C]);
+            const float ls = float(layer_scale[c]);
+            for (uint i = lo + tid; i < hi; i += tgs) {
+                float a = (float(z_b[i]) - mean) * scale * wa + ba;
+                float g = (float(z_b[i + boff]) - mean) * scale * wb + bb;
+                float sig = 1.0f / (1.0f + exp(-g));
+                o_b[i] = SCALAR_T(a * sig * ls + float(r_b[i]));
+            }
+            lo = hi;
+            ++c;
         }
     }
 }
@@ -132,22 +147,51 @@ kernel void apply_norm_glu_ls_resid(
             o4[i] = SCALAR4_T(a * sig * ls + float4(r4[i]));
         }
     } else {
+        // N % 4 != 0: walk the tile channel by channel (see common.metal). The
+        // flat output index IS idx_a and idx_b sits C*N past it, so the old
+        // per-element ``i / N`` and ``i % N`` divides both disappear.
+        const uint boff = C * N;
+        const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total_out_per_b);
         uint start = (uint)((ulong)t * (ulong)total_out_per_b / (ulong)num_tiles);
         uint end   = (uint)((ulong)(t + 1) * (ulong)total_out_per_b / (ulong)num_tiles);
-        for (uint i = start + tid; i < end; i += tgs) {
-            uint c  = i / N;
-            uint sp = i % N;
-            uint idx_a = c       * N + sp;
-            uint idx_b = (c + C) * N + sp;
-            float wa = float(nweight[c]);
-            float ba = float(nbias[c]);
-            float wb = float(nweight[c + C]);
-            float bb = float(nbias[c + C]);
-            float a = (float(z_b[idx_a]) - mean) * scale * wa + ba;
-            float b_val = (float(z_b[idx_b]) - mean) * scale * wb + bb;
-            float sig = 1.0f / (1.0f + exp(-b_val));
-            float ls = float(layer_scale[c]);
-            o_b[i] = SCALAR_T(a * sig * ls + float(r_b[i]));
+        uint c  = start / N;
+        uint lo = start;
+        while (lo < end) {
+            GN_CHANNEL_BOUNDS(lo, end, N, c, hi, head, vend);
+            const float wa = float(nweight[c]);
+            const float ba = float(nbias[c]);
+            const float wb = float(nweight[c + C]);
+            const float bb = float(nbias[c + C]);
+            const float ls = float(layer_scale[c]);
+            const uint vstart = vec_ok ? head : hi;
+            const uint vstop  = vec_ok ? vend : hi;
+
+            for (uint i = lo + tid; i < vstart; i += tgs) {
+                float a = (float(z_b[i]) - mean) * scale * wa + ba;
+                float g = (float(z_b[i + boff]) - mean) * scale * wb + bb;
+                float sig = 1.0f / (1.0f + exp(-g));
+                o_b[i] = SCALAR_T(a * sig * ls + float(r_b[i]));
+            }
+            if (vec_ok) {
+                device const SCALAR4_T* z4 = (device const SCALAR4_T*)z_b;
+                device const SCALAR4_T* r4 = (device const SCALAR4_T*)r_b;
+                device SCALAR4_T*       o4 = (device SCALAR4_T*)o_b;
+                const uint vboff = boff >> 2;
+                for (uint v = (vstart >> 2) + tid; v < (vstop >> 2); v += tgs) {
+                    float4 a = (float4(z4[v]) - mean) * scale * wa + ba;
+                    float4 g = (float4(z4[v + vboff]) - mean) * scale * wb + bb;
+                    float4 sig = 1.0f / (1.0f + exp(-g));
+                    o4[v] = SCALAR4_T(a * sig * ls + float4(r4[v]));
+                }
+            }
+            for (uint i = vstop + tid; i < hi; i += tgs) {
+                float a = (float(z_b[i]) - mean) * scale * wa + ba;
+                float g = (float(z_b[i + boff]) - mean) * scale * wb + bb;
+                float sig = 1.0f / (1.0f + exp(-g));
+                o_b[i] = SCALAR_T(a * sig * ls + float(r_b[i]));
+            }
+            lo = hi;
+            ++c;
         }
     }
 }

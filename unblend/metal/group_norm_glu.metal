@@ -64,19 +64,45 @@ kernel void group_norm_g1_glu(
             out4[i] = SCALAR4_T(a * sig);
         }
     } else {
-        for (uint i = tid; i < total_out; i += tgs) {
-            uint c_out = i / N;
-            uint sp    = i % N;
-            uint idx_a = c_out            * N + sp;
-            uint idx_b = (c_out + C_half) * N + sp;
-            float wa = float(weight[c_out]);
-            float ba = float(bias[c_out]);
-            float wb = float(weight[c_out + C_half]);
-            float bb = float(bias[c_out + C_half]);
-            float a = (float(in_b[idx_a]) - mean) * scale * wa + ba;
-            float b_val = (float(in_b[idx_b]) - mean) * scale * wb + bb;
-            float sig = 1.0f / (1.0f + exp(-b_val));
-            out_b[i] = SCALAR_T(a * sig);
+        // N % 4 != 0: walk the output channel by channel (see common.metal).
+        // The flat output index IS idx_a; idx_b sits C_half*N past it, so the
+        // old per-element ``i / N`` and ``i % N`` divides both disappear.
+        const uint boff = C_half * N;
+        const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total_out);
+        uint c  = 0u;
+        uint lo = 0u;
+        while (lo < total_out) {
+            GN_CHANNEL_BOUNDS(lo, total_out, N, c, hi, head, vend);
+            const float wa = float(weight[c]);
+            const float ba = float(bias[c]);
+            const float wb = float(weight[c + C_half]);
+            const float bb = float(bias[c + C_half]);
+            const uint vstart = vec_ok ? head : hi;
+            const uint vstop  = vec_ok ? vend : hi;
+
+            for (uint i = lo + tid; i < vstart; i += tgs) {
+                float a = (float(in_b[i]) - mean) * scale * wa + ba;
+                float g = (float(in_b[i + boff]) - mean) * scale * wb + bb;
+                out_b[i] = SCALAR_T(a / (1.0f + exp(-g)));
+            }
+            if (vec_ok) {
+                device const SCALAR4_T* in4  = (device const SCALAR4_T*)in_b;
+                device SCALAR4_T*       out4 = (device SCALAR4_T*)out_b;
+                const uint vboff = boff >> 2;
+                for (uint v = (vstart >> 2) + tid; v < (vstop >> 2); v += tgs) {
+                    float4 a = (float4(in4[v]) - mean) * scale * wa + ba;
+                    float4 g = (float4(in4[v + vboff]) - mean) * scale * wb + bb;
+                    float4 sig = 1.0f / (1.0f + exp(-g));
+                    out4[v] = SCALAR4_T(a * sig);
+                }
+            }
+            for (uint i = vstop + tid; i < hi; i += tgs) {
+                float a = (float(in_b[i]) - mean) * scale * wa + ba;
+                float g = (float(in_b[i + boff]) - mean) * scale * wb + bb;
+                out_b[i] = SCALAR_T(a / (1.0f + exp(-g)));
+            }
+            lo = hi;
+            ++c;
         }
     }
 }
@@ -127,21 +153,46 @@ kernel void apply_norm_glu(
     } else {
         // Tile over the OUTPUT space; each output element pulls its two input
         // channels independently regardless of where they sit in the input tile.
+        // N % 4 != 0, so walk the tile channel by channel (see common.metal):
+        // the flat output index IS idx_a and idx_b sits C_half*N past it.
+        const uint boff = C_half * N;
+        const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total_out_per_b);
         uint start = (uint)((ulong)t * (ulong)total_out_per_b / (ulong)num_tiles);
         uint end   = (uint)((ulong)(t + 1) * (ulong)total_out_per_b / (ulong)num_tiles);
-        for (uint i = start + tid; i < end; i += tgs) {
-            uint c_out = i / N;
-            uint sp    = i % N;
-            uint idx_a = c_out            * N + sp;
-            uint idx_b = (c_out + C_half) * N + sp;
-            float wa = float(weight[c_out]);
-            float ba = float(bias[c_out]);
-            float wb = float(weight[c_out + C_half]);
-            float bb = float(bias[c_out + C_half]);
-            float a = (float(x_b[idx_a]) - mean) * scale * wa + ba;
-            float b_val = (float(x_b[idx_b]) - mean) * scale * wb + bb;
-            float sig = 1.0f / (1.0f + exp(-b_val));
-            out_b[i] = SCALAR_T(a * sig);
+        uint c  = start / N;
+        uint lo = start;
+        while (lo < end) {
+            GN_CHANNEL_BOUNDS(lo, end, N, c, hi, head, vend);
+            const float wa = float(weight[c]);
+            const float ba = float(bias[c]);
+            const float wb = float(weight[c + C_half]);
+            const float bb = float(bias[c + C_half]);
+            const uint vstart = vec_ok ? head : hi;
+            const uint vstop  = vec_ok ? vend : hi;
+
+            for (uint i = lo + tid; i < vstart; i += tgs) {
+                float a = (float(x_b[i]) - mean) * scale * wa + ba;
+                float g = (float(x_b[i + boff]) - mean) * scale * wb + bb;
+                out_b[i] = SCALAR_T(a / (1.0f + exp(-g)));
+            }
+            if (vec_ok) {
+                device const SCALAR4_T* in4  = (device const SCALAR4_T*)x_b;
+                device SCALAR4_T*       out4 = (device SCALAR4_T*)out_b;
+                const uint vboff = boff >> 2;
+                for (uint v = (vstart >> 2) + tid; v < (vstop >> 2); v += tgs) {
+                    float4 a = (float4(in4[v]) - mean) * scale * wa + ba;
+                    float4 g = (float4(in4[v + vboff]) - mean) * scale * wb + bb;
+                    float4 sig = 1.0f / (1.0f + exp(-g));
+                    out4[v] = SCALAR4_T(a * sig);
+                }
+            }
+            for (uint i = vstop + tid; i < hi; i += tgs) {
+                float a = (float(x_b[i]) - mean) * scale * wa + ba;
+                float g = (float(x_b[i + boff]) - mean) * scale * wb + bb;
+                out_b[i] = SCALAR_T(a / (1.0f + exp(-g)));
+            }
+            lo = hi;
+            ++c;
         }
     }
 }

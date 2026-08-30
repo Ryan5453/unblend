@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .backends import ASSModel
+from .backends import ASSModel, CustomKernelModule
 from .exceptions import ValidationError
 
 DEFAULT_FREQS_PER_BANDS: tuple[int, ...] = (
@@ -33,7 +33,7 @@ DEFAULT_FREQS_PER_BANDS: tuple[int, ...] = (
 )
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(CustomKernelModule):
     def __init__(self, dim: int) -> None:
         """
         Root-mean-square LayerNorm with a learnable gain.
@@ -59,7 +59,11 @@ class RMSNorm(nn.Module):
 
             normalized = working * torch.rsqrt(mean_square.clamp_min(1e-12))
             return (normalized * self.gamma.float()).to(x.dtype)
-        if x.device.type == "mps" and not torch.is_grad_enabled():
+        if (
+            self.use_custom_kernels
+            and x.device.type == "mps"
+            and not torch.is_grad_enabled()
+        ):
             from .metal import metal_rms_norm
 
             return metal_rms_norm(x, self.gamma, self.scale)
@@ -107,7 +111,7 @@ def _binary_sum(tensors: list[Tensor]) -> Tensor:
     return tensors[0]
 
 
-class RotaryEmbedding(nn.Module):
+class RotaryEmbedding(CustomKernelModule):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         """
         Rotary position embedding (RoPE, Su et al.
@@ -121,8 +125,6 @@ class RotaryEmbedding(nn.Module):
         self._cos_sin_cache: dict[
             tuple[int, torch.device, torch.dtype], tuple[Tensor, Tensor]
         ] = {}
-
-        self.use_fused_cuda_kernel = True
 
         self._compiled_cos: Tensor | None = None
         self._compiled_sin: Tensor | None = None
@@ -198,15 +200,19 @@ class RotaryEmbedding(nn.Module):
             cos, sin = self._cos_sin(t.shape[-2], t.device, t.dtype)
 
         if (
-            t.device.type == "cuda"
-            and self.use_fused_cuda_kernel
+            self.use_custom_kernels
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
             and t.dtype in (torch.float16, torch.bfloat16)
         ):
-            from .cuda import fused_roformer_rotary
+            if t.device.type == "cuda":
+                from .cuda import fused_roformer_rotary
 
-            return fused_roformer_rotary(t, cos, sin)
+                return fused_roformer_rotary(t, cos, sin)
+            if t.device.type == "mps":
+                from .metal import metal_rotary
+
+                return metal_rotary(t, cos, sin)
 
         x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
         rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)

@@ -69,12 +69,33 @@ kernel void group_norm_g1_gelu(
             out4[i]  = SCALAR4_T(gelu_tanh4(y));
         }
     } else {
-        for (uint i = tid; i < total; i += tgs) {
-            uint  c  = i / N;
-            float w  = float(weight[c]);
-            float bv = float(bias[c]);
-            float y  = (float(in_b[i]) - mean) * scale * w + bv;
-            out_b[i] = SCALAR_T(gelu_tanh(y));
+        // N % 4 != 0: walk channel by channel so the affine params are hoisted
+        // and no per-element ``i / N`` divide is needed (see common.metal).
+        const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total);
+        uint c  = 0u;
+        uint lo = 0u;
+        while (lo < total) {
+            GN_CHANNEL_BOUNDS(lo, total, N, c, hi, head, vend);
+            const float w  = float(weight[c]);
+            const float bv = float(bias[c]);
+            const uint vstart = vec_ok ? head : hi;
+            const uint vstop  = vec_ok ? vend : hi;
+
+            for (uint i = lo + tid; i < vstart; i += tgs) {
+                out_b[i] = SCALAR_T(gelu_tanh((float(in_b[i]) - mean) * scale * w + bv));
+            }
+            if (vec_ok) {
+                device const SCALAR4_T* in4  = (device const SCALAR4_T*)in_b;
+                device SCALAR4_T*       out4 = (device SCALAR4_T*)out_b;
+                for (uint v = (vstart >> 2) + tid; v < (vstop >> 2); v += tgs) {
+                    out4[v] = SCALAR4_T(gelu_tanh4((float4(in4[v]) - mean) * scale * w + bv));
+                }
+            }
+            for (uint i = vstop + tid; i < hi; i += tgs) {
+                out_b[i] = SCALAR_T(gelu_tanh((float(in_b[i]) - mean) * scale * w + bv));
+            }
+            lo = hi;
+            ++c;
         }
     }
 }
@@ -116,14 +137,34 @@ kernel void apply_norm_gelu(
             out4[i]  = SCALAR4_T(gelu_tanh4(y));
         }
     } else {
+        // N % 4 != 0: walk the tile channel by channel (see common.metal).
+        const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total_per_b);
         uint start = (uint)((ulong)t * (ulong)total_per_b / (ulong)num_tiles);
         uint end   = (uint)((ulong)(t + 1) * (ulong)total_per_b / (ulong)num_tiles);
-        for (uint i = start + tid; i < end; i += tgs) {
-            uint  c  = i / N;
-            float w  = float(weight[c]);
-            float bv = float(bias[c]);
-            float y  = (float(x_b[i]) - mean) * scale * w + bv;
-            out_b[i] = SCALAR_T(gelu_tanh(y));
+        uint c  = start / N;
+        uint lo = start;
+        while (lo < end) {
+            GN_CHANNEL_BOUNDS(lo, end, N, c, hi, head, vend);
+            const float w  = float(weight[c]);
+            const float bv = float(bias[c]);
+            const uint vstart = vec_ok ? head : hi;
+            const uint vstop  = vec_ok ? vend : hi;
+
+            for (uint i = lo + tid; i < vstart; i += tgs) {
+                out_b[i] = SCALAR_T(gelu_tanh((float(x_b[i]) - mean) * scale * w + bv));
+            }
+            if (vec_ok) {
+                device const SCALAR4_T* in4  = (device const SCALAR4_T*)x_b;
+                device SCALAR4_T*       out4 = (device SCALAR4_T*)out_b;
+                for (uint v = (vstart >> 2) + tid; v < (vstop >> 2); v += tgs) {
+                    out4[v] = SCALAR4_T(gelu_tanh4((float4(in4[v]) - mean) * scale * w + bv));
+                }
+            }
+            for (uint i = vstop + tid; i < hi; i += tgs) {
+                out_b[i] = SCALAR_T(gelu_tanh((float(x_b[i]) - mean) * scale * w + bv));
+            }
+            lo = hi;
+            ++c;
         }
     }
 }
