@@ -24,21 +24,33 @@ const REVISIONS = {
 };
 
 test('browser SCNet catalog matches the Python registry', () => {
-    // The Python registry is YAML; scan it for model entries declaring
-    // `backend: scnet` rather than pulling in a YAML parser.
+    // The Python registry is YAML; scan it for model entries whose
+    // `architecture` is an SCNet variant rather than pulling in a YAML parser.
+    // The registry declares architecture only -- the backend is derived from it
+    // in repo.py -- so matching on `backend:` finds nothing.
     const yaml = readFileSync(new URL('../../../unblend/metadata.yaml', import.meta.url), 'utf8');
     let current = null;
     const pythonModels = [];
     for (const line of yaml.split('\n')) {
         const name = line.match(/^  ([A-Za-z0-9_]+):\s*$/);
         if (name) current = name[1];
-        if (current && /^    backend: scnet\s*$/.test(line)) pythonModels.push(current);
+        if (current && /^    architecture: scnet[A-Za-z0-9_]*\s*$/.test(line)) {
+            pythonModels.push(current);
+        }
     }
     pythonModels.sort();
     const browserModels = Object.entries(MODEL_CONFIGS)
         .filter(([, info]) => info.family === 'scnet')
         .map(([name]) => name)
         .sort();
+
+    // A scan that matches nothing yields an empty list, which would compare
+    // equal to an equally-empty browser side and pass -- so the drift check
+    // would silently stop working. Fail loudly if the registry format moves.
+    assert.ok(
+        pythonModels.length > 0,
+        'found no SCNet models in metadata.yaml; the registry format changed',
+    );
 
     assert.deepEqual(browserModels, pythonModels);
 });

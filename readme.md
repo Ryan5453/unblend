@@ -1,4 +1,4 @@
-# <img src="web/app/public/favicon.svg" width="30"> Unblend
+# <img src="/web/app/public/favicon.svg" width="30"> Unblend
 
 Unblend is a music source separation inference library designed to be blazing fast and easy-to-use.
 It implements one consistent API across four supported model architectures: HTDemucs, BS-RoFormer, Mel-Band RoFormer, and SCNet.
@@ -54,5 +54,5 @@ $ unblend separate audio_file_1.mp3 audio_file_2.mp3
 Unblend has various ways you can programatically use its API:
 - [ONNX export](https://github.com/Ryan5453/unblend/blob/main/onnx.md) 
 - [Python API](https://github.com/Ryan5453/unblend/blob/main/api.md)
-- [Browser API](https://github.com/Ryan5453/unblend/blob/main/web/demucs/README.md) 
+- [Browser API](https://github.com/Ryan5453/unblend/blob/main/web/unblend/README.md) 
 - [Cog](cog.yaml) (hosted on [Replicate](https://replicate.com/ryan5453/demucs))

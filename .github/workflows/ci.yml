@@ -143,4 +143,4 @@ jobs:
       - name: Build library and app
         run: npm run build
       - name: Lint app
-        run: npm run lint -w demucs-app
+        run: npm run lint -w unblend-app

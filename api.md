@@ -1,4 +1,4 @@
-# Unblend API
+# <img src="/web/app/public/favicon.svg" width="30"> Python API
 
 The Python API is primarily comprised of two classes: `Separator` and `SeparatedSources`.
 

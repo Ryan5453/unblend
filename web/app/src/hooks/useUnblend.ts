@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import type { DemucsState, ProgressPhase } from '../types';
+import type { UnblendState, ProgressPhase } from '../types';
 import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'unblend';
 import { decodeAudioFile } from '../utils/audio-decoder';
 import { ORT_WASM_PATHS } from '../onnx-config';
@@ -9,7 +9,7 @@ function isAbortError(error: unknown): boolean {
     return error instanceof DOMException && error.name === 'AbortError';
 }
 
-const initialState: DemucsState = {
+const initialState: UnblendState = {
     modelLoaded: false,
     modelLoading: false,
     audioLoaded: false,
@@ -38,8 +38,8 @@ const DEFAULT_SEGMENT_MS: Record<ModelType, number> = {
     scnet_xl_wide_v5: 30_300,
 };
 
-export function useDemucs() {
-    const [state, setState] = useState<DemucsState>(initialState);
+export function useUnblend() {
+    const [state, setState] = useState<UnblendState>(initialState);
     const [loadedModel, setLoadedModel] = useState<ModelType | null>(null);
     const [audioError, setAudioError] = useState<string | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);

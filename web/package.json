@@ -3,14 +3,14 @@
   "private": true,
   "license": "MIT",
   "workspaces": [
-    "demucs",
+    "unblend",
     "app"
   ],
   "scripts": {
     "build:lib": "npm run build -w unblend",
-    "build:app": "npm run build -w demucs-app",
+    "build:app": "npm run build -w unblend-app",
     "build": "npm run build:lib && npm run build:app",
     "test": "npm run test -w unblend",
-    "dev": "npm run build:lib && npm run dev -w demucs-app"
+    "dev": "npm run build:lib && npm run dev -w unblend-app"
   }
 }

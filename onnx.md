@@ -1,4 +1,4 @@
-# ONNX Export
+# <img src="/web/app/public/favicon.svg" width="30"> ONNX Export
 
 Unblend can export its models to ONNX for deployment in browsers, mobile apps, or other runtimes. This is how the [un/blend web app](https://demucs.app) runs separation in-browser.
 
@@ -18,39 +18,11 @@ $ unblend export-onnx --model htdemucs
 
 ## Precision
 
-Three things get called "precision" here, and they move independently:
+`--precision` sets how weights are *stored* in the exported graph, not what it computes in. It is unrelated to `unblend separate --precision`, which casts the model and genuinely does compute in fp16; here narrowed weights are cast back to fp32 before every op, so only the download shrinks. The default `native` uses the dtype the checkpoint's Safetensors header declares: fp16 for HTDemucs, because upstream rounded those weights at release, and fp32 for RoFormer and SCNet. That halves the HTDemucs exports (169 MB to 85 MB) with bit-identical weights.
 
-- **Training.** HTDemucs was trained in pure fp32 — upstream's training loop has no `autocast` or `GradScaler` anywhere. The RoFormer and SCNet checkpoints come from ZFTurbo's trainer, whose configs all set `use_amp: true`, so those were trained in fp16 mixed precision. Either way the master weights are fp32, so the learned values are fp32 either way, and every architecture here builds its modules in fp32.
-- **Storage.** The HTDemucs checkpoints (`htdemucs`, `htdemucs_ft`, `htdemucs_6s`) ship fp16 on disk; the RoFormer and SCNet checkpoints ship fp32.
-- **Runtime.** The PyTorch path picks fp16 on MPS and on CUDA with tensor cores, fp32 on CPU. That choice never reaches the ONNX graph.
+`fp32`, `bf16`, `fp16`, `fp8_e5m2`, and `fp8_e4m3` force the choice. `fp32` is the escape hatch for runtimes that mishandle narrow initializers; narrowing below what a checkpoint carries costs real quality (fp8 on HTDemucs loses ~0.7 dB SDR, mostly on drums). The mechanism is a low-precision initializer plus a `Cast` in front of every Conv, MatMul, Gemm, and recurrent op — browser runtimes produce audible noise when fp16 accumulates in those kernels.
 
-The fp16 HTDemucs checkpoints are upstream's decision, not ours. Demucs' `serialize_model` defaults to `half=True`, so Defossez rounded the weights to fp16 once at release to halve the download; loading widens them back to fp32 because the module is fp32. Unblend preserves the checkpoint exactly and does the same widening. The practical consequence is that HTDemucs weights are fp32 containers holding fp16-precision values, and exporting them as fp32 writes out 84 MB of mantissa bits that are all zero.
-
-### What `--precision` does
-
-`native`, the default, stores weights at the narrowest precision the checkpoint's own weights survive losslessly. It resolves per model rather than per family, and it reports the true floor rather than the first width that fits — fp8 values are exactly representable in fp16, so an fp8 checkpoint resolves to fp8 instead of stopping at fp16 and paying double.
-
-| Model | Native | Default export |
-|---|---|---|
-| `htdemucs`, `htdemucs_6s` | fp16 | 85 MB (from 169 MB), 56 MB (from 110 MB) |
-| RoFormer, SCNet | fp32 | unchanged |
-
-For HTDemucs this is free. The rewrite reaches 250 of 533 initializers but 99.7% of the weight bytes, every converted tensor is bit-identical to the checkpoint, and end-to-end output moves by at most 1.7e-6 relative — float-association noise from the inserted `Cast` nodes, roughly 115 dB down, not lost precision. For RoFormer and SCNet, whose checkpoints are genuinely fp32, `native` changes nothing.
-
-Any registered precision can also be forced. Narrowing below what a checkpoint carries does discard real precision: rounding the fp32-trained HTDemucs weights to fp8 costs 0.67 dB SDR overall on MUSDB18-HQ, unevenly — drums lose 1.9 dB while vocals lose 0.12 dB. `fp32` forces full width, the escape hatch for runtimes that mishandle narrow initializers. Exporting to fp8 raises the graph's opset to 19 automatically, since the fp8 tensor types do not exist before it.
-
-Storage is independent of arithmetic. Only fp16 on RoFormer converts compute:
-
-| Family | Weights | Compute | IO |
-|---|---|---|---|
-| Any family, any storage precision | as stored | fp32 | fp32 |
-| RoFormer at `fp16` | fp16 | fp16 | fp32 |
-
-Everything except RoFormer-at-fp16 gets the weight-only rewrite: narrowed initializers with a `Cast` back to fp32 in front of every Conv, ConvTranspose, MatMul, Gemm, and recurrent op. Downloads shrink, arithmetic is untouched. This matters for browser runtimes, where fp16 accumulation in Conv/MatMul kernels produces audible quantization noise; keeping compute in fp32 sidesteps that with no measurable quality loss.
-
-RoFormer instead goes through `onnxconverter-common`'s float16 converter and computes in fp16, keeping only the graph inputs and outputs fp32. Its attention trunk tolerates that where the convolutional stacks do not, and the numerically sensitive ops (`Clip`, `Cos`, `Reciprocal`, `ReduceMean`, `Sin`, `Softmax`, `Sqrt`) are blocked from conversion and stay fp32. This needs the `onnx` extra installed.
-
-Because those two cases both amount to "fp16", read `weight_precision` and `compute_precision` from the metadata rather than the older `precision` key, which reports storage only and cannot tell them apart.
+The exception is RoFormer at `fp16`, which converts arithmetic too, through `onnxconverter-common`: its attention trunk tolerates fp16 where convolutional stacks do not, and `Clip`, `Cos`, `Reciprocal`, `ReduceMean`, `Sin`, `Softmax`, and `Sqrt` are held at fp32. Because both cases are labelled "fp16", read `weight_precision` and `compute_precision` from the metadata rather than `precision`, which reports storage only.
 
 ## Shared contract
 

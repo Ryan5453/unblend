@@ -36,9 +36,9 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           py=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          js=$(node -p "require('./web/demucs/package.json').version")
+          js=$(node -p "require('./web/unblend/package.json').version")
           test "$py" = "$version" || { echo "pyproject.toml has $py, tag is $version"; exit 1; }
-          test "$js" = "$version" || { echo "web/demucs/package.json has $js, tag is $version"; exit 1; }
+          test "$js" = "$version" || { echo "web/unblend/package.json has $js, tag is $version"; exit 1; }
       - name: Sync Python dependencies
         run: uv sync --locked --extra dev --extra onnx --group onnx-test
       # See the matching step in ci.yml for why this pipes through pip compile.
@@ -72,7 +72,7 @@ jobs:
         run: |
           npm test
           npm run build
-          npm run lint -w demucs-app
+          npm run lint -w unblend-app
           npm audit --omit=dev --audit-level=high
       - name: Pack npm package
         run: |

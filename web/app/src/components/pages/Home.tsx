@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback, type DragEvent } from 'react';
-import { useDemucs } from '../../hooks/useDemucs';
+import { useUnblend } from '../../hooks/useUnblend';
 import { useHomeReset } from '../home-reset';
 import { WaveCanvas, RulerCanvas } from '../ui/WaveLane';
 import { Braid } from '../ui/Braid';
@@ -212,7 +212,7 @@ export function Home() {
         loadAudio,
         clearAudioError,
         separateAudio,
-    } = useDemucs();
+    } = useUnblend();
 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [phase, setPhase] = useState<Phase>('drop');

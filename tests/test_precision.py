@@ -138,33 +138,97 @@ def test_reduced_precision_error_separates_storage_from_compute() -> None:
     assert "stored at, which may be anything" in str(excinfo.value)
 
 
+def test_artifact_storage_dtype_reads_the_safetensors_header(
+    tmp_path: pathlib.Path,
+) -> None:
+    """
+    Storage dtype comes from the header, for every width a file may carry.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    from safetensors.torch import save_file
+
+    from unblend.repo import artifact_storage_dtype
+
+    for dtype in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        path = tmp_path / f"{dtype}.safetensors"
+        save_file({"w": torch.randn(8).to(dtype)}, str(path))
+        assert artifact_storage_dtype({"path": str(path)}) is dtype
+
+
+def test_artifact_storage_dtype_reports_the_widest_of_a_mixed_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """
+    A file mixing widths needs the widest to round-trip, so that is reported.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    from safetensors.torch import save_file
+
+    from unblend.repo import artifact_storage_dtype
+
+    path = tmp_path / "mixed.safetensors"
+    save_file(
+        {
+            "half": torch.randn(8).to(torch.float16),
+            "full": torch.randn(8),
+            "ints": torch.arange(4),
+        },
+        str(path),
+    )
+    assert artifact_storage_dtype({"path": str(path)}) is torch.float32
+
+
+def test_artifact_storage_dtype_is_none_without_a_readable_file() -> None:
+    """
+    A missing path, or a spec naming neither a path nor a digest, reads None.
+    """
+    from unblend.repo import artifact_storage_dtype
+
+    assert artifact_storage_dtype({"path": "/nonexistent/model.safetensors"}) is None
+    assert artifact_storage_dtype({}) is None
+
+
+def test_export_precision_falls_back_to_fp32_when_header_is_unreadable() -> None:
+    """
+    An uninspectable checkpoint exports at full width rather than guessing.
+
+    Narrowing on a guess could silently discard precision, so fp32 is the only
+    safe answer.
+    """
+    from unblend.onnx import _resolve_export_precision
+
+    absent = {"checkpoint": {"path": "/nonexistent/model.safetensors"}}
+    assert _resolve_export_precision("native", absent) is torch.float32
+    assert _resolve_export_precision("native", {"checkpoint": {}}) is torch.float32
+
+
+@pytest.mark.slow
 def test_export_native_precision_follows_the_checkpoint_header() -> None:
     """
-    "native" is the dtype the Safetensors header declares, not an inference.
+    Against the real registry, "native" recovers each checkpoint's own width.
 
-    HTDemucs ships fp16 because upstream rounded it at release; the RoFormer
-    and SCNet checkpoints are genuinely fp32.
+    Marked slow: resolution reads the cached artifact, so this needs the
+    checkpoints on disk. In the export path itself ``get_model`` has already
+    downloaded them by the time precision resolves.
     """
     from unblend.onnx import _resolve_export_precision
     from unblend.repo import ModelRepository
 
-    models = ModelRepository().list_models()
+    repo = ModelRepository()
+    models = repo.list_models()
     for name, expected in (
         ("htdemucs", torch.float16),
         ("htdemucs_6s", torch.float16),
         ("scnet_small", torch.float32),
         ("bs_roformer_anvuew", torch.float32),
     ):
+        repo.get_model(name)
         assert _resolve_export_precision("native", models[name]) is expected
-
-
-def test_export_precision_falls_back_to_fp32_when_header_is_unreadable() -> None:
-    """
-    A missing or unreadable checkpoint exports at full width, not a guess.
-    """
-    from unblend.onnx import _resolve_export_precision
-
-    absent = {"checkpoint": {"path": "/nonexistent/model.safetensors"}}
-    assert _resolve_export_precision("native", absent) is torch.float32
-    # A spec naming neither a local path nor a digest has nothing to inspect.
-    assert _resolve_export_precision("native", {"checkpoint": {}}) is torch.float32

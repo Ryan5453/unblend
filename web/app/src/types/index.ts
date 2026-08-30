@@ -7,7 +7,7 @@ export type ProgressPhase =
     | 'finalize'
     | 'complete';
 
-export interface DemucsState {
+export interface UnblendState {
     modelLoaded: boolean;
     modelLoading: boolean;
     audioLoaded: boolean;
