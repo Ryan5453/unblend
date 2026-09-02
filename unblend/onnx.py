@@ -899,6 +899,9 @@ def _export_metadata(
         "stft_normalized": "true" if stft["normalized"] else "false",
         "stft_window": stft_window,
         "batch_mode": "static" if static_batch else "dynamic",
+        "external_normalization": (
+            "true" if getattr(model, "external_normalization", True) else "false"
+        ),
     }
     if license_label:
         metadata["license"] = license_label
@@ -1096,9 +1099,6 @@ def _export_scnet_to_onnx(
         )
         metadata["logical_segment_samples"] = str(segment)
         metadata["stft_pad_samples"] = str(padding)
-        metadata["external_normalization"] = (
-            "true" if model.external_normalization else "false"
-        )
         _add_metadata(onnx_model, metadata)
         onnx.save(onnx_model, staging)
     return output_path

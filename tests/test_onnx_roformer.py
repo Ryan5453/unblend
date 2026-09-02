@@ -302,6 +302,7 @@ def test_export_and_onnxruntime_parity(builder, tmp_path) -> None:
     assert meta["stft_n_fft"] == str(N_FFT)
     assert meta["stft_hop_length"] == str(HOP)
     assert meta["precision"] == "fp32"
+    assert meta["external_normalization"] == "false"
 
     # Band splitting used to become one ~60-output Split, which exceeds the
     # WebGPU storage-buffer binding floor. The only remaining Split is the
