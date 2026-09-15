@@ -290,18 +290,29 @@ def _scaled_dot_product_attention(
     training: bool,
 ) -> Tensor:
     """
-    Run RoFormer self-attention with the fastest measured backend path.
+    Run RoFormer self-attention through PyTorch's fused attention kernel.
+
+    MPS used to take a hand-rolled path here (``softmax(q @ k.T) @ v``). That
+    materializes the whole ``[rows, heads, frames, frames]`` score tensor,
+    which is quadratic in the segment's frame count and linear in the batch:
+    ``bs_roformer_anvuew`` at ``chunk_batch_size=8`` asks for exactly 26.01 GiB
+    in one allocation and dies, and ``bs_roformer_sw`` segfaults the process
+    outright. ``scaled_dot_product_attention`` never materializes that tensor.
+    It is also ~17% faster on this hardware, and agrees with the old path to
+    ~4e-4 (fp16 rounding, below the run-to-run spread from unseeded shifts), so
+    the special case bought nothing on current torch.
 
     :param query: Queries ``[batch, heads, sequence, dim]``. :param key: Keys matching ``query`` shape. :param value: Values matching ``query`` shape. :param scale: Dot-product scale. :param dropout: Dropout probability. :param training: Whether the module is training. :return: Attention output.
     """
-    if query.device.type == "mps" and not training:
-        weights = (query * scale) @ key.transpose(-1, -2)
-        return weights.softmax(dim=-1) @ value
     return F.scaled_dot_product_attention(
         query,
         key,
         value,
         dropout_p=dropout if training else 0.0,
+        # Passed explicitly rather than left to the default. They are equal
+        # today (both ``dim_head ** -0.5``), but the caller owns ``scale`` and
+        # a change there must not silently diverge from the kernel's default.
+        scale=scale,
     )
 
 
@@ -863,6 +874,11 @@ class _RoformerBase(ASSModel):
         self.samplerate = samplerate
         self.max_allowed_segment = segment_samples / samplerate
 
+        # Forced on for inference, overriding whatever the checkpoint's config
+        # asked for: ``apply_model`` centre-trims each chunk's output back to
+        # the chunk length, so a shorter iSTFT result would fail that trim.
+        # Only Mel-Band reads this flag; BS-RoFormer always passes the input
+        # length to ``torch.istft`` directly.
         self.match_input_audio_length = True
 
     def _stft_window(self, device: torch.device) -> Tensor:

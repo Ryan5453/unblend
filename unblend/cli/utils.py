@@ -187,7 +187,7 @@ def get_models() -> dict[str, dict]:
     """
     Get every model the repository knows about.
 
-    Goes through ``ModelRepository`` rather than reading ``metadata.json``
+    Goes through ``ModelRepository`` rather than reading ``metadata.yaml``
     directly so models added via ``UNBLEND_EXTRA_MODELS`` appear in the CLI
     too — otherwise ``unblend models list`` would omit models that
     ``Separator`` can happily load.

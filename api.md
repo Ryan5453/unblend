@@ -1,4 +1,4 @@
-# <img src="/web/app/public/favicon.svg" width="30"> Python API
+# <img src="https://raw.githubusercontent.com/Ryan5453/unblend/main/web/app/public/favicon.svg" width="30"> Python API
 
 The Python API is primarily comprised of two classes: `Separator` and `SeparatedSources`.
 
@@ -16,6 +16,9 @@ separator = Separator(
     dtype: torch.dtype | str | None = "auto",
     compile: bool = False,
     chunk_batch_size: int | None = None,
+    custom_kernels: bool | None = None,
+    combine: str | None = None,
+    combine_params: dict | None = None,
 )
 ```
 
@@ -24,9 +27,12 @@ A `Separator` takes the following parameters:
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. If left as `None` (the default), unblend auto-selects the best available backend at construction time. Pass `"cpu"`, `"cuda"`, or `"mps"` to force one.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to ensembles like htdemucs_ft). This is a performance optimization (smaller download and memory footprint), it does not filter the output to one stem - use `SeparatedSources.isolate_stem` to actually isolate a stem.
-- `dtype` - Inference *compute* precision. The default `"auto"` uses FP16 on CUDA GPUs with tensor cores (compute capability ≥ 7.0) and on MPS; CPU and older CUDA GPUs use FP32. Compute precision is independent of the precision a checkpoint is *stored* at: modules are always built in FP32 and `load_state_dict` widens on the way in, so a checkpoint saved at any float width (FP16, BF16, FP8, …) loads and runs regardless of what this is set to. The upstream HTDemucs weights already exercise that, since they ship as FP16. Only dtypes the device has kernels for are accepted here; `unblend.precision` is the single place that describes which those are, and asking for one that is storage-only (FP8, which PyTorch has no convolution for) raises `ValidationError` with the supported list.
+- `dtype` - Inference *compute* precision. The default `"auto"` uses FP16 on CUDA GPUs with tensor cores (compute capability ≥ 7.0) and on MPS; CPU and older CUDA GPUs use FP32. Compute precision is independent of the precision a checkpoint is *stored* at: modules are always built in FP32 and `load_state_dict` widens on the way in, so a checkpoint saved at any float width (FP16, BF16, FP8, …) loads and runs regardless of what this is set to. The upstream HTDemucs weights already exercise that, since they ship as FP16. Only dtypes the device has kernels for are accepted here — `torch.float16` and `torch.bfloat16` — so asking for one that is storage-only (FP8, which PyTorch has no convolution for) raises `ValidationError` with the supported list.
 - `compile` - Optional, if `True`, compiles the model's neural-network core on CUDA — roughly 1.3–1.5× in FP16, at the cost of startup time and extra held VRAM, so it pays off on long jobs. CPU and MPS ignore it. The CLI decides per workload instead, with `--compile` / `--no-compile` to force either way.
 - `chunk_batch_size` - Optional, how many segments to run per forward pass. The default (`None`) sizes it from available memory and backs off if that proves too large; an explicit value is used exactly as given, and OOM raises.
+- `custom_kernels` - Optional, whether the fused CUDA/Metal kernels may be used. `None` (the default) defers to the `UNBLEND_CUSTOM_KERNELS` environment variable, which enables them unless set to a falsy value; `False` forces vanilla PyTorch ops on every device and skips the one-time CUDA extension build, which is the baseline for A/B comparisons.
+- `combine` - Optional, overrides how an ensemble's member outputs are combined for this instance. See [Combining members](#combining-members) for the mode names. Raises `ValidationError` on a single-member model.
+- `combine_params` - Optional, the STFT geometry the spectral combine modes use, as `{"n_fft": int, "hop_length": int}`. Defaults to `{"n_fft": 1024, "hop_length": 256}`; `n_fft` must be a whole multiple of `hop_length`.
 
 ### Attributes
 
@@ -333,42 +339,6 @@ Returns the version string (e.g. `"1.0.0"`).
 - `Model` — base `nn.Module` returned by `ModelRepository.get_model` for a single-layer model (e.g. plain `htdemucs`). Has `.sources` (stem names), `.samplerate`, `.audio_channels`.
 - `ModelEnsemble` — `nn.Module` returned for multi-member entries like `htdemucs_ft`. Holds `.models` (list[Model]), `.weights` (per-source mixing rows), and the shared `.sources` / `.samplerate` / `.audio_channels`.
 
-### Lower-level apply
-
-```python
-from unblend import apply_model, apply_model_multi
-```
-
-```python
-def apply_model(
-    model: Model | ModelEnsemble,
-    mix: Tensor | TensorChunk,
-    device: str | torch.device | None = None,
-    shifts: int = 0,
-    overlap: float = 0.25,
-    transition_power: float = 1.0,
-    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
-    use_only_stem: str | None = None,
-    chunk_batch_size: int = 1,
-) -> Tensor:
-```
-
-```python
-def apply_model_multi(
-    model: Model | ModelEnsemble,
-    mixes: list[Tensor | TensorChunk],
-    device: str | torch.device | None = None,
-    shifts: int = 0,
-    overlap: float = 0.25,
-    transition_power: float = 1.0,
-    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
-    use_only_stem: str | None = None,
-    chunk_batch_size: int = 1,
-) -> list[Tensor]:
-```
-
-`apply_model_multi` is the batched variant that pools tail chunks across inputs so every forward pass runs at full `chunk_batch_size`. `apply_model` is a thin single-input wrapper around it. Both expect raw `[channels, samples]` or `[batch, channels, samples]` tensors (already normalized — `Separator` handles normalization internally).
-
 ### Device
 
 ```python
@@ -435,7 +405,7 @@ written that way keeps working. The shipped registry is
 [`unblend/metadata.yaml`](https://github.com/Ryan5453/unblend/blob/main/unblend/metadata.yaml).
 
 ```bash
-export UNBLEND_EXTRA_MODELS=~/my-models.json
+export UNBLEND_EXTRA_MODELS=~/my-models.yaml
 unblend models list          # your model appears, marked "Local"
 unblend separate --model my_scnet track.wav
 ```
@@ -610,7 +580,7 @@ unblend models import model.ckpt --config config.yaml --name my_model \
 ```
 ✓ Loaded as mel_band_roformer and strict-loaded 1219 tensors
 ✓ Wrote ~/.unblend/imported/my_model.safetensors (869.4 MB)
-✓ Registered my_model in ~/.unblend/models.json
+✓ Registered my_model in ~/.unblend/models.yaml
 
 Try it: unblend separate --model my_model track.wav
 ```

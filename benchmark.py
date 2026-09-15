@@ -317,7 +317,18 @@ def _unscoreable_complement(separator: Separator) -> str | None:
         scoring, otherwise ``None``.
     """
     model = getattr(separator, "model", None)
-    if not getattr(model, "output_complement", False):
+    if model is None:
+        return None
+    # An ensemble carries no ``output_complement`` of its own; the flag lives
+    # on its members. If any member synthesises the complement then so does the
+    # ensemble's output, since every combine mode is elementwise over members.
+    members = getattr(model, "models", None)
+    synthesises = (
+        any(getattr(member, "output_complement", False) for member in members)
+        if members is not None
+        else bool(getattr(model, "output_complement", False))
+    )
+    if not synthesises:
         return None
     complement = model.sources[-1]
     return None if complement == "vocals" else complement
@@ -1679,26 +1690,16 @@ def main(
                 elapsed_sec = perf_counter() - started_at
                 detail_row["elapsed_sec"] = elapsed_sec
 
-                stem_scores: dict[str, float] = {}
-                if compute_sdr:
-                    # With use_only_stem, other stems are deliberately
-                    # degraded (they come from the one specialist) — scoring
-                    # them would only pollute the summary means.
-                    scored_stems = (
-                        tuple(s for s in track.reference_stems if s == use_only_stem)
-                        if use_only_stem is not None
-                        else track.reference_stems
-                    )
-                    for stem_name in scored_stems:
-                        if stem_name not in separated.sources:
-                            continue
-                        reference = separator._to_tensor(
-                            track.directory / f"{stem_name}.wav"
-                        )
-                        stem_scores[stem_name] = _compute_sdr(
-                            separated.sources[stem_name],
-                            reference,
-                        )
+                # Must go through _score_stems, not a local copy of it: this
+                # path used to inline the loop and silently lost the
+                # unscoreable-complement filter, so every single-head vocals
+                # model scored its "other" complement against MUSDB's "other"
+                # and reported ~-3 dB as if it were a result.
+                stem_scores = (
+                    _score_stems(separator, track, separated, only_stem=use_only_stem)
+                    if compute_sdr
+                    else {}
+                )
 
                 detail_row["status"] = "ok"
                 detail_row["error_type"] = ""

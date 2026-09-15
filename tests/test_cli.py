@@ -710,3 +710,127 @@ def test_model_names_include_locally_added_models() -> None:
 
     with pytest.raises(typer.BadParameter, match="not a known model"):
         validate_model_name("no_such_model")
+
+
+def test_chunk_batch_size_reaches_the_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``--chunk-batch-size`` is forwarded to ``Separator``, so the value
+    ``unblend tune`` recommends is the value inference actually runs at.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    captured: dict[str, object] = {}
+
+    class _RecordingSeparator(_StubSeparator):
+        """
+        Records the kwargs the CLI constructed it with.
+        """
+
+        def __init__(self, **kwargs: object) -> None:
+            """
+            Capture construction kwargs, then behave like the stub.
+
+            :param kwargs: Keyword arguments the CLI passed.
+            """
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+        def separate(self, **kwargs: object) -> object:
+            """
+            Return a result whose stems the export loop can iterate.
+
+            :param kwargs: Ignored separation arguments.
+            :return: An object exposing an empty ``sources`` mapping.
+            """
+            return SimpleNamespace(sources={})
+
+    monkeypatch.setattr(
+        "unblend.cli.separate.ensure_model_available", lambda *a, **k: True
+    )
+    monkeypatch.setattr("unblend.cli.separate.Separator", _RecordingSeparator)
+
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(
+        [
+            "separate",
+            str(wav_path),
+            "--chunk-batch-size",
+            "7",
+            "-o",
+            str(tmp_path / "out" / "{stem}.{ext}"),
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["chunk_batch_size"] == 7
+
+
+def test_chunk_batch_size_defaults_to_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Omitting ``--chunk-batch-size`` passes ``None``, which is what selects
+    ``Separator``'s memory-based auto sizing.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    captured: dict[str, object] = {}
+
+    class _RecordingSeparator(_StubSeparator):
+        """
+        Records the kwargs the CLI constructed it with.
+        """
+
+        def __init__(self, **kwargs: object) -> None:
+            """
+            Capture construction kwargs, then behave like the stub.
+
+            :param kwargs: Keyword arguments the CLI passed.
+            """
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+        def separate(self, **kwargs: object) -> object:
+            """
+            Return a result whose stems the export loop can iterate.
+
+            :param kwargs: Ignored separation arguments.
+            :return: An object exposing an empty ``sources`` mapping.
+            """
+            return SimpleNamespace(sources={})
+
+    monkeypatch.setattr(
+        "unblend.cli.separate.ensure_model_available", lambda *a, **k: True
+    )
+    monkeypatch.setattr("unblend.cli.separate.Separator", _RecordingSeparator)
+
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    result = _invoke(
+        ["separate", str(wav_path), "-o", str(tmp_path / "out" / "{stem}.{ext}")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["chunk_batch_size"] is None
+
+
+def test_chunk_batch_size_rejects_out_of_range_values(tmp_path: Path) -> None:
+    """
+    The CLI bounds match ``Separator``'s own validation (1..1024), so a typo
+    fails at parse time instead of after a model download.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    wav_path = tmp_path / "clip.wav"
+    AudioEncoder(samples=torch.zeros(2, 4410), sample_rate=44100).to_file(wav_path)
+
+    for bad in ("0", "2048"):
+        result = _invoke(["separate", str(wav_path), "--chunk-batch-size", bad])
+        assert result.exit_code != 0, f"{bad} should be rejected"

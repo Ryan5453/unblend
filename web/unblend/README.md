@@ -1,4 +1,4 @@
-# <img src="/web/app/public/favicon.svg" width="30"> Browser API
+# <img src="https://raw.githubusercontent.com/Ryan5453/unblend/main/web/app/public/favicon.svg" width="30"> Browser API
 
 Unblend implements a browser API for easy access of the models. However, it is significantly slower than the native implementation.
 

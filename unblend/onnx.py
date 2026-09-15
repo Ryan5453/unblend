@@ -10,6 +10,7 @@ import math
 import os
 import shutil
 import tempfile
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator
@@ -592,8 +593,6 @@ def _convert_roformer_to_fp16(onnx_model: "onnx.ModelProto") -> None:
 
     :param onnx_model: Loaded ONNX model; modified in place.
     """
-    import warnings
-
     from onnx import TensorProto
 
     try:
@@ -1249,26 +1248,35 @@ def export_to_onnx(
     )
 
     with _atomic_onnx_path(output_path) as staging_path:
-        torch.onnx.export(
-            wrapper,
-            (dummy_spec_real, dummy_spec_imag, dummy_audio),
-            staging_path,
-            input_names=["spec_real", "spec_imag", "audio"],
-            output_names=["out_spec_real", "out_spec_imag", "out_wave"],
-            dynamic_axes=None
-            if static_batch
-            else {
-                "spec_real": {0: "batch"},
-                "spec_imag": {0: "batch"},
-                "audio": {0: "batch"},
-                "out_spec_real": {0: "batch"},
-                "out_spec_imag": {0: "batch"},
-                "out_wave": {0: "batch"},
-            },
-            opset_version=opset_version,
-            do_constant_folding=True,
-            dynamo=False,
-        )
+        # The legacy tracer warns about every Python-level branch it bakes in
+        # as a constant. Here they all read static geometry -- the encoder
+        # stride, ``nfft``, the transformer's ``d_model``, and the segment
+        # length the graph is traced at -- never the batch axis, which is the
+        # only dynamic dimension in this export. Constant-folding them is what
+        # the export is supposed to do, so the warnings are noise. Scoped to
+        # this call so a tracer complaint anywhere else still surfaces.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=torch.jit.TracerWarning)
+            torch.onnx.export(
+                wrapper,
+                (dummy_spec_real, dummy_spec_imag, dummy_audio),
+                staging_path,
+                input_names=["spec_real", "spec_imag", "audio"],
+                output_names=["out_spec_real", "out_spec_imag", "out_wave"],
+                dynamic_axes=None
+                if static_batch
+                else {
+                    "spec_real": {0: "batch"},
+                    "spec_imag": {0: "batch"},
+                    "audio": {0: "batch"},
+                    "out_spec_real": {0: "batch"},
+                    "out_spec_imag": {0: "batch"},
+                    "out_wave": {0: "batch"},
+                },
+                opset_version=opset_version,
+                do_constant_folding=True,
+                dynamo=False,
+            )
 
         onnx_model = onnx.load(staging_path)
 

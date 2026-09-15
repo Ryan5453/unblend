@@ -1,6 +1,6 @@
-# <img src="/web/app/public/favicon.svg" width="30"> ONNX Export
+# <img src="https://raw.githubusercontent.com/Ryan5453/unblend/main/web/app/public/favicon.svg" width="30"> ONNX Export
 
-Unblend can export its models to ONNX for deployment in browsers, mobile apps, or other runtimes. This is how the [un/blend web app](https://demucs.app) runs separation in-browser.
+Unblend can export its models to ONNX for deployment in browsers, mobile apps, or other runtimes. This is how the [un/blend web app](https://unblend.dev) runs separation in-browser.
 
 The CLI can export any single-checkpoint model (ensembles are not currently supported) like this:
 

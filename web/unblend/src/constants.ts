@@ -29,8 +29,8 @@ export type ModelFamily = 'htdemucs' | 'roformer' | 'scnet';
  * - `roformer`: plain centered reflect-pad STFT (all `nfft/2 + 1` bins, no
  *   normalization — the checkpoints use `torch.stft(normalized=False)`), raw
  *   audio in (no normalization), spectrogram masking only (no time branch).
- * - `scnet`: centered STFT (all bins, per-variant window), track-level input
- *   normalization, and spectrogram-only output. Some checkpoints internally
+ * - `scnet`: centered STFT (all bins, per-variant window), raw audio in (no
+ *   normalization), and spectrogram-only output. Some checkpoints internally
  *   zero-pad each logical chunk before the STFT; `modelInputSamples` records
  *   that graph-facing length without changing overlap/chunk boundaries.
  */

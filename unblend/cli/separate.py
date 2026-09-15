@@ -332,6 +332,17 @@ def separate_command(
             rich_help_panel="Processing",
         ),
     ] = Precision.auto,
+    chunk_batch_size: Annotated[
+        int | None,
+        typer.Option(
+            "--chunk-batch-size",
+            min=1,
+            max=1024,
+            help="How many split chunks to run per forward pass. Defaults to sizing from available memory, backing off on OOM; an explicit value is used as given. 'unblend tune' measures the best value for this machine.",
+            show_default=False,
+            rich_help_panel="Processing",
+        ),
+    ] = None,
     # Output
     output: Annotated[
         str,
@@ -389,6 +400,9 @@ def separate_command(
         set to a falsy value).
     :param precision: Inference precision; auto picks fp16 on CUDA (with tensor
         cores) and MPS, fp32 on CPU
+    :param chunk_batch_size: How many split chunks to run per forward pass.
+        ``None`` sizes it from available memory and backs off on OOM; an
+        explicit value is used exactly as given, and OOM raises.
     :param output: Output path template; variables are {model}, {track}, {stem},
         {ext}, {date}, {time}, {timestamp}
     :param isolate_stem: Only creates a {stem} and no_{stem} stem/file
@@ -489,6 +503,7 @@ def separate_command(
             only_load=only_load_stem,
             dtype=dtype,
             compile=compile_model is True,
+            chunk_batch_size=chunk_batch_size,
             custom_kernels=custom_kernels,
             combine=combine,
         )

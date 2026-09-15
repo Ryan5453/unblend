@@ -577,10 +577,7 @@ class HTDemucs(ASSModel):
         if model_dtype != torch.float32:
             x = x.to(model_dtype)
             xt = xt.to(model_dtype)
-            x, xt = self.forward_core(x, xt)
-
-        else:
-            x, xt = self.forward_core(x, xt)
+        x, xt = self.forward_core(x, xt)
 
         S = len(self.sources)
         x = x.view(B, S, -1, Fq, T)
