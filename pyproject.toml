@@ -86,6 +86,11 @@ wheel-include = [
 ]
 
 [tool.pytest.ini_options]
+# Collect only our own suite. Without this, pytest walks the whole rootdir and
+# picks up anything that happens to be checked out under it -- the vendored
+# upstream clone under benchmarks/ ships its own tests/ and errors during
+# collection, taking the entire run down with it.
+testpaths = ["tests"]
 addopts = "-m 'not slow'"
 markers = [
     "slow: downloads models / runs real inference (deselect with '-m \"not slow\"')",

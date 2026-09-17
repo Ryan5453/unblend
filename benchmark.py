@@ -7,12 +7,15 @@ import inspect
 import json
 import math
 import os
+import platform
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
 import threading
 import traceback
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -294,6 +297,108 @@ def _load_local_manifest(manifest_path: Path) -> dict[str, Any]:
             state=state,
         )
     return models
+
+
+def _cpu_model() -> str | None:
+    """
+    Best-effort CPU model string for the current host.
+
+    Timings from different CPU generations are not comparable, so a benchmark
+    run has to record which one produced it. SLURM will silently satisfy a job
+    from any node in a heterogeneous partition, which makes this the only
+    reliable after-the-fact evidence that a multi-job campaign stayed on one
+    CPU model.
+
+    :return: Human-readable CPU model, or ``None`` when it cannot be determined.
+    """
+    if sys.platform == "linux":
+        try:
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            return subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return platform.processor() or None
+
+
+def _host_provenance(device: str) -> dict[str, Any]:
+    """
+    Collect host, toolchain and scheduler facts for the current process.
+
+    Recorded alongside every run so that results from a sharded SLURM campaign
+    can be checked for homogeneity afterwards rather than trusted blindly.
+
+    :param device: Device the benchmark is running on, used to decide whether
+        GPU fields are meaningful.
+    :return: Mapping of provenance keys to values, with ``None`` where a fact
+        does not apply to this host.
+    """
+    gpu_name: str | None = None
+    gpu_count: int | None = None
+    cuda_version: str | None = None
+    if device == "cuda" and torch.cuda.is_available():
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_count = torch.cuda.device_count()
+            cuda_version = torch.version.cuda
+        except (AssertionError, RuntimeError):
+            pass
+
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "cpu_model": _cpu_model(),
+        "cpu_count": os.cpu_count(),
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_num_interop_threads": torch.get_num_interop_threads(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+        "torch_version": torch.__version__,
+        "python_version": platform.python_version(),
+        "cuda_version": cuda_version,
+        "gpu_name": gpu_name,
+        "gpu_count": gpu_count,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_job_name": os.environ.get("SLURM_JOB_NAME"),
+        "slurm_constraint": os.environ.get("SLURM_JOB_CONSTRAINT"),
+        "slurm_nodelist": os.environ.get("SLURM_JOB_NODELIST"),
+        "slurm_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK"),
+    }
+
+
+def _track_duration_sec(path: Path) -> float:
+    """
+    Duration of a track in seconds, read from the header without decoding.
+
+    The realtime factor every table reports is ``audio_sec / wall_sec``, and a
+    campaign sharded with ``--track-offset`` gives each shard a different track
+    subset — so a global mean track length would misreport every shard. Reading
+    the real duration keeps the factor exact per shard.
+
+    :param path: Path to the mixture audio file.
+    :return: Duration in seconds, or ``nan`` if it cannot be determined.
+    """
+    try:
+        with wave.open(str(path), "rb") as handle:
+            return handle.getnframes() / float(handle.getframerate())
+    except (wave.Error, OSError, ZeroDivisionError):
+        pass
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        return float(AudioDecoder(str(path)).metadata.duration_seconds)
+    except Exception:
+        return float("nan")
 
 
 def _unscoreable_complement(separator: Separator) -> str | None:
@@ -934,6 +1039,18 @@ def _resolve_device(device_flag: str | None) -> str:
     )
 
 
+def _synchronize(device: str) -> None:
+    """
+    Block until queued device work has finished, so warmup really is finished.
+
+    :param device: ``"cuda"``, ``"mps"``, or ``"cpu"``. Anything else is a no-op.
+    """
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mps" and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
+
+
 def _empty_cache(device: str) -> None:
     """
     Empty the framework allocator cache for the given device, if supported.
@@ -1112,6 +1229,47 @@ def main(
         min=1,
         help="Limit benchmarking to the first N tracks",
     ),
+    warmup_passes: int = typer.Option(
+        0,
+        "--warmup-passes",
+        min=0,
+        help=(
+            "Discarded separations run before timing starts. CUDA needs this: "
+            "the batch-size probe calls empty_cache() and then sizes batches far "
+            "larger than it ever measured, so the caching allocator has to grow "
+            "from cold. Each pass covers every track, because chunk count varies "
+            "with track length. Without it, H200 fp16 measures 194x instead of "
+            "its steady-state 800x."
+        ),
+    ),
+    vram_sampler_enabled: bool = typer.Option(
+        False,
+        "--vram-sampler/--no-vram-sampler",
+        help=(
+            "Sample NVML GPU memory by shelling out to nvidia-smi. Off by "
+            "default: each sample spawns a subprocess that takes ~0.5-1.5s and "
+            "serialises against CUDA work, which destroys timings on fast "
+            "devices. Enable only for memory profiling, never for throughput."
+        ),
+    ),
+    preload_audio: bool = typer.Option(
+        False,
+        "--preload-audio/--no-preload-audio",
+        help=(
+            "Decode every track once before timing and hand the separator a "
+            "tensor, so per-track wall measures separation rather than file I/O. "
+            "Essential on CUDA, where decode dominates."
+        ),
+    ),
+    track_offset: int = typer.Option(
+        0,
+        "--track-offset",
+        min=0,
+        help=(
+            "Skip the first N tracks before applying --limit, so one config "
+            "can be sharded across jobs by track range"
+        ),
+    ),
     seed: int | None = typer.Option(
         1234,
         "--seed",
@@ -1212,6 +1370,10 @@ def main(
     :param musdb_root: Path to the MUSDB18-HQ split directory.
     :param output_dir: Directory to write results into (auto-named if None).
     :param limit: Limit benchmarking to the first N tracks.
+    :param warmup_passes: Discarded separations before timing, to warm the allocator.
+    :param vram_sampler_enabled: Poll nvidia-smi for NVML peak VRAM; perturbs timings.
+    :param preload_audio: Decode tracks before timing so wall time excludes I/O.
+    :param track_offset: Number of leading tracks to skip before ``limit``.
     :param seed: Base seed used to derive a deterministic per-track seed.
     :param chunk_batch_size: Override for chunks processed per batch.
     :param dataset_throughput: Measure whole-dataset wall via the batched path.
@@ -1302,6 +1464,11 @@ def main(
             precisions = ["fp32"]
 
     tracks = _discover_tracks(musdb_root)
+    track_duration_by_name = {
+        t.name: _track_duration_sec(t.mixture_path) for t in tracks
+    }
+    if track_offset:
+        tracks = tracks[track_offset:]
     if limit is not None:
         tracks = tracks[:limit]
 
@@ -1330,12 +1497,59 @@ def main(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = Path("benchmarks") / "musdb" / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
+    detail_csv = output_dir / "benchmark_details.csv"
+    summary_csv = output_dir / "benchmark_summary.csv"
+    metadata_json = output_dir / "benchmark_metadata.json"
 
     typer.echo(f"Benchmarking {len(configs)} configs across {len(tracks)} MUSDB tracks")
     typer.echo(f"Results directory: {output_dir}")
 
     details_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
+
+    # The CSVs below are only written once every config has finished, so a run
+    # killed by a SLURM walltime, an OOM or a segfault would otherwise produce
+    # nothing at all. Mirror each row into an append-only JSONL as it is
+    # produced, flushed per row, so a partial run stays recoverable.
+    partial_jsonl = output_dir / "benchmark_partial.jsonl"
+
+    # The full metadata write happens after the run, but a job that is killed
+    # never reaches it — and a recovered shard with no cpu_model cannot be
+    # checked for host homogeneity, which is the whole point of recording it.
+    # Write provenance now and overwrite with the complete record at the end.
+    metadata_json.write_text(
+        json.dumps({"status": "running", **_host_provenance(device)}, indent=2)
+    )
+
+    def _flush_partial(kind: str, row: dict[str, Any]) -> None:
+        """
+        Append one row to the crash-resilient JSONL sidecar.
+
+        :param kind: Either ``"detail"`` or ``"summary"``.
+        :param row: The row to persist.
+        """
+        with open(partial_jsonl, "a") as handle:
+            handle.write(json.dumps({"kind": kind, **row}, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _record_detail(row: dict[str, Any]) -> None:
+        """
+        Accumulate a per-track row and persist it immediately.
+
+        :param row: The detail row to record.
+        """
+        details_rows.append(row)
+        _flush_partial("detail", row)
+
+    def _record_summary(row: dict[str, Any]) -> None:
+        """
+        Accumulate a per-config row and persist it immediately.
+
+        :param row: The summary row to record.
+        """
+        summary_rows.append(row)
+        _flush_partial("summary", row)
 
     for config_index, config in enumerate(configs, start=1):
         variant_label = (
@@ -1362,7 +1576,8 @@ def main(
                 upstream_python_version=upstream_python,
                 compute_sdr=compute_sdr,
             )
-            details_rows.extend(upstream_details)
+            for upstream_row in upstream_details:
+                _record_detail(upstream_row)
             ok_rows = [row for row in upstream_details if row.get("status") == "ok"]
             ok_elapsed = [
                 float(row["elapsed_sec"])
@@ -1396,7 +1611,7 @@ def main(
                     statistics.fmean(stem_values) if stem_values else float("nan")
                 )
 
-            summary_rows.append(
+            _record_summary(
                 {
                     **_summary_row_base(config, chunk_batch_size, seed, device),
                     "status": "ok" if len(ok_rows) == len(tracks) else "partial",
@@ -1467,7 +1682,7 @@ def main(
         if config.model not in LOCAL_MODELS and not ensure_model_available(
             config.model
         ):
-            summary_rows.append(
+            _record_summary(
                 {
                     **_summary_row_base(
                         config,
@@ -1490,8 +1705,14 @@ def main(
         rss_sampler.start()
         # NVML-truth GPU memory (sees CUDAGraph pools that the torch
         # allocator metric misses); None off-CUDA.
+        # Off unless explicitly asked for: the sampler shells out to nvidia-smi
+        # every 0.2s, each call costing ~0.5-1.5s and serialising against CUDA
+        # work. On H200 fp16 a track separates in ~0.3s, so this alone made
+        # measurements 4-5x slow and intermittently bimodal -- tracks that fell
+        # between polls ran at full speed, tracks that caught one did not.
+        # ``peak_vram_mb`` (torch allocator) is unaffected and still recorded.
         vram_sampler = None
-        if device == "cuda":
+        if device == "cuda" and vram_sampler_enabled:
             vram_sampler = _PeakVramSampler(os.getpid())
             vram_sampler.start()
 
@@ -1509,7 +1730,7 @@ def main(
                 chunk_batch_size=chunk_batch_size,
             )
         except Exception as error:
-            summary_rows.append(
+            _record_summary(
                 {
                     **_summary_row_base(
                         config,
@@ -1641,7 +1862,7 @@ def main(
                     for stem_name in REFERENCE_STEMS:
                         detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
                     successful_track_rows.append(detail_row)
-                    details_rows.append(detail_row)
+                    _record_detail(detail_row)
                 del group_results
 
             # Per-track wall time isn't individually observable inside a
@@ -1662,6 +1883,58 @@ def main(
             if measured_peak is not None:
                 peak_vram_bytes = max(peak_vram_bytes, measured_peak)
 
+        # Decode every track once, before timing starts. Passing a path makes
+        # ``separate()`` decode inside the timed region, and on CUDA that
+        # dominates: H200 fp16 separates 240 s of audio in ~0.27 s, while
+        # reading and decoding a 250 s WAV off shared storage costs several
+        # times that. Worse, it biases *comparisons* -- the faster the
+        # separation, the larger the fixed I/O share, which compresses and can
+        # even invert precision ratios. Tensors are handed in instead, at the
+        # separator's own sample rate so no resampling happens either.
+        preloaded_audio: dict[str, Any] | None = None
+        if preload_audio and not use_batched:
+            preload_started = perf_counter()
+            preloaded_audio = {
+                track.name: (
+                    separator._to_tensor(track.mixture_path),
+                    separator.sample_rate,
+                )
+                for track in tracks
+            }
+            typer.echo(
+                f"  preloaded {len(preloaded_audio)} tracks in "
+                f"{perf_counter() - preload_started:.1f}s (excluded from timings)"
+            )
+
+        # A full discarded pass over *every* track, not N passes over one. Chunk
+        # count varies with track length, so each distinct length asks the
+        # allocator for a size it has not cached yet; warming a single track
+        # leaves every other length cold. Measured: 3 passes on the longest
+        # track moved H200 fp16 from 209x to 231x, while one pass over all 15
+        # tracks reaches the true 800x steady state.
+        if warmup_passes and not use_batched and tracks:
+            warm_started = perf_counter()
+            for _ in range(warmup_passes):
+                for warm_track in tracks:
+                    try:
+                        separator.separate(
+                            audio=preloaded_audio[warm_track.name]
+                            if preloaded_audio is not None
+                            else warm_track.mixture_path,
+                            shifts=config.shifts,
+                            split_overlap=config.split_overlap,
+                            seed=seed,
+                            use_only_stem=use_only_stem,
+                        )
+                    except Exception as exc:  # never fail the config on warmup
+                        typer.echo(f"  warmup failed ({type(exc).__name__}: {exc})")
+                        break
+            _synchronize(device)
+            typer.echo(
+                f"  warmed {warmup_passes} pass(es) over {len(tracks)} tracks in "
+                f"{perf_counter() - warm_started:.1f}s (discarded)"
+            )
+
         for track_index, track in enumerate([] if use_batched else tracks, start=1):
             detail_row = {
                 **_detail_row_base(
@@ -1681,7 +1954,9 @@ def main(
             started_at = perf_counter()
             try:
                 separated = separator.separate(
-                    audio=track.mixture_path,
+                    audio=preloaded_audio[track.name]
+                    if preloaded_audio is not None
+                    else track.mixture_path,
                     shifts=config.shifts,
                     split_overlap=config.split_overlap,
                     seed=detail_row["track_seed"],
@@ -1714,7 +1989,7 @@ def main(
                     detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
 
                 successful_track_rows.append(detail_row)
-                details_rows.append(detail_row)
+                _record_detail(detail_row)
             except Exception as error:
                 elapsed_sec = perf_counter() - started_at
                 error_type = type(error).__name__
@@ -1731,7 +2006,7 @@ def main(
                 for stem_name in REFERENCE_STEMS:
                     detail_row[f"{stem_name}_sdr"] = None
 
-                details_rows.append(detail_row)
+                _record_detail(detail_row)
                 if is_oom:
                     oom_count += 1
                 else:
@@ -1789,7 +2064,23 @@ def main(
         peak_rss_mb = rss_sampler.stop()
         peak_vram_smi_mb = vram_sampler.stop() if vram_sampler else None
 
-        summary_rows.append(
+        # Audio actually processed by this config, so the realtime factor is
+        # exact for this shard's track subset rather than assuming a mean
+        # track length (which --track-offset shards would violate).
+        ok_audio_sec = sum(
+            track_duration_by_name.get(str(row["track_name"]), float("nan"))
+            for row in ok_rows
+        )
+        # The same, excluding the first track. Pairs with ``remaining_total_sec``
+        # to give a steady-state realtime factor: the first track carries model
+        # init, cuDNN autotuning and CUDA-graph capture, which BENCHMARK.md §2
+        # requires be discarded rather than averaged into throughput.
+        ok_audio_sec_excl_first = sum(
+            track_duration_by_name.get(str(row["track_name"]), float("nan"))
+            for row in ok_rows[1:]
+        )
+
+        _record_summary(
             {
                 **_summary_row_base(
                     config,
@@ -1803,6 +2094,8 @@ def main(
                 "error_message": config_error_message,
                 "num_tracks": len(tracks),
                 "ok_tracks": len(ok_rows),
+                "ok_audio_sec": ok_audio_sec,
+                "ok_audio_sec_excl_first": ok_audio_sec_excl_first,
                 "error_tracks": error_count,
                 "oom_tracks": oom_count,
                 "model_init_sec": model_init_sec,
@@ -1879,10 +2172,6 @@ def main(
         gc.collect()
         _empty_cache(device)
 
-    detail_csv = output_dir / "benchmark_details.csv"
-    summary_csv = output_dir / "benchmark_summary.csv"
-    metadata_json = output_dir / "benchmark_metadata.json"
-
     detail_fieldnames = [
         "config_id",
         "variant",
@@ -1936,6 +2225,8 @@ def main(
         "error_message",
         "num_tracks",
         "ok_tracks",
+        "ok_audio_sec",
+        "ok_audio_sec_excl_first",
         "error_tracks",
         "oom_tracks",
         "model_init_sec",
@@ -1968,6 +2259,7 @@ def main(
             )
 
     metadata = {
+        "status": "complete",
         "musdb_root": str(musdb_root),
         "output_dir": str(output_dir),
         "device": device,
@@ -1978,6 +2270,10 @@ def main(
         "split_overlaps": split_overlaps,
         "seed": seed,
         "limit": limit,
+        "track_offset": track_offset,
+        "preload_audio": preload_audio,
+        "warmup_passes": warmup_passes,
+        "vram_sampler_enabled": vram_sampler_enabled,
         "dataset_throughput": dataset_throughput,
         "compute_sdr": compute_sdr,
         "use_only_stem": use_only_stem,
@@ -1988,6 +2284,8 @@ def main(
         "upstream_python": upstream_python if include_upstream else None,
         "detail_csv": str(detail_csv),
         "summary_csv": str(summary_csv),
+        "partial_jsonl": str(partial_jsonl),
+        **_host_provenance(device),
     }
     metadata_json.write_text(json.dumps(metadata, indent=2))
 
