@@ -7,11 +7,7 @@ It implements one consistent API across four supported model architectures: HTDe
 
 ### Prerequisites
 
-- FFmpeg **v4–v8** available in your `PATH`. Decoding goes through `torchcodec`,
-  which ships one loader per FFmpeg major and currently covers 4 through 8.
-  FFmpeg 9 is **not** supported yet and fails at import, not at runtime — which
-  matters on macOS, where `brew install ffmpeg` now installs 9. Use
-  `brew install ffmpeg@7` there until `torchcodec` adds a 9 loader.
+- FFmpeg v4–v8
 - [`uv`](https://docs.astral.sh/uv/#installation)
 - Optional: C/C++ compiler such as GCC, Clang, or MSVC - enables torch.compile support
 - Optional: NVCC (NVIDIA CUDA Compiler) - enables custom CUDA kernels
