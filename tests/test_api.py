@@ -921,3 +921,45 @@ def test_run_with_oom_backoff_sticky_eager_downgrade() -> None:
 
     assert sep._run_with_oom_backoff(dispatch, chunk_batch_size=4, allow=True) == "done"
     assert sep.chunk_batch_size == 2
+
+
+def test_sizing_reference_accepts_every_registry_architecture() -> None:
+    """
+    Every shipped architecture is usable as the VRAM-sizing reference.
+
+    This used to be gated on a hand-listed ``(HTDemucs, _RoformerBase)`` tuple,
+    so SCNet — added later — silently failed the check and every SCNet fell
+    back to the hardcoded ``chunk_batch_size = 4`` no matter how much VRAM the
+    card had. Gating on ``ASSModel`` means a newly added architecture is
+    included by construction; this test fails if anyone narrows it again.
+    """
+    import unblend.api as api
+    from unblend.backends import ASSModel
+    from unblend.scnet import SCNet, SCNetMasked
+
+    for klass in (SCNet, SCNetMasked):
+        assert issubclass(klass, ASSModel), f"{klass.__name__} must be an ASSModel"
+
+    separator = api.Separator.__new__(api.Separator)
+    for klass in (SCNet, SCNetMasked):
+        model = klass.__new__(klass)
+        separator.model = model
+        assert separator._sizing_reference() is model, (
+            f"{klass.__name__} must be usable as the sizing reference"
+        )
+
+
+def test_prewarm_allocator_is_a_noop_off_cuda() -> None:
+    """
+    Allocator pre-warming only applies to the CUDA caching allocator.
+
+    It must not run (or touch ``torch.cuda``) on CPU/MPS, where construction
+    would otherwise fail on a machine without CUDA.
+    """
+    import unblend.api as api
+
+    separator = api.Separator.__new__(api.Separator)
+    separator._compile_enabled = False
+    for device in ("cpu", "mps"):
+        separator.device = device
+        separator._prewarm_allocator()  # must return without touching CUDA
