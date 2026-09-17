@@ -71,7 +71,17 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FFmpeg
-        run: brew install ffmpeg
+        # Pinned major, not plain `ffmpeg`. torchcodec ships one loader per
+        # FFmpeg major (libtorchcodec_core4..core8, i.e. libavutil.56..60) and
+        # picks a match at import. Homebrew now pours ffmpeg 9, whose
+        # libavutil.61 matches none of them, so every loader fails and the
+        # whole suite errors during collection. torchcodec bakes an rpath of
+        # /opt/homebrew/opt/ffmpeg/lib, so a versioned keg has to be linked
+        # into that path for the lookup to resolve.
+        run: |
+          brew install ffmpeg@7
+          ln -sfn /opt/homebrew/opt/ffmpeg@7 /opt/homebrew/opt/ffmpeg
+          python3 -c "import glob;print('libavutil:', glob.glob('/opt/homebrew/opt/ffmpeg/lib/libavutil.*.dylib'))"
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
