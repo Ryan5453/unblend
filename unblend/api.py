@@ -32,7 +32,7 @@ from .apply import (
     apply_model_multi,
 )
 from .audio import convert_audio, prevent_clip
-from .backends import disable_custom_kernels
+from .backends import ASSModel, disable_custom_kernels
 from .exceptions import (
     LoadAudioError,
     ModelLoadingError,
@@ -243,6 +243,33 @@ class Separator:
     _CHUNK_BATCH_MAX_ATTEMPTS: int = 4
     _COMPILE_ROFORMER_CBS_CANDIDATES: tuple[int, ...] = (4, 8, 16, 32)
 
+    def _members(self) -> "list[Model]":
+        """
+        The concrete models this separator runs, ensemble or not.
+
+        :return: One entry for a single model, one per member for an ensemble.
+        """
+        if isinstance(self.model, ModelEnsemble):
+            return list(self.model.models)
+        return [self.model]
+
+    def _sizing_reference(self) -> "Model | None":
+        """
+        The model to probe and warm for memory sizing.
+
+        Gated on :class:`ASSModel` rather than a hand-listed tuple of
+        architectures. That base class *is* the contract this uses — it
+        guarantees ``samplerate``, ``audio_channels``, ``max_allowed_segment``
+        and a ``(batch, channels, samples)`` forward — so listing concrete
+        classes only means a newly added architecture silently opts out. SCNet
+        did exactly that: it was excluded, so every SCNet fell through to the
+        hardcoded ``chunk_batch_size = 4`` fallback regardless of how much VRAM
+        the card had.
+
+        :return: The reference model, or ``None`` if there is nothing runnable.
+        """
+        return next((m for m in self._members() if isinstance(m, ASSModel)), None)
+
     def _measure_per_chunk_steady_bytes(self) -> int | None:
         """
         Measure per-chunk steady VRAM via eager batch-1 forward.
@@ -251,13 +278,7 @@ class Separator:
         """
         if self.device != "cuda":
             return None
-        supported = (HTDemucs, _RoformerBase)
-        if isinstance(self.model, ModelEnsemble):
-            ref = next((m for m in self.model.models if isinstance(m, supported)), None)
-        elif isinstance(self.model, supported):
-            ref = self.model
-        else:
-            ref = None
+        ref = self._sizing_reference()
         if ref is None:
             return None
         try:
@@ -293,6 +314,55 @@ class Separator:
             return measured
         except Exception:
             return None
+
+    def _prewarm_allocator(self) -> None:
+        """
+        Run one discarded forward per member at the chosen batch size.
+
+        The sizing probe times a *batch-1* forward and calls ``empty_cache()``
+        first so its peak reading is clean, which leaves the caching allocator
+        holding almost nothing. Inference then runs at the chosen batch size,
+        so without this the allocator has to grow into blocks it has never seen
+        — the first several tracks pay that growth and a short job can finish
+        before reaching steady state, which looks like the model simply being
+        slow.
+
+        Best effort by design: this is an optimisation, and a failure here must
+        not stop construction. A batch that genuinely does not fit is caught by
+        the OOM backoff on the real call, which can also lower the batch size.
+        """
+        if self.device != "cuda" or self._compile_enabled:
+            return
+        # Every CUDA call stays inside the guard, including the sync: this runs
+        # on stubs and on builds without CUDA, where even ``synchronize()``
+        # raises.
+        try:
+            warmed = False
+            for member in self._members():
+                if not isinstance(member, ASSModel):
+                    continue
+                parameter = next(member.parameters(), None)
+                if parameter is None:
+                    continue
+                segment_length = int(
+                    round(member.samplerate * member.max_allowed_segment)
+                )
+                dummy = torch.zeros(
+                    self.chunk_batch_size,
+                    member.audio_channels,
+                    segment_length,
+                    device=parameter.device,
+                    dtype=torch.float32,
+                )
+                with torch.inference_mode():
+                    member(dummy)
+                del dummy
+                warmed = True
+            if warmed:
+                torch.cuda.synchronize()
+        except Exception:
+            # Includes OOM: fall through to the real call's backoff.
+            return
 
     def _initial_chunk_batch_size_estimate(self) -> int:
         """
@@ -759,6 +829,7 @@ class Separator:
                     )
                     for target in targets:
                         target._forward_reserve_bytes = reserve
+            self._prewarm_allocator()
         finally:
             if prev_cudnn_benchmark is not None:
                 torch.backends.cudnn.benchmark = prev_cudnn_benchmark
