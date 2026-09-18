@@ -1,4 +1,4 @@
-anyio==4.12.1
+anyio==4.14.2
 certifi==2026.1.4
 click==8.3.1
 cuda-bindings==13.3.1
