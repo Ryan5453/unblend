@@ -373,15 +373,36 @@ class Separator:
         if self.device == "cpu":
             return 1
         if self.device == "mps":
-            try:
-                budget = torch.mps.recommended_max_memory()
-            except Exception:
-                return 2
-            if budget >= 20e9:
-                return 8
-            if budget >= 10e9:
-                return 4
-            return 2
+            # Measured, not guessed. This used to be a memory-tier lookup
+            # (>=20 GB -> 8, >=10 GB -> 4, else 2), which sized purely on how
+            # much memory was available and never on whether a larger batch
+            # was actually faster. Measured on an M2 Max, it is not:
+            #
+            #   htdemucs              cbs 1 fastest; 8 is 2% slower
+            #   melband_roformer_kim  cbs 4 fastest; 1 is 5% slower
+            #   scnet_small           cbs 2 fastest; 1 is 18% slower,
+            #                         and 16 is a 7x cliff (17 GB peak)
+            #   bs_roformer_sw        cbs 1 fastest; 8 is **2.0x slower**
+            #
+            # No model gained meaningfully from a bigger batch and one lost
+            # half its throughput, because MPS gives batched attention no
+            # advantage while the working set grows with it. The old default
+            # of 8 was therefore the worst available choice for BS-RoFormer
+            # and was also what drove the allocations behind the RoFormer
+            # crashes fixed earlier. Unity is never more than ~18% off the
+            # per-model optimum, uses the least memory, and avoids every
+            # cliff; callers who have measured their own case can raise it
+            # with ``chunk_batch_size=``.
+            #
+            # Measuring it per run was tried and rejected. A timing sweep
+            # costs ~155 s, which a single-song run never earns back -- the
+            # break-even is 72-245 songs depending on the model, and for
+            # htdemucs there is none, because unity is already its optimum.
+            # Most models' batch effects also sit under the 2.3% run-to-run
+            # noise floor measured on this hardware, so a sweep mostly
+            # fits noise. It reliably catches only the cliffs above, which
+            # returning 1 already avoids for free.
+            return 1
 
         per_chunk_steady = getattr(self, "_per_chunk_steady_bytes", None)
         if per_chunk_steady is None:

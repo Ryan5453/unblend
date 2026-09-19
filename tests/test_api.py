@@ -963,3 +963,31 @@ def test_prewarm_allocator_is_a_noop_off_cuda() -> None:
     for device in ("cpu", "mps"):
         separator.device = device
         separator._prewarm_allocator()  # must return without touching CUDA
+
+
+def test_mps_batch_size_default_is_one() -> None:
+    """
+    MPS defaults to one chunk per forward.
+
+    The previous memory-tier default (>=20 GB -> 8) sized on available memory
+    without ever checking throughput. Measured, no model gains meaningfully
+    from a larger batch on MPS and ``bs_roformer_sw`` loses 2.0x at 8, so the
+    tiers were strictly harmful on that model. This pins the default so a
+    memory-derived heuristic cannot quietly come back.
+    """
+    import unblend.api as api
+
+    separator = api.Separator.__new__(api.Separator)
+    separator.device = "mps"
+    assert separator._initial_chunk_batch_size_estimate() == 1
+
+
+def test_cpu_batch_size_default_is_one() -> None:
+    """
+    CPU is unchanged at one chunk per forward.
+    """
+    import unblend.api as api
+
+    separator = api.Separator.__new__(api.Separator)
+    separator.device = "cpu"
+    assert separator._initial_chunk_batch_size_estimate() == 1
