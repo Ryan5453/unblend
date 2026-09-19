@@ -280,6 +280,27 @@ class FeedForward(nn.Module):
         return self.net[5](out)
 
 
+# CUDA's fused attention kernels carry the batch dimension in ``gridDim.y``,
+# which tops out at 65535 blocks. RoFormer's frequency-axis attention folds
+# frames into that dimension (``batch * frames`` rows, see ``_run_transformers``),
+# so the ceiling binds at a chunk batch size of 81 for melband_roformer_kim,
+# 56 for bs_roformer_sw and 34 for bs_roformer_anvuew -- all of them below
+# what the CUDA batch-size estimator picks on a large card. Past the limit the
+# launch fails outright with ``cudaErrorInvalidConfiguration``; torch does not
+# fall back to the math kernel for it.
+_MAX_CUDA_ATTENTION_ROWS = 65535
+
+
+def _max_attention_rows(query: Tensor) -> int | None:
+    """
+    Report the row ceiling the attention kernel imposes for ``query``'s device.
+
+    :param query: Queries ``[rows, heads, sequence, dim]``.
+    :return: Maximum rows per launch, or ``None`` where no limit applies.
+    """
+    return _MAX_CUDA_ATTENTION_ROWS if query.is_cuda else None
+
+
 def _scaled_dot_product_attention(
     query: Tensor,
     key: Tensor,
@@ -304,6 +325,25 @@ def _scaled_dot_product_attention(
 
     :param query: Queries ``[batch, heads, sequence, dim]``. :param key: Keys matching ``query`` shape. :param value: Values matching ``query`` shape. :param scale: Dot-product scale. :param dropout: Dropout probability. :param training: Whether the module is training. :return: Attention output.
     """
+    rows = query.shape[0]
+    limit = _max_attention_rows(query)
+    if limit is not None and rows > limit:
+        # Every row attends independently, so splitting them is exact rather
+        # than an approximation -- it costs an extra launch, not accuracy.
+        return _binary_concat(
+            [
+                _scaled_dot_product_attention(
+                    query[start : start + limit],
+                    key[start : start + limit],
+                    value[start : start + limit],
+                    scale=scale,
+                    dropout=dropout,
+                    training=training,
+                )
+                for start in range(0, rows, limit)
+            ],
+            dim=0,
+        )
     return F.scaled_dot_product_attention(
         query,
         key,

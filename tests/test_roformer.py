@@ -14,9 +14,15 @@ mixture-complement convention, and that both flow through the shared
 import pytest
 import torch
 
+from unblend import roformer
 from unblend.apply import apply_model, apply_model_multi
 from unblend.exceptions import ValidationError
-from unblend.roformer import BSRoformer, MelBandRoformer, build_roformer
+from unblend.roformer import (
+    BSRoformer,
+    MelBandRoformer,
+    _scaled_dot_product_attention,
+    build_roformer,
+)
 
 SR = 44100
 
@@ -402,3 +408,34 @@ def test_rotary_rotation_accepts_half_inputs() -> None:
     assert out.dtype == torch.float16
     assert out.shape == t.shape
     assert torch.isfinite(out).all()
+
+
+def test_attention_row_split_matches_unsplit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Splitting the batch rows to dodge CUDA's grid ceiling stays exact.
+
+    CUDA's fused attention kernels cap the batch dimension at 65535 blocks,
+    and RoFormer's frequency-axis attention runs ``batch * frames`` rows
+    through it, so a large ``chunk_batch_size`` trips the limit. The split
+    that avoids it must not perturb the result.
+
+    :param monkeypatch: Fixture used to lower the limit onto a tiny tensor.
+    """
+    torch.manual_seed(0)
+    shape = (7, 2, 5, 16)
+    query, key, value = (torch.randn(*shape) for _ in range(3))
+    kwargs = {"scale": 16**-0.5, "dropout": 0.0, "training": False}
+
+    expected = _scaled_dot_product_attention(query, key, value, **kwargs)
+    monkeypatch.setattr(roformer, "_max_attention_rows", lambda _query: 3)
+    actual = _scaled_dot_product_attention(query, key, value, **kwargs)
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_attention_row_limit_applies_only_to_cuda() -> None:
+    """
+    The ceiling is a CUDA launch limit, so other devices stay unrestricted.
+    """
+    assert roformer._max_attention_rows(torch.zeros(1, 1, 1, 1)) is None
