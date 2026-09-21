@@ -8,6 +8,7 @@ import torch
 from unblend import (
     SeparatedSources,
     __version__,
+    api,
     get_version,
 )
 from unblend.api import Separator, select_model
@@ -991,3 +992,40 @@ def test_cpu_batch_size_default_is_one() -> None:
     separator = api.Separator.__new__(api.Separator)
     separator.device = "cpu"
     assert separator._initial_chunk_batch_size_estimate() == 1
+
+
+def test_preferred_batch_multiple_rounds_down_only_for_listed_models() -> None:
+    """
+    The mod-8 alignment fix applies to scnet_small and nothing else.
+
+    `scnet_small` loses up to 39% of its throughput when the chunk batch size
+    is not a multiple of 8, but `htdemucs` is 11% *faster* unaligned, so the
+    rounding must stay keyed on the model rather than the architecture.
+    """
+    assert api._PREFERRED_BATCH_MULTIPLE == {"scnet_small": 8}
+
+
+@pytest.mark.parametrize(
+    ("model_name", "estimate", "expected"),
+    [
+        ("scnet_small", 129, 128),
+        ("scnet_small", 131, 128),
+        ("scnet_small", 16, 16),
+        # Below the multiple the estimate is a memory bound worth keeping:
+        # rounding 5 down to 0 would be nonsense, and up would risk an OOM.
+        ("scnet_small", 5, 5),
+        ("htdemucs", 129, 129),
+        ("scnet_xl_wide_v5", 55, 55),
+    ],
+)
+def test_preferred_batch_multiple_application(
+    model_name: str, estimate: int, expected: int
+) -> None:
+    """
+    Rounding is downward, model-scoped, and inert below the multiple.
+
+    :param model_name: Registry model the estimate belongs to.
+    :param estimate: Raw memory-derived estimate.
+    :param expected: Value after alignment.
+    """
+    assert api._align_batch_size(model_name, estimate) == expected

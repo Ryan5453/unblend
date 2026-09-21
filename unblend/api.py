@@ -217,6 +217,35 @@ def _validate_chunk_batch_size(value: object) -> None:
         raise ValidationError(f"chunk_batch_size must be <= 1024, got {value}")
 
 
+#: Registry models whose throughput depends on the chunk batch size being a
+#: multiple of some value, and by how much. Measured per model, never inferred:
+#: `scnet_small` drops to 61-78% of its aligned throughput at
+#: `chunk_batch_size % 8 == 1` (H200 and A100 agree on the direction), while
+#: `htdemucs` is 11% *faster* unaligned and `scnet_xl_wide_v5` shows no effect
+#: at all. So this is not an architecture rule and not a tensor-core rule --
+#: rounding globally would be a regression on two of the four models tested.
+#: The cause is unexplained; the measurement is reproducible.
+_PREFERRED_BATCH_MULTIPLE: dict[str, int] = {"scnet_small": 8}
+
+
+def _align_batch_size(model_name: str | None, estimate: int) -> int:
+    """
+    Round a memory-derived batch estimate onto a model's preferred multiple.
+
+    Rounds down, never up: the estimate is a memory bound, so exceeding it to
+    gain alignment would trade a throughput win for an OOM. Left alone below
+    the multiple, so a card tight enough to want a small batch keeps it.
+
+    :param model_name: Registry model name, or ``None`` for a custom model.
+    :param estimate: Raw estimate derived from available memory.
+    :return: The estimate, aligned if this model asks for it.
+    """
+    multiple = _PREFERRED_BATCH_MULTIPLE.get(model_name or "")
+    if multiple is None or estimate < multiple:
+        return estimate
+    return estimate - (estimate % multiple)
+
+
 def _contains_htdemucs(model: "Model | ModelEnsemble") -> bool:
     """
     Whether ``model`` is (or contains) an HTDemucs, used to gate the
@@ -435,8 +464,11 @@ class Separator:
             )
         )
         if self._compile_enabled and wants_power_of_two:
+            # Already a power of two, hence already aligned to any multiple
+            # _PREFERRED_BATCH_MULTIPLE asks for.
             return max(1, 1 << (estimate.bit_length() - 1))
-        return estimate
+
+        return _align_batch_size(self._model_name, estimate)
 
     def _setup_compile(self) -> None:
         """
@@ -813,6 +845,7 @@ class Separator:
                     if has_swappable_modules(member):
                         apply_cuda_optimizations(member)
 
+            self._model_name = model if isinstance(model, str) else None
             self._compile_enabled = compile and self.device == "cuda"
             self._eager_probe_seconds: float | None = None
             self._per_chunk_steady_bytes: int | None = None
