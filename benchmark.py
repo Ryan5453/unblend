@@ -331,6 +331,40 @@ def _cpu_model() -> str | None:
     return platform.processor() or None
 
 
+def _custom_kernels_loaded(device: str) -> bool | None:
+    """
+    Whether the fused kernels for ``device`` actually built and loaded.
+
+    A failed build is not an error: ``unblend.cuda`` downgrades it to a
+    ``RuntimeWarning`` and falls back to reference PyTorch ops, so the run
+    exits 0 and every CSV looks normal while the numbers silently describe the
+    unfused path. The gap is wide enough to be mistaken for variance -- 56% on
+    ``scnet_xl_wide_v5`` in one CUDA campaign. The usual cause is ``ninja``
+    being installed but not on ``PATH``, since torch shells out to the binary.
+
+    :param device: Device the benchmark is running on.
+    :return: True/False for devices that have fused kernels, ``None`` for CPU.
+    """
+    if device == "cuda":
+        try:
+            import unblend.cuda as cuda_kernels
+
+            # Read the cached handle rather than calling _get_extension(),
+            # which would *build* the extension -- a pointless two minutes on
+            # a run that deliberately passed custom_kernels=False.
+            return cuda_kernels._extension is not None
+        except Exception:
+            return False
+    if device == "mps":
+        try:
+            import unblend.metal as metal_kernels
+
+            return metal_kernels._get_kernel("rms_norm", torch.float16) is not None
+        except Exception:
+            return False
+    return None
+
+
 def _host_provenance(device: str) -> dict[str, Any]:
     """
     Collect host, toolchain and scheduler facts for the current process.
@@ -368,6 +402,7 @@ def _host_provenance(device: str) -> dict[str, Any]:
         "cuda_version": cuda_version,
         "gpu_name": gpu_name,
         "gpu_count": gpu_count,
+        "custom_kernels_loaded": _custom_kernels_loaded(device),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "slurm_job_name": os.environ.get("SLURM_JOB_NAME"),
         "slurm_constraint": os.environ.get("SLURM_JOB_CONSTRAINT"),
