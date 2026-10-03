@@ -1,73 +1,43 @@
 build:
   gpu: true
-  # Read this before changing `cuda:` -- three constraints interlock and the
-  # obvious values are all wrong.
-  #
-  # 1. The field cannot be omitted. Cog's torch matrix stops at 2.11.0, so it
-  #    cannot infer a CUDA version for our 2.13.0 pin and hard-errors with
-  #    "cog doesn't know what CUDA version is compatible with torch".
-  #
-  # 2. It cannot be 13.0, which is what actually gets installed. uv.lock
-  #    resolves the cu13 stack (nvidia-*-cu13) and pip takes it from PyPI
-  #    regardless of this field, since an unmatched torch means Cog emits no
-  #    --extra-index-url. But r8.im/cog-base publishes no cuda13.0-python3.12
-  #    image (nor 12.9), so Cog falls back to nvidia/cuda:...-ubuntu24.04, and
-  #    that fallback is broken upstream: it runs `uv python install 3.12` then
-  #    `uv run pip install` into that uv-managed interpreter, which PEP 668
-  #    rejects. Cog's --break-system-packages fix is only wired to its internal
-  #    `cog base-image` command, so build/push can never set it (thru 0.21.0).
-  #
-  # 3. It cannot be worked around with --use-cuda-base-image false. That builds
-  #    fine on python:3.12-slim, but pkg/image/build.go labels whatever base it
-  #    used as run.cog.cog-base-image-name without checking it is a Replicate
-  #    image. Replicate then tries to resolve base layers from an image its
-  #    fleet has no reason to have cached. The result is a container that never
-  #    starts, emits no logs, and cannot be cancelled.
-  #
-  # So it has to be a CUDA version with a published r8.im base, and 12.8 is the
-  # newest one. The understatement is inert: torch carries its own CUDA runtime
-  # in the pip wheels, so the base only has to be no NEWER than the wheels
-  # expect -- which is what tests/test_packaging.py enforces. The real driver
-  # floor (>= 580) comes from the cu130 wheels, not from this field, and
-  # predictor.setup() fails loudly rather than dropping to CPU if it is unmet.
+  # `cuda:` names the base image only; torch's pip wheels bring their own
+  # CUDA 13 runtime. It must be set (Cog cannot infer a CUDA version for this
+  # torch pin), must have a published r8.im/cog-base image (13.0 does not;
+  # Cog's fallback base fails to build, and a non-Replicate base built with
+  # --use-cuda-base-image false never starts on Replicate), and must be no
+  # newer than the wheels expect, which tests/test_packaging.py enforces.
+  # 12.8 is the newest that qualifies. The real driver floor comes from the
+  # cu130 wheels, and predictor.setup() fails loudly if it is unmet.
+  # The predictor builds Separator(compile=True), whose compiled graph uses
+  # stock PyTorch ops rather than the fused CUDA kernels, so the image needs no
+  # nvcc; setup() logs custom_kernels_loaded (False here).
   cuda: "12.8"
   python_version: "3.12"
-  # The CLI decides which Python SDK lands in the image, and the SDK changed
-  # incompatibly at 0.17.0: it swapped the pydantic runtime for coglet, where
-  # ``cog.BaseModel`` is a bare marker class with no field handling at all.
-  # ``Output`` used to be a BaseModel carrying a dynamic set of stem names via
-  # ``class Config: extra = "allow"``; under coglet that became a silent no-op
-  # and every prediction died with "Output.__init__() got an unexpected
-  # keyword argument 'drums'" -- at predict time, long after build and setup
-  # both looked healthy.
-  #
-  # predictor.py's ``Output`` is now a TypedDict (see the rationale there),
-  # which Cog's static schema generator accepts alongside BaseModel and which
-  # is a plain dict at runtime, so it leans on no SDK machinery at all. That
-  # works on both SDK lines, so this Cog is NOT pinned to a CLI version:
-  # verified on 0.16.9 (correct 8-key Output schema generated; 4-stem,
-  # isolate_stem, and invalid-model-422 predictions all served) and on 0.21.0
-  # in production.
-  #
-  # Note that build.sdk_version cannot be used to hold the SDK back on a new
-  # CLI: 0.21.0 rejects any SDK below 0.17.0 with "not supported by static
-  # schema generation". The CLI version and the SDK generation are welded
-  # together, which is why the fix had to be on our side.
+  # Not pinned to a Cog CLI version: predictor.py's TypedDict ``Output`` and
+  # single-choice ``model`` input build with the pydantic SDK (0.16 and
+  # earlier) and with Cog 0.20+, which generates the schema statically. The
+  # 0.17-0.19 Python schema inspector rejects both.
   # Generated from uv.lock; CI fails if this export drifts.
   python_requirements: "requirements-cog.txt"
   system_packages:
     - "ffmpeg"
   run:
     - mkdir -p /root/.unblend/models
-    # This Cog serves htdemucs only (see predictor.py), so bake just that
-    # model's single layer into the image to avoid downloading it on cold
-    # start. The URL and checksum come from unblend/metadata.yaml; the cache
-    # filename is the short checksum, matching unblend.repo's naming.
-    # predictor.setup() would otherwise download htdemucs by name on first boot.
+    # Bake the only served model (htdemucs) into the image so cold starts
+    # skip the download. URL and checksum come from unblend/metadata.yaml; the
+    # filename is the short checksum, matching unblend.repo's cache naming.
     - curl --fail --location --max-time 7200 --max-filesize 84023856 --output /root/.unblend/models/d3cb2f212d065294.safetensors https://huggingface.co/Ryan5453/unblend/resolve/9ba75778acf1b64fc40a9ea05137a2c6af9cd1d5/htdemucs.safetensors
     - echo 'd3cb2f212d0652945fd033c26e1fbfdf9b6fbb9087aa6104def87f08b1016a81  /root/.unblend/models/d3cb2f212d065294.safetensors' | sha256sum --check --strict
+    # Drop the base image's LD_LIBRARY_PATH (its CUDA 12.8 libraries) for
+    # processes Python spawns. It can't change the running interpreter: the
+    # loader reads the variable at process start. The main process is safe
+    # anyway, because the CUDA 12 and 13 libraries have different sonames.
     - python -c "import site; open(site.getsitepackages()[0] + '/sitecustomize.py', 'w').write('import os\nos.environ.pop(\"LD_LIBRARY_PATH\", None)\n')"
 
+# Environment variables predictor.py reads:
+#   UNBLEND_MAX_AUDIO_SECONDS  longest accepted input (default 1800)
+#   UNBLEND_BATCH_WINDOW_MS    how long to wait for requests to batch (default 50)
+#   UNBLEND_ALLOW_CPU=1        start even when CUDA is unavailable
 predict: "predictor.py:Predictor"
 concurrency:
   max: 32

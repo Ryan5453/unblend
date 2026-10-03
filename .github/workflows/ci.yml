@@ -4,13 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs this whole workflow as a gate before publishing.
+  workflow_call:
 
 permissions:
   contents: read
 
+# When called from release.yml, github.workflow is the caller's name, so the
+# fixed "ci-" prefix keeps this group distinct from the caller's own
+# (groups are case-insensitive, and "Release-..." would collide with
+# "release-..."); an identical group would deadlock the called run. Tag
+# pushes never cancel: a release gate must run to completion.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   lint:
@@ -46,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -108,7 +115,9 @@ jobs:
           listing=$(unzip -l dist/*.whl)
           echo "$listing" | grep -q "unblend/metadata.yaml"
           echo "$listing" | grep -qi "licenses/LICENSE"
-          for kernel in unblend/metal/*.metal; do
+          echo "$listing" | grep -q "unblend/py.typed"
+          echo "$listing" | grep -q "unblend/__main__.py"
+          for kernel in unblend/metal/*.metal unblend/cuda/*.cu unblend/cuda/*.cuh unblend/cuda/*.cpp unblend/cuda/*.h; do
             echo "$listing" | grep -q "$kernel"
           done
 
@@ -128,8 +137,15 @@ jobs:
         run: uv sync --locked --extra dev --extra onnx --group onnx-test
       - name: Smoke-test ONNX import
         run: uv run python -c "import onnx; import unblend.onnx; import onnxruntime; print('onnx', onnx.__version__, 'ort', onnxruntime.__version__)"
+      # Every test_onnx_* file plus any other module that importorskips the
+      # onnx packages (e.g. the SCNet export tests), which skip in the plain
+      # test job. Discovered, not listed, so new ones can't silently skip.
       - name: Run ONNX tests
-        run: uv run pytest -m "not slow" -q tests/test_onnx_stft.py tests/test_onnx_roformer.py
+        run: |
+          files=$( { ls tests/test_onnx_*.py; grep -lE 'importorskip\("onnx' tests/*.py; } | sort -u)
+          echo "$files"
+          # shellcheck disable=SC2086
+          uv run pytest -m "not slow" -q $files
 
   web:
     runs-on: ubuntu-latest
@@ -143,7 +159,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Install dependencies

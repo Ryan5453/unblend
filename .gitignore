@@ -1,12 +1,16 @@
 TODO.md
 .cog/
 .upstream-venv/
+*.profraw
 # Local scratch space for benchmark campaigns: checkpoints, vendored upstream
 # clones, run logs, result dumps and one-off driver scripts. None of it ships.
 # The only benchmark code in this repo is benchmark.py at the root -- anything
 # worth keeping belongs there, not here.
 benchmarks/
 .claude
+
+# The CLI's default output folder
+/separated/
 
 # Benchmark output directories (also produced at repo root by --output-dir)
 /musdb_*/
@@ -176,7 +180,6 @@ cython_debug/
 
 # Logs
 logs
-*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -200,7 +203,12 @@ dist-ssr
 *.sw?
 
 web/app/public/*.onnx
+*.onnx.data
 
 # Working notes for the benchmark campaign; not part of the release.
 BENCHMARK.md
 SLURM_HANDOFF.md
+
+# Root-level ONNX exports (e.g. htdemucs_fp16.onnx); web/app/public/*.onnx
+# above is covered too.
+*.onnx

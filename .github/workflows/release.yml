@@ -12,6 +12,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The full CI workflow (every Python version, the macOS/Metal job, ONNX and
+  # web) must pass on the tagged commit before anything publishes. Called
+  # workflows can only narrow the caller's permissions, so this stays
+  # read-only.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   preflight:
     runs-on: ubuntu-latest
     steps:
@@ -20,21 +29,25 @@ jobs:
           persist-credentials: false
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # No dependency caches in the release jobs: what they build is
+      # published, so nothing restored from a cache should feed it.
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
+          enable-cache: false
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
       # Guard against tagging without bumping versions: publish is idempotent,
       # so a stale version would otherwise silently release nothing.
       - name: Check tag matches package versions
         run: |
           version="${GITHUB_REF_NAME#v}"
+          # Prerelease suffixes differ between PEP 440 and semver, and npm
+          # would publish one to "latest"; only plain releases go out.
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Tag $GITHUB_REF_NAME is not vX.Y.Z"; exit 1; }
           py=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
           js=$(node -p "require('./web/unblend/package.json').version")
           test "$py" = "$version" || { echo "pyproject.toml has $py, tag is $version"; exit 1; }
@@ -61,7 +74,9 @@ jobs:
           listing=$(unzip -l dist/*.whl)
           echo "$listing" | grep -q "unblend/metadata.yaml"
           echo "$listing" | grep -qi "licenses/LICENSE"
-          for kernel in unblend/metal/*.metal; do
+          echo "$listing" | grep -q "unblend/py.typed"
+          echo "$listing" | grep -q "unblend/__main__.py"
+          for kernel in unblend/metal/*.metal unblend/cuda/*.cu unblend/cuda/*.cuh unblend/cuda/*.cpp unblend/cuda/*.h; do
             echo "$listing" | grep -q "$kernel"
           done
       - name: Install web dependencies
@@ -74,6 +89,11 @@ jobs:
           npm run build
           npm run lint -w unblend-app
           npm audit --omit=dev --audit-level=high
+      # Re-hash every model artifact the browser library pins against Hugging
+      # Face, so a release never ships a digest that no longer matches.
+      - name: Verify model artifact digests
+        working-directory: web
+        run: npm run verify:model-artifacts -w unblend
       - name: Pack npm package
         run: |
           mkdir -p release-artifacts
@@ -92,12 +112,13 @@ jobs:
           path: release-artifacts/*.tgz
           if-no-files-found: error
 
-  publish:
-    needs: preflight
+  # PyPI and npm publish in separate jobs so one registry failing (e.g. npm's
+  # first version, which must be published by hand before trusted publishing
+  # can be enabled) never blocks the other. Configure trusted publishers for
+  # package "unblend", this workflow, and environment "release" on both.
+  publish-pypi:
+    needs: [ci, preflight]
     runs-on: ubuntu-latest
-    # Configure trusted publishers for package "unblend", this workflow, and
-    # environment "release" on both npm and PyPI. npm's first package version
-    # must still be published manually before trusted publishing can be enabled.
     environment: release
     permissions:
       contents: read
@@ -107,17 +128,31 @@ jobs:
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
+          enable-cache: false
+      - name: Download Python distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-distributions
+          path: dist
+      - name: Publish to PyPI
+        # --check-url makes reruns idempotent: files already on PyPI are
+        # skipped instead of erroring.
+        run: uv publish --check-url https://pypi.org/simple/ dist/*
+
+  publish-npm:
+    needs: [ci, preflight]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # npm >= 11.5 is required for OIDC trusted publishing.
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      - name: Download Python distributions
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: python-distributions
-          path: dist
       - name: Download npm package
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -139,13 +174,12 @@ jobs:
             cat npm-view.err >&2
             exit "$status"
           fi
-      - name: Publish to PyPI
-        # --check-url makes reruns idempotent: files already on PyPI are
-        # skipped instead of erroring.
-        run: uv publish --check-url https://pypi.org/simple/ dist/*
 
   github-release:
-    needs: publish
+    needs: [publish-pypi, publish-npm]
+    # PyPI is the release of record; a failed npm publish (e.g. the first one,
+    # which must be done by hand) shouldn't hold back the GitHub Release.
+    if: ${{ !cancelled() && needs.publish-pypi.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -153,6 +187,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+          merge-multiple: true
       - name: Extract changelog section for this version
         run: |
           # changelog.md headings keep the tag's "v" prefix (## v1.0.0), so
@@ -170,5 +209,5 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists; skipping."
           else
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md release-assets/*
           fi

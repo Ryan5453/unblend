@@ -8,7 +8,7 @@
 .gitignore
 
 # Exclude Python cache files
-__pycache__
+**/__pycache__
 .mypy_cache
 .pytest_cache
 .ruff_cache
@@ -25,10 +25,28 @@ web/
 tests/
 
 # Exclude macOS metadata
-.DS_Store
+**/.DS_Store
+
+# Exclude ONNX exports (e.g. htdemucs_fp16.onnx)
+*.onnx
+*.onnx.data
+**/*.onnx
+**/*.onnx.data
 
 # Exclude benchmark output directories
 benchmarks/
 /musdb_*/
 /upstream_*/
 /dt_*/
+
+# Exclude local environments, build output and working notes
+.upstream-venv/
+dist/
+.idea/
+.claude
+BENCHMARK.md
+SLURM_HANDOFF.md
+TODO.md
+FIXES.md
+separated/
+*.profraw
