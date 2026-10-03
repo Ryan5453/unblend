@@ -1425,10 +1425,14 @@ def test_a_config_nested_too_deeply_is_a_clean_error(tmp_path: Path) -> None:
     """
     A config the parser can't recurse through is reported, not a traceback.
 
+    YAML, because its parser is pure Python and so hits the recursion limit
+    on every version; Python 3.14's C JSON parser guards by stack size
+    instead and parses 100,000 levels on a normal stack.
+
     :param tmp_path: pytest temporary directory fixture
     """
-    path = tmp_path / "deep.json"
-    path.write_text("[" * 100_000 + "]" * 100_000)
+    path = tmp_path / "deep.yaml"
+    path.write_text("[" * 5_000 + "]" * 5_000)
     with pytest.raises(ValidationError, match="nested too deeply"):
         read_config(path)
 
