@@ -107,8 +107,8 @@ Mobile browsers may kill a tab well before that. To keep the peak down, release 
 
 | Model | Stems | Family | Weights license |
 |---|---|---|---|
-| `htdemucs` | drums, bass, other, vocals | HTDemucs | MIT |
-| `htdemucs_6s` | + guitar, piano | HTDemucs | MIT |
+| `htdemucs` | drums, bass, other, vocals | HTDemucs | unlicensed |
+| `htdemucs_6s` | + guitar, piano | HTDemucs | unlicensed |
 | `bs_roformer_sw` | bass, drums, other, vocals, guitar, piano | BS-RoFormer | unlicensed |
 | `melband_roformer_kim` | vocals, other¹ | Mel-Band RoFormer | MIT |
 | `scnet_small` | drums, bass, other, vocals | SCNet Masked Small | unlicensed |

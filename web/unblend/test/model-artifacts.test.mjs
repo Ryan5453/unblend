@@ -15,12 +15,12 @@ const MODELS = [
 ];
 const PRECISIONS = ['fp32', 'fp16'];
 const REVISIONS = {
-    htdemucs: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
-    htdemucs_6s: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
-    bs_roformer_sw: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
-    melband_roformer_kim: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
-    scnet_small: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
-    scnet_xl_wide_v5: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
+    htdemucs: '30b749fd691312b1e4b3f8fe79df0b51cde836cd',
+    htdemucs_6s: '30b749fd691312b1e4b3f8fe79df0b51cde836cd',
+    bs_roformer_sw: '30b749fd691312b1e4b3f8fe79df0b51cde836cd',
+    melband_roformer_kim: '30b749fd691312b1e4b3f8fe79df0b51cde836cd',
+    scnet_small: '30b749fd691312b1e4b3f8fe79df0b51cde836cd',
+    scnet_xl_wide_v5: '30b749fd691312b1e4b3f8fe79df0b51cde836cd',
 };
 
 test('browser SCNet catalog matches the Python registry', () => {

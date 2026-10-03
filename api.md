@@ -225,7 +225,7 @@ This returns a deep copy of every registry entry, keyed by name, with a derived 
         "sources": ["drums", "bass", "other", "vocals"],
         "checkpoint": {"format": "safetensors", "url": str, "sha256": str, "size_bytes": int},
         "config": dict,
-        "license": "MIT",
+        "license": "unlicensed",
         "license_note": str,
         "provenance": str,
     },

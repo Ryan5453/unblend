@@ -77,7 +77,7 @@ export const MODEL_CONFIGS: Readonly<Record<ModelType, ModelConfig>> = {
         sources: ['drums', 'bass', 'other', 'vocals'],
         normalizeInput: true,
         hasTimeBranch: true,
-        license: 'MIT',
+        license: 'unlicensed',
     },
     'htdemucs_6s': {
         family: 'htdemucs',
@@ -88,7 +88,7 @@ export const MODEL_CONFIGS: Readonly<Record<ModelType, ModelConfig>> = {
         sources: ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano'],
         normalizeInput: true,
         hasTimeBranch: true,
-        license: 'MIT',
+        license: 'unlicensed',
     },
     'bs_roformer_sw': {
         family: 'roformer',

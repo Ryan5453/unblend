@@ -6,12 +6,13 @@
 # field reference; `unblend models list` renders it.
 models:
   htdemucs:
-    license: MIT
+    license: unlicensed
     license_note: >-
-      MIT. Alexandre Defossez published these exact weights (matching the official signature
-      filenames) as Safetensors on 2026-07-11 at https://huggingface.co/adefossez/HTDemucs*,
-      which declares license: mit. Before that the weights were distributed from a bare CDN
-      with no grant.
+      No grant for the weights. Meta's demucs repository (https://github.com/facebookresearch/demucs)
+      is MIT, but that covers its source code; the official checkpoints were distributed from a
+      bare CDN with no terms. Alexandre Defossez republished these exact weights as Safetensors
+      at https://huggingface.co/adefossez/HTDemucs* on 2026-07-11 with license: mit on the
+      cards, then removed the license from all three cards on 2026-08-31, so no grant stands.
     sources: [drums, bass, other, vocals]
     checkpoint:
       format: safetensors
@@ -73,12 +74,13 @@ models:
     provenance: >-
       HTDemucs (Meta / Alexandre Defossez), official signature 955717e8; weights at https://huggingface.co/adefossez/HTDemucs
   htdemucs_ft:
-    license: MIT
+    license: unlicensed
     license_note: >-
-      MIT. Alexandre Defossez published these exact weights (matching the official signature
-      filenames) as Safetensors on 2026-07-11 at https://huggingface.co/adefossez/HTDemucs*,
-      which declares license: mit. Before that the weights were distributed from a bare CDN
-      with no grant.
+      No grant for the weights. Meta's demucs repository (https://github.com/facebookresearch/demucs)
+      is MIT, but that covers its source code; the official checkpoints were distributed from a
+      bare CDN with no terms. Alexandre Defossez republished these exact weights as Safetensors
+      at https://huggingface.co/adefossez/HTDemucs* on 2026-07-11 with license: mit on the
+      cards, then removed the license from all three cards on 2026-08-31, so no grant stands.
     sources: [drums, bass, other, vocals]
     members:
     - format: safetensors
@@ -161,12 +163,13 @@ models:
       HTDemucs fine-tuned bag of 4 (Meta / Alexandre Defossez), official signatures f7e0c4bc,
       d12395a8, 92cfc3b6, 04573f0d; weights at https://huggingface.co/adefossez/HTDemucs-ft
   htdemucs_6s:
-    license: MIT
+    license: unlicensed
     license_note: >-
-      MIT. Alexandre Defossez published these exact weights (matching the official signature
-      filenames) as Safetensors on 2026-07-11 at https://huggingface.co/adefossez/HTDemucs*,
-      which declares license: mit. Before that the weights were distributed from a bare CDN
-      with no grant.
+      No grant for the weights. Meta's demucs repository (https://github.com/facebookresearch/demucs)
+      is MIT, but that covers its source code; the official checkpoints were distributed from a
+      bare CDN with no terms. Alexandre Defossez republished these exact weights as Safetensors
+      at https://huggingface.co/adefossez/HTDemucs* on 2026-07-11 with license: mit on the
+      cards, then removed the license from all three cards on 2026-08-31, so no grant stands.
     sources: [drums, bass, other, vocals, guitar, piano]
     checkpoint:
       format: safetensors
@@ -494,11 +497,11 @@ models:
     - model: melband_roformer_kim
     - model: bs_roformer_anvuew
   htdemucs_scnet_ensemble:
-    license: mixed
+    license: unlicensed
     license_note: >-
-      This entry redistributes nothing of its own: it references the htdemucs (MIT) and scnet_xl_wide_v5
-      (no license grant) checkpoints, each downloaded under its own terms. The SCNet checkpoint's
-      lack of any grant governs the pair -- see those entries for the detail.
+      This entry redistributes nothing of its own: it references the htdemucs and scnet_xl_wide_v5
+      checkpoints, each downloaded under its own terms, and neither carries a license grant --
+      see those entries for the detail.
     provenance: >-
       HTDemucs and SCNet xl-wide over the same four stems, blended with the default weighted
       mean. The two architectures disagree about input normalisation, which Unblend applies
