@@ -15,12 +15,12 @@ const MODELS = [
 ];
 const PRECISIONS = ['fp32', 'fp16'];
 const REVISIONS = {
-    htdemucs: 'eda32466a76dc81c5e66af6577dbc20fb219e959',
-    htdemucs_6s: 'eda32466a76dc81c5e66af6577dbc20fb219e959',
-    bs_roformer_sw: 'a80a71b41face40edc91178c07edfedeca4cbb19',
-    melband_roformer_kim: 'a80a71b41face40edc91178c07edfedeca4cbb19',
-    scnet_small: 'ac4b06164d974e1242bd9fc7585305e5ea022d0f',
-    scnet_xl_wide_v5: '396e6583cea8e5104f35c05d87cf60883794a58e',
+    htdemucs: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
+    htdemucs_6s: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
+    bs_roformer_sw: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
+    melband_roformer_kim: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
+    scnet_small: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
+    scnet_xl_wide_v5: '45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3',
 };
 
 test('browser SCNet catalog matches the Python registry', () => {
@@ -53,6 +53,33 @@ test('browser SCNet catalog matches the Python registry', () => {
     );
 
     assert.deepEqual(browserModels, pythonModels);
+});
+
+test('browser model settings match the Python registry', () => {
+    // Line scan of each entry's top-level fields, as above (no YAML parser).
+    const yaml = readFileSync(new URL('../../../unblend/metadata.yaml', import.meta.url), 'utf8');
+    const entries = {};
+    let current = null;
+    for (const line of yaml.split('\n')) {
+        const name = line.match(/^  ([A-Za-z0-9_]+):\s*$/);
+        if (name) {
+            current = name[1];
+            entries[current] = {};
+            continue;
+        }
+        const field = line.match(/^    (sources|license|segment_samples): (.+?)\s*$/);
+        if (current && field) entries[current][field[1]] = field[2];
+    }
+    for (const [model, config] of Object.entries(MODEL_CONFIGS)) {
+        const entry = entries[model];
+        assert.ok(entry, `${model} is not in metadata.yaml`);
+        assert.equal(`[${config.sources.join(', ')}]`, entry.sources, `${model} sources`);
+        assert.equal(config.license, entry.license, `${model} license`);
+        // HTDemucs declares its segment in seconds inside its config.
+        if (entry.segment_samples !== undefined) {
+            assert.equal(config.segmentSamples, Number(entry.segment_samples), `${model} segment`);
+        }
+    }
 });
 
 test('model artifact registry is complete, immutable, and well-formed', () => {

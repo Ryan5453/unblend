@@ -1,23 +1,13 @@
 /**
- * Worker-only module. Each worker builds its own DSP instance via
- * ``createDSP``; the FFT/window state inside is private to that instance.
- * Importing this file from the main thread would share that state across
- * the STFT worker, which is unsafe.
+ * Segment STFT/iSTFT for the STFT and iSTFT workers. Each ``createDSP``
+ * instance owns preallocated FFT/window buffers that its methods reuse and
+ * return, so an instance must not be shared by concurrent callers.
  *
- * Three DSP families:
- * - ``htdemucs``: Demucs pre-padding + frame trims around a √N-normalized
- *   STFT with the Nyquist bin dropped (matches ``HTDemucs._spec``).
- * - ``roformer``: plain centered reflect-pad STFT keeping all bins with no
- *   normalization (matches ``torch.stft(center=True, normalized=False)`` as
- *   the RoFormer checkpoints use it).
- * - ``scnet``: the same centered STFT, √N-normalized; plain SCNet is
- *   unwindowed while the masked variants (``scnet_small``) use a Hann window —
- *   plain SCNet passes no ``window`` to ``torch.stft`` and sets
- *   ``normalized=True``. Both are handled by the roformer path via the
- *   ``window``/``normalized`` config fields rather than a separate
- *   implementation, since nothing else differs.
+ * Per-family DSP is documented on ``ModelConfig`` (constants.ts). HTDemucs
+ * gets its own implementation; RoFormer and SCNet share the centered-STFT
+ * one, differing only in the ``window``/``normalized`` config fields.
  */
-import FFT from 'fft.js';
+import FFT from './vendor/fft.js';
 import type { DSPConfig, STFTResult } from './constants.js';
 
 const NUM_CHANNELS = 2;
@@ -326,8 +316,8 @@ function createRoformerDSP(config: DSPConfig): DSP {
     }
 
     const fftInstance = new FFT(NFFT);
-    // SCNet shares this DSP but is unwindowed and sqrt(N)-normalised; both
-    // default to the RoFormer behaviour when unset.
+    // Window and scaling come from the config (SCNet variants set them);
+    // unset means the RoFormer behaviour: Hann, unnormalized.
     const analysisWindow =
         config.window === 'rectangular'
             ? makeRectangularWindow(NFFT)

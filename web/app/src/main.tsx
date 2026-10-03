@@ -5,6 +5,7 @@ import { Layout } from './components/Layout'
 import { Home } from './components/pages/Home'
 import { About } from './components/pages/About'
 import { Privacy } from './components/pages/Privacy'
+import { NotFound } from './components/pages/NotFound'
 import './index.css'
 
 // Dev/benchmark-only tooling: lazy-loaded into its own chunk and only
@@ -38,6 +39,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                     <Route path="/about" element={<About />} />
                     <Route path="/privacy" element={<Privacy />} />
                     {benchmarkRoute}
+                    <Route path="*" element={<NotFound />} />
                 </Route>
             </Routes>
         </BrowserRouter>

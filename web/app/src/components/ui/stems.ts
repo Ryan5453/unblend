@@ -1,8 +1,4 @@
-// Shared "stem voices" for the mix visualisations (Braid + SplitDiagram).
-//
-// Both components draw the same four instrument waveforms, so they live here in
-// one place. Previously each component kept its own copy, which let the drum
-// envelope fix land in one and silently drift in the other — keep them shared.
+// The four instrument "voices" the Braid visualisation draws.
 
 export interface StemLine {
     label: string;
@@ -13,18 +9,16 @@ export interface StemLine {
 
 // Percussive envelope for the drum stem. Each beat is a smooth "thump":
 // sin(pi * s^0.6)^2 rises from and returns to zero with *zero slope* at both
-// ends, so consecutive beats meet with no value or slope discontinuity. That
-// removes the sharp corner that used to read as a "bump" in the drawn line,
-// while the s^0.6 warp skews the peak early (~s=0.31) to keep an attack-like,
-// percussive feel. The expression already peaks at 1, so the stem keeps its
-// visual amplitude.
+// ends, so consecutive beats meet with no value or slope discontinuity (no
+// visible corner in the drawn line), while the s^0.6 warp skews the peak early
+// (~s=0.31) to keep an attack-like, percussive feel. The expression already
+// peaks at 1, so the stem keeps its visual amplitude.
 const drumEnv = (s: number) => {
     const thump = Math.sin(Math.PI * Math.pow(s, 0.6));
     return thump * thump;
 };
 
-// Each stem has its own waveform character; the mix line is literally their
-// sum, so the diagram is a true picture of what separation does.
+// Each stem has its own waveform character.
 export const STEMS: StemLine[] = [
     {
         label: 'VOCALS',
@@ -57,10 +51,8 @@ export const STEMS: StemLine[] = [
     },
 ];
 
-export const AMP_SUM = STEMS.reduce((sum, s) => sum + s.amp, 0);
-
 export const INK = [25, 25, 22];
-export const RED = [207, 59, 23];
+export const RED = [189,54,19];
 
 export const smooth = (u: number) => u * u * (3 - 2 * u);
 export const lerp = (a: number, b: number, k: number) => a + (b - a) * k;

@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useSyncExternalStore, type KeyboardEvent, type RefObject } from 'react';
+import type { Playhead } from '../../utils/playhead';
 
 const INK = '25,25,22';
-const RED = '207,59,23';
+const RED = '189,54,19';
 
 function gridLines(ctx: CanvasRenderingContext2D, w: number, h: number, duration: number) {
     const dur = Math.max(1, Math.round(duration));
@@ -16,30 +17,77 @@ function gridLines(ctx: CanvasRenderingContext2D, w: number, h: number, duration
     ctx.fillRect(0, h / 2 - 0.5, w, 1);
 }
 
+/** Playback fraction 0..1, re-rendering only the subscribing component. */
+function usePlayheadFraction(playhead: Playhead, duration: number): number {
+    const t = useSyncExternalStore(playhead.subscribe, playhead.get);
+    return duration > 0 ? Math.min(1, Math.max(0, t / duration)) : 0;
+}
+
+/**
+ * Observe the canvas once for pointer seeking and resizes. The resize handler
+ * calls through a ref so it always redraws with the latest props rather than
+ * the first render's closure (which drew stale or empty data).
+ */
+function useCanvasBindings(
+    ref: RefObject<HTMLCanvasElement | null>,
+    draw: () => void,
+    onSeek: (fraction: number) => void,
+) {
+    const drawRef = useRef(draw);
+    const seekRef = useRef(onSeek);
+    useEffect(() => {
+        drawRef.current = draw;
+        seekRef.current = onSeek;
+    });
+    useEffect(() => {
+        const c = ref.current;
+        if (!c) return;
+        const detach = attachSeek(c, f => seekRef.current(f));
+        const ro = new ResizeObserver(() => drawRef.current());
+        ro.observe(c);
+        return () => {
+            detach();
+            ro.disconnect();
+        };
+    }, [ref]);
+}
+
 function attachSeek(canvas: HTMLCanvasElement, onSeek: (fraction: number) => void) {
     const seek = (clientX: number) => {
         const r = canvas.getBoundingClientRect();
         onSeek(Math.min(1, Math.max(0, (clientX - r.left) / r.width)));
     };
+    // Pointer capture keeps the drag's move/up events on the canvas even
+    // when the pointer leaves it (or the window), and releases on its own
+    // when the pointer is lifted or the gesture is cancelled.
+    let dragging: number | null = null;
     const down = (e: PointerEvent) => {
+        if (e.button !== 0) return;
         e.preventDefault();
+        dragging = e.pointerId;
+        canvas.setPointerCapture(e.pointerId);
         seek(e.clientX);
-        const move = (ev: PointerEvent) => seek(ev.clientX);
-        const up = () => {
-            window.removeEventListener('pointermove', move);
-            window.removeEventListener('pointerup', up);
-        };
-        window.addEventListener('pointermove', move);
-        window.addEventListener('pointerup', up);
+    };
+    const move = (e: PointerEvent) => {
+        if (e.pointerId === dragging) seek(e.clientX);
+    };
+    const end = (e: PointerEvent) => {
+        if (e.pointerId === dragging) dragging = null;
     };
     canvas.addEventListener('pointerdown', down);
-    return () => canvas.removeEventListener('pointerdown', down);
+    canvas.addEventListener('pointermove', move);
+    canvas.addEventListener('lostpointercapture', end);
+    return () => {
+        canvas.removeEventListener('pointerdown', down);
+        canvas.removeEventListener('pointermove', move);
+        canvas.removeEventListener('lostpointercapture', end);
+    };
 }
 
 interface WaveCanvasProps {
     peaks: number[];
     height: number;
-    progress: number;
+    playhead: Playhead;
     duration: number;
     gain: number;
     colorPlayed: string;
@@ -50,7 +98,7 @@ interface WaveCanvasProps {
 export function WaveCanvas({
     peaks,
     height,
-    progress,
+    playhead,
     duration,
     gain,
     colorPlayed,
@@ -58,12 +106,7 @@ export function WaveCanvas({
     onSeek,
 }: WaveCanvasProps) {
     const ref = useRef<HTMLCanvasElement>(null);
-
-    // Keep the latest onSeek without re-binding the pointer listener.
-    const seekRef = useRef(onSeek);
-    useEffect(() => {
-        seekRef.current = onSeek;
-    });
+    const progress = usePlayheadFraction(playhead, duration);
 
     const draw = () => {
         const c = ref.current;
@@ -93,36 +136,37 @@ export function WaveCanvas({
 
     // Redraw on any visual input change.
     useEffect(draw);
-
-    // Bind pointer seeking + redraw on resize once.
-    useEffect(() => {
-        const c = ref.current;
-        if (!c) return;
-        const detach = attachSeek(c, (f) => seekRef.current(f));
-        const ro = new ResizeObserver(() => draw());
-        ro.observe(c);
-        return () => {
-            detach();
-            ro.disconnect();
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    useCanvasBindings(ref, draw, onSeek);
 
     return <canvas ref={ref} style={{ height: `${height}px` }} />;
 }
 
 interface RulerCanvasProps {
-    progress: number;
+    playhead: Playhead;
     duration: number;
     onSeek: (fraction: number) => void;
 }
 
-export function RulerCanvas({ progress, duration, onSeek }: RulerCanvasProps) {
+/** Seconds moved per arrow-key press on the focused ruler. */
+const KEY_SEEK_SECONDS = 5;
+
+function rulerStep(dur: number): number {
+    const minStep = dur > 400 ? Math.ceil(dur / 400) : 1;
+    for (const step of [1, 5, 30, 60]) {
+        if (step >= minStep) return step;
+    }
+    return Math.ceil(minStep / 60) * 60;
+}
+
+function clock(seconds: number): string {
+    const s = Math.max(0, Math.floor(seconds));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+export function RulerCanvas({ playhead, duration, onSeek }: RulerCanvasProps) {
     const ref = useRef<HTMLCanvasElement>(null);
-    const seekRef = useRef(onSeek);
-    useEffect(() => {
-        seekRef.current = onSeek;
-    });
+    const currentTime = useSyncExternalStore(playhead.subscribe, playhead.get);
+    const progress = duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
 
     const draw = () => {
         const c = ref.current;
@@ -141,7 +185,10 @@ export function RulerCanvas({ progress, duration, onSeek }: RulerCanvasProps) {
         ctx.fillStyle = `rgba(${INK},.12)`;
         ctx.fillRect(0, h - 1, w, 1);
         const dur = Math.max(1, Math.round(duration));
-        for (let s = 0; s <= dur; s++) {
+        // Same cap as gridLines. Steps stay multiples of 1, 5, 30 or 60 s
+        // so the 5 s / 30 s emphasis and the labels below still land.
+        const stepSec = rulerStep(dur);
+        for (let s = 0; s <= dur; s += stepSec) {
             const x = (s / dur) * w;
             let th = 4;
             let a = 0.18;
@@ -155,7 +202,7 @@ export function RulerCanvas({ progress, duration, onSeek }: RulerCanvasProps) {
             ctx.fillStyle = `rgba(${INK},${a})`;
             ctx.fillRect(x, h - 1 - th, 1, th);
             if (s % 30 === 0 && s < dur) {
-                ctx.fillStyle = 'rgba(118,118,110,1)';
+                ctx.fillStyle = 'rgba(102,102,96,1)';
                 ctx.font = '9px "IBM Plex Mono", monospace';
                 ctx.fillText(`${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`, x + 4, 11);
             }
@@ -171,19 +218,34 @@ export function RulerCanvas({ progress, duration, onSeek }: RulerCanvasProps) {
     };
 
     useEffect(draw);
+    useCanvasBindings(ref, draw, onSeek);
 
-    useEffect(() => {
-        const c = ref.current;
-        if (!c) return;
-        const detach = attachSeek(c, (f) => seekRef.current(f));
-        const ro = new ResizeObserver(() => draw());
-        ro.observe(c);
-        return () => {
-            detach();
-            ro.disconnect();
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    // Keyboard seeking: the ruler is the timeline's single focusable slider.
+    const onKeyDown = (e: KeyboardEvent<HTMLCanvasElement>) => {
+        if (!(duration > 0)) return;
+        let target: number;
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') target = currentTime - KEY_SEEK_SECONDS;
+        else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') target = currentTime + KEY_SEEK_SECONDS;
+        else if (e.key === 'Home') target = 0;
+        else if (e.key === 'End') target = duration;
+        else return;
+        e.preventDefault();
+        onSeek(Math.min(1, Math.max(0, target / duration)));
+    };
 
-    return <canvas ref={ref} style={{ height: '32px' }} />;
+    return (
+        <canvas
+            ref={ref}
+            style={{ height: '32px' }}
+            tabIndex={0}
+            role="slider"
+            aria-label="Playback position"
+            aria-valuemin={0}
+            aria-valuemax={Math.round(duration)}
+            aria-valuenow={Math.round(currentTime)}
+            aria-valuetext={`${clock(currentTime)} of ${clock(duration)}`}
+            aria-keyshortcuts="ArrowLeft ArrowRight Home End"
+            onKeyDown={onKeyDown}
+        />
+    );
 }

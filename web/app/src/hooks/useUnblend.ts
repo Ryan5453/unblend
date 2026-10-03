@@ -1,9 +1,38 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { UnblendState, ProgressPhase } from '../types';
 import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'unblend';
-import { decodeAudioFile } from '../utils/audio-decoder';
 import { ORT_WASM_PATHS } from '../onnx-config';
 import { finalizeStems } from '../utils/stem-finalizer';
+
+/**
+ * Encode the decoded track as a 16-bit WAV blob URL for the ORIGINAL lane,
+ * for sources the browser's media stack can't play itself (ffmpeg-only codecs
+ * such as ALAC in Chrome or WMA). Uses the first two channels, like the
+ * separator, and reuses the stem finalizer's worker for the encode.
+ */
+async function pcmOriginalUrl(buffer: AudioBuffer): Promise<string> {
+    const left = buffer.getChannelData(0);
+    const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+    const interleaved = new Float32Array(buffer.length * 2);
+    for (let i = 0; i < buffer.length; i++) {
+        interleaved[i * 2] = left[i];
+        interleaved[i * 2 + 1] = right[i];
+    }
+    const [encoded] = await finalizeStems(
+        { original: interleaved },
+        buffer.sampleRate,
+        new AbortController().signal,
+    );
+    return URL.createObjectURL(encoded.blob);
+}
+
+/** Whether an <audio> element can be expected to play this file natively. */
+function mayPlayNatively(file: File): boolean {
+    // An empty MIME type (common for .mka, .ape, ...) is unknown, not
+    // unsupported; the ORIGINAL lane falls back on a media error instead.
+    if (!file.type || typeof document === 'undefined') return true;
+    return document.createElement('audio').canPlayType(file.type) !== '';
+}
 
 function isAbortError(error: unknown): boolean {
     return error instanceof DOMException && error.name === 'AbortError';
@@ -11,11 +40,8 @@ function isAbortError(error: unknown): boolean {
 
 const initialState: UnblendState = {
     modelLoaded: false,
-    modelLoading: false,
-    audioLoaded: false,
     audioBuffer: null,
     audioFile: null,
-    separating: false,
     progressDeterminate: false,
     progressPhase: 'idle',
     progress: 0,
@@ -58,24 +84,23 @@ export function useUnblend() {
 
     // Terminal-style log lines surfaced to the processing view.
     const [logs, setLogs] = useState<string[]>([]);
-    // Store pre-created blob URLs.
     const [originalUrl, setOriginalUrl] = useState<string | null>(null);
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
     // Precomputed waveform peaks per stem (0..1), for the studio lanes.
     const [stemPeaks, setStemPeaks] = useState<Record<string, number[]>>({});
-    // Store artwork URL (album art from audio file)
     const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
     // Mirror the latest object URLs into refs so the unmount cleanup can
     // revoke them without reading stale state from its empty-deps closure.
     const originalUrlRef = useRef<string | null>(null);
+    // Whether originalUrl already holds decoded PCM rather than the source file.
+    const originalIsPcmRef = useRef(false);
     const stemUrlsRef = useRef<Record<string, string>>({});
     const artworkUrlRef = useRef<string | null>(null);
-    // Store track metadata from audio file
     const [trackTitle, setTrackTitle] = useState<string | null>(null);
     const [trackArtist, setTrackArtist] = useState<string | null>(null);
 
-    // Route diagnostics to the console. These were previously accumulated in an
-    // unbounded state array that no component ever rendered.
+    // Mirror diagnostics to the console and keep the last 200 lines for the
+    // processing view's log.
     const addLog = useCallback((message: string, type: 'info' | 'success' | 'error' = 'info') => {
         if (type === 'error') {
             console.error(`[unblend] ${message}`);
@@ -87,8 +112,6 @@ export function useUnblend() {
             return next.length > 200 ? next.slice(next.length - 200) : next;
         });
     }, []);
-
-    const clearLogs = useCallback(() => setLogs([]), []);
 
     const setStatus = useCallback((status: string) => {
         setState(prev => ({ ...prev, status }));
@@ -140,6 +163,14 @@ export function useUnblend() {
             return false;
         }
 
+        const resetLoadState = () => setState(prev => ({
+            ...prev,
+            modelLoaded: false,
+            progress: 0,
+            progressDeterminate: false,
+            progressPhase: 'idle',
+        }));
+
         const controller = new AbortController();
         modelLoadAbortRef.current = controller;
         modelLoadInFlightRef.current = true;
@@ -155,7 +186,6 @@ export function useUnblend() {
 
             setState(prev => ({
                 ...prev,
-                modelLoading: true,
                 modelLoaded: false,
                 progress: 0,
                 progressDeterminate: false,
@@ -170,17 +200,20 @@ export function useUnblend() {
                 precision,
                 wasmPaths: ORT_WASM_PATHS,
                 signal: controller.signal,
-                onProgress: (phase, loaded, total) => {
+                onProgress: (phase, loaded, total, source) => {
                     if (!mountedRef.current) return;
                     if (phase === 'download') {
+                        const fromCache = source === 'cache';
+                        const verb = fromCache ? 'Loading model from cache' : 'Downloading model';
+                        const barPhase = fromCache ? 'cache' : 'download';
                         const loadedMiB = (loaded / (1024 * 1024)).toFixed(1);
                         if (total > 0) {
                             const totalMiB = (total / (1024 * 1024)).toFixed(1);
-                            setStatus(`Downloading model... ${loadedMiB} / ${totalMiB} MiB`);
-                            setProgress((loaded / total) * 100, true, 'download');
+                            setStatus(`${verb}... ${loadedMiB} / ${totalMiB} MiB`);
+                            setProgress((loaded / total) * 100, true, barPhase);
                         } else {
-                            setStatus(`Downloading model... ${loadedMiB} MiB`);
-                            setProgress(0, false, 'download');
+                            setStatus(`${verb}... ${loadedMiB} MiB`);
+                            setProgress(0, false, barPhase);
                         }
                     } else {
                         // ORT exposes no progress for runtime setup or graph
@@ -191,7 +224,10 @@ export function useUnblend() {
                 },
             });
             if (!mountedRef.current || controller.signal.aborted) {
+                // Cancelled after the load resolved: discard the separator and
+                // reset the load state exactly like an in-flight abort.
                 await separator.unload();
+                if (mountedRef.current) resetLoadState();
                 return false;
             }
             separatorRef.current = separator;
@@ -208,7 +244,6 @@ export function useUnblend() {
 
             setState(prev => ({
                 ...prev,
-                modelLoading: false,
                 modelLoaded: true,
                 progress: 0,
                 progressDeterminate: false,
@@ -217,16 +252,7 @@ export function useUnblend() {
             return true;
         } catch (err) {
             if (controller.signal.aborted || isAbortError(err)) {
-                if (mountedRef.current) {
-                    setState(prev => ({
-                        ...prev,
-                        modelLoading: false,
-                        modelLoaded: false,
-                        progress: 0,
-                        progressDeterminate: false,
-                        progressPhase: 'idle',
-                    }));
-                }
+                if (mountedRef.current) resetLoadState();
                 return false;
             }
             if (!mountedRef.current) return false;
@@ -235,14 +261,7 @@ export function useUnblend() {
             setLoadedModel(null);
             addLog(message, 'error');
             setAudioError(message);
-            setState(prev => ({
-                ...prev,
-                modelLoading: false,
-                modelLoaded: false,
-                progress: 0,
-                progressDeterminate: false,
-                progressPhase: 'idle',
-            }));
+            resetLoadState();
             return false;
         } finally {
             if (modelLoadAbortRef.current === controller) {
@@ -282,6 +301,7 @@ export function useUnblend() {
                 URL.revokeObjectURL(originalUrlRef.current);
             }
             originalUrlRef.current = null;
+            originalIsPcmRef.current = false;
             setOriginalUrl(null);
             Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
             stemUrlsRef.current = {};
@@ -298,7 +318,6 @@ export function useUnblend() {
             audioBufferRef.current = null;
             setState(prev => ({
                 ...prev,
-                audioLoaded: false,
                 audioBuffer: null,
                 audioFile: null,
             }));
@@ -309,6 +328,9 @@ export function useUnblend() {
             addLog(`Loading audio: ${file.name}`, 'info');
             const ctx = getAudioContext();
 
+            // Mediabunny is most of the app's JS, so the decoder is split into
+            // its own chunk and only fetched once the user picks a file.
+            const { decodeAudioFile } = await import('../utils/audio-decoder');
             const { buffer: audioBuffer, artwork, title, artist, usedFallback } = await decodeAudioFile(
                 file,
                 ctx,
@@ -322,17 +344,15 @@ export function useUnblend() {
             if (usedFallback === 'ffmpeg') {
                 addLog('Audio decoded using fallback decoder (ffmpeg.wasm)', 'info');
             } else {
-                addLog('Audio decoded with Mediabunny', 'info');
+                addLog('Audio decoded in the browser (Mediabunny / decodeAudioData)', 'info');
             }
 
-            // Store artwork if present
             if (artwork) {
                 artworkUrlRef.current = artwork;
                 setArtworkUrl(artwork);
                 addLog('Album artwork extracted', 'info');
             }
 
-            // Store track metadata if present
             if (title) {
                 setTrackTitle(title);
                 addLog(`Track title: ${title}`, 'info');
@@ -344,20 +364,38 @@ export function useUnblend() {
 
             addLog('Audio loaded successfully.', 'success');
 
-            const sourceUrl = URL.createObjectURL(file);
+            // ffmpeg.wasm is only reached when WebCodecs can't decode the
+            // codec, so the <audio> element almost certainly can't either;
+            // play the decoded PCM instead of a silent ORIGINAL lane.
+            let usePcm = usedFallback === 'ffmpeg' || !mayPlayNatively(file);
+            let sourceUrl: string | null = null;
+            if (usePcm) {
+                try {
+                    sourceUrl = await pcmOriginalUrl(audioBuffer);
+                } catch (error) {
+                    // Not fatal: separation only needs the decoded buffer.
+                    console.error('[unblend] Failed to encode the original track:', error);
+                    usePcm = false;
+                }
+            }
+            sourceUrl ??= URL.createObjectURL(file);
+            if (!mountedRef.current) {
+                URL.revokeObjectURL(sourceUrl);
+                return false;
+            }
             originalUrlRef.current = sourceUrl;
+            originalIsPcmRef.current = usePcm;
             setOriginalUrl(sourceUrl);
             audioBufferRef.current = audioBuffer;
             setState(prev => ({
                 ...prev,
-                audioLoaded: true,
                 audioBuffer,
                 audioFile: file,
             }));
             return true;
         } catch (error) {
             if (!mountedRef.current) return false;
-            const errorMessage = (error as Error).message;
+            const errorMessage = error instanceof Error ? error.message : String(error);
             addLog(`Failed to load audio: ${errorMessage}`, 'error');
             setAudioError(errorMessage);
             return false;
@@ -409,9 +447,11 @@ export function useUnblend() {
         separateInFlightRef.current = true;
         setAudioError(null);
         let localUrls: string[] = [];
+        // Once separate() resolves the Separator is still valid; a later
+        // finalize failure or cancel must not discard the loaded model.
+        let separated = false;
 
         try {
-            setState(prev => ({ ...prev, separating: true }));
             // Revoke the previous run's object URLs before dropping them.
             Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
             stemUrlsRef.current = {};
@@ -457,6 +497,7 @@ export function useUnblend() {
                     }));
                 },
             });
+            separated = true;
             if (!mountedRef.current) return false;
 
             // Build blob URLs for the player UI.
@@ -495,27 +536,27 @@ export function useUnblend() {
             setStatus('Complete!');
             setProgress(100, true, 'complete');
             addLog(`Finished separation in ${(result.wallMs / 1000).toFixed(2)}s.`, 'success');
-            setState(prev => ({ ...prev, separating: false }));
             return true;
         } catch (error) {
             localUrls.forEach(url => URL.revokeObjectURL(url));
-            // Any failed worker-backed run permanently invalidates the library
-            // Separator. Detach exactly the instance this call used so a future
-            // load cannot be clobbered by a late catch/finally from this run.
-            if (separatorRef.current === separator) {
-                separatorRef.current = null;
-                setLoadedModel(null);
+            if (!separated) {
+                // A failed or aborted separate() permanently invalidates the
+                // library Separator. Detach exactly the instance this call used
+                // so a future load cannot be clobbered by this late catch.
+                if (separatorRef.current === separator) {
+                    separatorRef.current = null;
+                    setLoadedModel(null);
+                }
+                await separator.unload();
             }
-            await separator.unload();
+            const modelLoaded = separated && separatorRef.current === separator;
             if (controller.signal.aborted || isAbortError(error)) {
                 if (mountedRef.current) {
                     setStatus('Separation cancelled');
                     setProgress(0, false, 'idle');
                     setState(prev => ({
                         ...prev,
-                        modelLoaded: false,
-                        modelLoading: false,
-                        separating: false,
+                        modelLoaded,
                     }));
                 }
                 return false;
@@ -529,9 +570,7 @@ export function useUnblend() {
             setProgress(0, false, 'idle');
             setState(prev => ({
                 ...prev,
-                modelLoaded: false,
-                modelLoading: false,
-                separating: false,
+                modelLoaded,
             }));
             return false;
         } finally {
@@ -541,6 +580,48 @@ export function useUnblend() {
             }
         }
     }, [addLog, setStatus, setProgress]);
+
+    /**
+     * Swap the ORIGINAL lane to decoded PCM, e.g. after its <audio> element
+     * reports that the browser can't play the source file. No-op if it
+     * already plays PCM or no track is loaded.
+     */
+    const switchOriginalToPcm = useCallback(async () => {
+        const buffer = audioBufferRef.current;
+        if (!buffer || originalIsPcmRef.current) return;
+        originalIsPcmRef.current = true;
+        let url: string;
+        try {
+            url = await pcmOriginalUrl(buffer);
+        } catch (error) {
+            originalIsPcmRef.current = false;
+            console.error('[unblend] Failed to encode the original track:', error);
+            return;
+        }
+        // A newer track (or unmount) replaced this one while encoding.
+        if (!mountedRef.current || audioBufferRef.current !== buffer) {
+            URL.revokeObjectURL(url);
+            return;
+        }
+        if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current);
+        originalUrlRef.current = url;
+        setOriginalUrl(url);
+        addLog('Original track plays from decoded audio', 'info');
+    }, [addLog]);
+
+    /** Discard the separated stems, revoking their object URLs. */
+    const clearStems = useCallback(() => {
+        Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
+        stemUrlsRef.current = {};
+        setStemUrls({});
+        setStemPeaks({});
+    }, []);
+
+    /** Abort an in-flight model load and/or separation (and its finalize). */
+    const cancel = useCallback(() => {
+        modelLoadAbortRef.current?.abort();
+        separationAbortRef.current?.abort();
+    }, []);
 
     // Keep refs in sync with the latest object URLs for the unmount cleanup.
     useEffect(() => {
@@ -588,7 +669,9 @@ export function useUnblend() {
         loadModel,
         loadAudio,
         clearAudioError,
-        clearLogs,
         separateAudio,
+        clearStems,
+        switchOriginalToPcm,
+        cancel,
     };
 }

@@ -6,7 +6,12 @@ import {
     type ModelType,
 } from './constants.js';
 import { MODEL_ARTIFACTS } from './model-artifacts.js';
-import { OnnxClient, type LoadProgressCallback } from './onnx-client.js';
+import {
+    ModelLoadError,
+    OnnxClient,
+    type LoadProgressCallback,
+    type OnnxLoadOptions,
+} from './onnx-client.js';
 import { STFTClient } from './stft-client.js';
 import { ISTFTClient } from './istft-client.js';
 import {
@@ -22,9 +27,10 @@ export interface LoadModelOptions {
     /** Defaults to 'webgpu'; supported models fall back to WASM if needed. */
     backend?: 'webgpu' | 'wasm';
     /**
-     * Model precision. HTDemucs ``'fp16'`` uses half-precision weight storage
-     * with fp32 compute. RoFormer ``'fp16'`` uses mixed-precision weights and
-     * activations while retaining fp32 IO, normalization, trig, and softmax.
+     * Model precision; defaults to 'fp32'. ``'fp16'`` stores weights in half
+     * precision with fp32 compute, except RoFormer, whose ``'fp16'`` also runs
+     * mixed-precision activations (keeping fp32 IO, normalization, trig, and
+     * softmax).
      */
     precision?: ModelPrecision;
     /** Override ORT's .wasm asset URL prefix; defaults to bundler-resolved. */
@@ -35,9 +41,16 @@ export interface LoadModelOptions {
      * Fetch the ONNX weights from this URL instead of the registered
      * Hugging Face artifact. The model's config/precision still come from
      * ``model``; only the byte source changes. Intended for testing a locally
-     * exported model before it is published.
+     * exported model before it is published. Overridden URLs are never
+     * cached.
      */
     modelUrl?: string;
+    /**
+     * Keep the downloaded weights in Cache Storage, keyed by the immutable
+     * artifact URL, so later loads skip the download. Defaults to true.
+     * Silently uncached where Cache Storage is unavailable or full.
+     */
+    cache?: boolean;
     /**
      * Override ORT's graph optimization level; defaults to 'all'. Exposed for
      * diagnosing EP-specific optimizer bugs (a lower level skips fusion/
@@ -92,7 +105,7 @@ async function isWebGPUAvailable(): Promise<boolean> {
 
 export class Separator {
     readonly model: ModelType;
-    readonly sources: string[];
+    readonly sources: readonly string[];
     readonly backend: 'webgpu' | 'wasm';
     readonly precision: ModelPrecision;
     /** License of the model weights. */
@@ -140,18 +153,20 @@ export class Separator {
             );
         }
         const precision: ModelPrecision = options.precision ?? 'fp32';
-        const modelArtifacts = MODEL_ARTIFACTS[model];
-        if (!modelArtifacts) {
+        // Own-property checks: a name like 'constructor' or 'toString' must be
+        // rejected, not resolved through Object.prototype.
+        if (typeof model !== 'string' || !Object.hasOwn(MODEL_ARTIFACTS, model)) {
             throw new Error(
                 `Unknown model '${model}'. Valid models: ${Object.keys(MODEL_ARTIFACTS).join(', ')}.`
             );
         }
-        const artifact = modelArtifacts[precision];
-        if (!artifact) {
+        const modelArtifacts = MODEL_ARTIFACTS[model];
+        if (typeof precision !== 'string' || !Object.hasOwn(modelArtifacts, precision)) {
             throw new Error(
                 `Unknown precision '${precision}'. Valid precisions: ${Object.keys(modelArtifacts).join(', ')}.`
             );
         }
+        const artifact = modelArtifacts[precision];
         const modelUrl = options.modelUrl ?? artifact.url;
         const config = MODEL_CONFIGS[model];
         if (preferredBackend === 'wasm' && config.webgpuRequired) {
@@ -185,20 +200,35 @@ export class Separator {
             throwIfAborted(options.signal);
 
             onnx = new OnnxClient();
-            const workerOptions = {
+            const workerOptions: OnnxLoadOptions = {
                 wasmPaths: options.wasmPaths,
                 numThreads: options.numThreads,
                 graphOptimizationLevel: options.graphOptimizationLevel,
+                model,
+                cache: options.modelUrl === undefined && options.cache !== false
+                    ? { key: artifact.url, expectedBytes: artifact.sizeBytes }
+                    : undefined,
+                // An overridden URL's size is unknown; registered artifacts
+                // must match their attested size whether or not they cache.
+                expectedBytes: options.modelUrl === undefined ? artifact.sizeBytes : undefined,
             };
+            const canFallBack = backend === 'webgpu' && !config.webgpuRequired;
             try {
                 await awaitWithSignal(
-                    onnx.load(modelUrl, backend, workerOptions, options.onProgress),
+                    onnx.load(
+                        modelUrl,
+                        backend,
+                        { ...workerOptions, returnBytesOnFailure: canFallBack },
+                        options.onProgress,
+                    ),
                     options.signal
                 );
             } catch (error) {
                 // Never reinterpret an abort as a WebGPU failure/fallback.
                 throwIfAborted(options.signal);
-                if (backend !== 'webgpu' || config.webgpuRequired) throw error;
+                if (!canFallBack) throw error;
+                // A failed download would fail identically on WASM.
+                if (error instanceof ModelLoadError && error.stage === 'fetch') throw error;
                 console.warn(
                     `[unblend] ${model} failed to initialize with WebGPU; falling back to WASM:`,
                     error,
@@ -206,8 +236,14 @@ export class Separator {
                 onnx.terminate(error);
                 backend = 'wasm';
                 onnx = new OnnxClient();
+                const modelBytes = error instanceof ModelLoadError ? error.modelBytes : undefined;
                 await awaitWithSignal(
-                    onnx.load(modelUrl, backend, workerOptions, options.onProgress),
+                    onnx.load(
+                        modelUrl,
+                        backend,
+                        { ...workerOptions, modelBytes },
+                        options.onProgress,
+                    ),
                     options.signal
                 );
             }
@@ -238,7 +274,12 @@ export class Separator {
         audioBuffer: AudioBuffer,
         options: SeparationOptions = {}
     ): Promise<SeparationResult> {
-        if (this.disposed) throw new Error('Separator has been unloaded');
+        if (this.disposed) {
+            throw new Error(
+                'Separator is no longer usable (it was unloaded, or an earlier separation was '
+                + 'aborted or failed); load a new one',
+            );
+        }
         if (this.active) throw new Error('Separation already in progress');
         if (audioBuffer.sampleRate !== SAMPLE_RATE) {
             throw new Error(

@@ -20,7 +20,7 @@ export type ModelType =
 export type ModelFamily = 'htdemucs' | 'roformer' | 'scnet';
 
 /**
- * Everything the pipeline needs to know about one model. The two families
+ * Everything the pipeline needs to know about one model. The three families
  * share the chunk/overlap-add machinery but differ in DSP:
  *
  * - `htdemucs`: Demucs pre-padding + frame trims around a √N-normalized STFT
@@ -35,40 +35,39 @@ export type ModelFamily = 'htdemucs' | 'roformer' | 'scnet';
  *   that graph-facing length without changing overlap/chunk boundaries.
  */
 export interface ModelConfig {
-    family: ModelFamily;
-    nfft: number;
-    hopLength: number;
+    readonly family: ModelFamily;
+    readonly nfft: number;
+    readonly hopLength: number;
     /** Logical chunk length used for splitting, overlap-add, and output trim. */
-    segmentSamples: number;
+    readonly segmentSamples: number;
     /**
      * Samples transformed and fed to the graph when the architecture pads a
      * logical chunk internally. Defaults to `segmentSamples`.
      */
-    modelInputSamples?: number;
+    readonly modelInputSamples?: number;
     /** Stems the ONNX graph emits, in output order. */
-    modelSources: string[];
+    readonly modelSources: readonly string[];
     /** Final stems returned to the caller (includes any complement stem). */
-    sources: string[];
+    readonly sources: readonly string[];
     /**
      * Single-mask models emit one stem; the second is computed client-side
      * as ``mixture - stem`` after separation.
      */
-    complement?: { stem: string; name: string };
-    /** Track-level mean/std normalization around the model. */
-    normalizeInput: boolean;
-    /** Whether the graph has the HTDemucs time-domain branch (``out_wave``). */
-    hasTimeBranch: boolean;
+    readonly complement?: { readonly stem: string; readonly name: string };
+    readonly normalizeInput: boolean;
+    /** HTDemucs time-domain branch (``out_wave``). */
+    readonly hasTimeBranch: boolean;
     /** Refuse the fixed-memory WASM heap and require WebGPU for this model. */
-    webgpuRequired?: boolean;
+    readonly webgpuRequired?: boolean;
     /** License of the model weights (shown so apps can surface it). */
-    license: string;
+    readonly license: string;
     /** STFT analysis window; defaults to Hann when unset. */
-    window?: 'hann' | 'rectangular';
+    readonly window?: 'hann' | 'rectangular';
     /** Whether the STFT is 1/sqrt(nfft)-scaled; defaults to false. */
-    stftNormalized?: boolean;
+    readonly stftNormalized?: boolean;
 }
 
-export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
+export const MODEL_CONFIGS: Readonly<Record<ModelType, ModelConfig>> = {
     'htdemucs': {
         family: 'htdemucs',
         nfft: NFFT,
@@ -161,15 +160,23 @@ export const MODEL_CONFIGS: Record<ModelType, ModelConfig> = {
     },
 };
 
+/** Freeze a config tree so callers can't mutate the shared object. */
+export function deepFreeze<T>(value: T): T {
+    if (value !== null && typeof value === 'object') {
+        for (const child of Object.values(value)) deepFreeze(child);
+        Object.freeze(value);
+    }
+    return value;
+}
+deepFreeze(MODEL_CONFIGS);
+
 /**
  * Spectrogram dims the ONNX graph expects for one segment of ``config``.
  * HTDemucs drops the Nyquist bin and trims to ``ceil(segment / hop)`` frames
- * (its Demucs-specific padding); RoFormer keeps all bins and the standard
- * centered frame count.
+ * (its Demucs-specific padding); RoFormer and SCNet keep all bins and the
+ * standard centered frame count of the graph-facing input.
  */
 export function specDims(config: ModelConfig): { numBins: number; numFrames: number } {
-    // Only HTDemucs trims; roformer and scnet both keep every bin and the
-    // standard centered frame count.
     if (config.family === 'htdemucs') {
         return {
             numBins: config.nfft / 2,
@@ -207,7 +214,7 @@ export interface STFTResult {
     numFrames: number;
 }
 
-/** DSP parameters a worker needs to build its FFT state for one model. */
+/** The subset of `ModelConfig` a worker needs to build its FFT state. */
 export interface DSPConfig {
     family: ModelFamily;
     nfft: number;
@@ -216,15 +223,14 @@ export interface DSPConfig {
     /** Logical overlap-add chunk length; defaults to `segmentSamples`. */
     chunkSamples?: number;
     /**
-     * STFT analysis window. Plain SCNet passes no window to ``torch.stft``,
-     * so applying Hann there would silently change the result.
+     * STFT analysis window. Plain SCNet (XL) passes no window to
+     * ``torch.stft``, so applying Hann there would silently change the result.
      */
     window?: 'hann' | 'rectangular';
     /** Whether the STFT is 1/sqrt(nfft)-scaled (``normalized=True``). */
     normalized?: boolean;
 }
 
-/** Extract the DSP subset of a model config (what the workers consume). */
 export function dspConfig(config: ModelConfig): DSPConfig {
     return {
         family: config.family,

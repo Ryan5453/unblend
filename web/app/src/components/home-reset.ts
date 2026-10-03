@@ -1,17 +1,23 @@
 import { createContext, useContext } from 'react';
 
 /**
- * Lets the site chrome (the header wordmark and the "Studio" nav link) trigger
- * the Home page's soft reset — the same thing the "New File" button does —
- * without remounting Home (which would needlessly reload the model).
+ * Lets the site chrome (the header wordmark and nav links) reach the Home
+ * page without remounting it (which would needlessly reload the model):
+ * `trigger` runs Home's soft reset, the same thing the "New File" button does,
+ * and `confirmLeave` asks before navigating away would discard its work.
  *
- * Home registers its reset handler via `register`; the header calls `trigger`.
+ * Home registers its handlers via `register`; the header calls the rest.
  */
-export type ResetFn = () => void;
+export interface HomeHandlers {
+    reset: () => void;
+    /** Returns false if the user chose to stay on Home. */
+    confirmLeave: () => boolean;
+}
 
 export interface HomeResetControl {
-    register: (fn: ResetFn | null) => void;
+    register: (handlers: HomeHandlers | null) => void;
     trigger: () => void;
+    confirmLeave: () => boolean;
 }
 
 export const HomeResetContext = createContext<HomeResetControl | null>(null);

@@ -2,9 +2,12 @@
  * Audio decoder with two-tier fallback for maximum format support.
  * 
  * Fallback chain:
- * 1. Mediabunny (primary, handles most formats via WebCodecs)
+ * 1. Mediabunny (primary, handles most formats via WebCodecs). For MP3, AAC
+ *    and Opus (except Opus in MP4/M4A/MOV) the samples come from the browser's
+ *    decodeAudioData instead, which trims encoder padding; Mediabunny still
+ *    supplies tags and artwork.
  * 2. ffmpeg.wasm (lazy-loaded, handles exotic codecs like ALAC)
- * 
+ *
  * Both tiers attempt to extract album artwork from the audio file.
  */
 
@@ -13,15 +16,12 @@ import {
     ALL_FORMATS,
     BufferSource,
     AudioSampleSink,
+    IsobmffInputFormat,
 } from 'mediabunny';
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { toBlobURL } from '@ffmpeg/util';
+// Type-only: the ffmpeg modules are imported dynamically in loadFFmpeg so
+// they stay out of the main bundle unless the fallback is actually needed.
+import type { FFmpeg } from '@ffmpeg/ffmpeg';
 
-// Set to true to enable verbose decode logging during development.
-const DEBUG = false;
-const debug = (...args: unknown[]) => { if (DEBUG) console.log(...args); };
-
-// Lazy-loaded ffmpeg instance
 let ffmpegInstance: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
 
@@ -45,33 +45,23 @@ export interface DecodeResult {
  */
 async function loadFFmpeg(): Promise<FFmpeg> {
     if (ffmpegInstance?.loaded) {
-        debug('ffmpeg.wasm already loaded');
         return ffmpegInstance;
     }
 
     if (ffmpegLoadPromise) {
-        debug('ffmpeg.wasm load already in progress...');
         return ffmpegLoadPromise;
     }
 
     ffmpegLoadPromise = (async () => {
         try {
-            debug('Initializing ffmpeg.wasm...');
+            const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
+                import('@ffmpeg/ffmpeg'),
+                import('@ffmpeg/util'),
+            ]);
             const ffmpeg = new FFmpeg();
 
-            // Add logging for progress
-            ffmpeg.on('log', ({ message }) => {
-                debug('[ffmpeg]', message);
-            });
-
-            ffmpeg.on('progress', ({ progress, time }) => {
-                debug(`[ffmpeg] Progress: ${Math.round(progress * 100)}%, Time: ${time}`);
-            });
-
-            debug('Downloading ffmpeg-core... This may take a moment.');
-
-            // Use toBlobURL to fetch and convert to blob URLs
-            // This works around Vite/ESM module loading issues with CDN resources
+            // Blob URLs work around Vite/ESM module loading issues with
+            // cross-origin CDN scripts.
             const coreURL = await toBlobURL(
                 `${FFMPEG_CDN_BASE}/ffmpeg-core.js`,
                 'text/javascript'
@@ -86,11 +76,8 @@ async function loadFFmpeg(): Promise<FFmpeg> {
                 'text/javascript'
             );
 
-            debug('Core files downloaded, initializing...');
-
             await ffmpeg.load({ coreURL, wasmURL, workerURL });
 
-            debug('ffmpeg.wasm loaded successfully!');
             ffmpegInstance = ffmpeg;
             return ffmpeg;
         } catch (error) {
@@ -103,9 +90,6 @@ async function loadFFmpeg(): Promise<FFmpeg> {
     return ffmpegLoadPromise;
 }
 
-/**
- * Get file extension from filename
- */
 function getExtension(fileName: string): string {
     const match = fileName.match(/\.[^.]+$/);
     return match ? match[0] : '';
@@ -130,7 +114,6 @@ async function extractArtworkWithFFmpeg(
             artworkName
         ]);
 
-        // Check if artwork was extracted
         try {
             const artworkData = await ffmpeg.readFile(artworkName) as Uint8Array;
             if (artworkData && artworkData.length > 0) {
@@ -139,12 +122,12 @@ async function extractArtworkWithFFmpeg(
                 return URL.createObjectURL(blob);
             }
         } catch {
-            // No artwork extracted, that's fine
+            // Most files have no embedded artwork.
         }
 
         return null;
     } catch {
-        // Artwork extraction failed, not a big deal
+        // Artwork is optional; never fail the decode over it.
         return null;
     }
 }
@@ -159,38 +142,19 @@ async function extractMetadataWithFFmpeg(
     try {
         const metadataName = 'metadata.txt';
 
-        // Extract metadata to ffmetadata format
         await ffmpeg.exec([
             '-i', inputName,
             '-f', 'ffmetadata',
             metadataName
         ]);
 
-        // Read metadata file
         try {
             const metadataBytes = await ffmpeg.readFile(metadataName) as Uint8Array;
             const metadataText = new TextDecoder().decode(metadataBytes);
             await ffmpeg.deleteFile(metadataName);
 
-            // Parse ffmetadata format (key=value lines)
-            let title: string | null = null;
-            let artist: string | null = null;
-
-            for (const line of metadataText.split('\n')) {
-                const [key, ...valueParts] = line.split('=');
-                const value = valueParts.join('=').trim();
-                
-                if (key?.toLowerCase() === 'title' && value) {
-                    title = value;
-                    debug('Extracted title from ffmpeg:', title);
-                }
-                if (key?.toLowerCase() === 'artist' && value) {
-                    artist = value;
-                    debug('Extracted artist from ffmpeg:', artist);
-                }
-            }
-
-            return { title, artist };
+            const tags = parseFfmetadataGlobals(metadataText);
+            return { title: tags.title || null, artist: tags.artist || null };
         } catch {
             // No metadata file
             return { title: null, artist: null };
@@ -210,7 +174,6 @@ async function decodeWithFFmpeg(
     targetSampleRate: number,
     onStatus?: (status: string) => void
 ): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
-    debug('Loading ffmpeg.wasm for decoding...');
     // The ffmpeg-core.wasm binary (~30MB) is fetched from a CDN here, on top
     // of the audio decode itself — worth its own status line since it's the
     // slowest, least predictable step in this fallback path.
@@ -226,22 +189,21 @@ async function decodeWithFFmpeg(
         // a partial write is removed too).
         await ffmpeg.writeFile(inputName, new Uint8Array(arrayBuffer));
 
-        // Extract artwork first (before modifying the file)
         artwork = await extractArtworkWithFFmpeg(ffmpeg, inputName);
 
-        // Extract metadata (title, artist)
         const { title, artist } = await extractMetadataWithFFmpeg(ffmpeg, inputName);
 
-        // Convert to WAV format (universally decodable)
+        // Convert to WAV format (universally decodable). Keep the source's
+        // channels rather than downmixing (-ac 2 would fold surround into
+        // stereo): like the Mediabunny path, the separator then duplicates
+        // mono and uses only the first two channels of anything wider.
         await ffmpeg.exec([
             '-i', inputName,
             '-ar', String(targetSampleRate),
-            '-ac', '2', // stereo
             '-f', 'wav',
             outputName
         ]);
 
-        // Read output file
         const outputData = await ffmpeg.readFile(outputName);
 
         // Decode the WAV with native Web Audio API. Close the context on
@@ -279,12 +241,24 @@ async function decodeWithMediabunny(
     targetSampleRate: number,
     audioContext: AudioContext
 ): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
-    // Create input from array buffer
     const input = new Input({
         formats: ALL_FORMATS,
         source: new BufferSource(arrayBuffer),
     });
+    // Dispose on every path, including decode errors.
+    try {
+        return await decodeMediabunnyInput(input, targetSampleRate, audioContext, arrayBuffer);
+    } finally {
+        input.dispose();
+    }
+}
 
+async function decodeMediabunnyInput(
+    input: Input,
+    targetSampleRate: number,
+    audioContext: AudioContext,
+    bytes: ArrayBuffer
+): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
     // Extract artwork and metadata from tags
     let artwork: string | null = null;
     let title: string | null = null;
@@ -295,81 +269,97 @@ async function decodeWithMediabunny(
             const image = tags.images[0];
             const blob = new Blob([new Uint8Array(image.data)], { type: image.mimeType || 'image/jpeg' });
             artwork = URL.createObjectURL(blob);
-            debug('Extracted artwork from audio file');
         }
-        // Extract title and artist
         if (tags.title) {
             title = tags.title;
-            debug('Extracted title:', title);
         }
         if (tags.artist) {
             artist = tags.artist;
-            debug('Extracted artist:', artist);
         }
-    } catch (e) {
-        debug('Could not extract metadata tags:', e);
+    } catch {
+        // Metadata tags are optional; decode without them.
     }
 
     // From here on, any failure must revoke the artwork object URL created
     // above or it would leak (the caller never sees it on the throw path).
     try {
-        // Get audio track
         const audioTrack = await input.getPrimaryAudioTrack();
         if (!audioTrack) {
-            input.dispose();
             throw new Error('No audio track found in file');
         }
 
-        // Check if we can decode this track
+        // MP3, AAC and Opus start or end with encoder padding: AAC's priming
+        // frames, MP3's LAME/Xing gapless delay, Opus's end trim (its pre-skip
+        // Mediabunny already drops). Decoding every frame keeps it: MP3/AAC
+        // stems come out ~25 ms late, Opus ones with an extra tail. The
+        // browser's own decoder trims it (as its playback of the original
+        // does), so use it for the samples, keeping Mediabunny's tags and
+        // artwork. Ahead of the WebCodecs check: browsers without AudioDecoder
+        // still decode these this way.
+        // Not Opus in MP4/M4A: Chrome's decodeAudioData skips its pre-skip
+        // twice there (dOps and the edit list), starting the stems ~6.5 ms
+        // early, while Mediabunny skips it once.
+        const isobmff = (await input.getFormat()) instanceof IsobmffInputFormat;
+        const trimmedByBrowser =
+            audioTrack.codec === 'mp3' ||
+            audioTrack.codec === 'aac' ||
+            (audioTrack.codec === 'opus' && !isobmff);
+        if (trimmedByBrowser) {
+            try {
+                // A copy: decodeAudioData detaches its argument.
+                const buffer = await audioContext.decodeAudioData(bytes.slice(0));
+                return { buffer, artwork, title, artist };
+            } catch {
+                // Fall through to frame-by-frame decoding.
+            }
+        }
+
         const canDecode = await audioTrack.canDecode();
         if (!canDecode) {
-            input.dispose();
             throw new Error(`Cannot decode audio codec: ${audioTrack.codec || 'unknown'}`);
         }
 
-        // Get audio properties
         const sampleRate = audioTrack.sampleRate;
         const numberOfChannels = audioTrack.numberOfChannels;
-        const duration = await audioTrack.computeDuration();
 
-        // Calculate total samples
-        const totalSamples = Math.ceil(duration * sampleRate);
-
-        // Create output AudioBuffer (reuse the caller's AudioContext to avoid
-        // leaking contexts; browsers cap the number of live AudioContexts).
-        const buffer = audioContext.createBuffer(
-            numberOfChannels,
-            totalSamples,
-            sampleRate
-        );
-
-        // Use AudioSampleSink to decode all samples
+        // Collect decoded chunks and size the buffer from the frames actually
+        // decoded. computeDuration() is only an estimate from container
+        // metadata, so sizing from it could pad silence or truncate audio.
+        const chunks: Float32Array[][] = Array.from({ length: numberOfChannels }, () => []);
         const sink = new AudioSampleSink(audioTrack);
-
         let samplesWritten = 0;
 
         for await (const sample of sink.samples()) {
-            // Copy each channel
-            for (let ch = 0; ch < numberOfChannels; ch++) {
-                const channelBytesNeeded = sample.allocationSize({ planeIndex: ch, format: 'f32-planar' });
-                const channelData = new Float32Array(channelBytesNeeded / 4);
-                sample.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
-
-                // Copy to output buffer
-                const outputChannel = buffer.getChannelData(ch);
-                const framesToCopy = Math.min(channelData.length, totalSamples - samplesWritten);
-                for (let i = 0; i < framesToCopy; i++) {
-                    outputChannel[samplesWritten + i] = channelData[i];
+            try {
+                const frames = sample.numberOfFrames;
+                for (let ch = 0; ch < numberOfChannels; ch++) {
+                    const channelData = new Float32Array(frames);
+                    sample.copyTo(channelData, { planeIndex: ch, format: 'f32-planar', frameCount: frames });
+                    chunks[ch].push(channelData);
                 }
+                samplesWritten += frames;
+            } finally {
+                sample.close();
             }
-
-            samplesWritten += sample.numberOfFrames;
-            sample.close();
         }
 
-        input.dispose();
+        if (samplesWritten === 0) {
+            throw new Error('Audio track decoded to zero samples');
+        }
 
-        // Resample if needed
+        // Create output AudioBuffer (reuse the caller's AudioContext to avoid
+        // leaking contexts; browsers cap the number of live AudioContexts).
+        const buffer = audioContext.createBuffer(numberOfChannels, samplesWritten, sampleRate);
+        for (let ch = 0; ch < numberOfChannels; ch++) {
+            const outputChannel = buffer.getChannelData(ch);
+            let offset = 0;
+            for (const chunk of chunks[ch]) {
+                outputChannel.set(chunk, offset);
+                offset += chunk.length;
+            }
+            chunks[ch].length = 0;
+        }
+
         if (sampleRate !== targetSampleRate) {
             const offlineCtx = new OfflineAudioContext(
                 numberOfChannels,
@@ -403,26 +393,66 @@ export async function decodeAudioFile(
 
     // Tier 1: Try Mediabunny first (handles most formats via WebCodecs)
     try {
-        debug('Attempting to decode with Mediabunny...');
         onStatus?.('Decoding audio...');
         const { buffer, artwork, title, artist } = await decodeWithMediabunny(arrayBuffer, audioContext.sampleRate, audioContext);
-        debug('Successfully decoded with Mediabunny');
         return { buffer, artwork, title, artist, usedFallback: 'mediabunny' };
-    } catch (mediabunnyError) {
-        debug('Mediabunny decode failed, trying ffmpeg.wasm:', mediabunnyError);
+    } catch {
+        // Fall through to ffmpeg.wasm.
     }
 
     // Tier 2: Try ffmpeg.wasm (handles exotic codecs like ALAC, WMA, etc)
     try {
-        debug('Attempting to decode with ffmpeg.wasm...');
         const { buffer, artwork, title, artist } = await decodeWithFFmpeg(arrayBuffer, file.name, audioContext.sampleRate, onStatus);
-        debug('Successfully decoded with ffmpeg.wasm');
         return { buffer, artwork, title, artist, usedFallback: 'ffmpeg' };
     } catch (ffmpegError) {
         console.error('All decode methods failed:', ffmpegError);
         throw new Error(
             `Unable to decode "${file.name}". This audio format is not supported. ` +
-            `Error: ${ffmpegError instanceof Error ? ffmpegError.message : String(ffmpegError)}`
+            `Error: ${ffmpegError instanceof Error ? ffmpegError.message : String(ffmpegError)}`,
+            { cause: ffmpegError },
         );
     }
 }
+
+/**
+ * Read the global (file-level) tags from ffmpeg's ffmetadata output.
+ *
+ * Stops at the first ``[CHAPTER]`` or ``[STREAM]`` section, whose own
+ * ``title=`` lines would otherwise overwrite the track's. Values have ``=``,
+ * ``;``, ``#``, ``\`` and newlines backslash-escaped; a trailing backslash
+ * continues the value on the next line.
+ */
+export function parseFfmetadataGlobals(text: string): Record<string, string> {
+    const tags: Record<string, string> = {};
+    let pending = '';
+    for (const raw of text.split('\n')) {
+        const line = pending + raw;
+        pending = '';
+        // ffmpeg's only section markers; a key may itself start with '['.
+        if (/^\[(CHAPTER|STREAM)\]$/.test(line)) break;
+        if (line.startsWith(';') || line.startsWith('#') || !line) continue;
+        // An odd number of trailing backslashes escapes the newline.
+        const trailing = line.length - line.replace(/\\+$/, '').length;
+        if (trailing % 2 === 1) {
+            pending = line.slice(0, -1) + '\n';
+            continue;
+        }
+        let key = '';
+        let value = '';
+        let inValue = false;
+        for (let i = 0; i < line.length; i++) {
+            let ch = line[i];
+            if (ch === '\\' && i + 1 < line.length) {
+                ch = line[++i];
+            } else if (ch === '=' && !inValue) {
+                inValue = true;
+                continue;
+            }
+            if (inValue) value += ch;
+            else key += ch;
+        }
+        if (inValue) tags[key.trim().toLowerCase()] = value.trim();
+    }
+    return tags;
+}
+

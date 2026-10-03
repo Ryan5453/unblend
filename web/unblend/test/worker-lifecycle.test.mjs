@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { ISTFTClient } from '../dist/istft-client.js';
+import { MODEL_ARTIFACTS } from '../dist/model-artifacts.js';
 import { OnnxClient } from '../dist/onnx-client.js';
 import { Separator } from '../dist/separator.js';
 import { STFTClient } from '../dist/stft-client.js';
@@ -202,6 +203,92 @@ test('WebGPU load failure retries once on a fresh WASM worker', async () => {
     assert.equal(onnxWorkers[1].terminateCalls, 1);
 });
 
+test('WebGPU session failure hands its bytes to the WASM retry', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { gpu: { requestAdapter: async () => ({}) } },
+    });
+    const bytes = new Uint8Array([1, 2, 3]);
+    const loads = [];
+    FakeWorker.handler = (worker, message) => {
+        if (message.type === 'load') {
+            loads.push({ message, transfer: worker.transfers.at(-1) });
+            const first = loads.length === 1;
+            worker.respond({
+                type: 'load',
+                requestId: message.requestId,
+                success: !first,
+                error: first ? 'WebGPU session failed' : undefined,
+                stage: first ? 'session' : undefined,
+                modelBytes: first ? bytes : undefined,
+            });
+            return;
+        }
+        successfulLoadHandler(worker, message);
+    };
+
+    const separator = await Separator.load('htdemucs', { backend: 'webgpu' });
+    assert.equal(separator.backend, 'wasm');
+    assert.equal(loads[0].message.returnBytesOnFailure, true);
+    assert.equal(loads[1].message.modelBytes, bytes);
+    assert.deepEqual(loads[1].transfer, [bytes.buffer]);
+    await separator.unload();
+});
+
+test('WebGPU download failure is rethrown without a WASM retry', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { gpu: { requestAdapter: async () => ({}) } },
+    });
+    FakeWorker.handler = (worker, message) => {
+        if (message.type === 'load') {
+            worker.respond({
+                type: 'load',
+                requestId: message.requestId,
+                success: false,
+                error: 'Failed to fetch model: 404 Not Found',
+                stage: 'fetch',
+            });
+        }
+    };
+
+    await assert.rejects(
+        Separator.load('htdemucs', { backend: 'webgpu' }),
+        /404 Not Found/,
+    );
+    const onnxWorkers = FakeWorker.instances.filter(worker =>
+        worker.url.includes('onnx-worker.js')
+    );
+    assert.equal(onnxWorkers.length, 1);
+});
+
+test('registered artifacts are cached unless opted out or overridden', async () => {
+    const loadFor = async options => {
+        resetFakes();
+        FakeWorker.handler = successfulLoadHandler;
+        const separator = await Separator.load(
+            'scnet_small',
+            { backend: 'wasm', precision: 'fp16', ...options },
+        );
+        const load = FakeWorker.instances[0].messages.find(m => m.type === 'load');
+        await separator.unload();
+        return load;
+    };
+    const size = MODEL_ARTIFACTS.scnet_small.fp16.sizeBytes;
+    const { cache, expectedBytes } = await loadFor({});
+    assert.match(cache.key, /\/resolve\/[0-9a-f]{40}\/scnet_small_fp16\.onnx$/);
+    assert.equal(cache.expectedBytes, size);
+    assert.equal(expectedBytes, size);
+    // Opting out of caching still enforces the attested size; an overridden
+    // URL has no known size.
+    const uncached = await loadFor({ cache: false });
+    assert.equal(uncached.cache, undefined);
+    assert.equal(uncached.expectedBytes, size);
+    const overridden = await loadFor({ modelUrl: 'http://localhost/local.onnx' });
+    assert.equal(overridden.cache, undefined);
+    assert.equal(overridden.expectedBytes, undefined);
+});
+
 for (const model of ['bs_roformer_sw', 'scnet_xl_wide_v5']) {
     test(`${model} refuses WASM before constructing workers`, async () => {
         await assert.rejects(
@@ -293,7 +380,7 @@ test('active separation rejects concurrency; abort invalidates the instance', as
     );
     controller.abort(reason);
     await assert.rejects(first, error => error === reason);
-    await assert.rejects(separator.separate(tinyAudioBuffer()), /has been unloaded/);
+    await assert.rejects(separator.separate(tinyAudioBuffer()), /no longer usable/);
     assert.deepEqual(
         FakeWorker.instances.map(worker => worker.terminateCalls),
         [1, 1, 1],
@@ -316,7 +403,7 @@ test('worker-backed separation failure invalidates the instance', async () => {
     };
 
     await assert.rejects(separator.separate(tinyAudioBuffer()), /synthetic STFT failure/);
-    await assert.rejects(separator.separate(tinyAudioBuffer()), /has been unloaded/);
+    await assert.rejects(separator.separate(tinyAudioBuffer()), /no longer usable/);
     assert.deepEqual(
         FakeWorker.instances.map(worker => worker.terminateCalls),
         [1, 1, 1],
@@ -326,7 +413,7 @@ test('worker-backed separation failure invalidates the instance', async () => {
 test('invalid options reject before marking the separator active', async () => {
     const separator = await loadedSeparator();
     await assert.rejects(
-        separator.separate(tinyAudioBuffer(), { shifts: 0 }),
+        separator.separate(tinyAudioBuffer(), { shifts: -1 }),
         /shifts must be an integer/,
     );
 
@@ -341,4 +428,19 @@ test('invalid options reject before marking the separator active', async () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     controller.abort();
     await assert.rejects(pending, error => error?.name === 'AbortError');
+});
+
+test('Separator.load rejects Object.prototype keys as model or precision names', async () => {
+    resetFakes();
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+        await assert.rejects(
+            Separator.load(name, { backend: 'wasm' }),
+            /Unknown model/,
+        );
+        await assert.rejects(
+            Separator.load('htdemucs', { backend: 'wasm', precision: name }),
+            /Unknown precision/,
+        );
+    }
+    assert.equal(FakeWorker.instances.length, 0);
 });

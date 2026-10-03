@@ -1,4 +1,5 @@
 import type { ModelType } from './constants.js';
+import { deepFreeze } from './constants.js';
 
 export type ArtifactPrecision = 'fp32' | 'fp16';
 
@@ -16,85 +17,87 @@ export interface ModelArtifact {
  *
  * The onnx worker fetches these URLs itself (rather than handing them to
  * `InferenceSession.create` directly) so it can report real download
- * progress; this briefly doubles peak memory (fetched buffer + ORT's parsed
- * copy) instead of ORT streaming the file on its own. The checked-in
+ * progress and keep them in Cache Storage keyed by URL; this briefly doubles
+ * peak memory (fetched buffer + ORT's parsed copy) instead of ORT streaming
+ * the file on its own. The checked-in
  * size/digest contract is verified by `npm run verify:model-artifacts` before
  * a release, not by hashing the buffer at load time.
  */
-export const MODEL_ARTIFACTS: Record<
-    ModelType,
-    Record<ArtifactPrecision, ModelArtifact>
+export const MODEL_ARTIFACTS: Readonly<
+    Record<ModelType, Readonly<Record<ArtifactPrecision, ModelArtifact>>>
 > = {
     htdemucs: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/htdemucs_fp32.onnx',
-            sizeBytes: 168678764,
-            sha256: 'b067d9ca7f3a93a0c41920a864481dd7a308ce16d20ed144ba41490d5e31a3ce',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/htdemucs_fp32.onnx',
+            sizeBytes: 168679100,
+            sha256: '34f88bbb86740c8d9ed5eed2c212e125180465a0154ba51b27b9c00b520b34f0',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/htdemucs_fp16.onnx',
-            sizeBytes: 91324835,
-            sha256: 'a7efcbad9625cbdde3f00967f75d6ba728384d825c2c92ab479938570007ab17',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/htdemucs_fp16.onnx',
+            sizeBytes: 85034599,
+            sha256: '7ece9b83307c12120d163bdf558cc2ad1750e4d7dab19846cfa0bc5cb0f22ae9',
         },
     },
     htdemucs_6s: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/htdemucs_6s_fp32.onnx',
-            sizeBytes: 110395431,
-            sha256: '38ad2757bd1a9aca34ecb68af38106fa75efc6e018a24f62dd1993ec74acf25d',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/htdemucs_6s_fp32.onnx',
+            sizeBytes: 110395767,
+            sha256: 'c5c1bfe109fcf5d78f72d1633e129c5bc99ce1789031962487041a2b03fdfea0',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/eda32466a76dc81c5e66af6577dbc20fb219e959/htdemucs_6s_fp16.onnx',
-            sizeBytes: 59382714,
-            sha256: '0fcaed84ca1f48781db053a5dc44f379cefc29734e36200cf05941aa03a40388',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/htdemucs_6s_fp16.onnx',
+            sizeBytes: 55844998,
+            sha256: '7199b39a4dd7cb73fb7debfef81fc6cf36ed78a4cdab8f6fbdf2cb9c07960f0f',
         },
     },
     bs_roformer_sw: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/bs_roformer_sw_fp32.onnx',
-            sizeBytes: 713020597,
-            sha256: 'ec8f26334000e982a05365a88fb77672d9ddb10a140adfeb72e9ef572082be8f',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/bs_roformer_sw_fp32.onnx',
+            sizeBytes: 700419210,
+            sha256: '09585bc2a70dec895ff8a2dd316314850cce4e620304eb46d6926a4e62d12461',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/bs_roformer_sw_fp16.onnx',
-            sizeBytes: 363867964,
-            sha256: '3c687f57679321e4c8ab35c267630a74605a8ce786f27b071000adca3c16218e',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/bs_roformer_sw_fp16.onnx',
+            sizeBytes: 351215164,
+            sha256: '560ef7646b40c0ed4ae958caacba4fcdc17f08649f8fd56034e5895a7e26ecae',
         },
     },
     melband_roformer_kim: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/melband_roformer_kim_fp32.onnx',
-            sizeBytes: 951444823,
-            sha256: 'fab1113cdfee5c8ab724223e8329d91b6a76767d58df36d1e2ab245c3413af9f',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/melband_roformer_kim_fp32.onnx',
+            sizeBytes: 946125448,
+            sha256: '8e41cda95e7772ef789740080bc41e9bb3ffd7c489b530644a0b6ab231fdfe99',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/a80a71b41face40edc91178c07edfedeca4cbb19/melband_roformer_kim_fp16.onnx',
-            sizeBytes: 478901267,
-            sha256: '96d42889773713979b2c7e2f6b168942357a009fe516cc554df021321a1a89c6',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/melband_roformer_kim_fp16.onnx',
+            sizeBytes: 473549669,
+            sha256: '7600639eee90a7e2732b71af90618defac0cacaca5ddfed7b783babfdf8474bf',
         },
     },
     scnet_small: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/ac4b06164d974e1242bd9fc7585305e5ea022d0f/scnet_small_fp32.onnx',
-            sizeBytes: 50197643,
-            sha256: 'ff6ee6bba0f64d5ded6b540ea2fbc29b4ba169bddba44c287d56a6e4c06aaeec',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/scnet_small_fp32.onnx',
+            sizeBytes: 48101059,
+            sha256: 'eee1bf82b7c9d756a388e00fc142ba1c427444b53a07d626cfa903a450f83281',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/ac4b06164d974e1242bd9fc7585305e5ea022d0f/scnet_small_fp16.onnx',
-            sizeBytes: 29081412,
-            sha256: 'dd421539061d3b2909be4fa7aa18d66e95de44ad75c63c147c90a8e6fc12f62a',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/scnet_small_fp16.onnx',
+            sizeBytes: 27057704,
+            sha256: '2fbb85960a8899f81e1363ccff69cc7299f2059ecad11477c2321eb5e168813d',
         },
     },
     scnet_xl_wide_v5: {
         fp32: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/396e6583cea8e5104f35c05d87cf60883794a58e/scnet_xl_wide_v5_fp32.onnx',
-            sizeBytes: 247151158,
-            sha256: 'f9c11da7debc10b29ea5032c7996c032796376ac39791cd34cd89c98213bad2a',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/scnet_xl_wide_v5_fp32.onnx',
+            sizeBytes: 221482626,
+            sha256: '6e2e46b669fa368247afbe867aaa61317425f3f0568309fd6e0c79671c39f0b6',
         },
         fp16: {
-            url: 'https://huggingface.co/Ryan5453/unblend/resolve/396e6583cea8e5104f35c05d87cf60883794a58e/scnet_xl_wide_v5_fp16.onnx',
-            sizeBytes: 140330178,
-            sha256: '0fa7447b5e7cf2f889ec727548a09f5c9eb2b8981c9c4fe9a09efe052b78477d',
+            url: 'https://huggingface.co/Ryan5453/unblend/resolve/45ab0266ad9bacd1fca47cc9bc9bc7f87ca703e3/scnet_xl_wide_v5_fp16.onnx',
+            sizeBytes: 114857118,
+            sha256: 'd97f0e7d945bfa46a32dca5b3dcd231003ff7f14fc9ab676637e4adab77b91c7',
         },
     },
 };
+
+deepFreeze(MODEL_ARTIFACTS);

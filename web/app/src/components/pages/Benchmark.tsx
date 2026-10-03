@@ -164,15 +164,23 @@ export function Benchmark() {
 
         // Try the modern FileSystemAccess interface first.
         if (dt.items && dt.items.length > 0) {
-            const handles: File[] = [];
+            // Take every entry synchronously: the DataTransferItemList is
+            // emptied once the handler first awaits.
+            const entries: FileSystemEntry[] = [];
             for (let i = 0; i < dt.items.length; i++) {
-                const item = dt.items[i];
-                const entry = (item as DataTransferItem & {
+                const entry = (dt.items[i] as DataTransferItem & {
                     webkitGetAsEntry?: () => FileSystemEntry | null;
                 }).webkitGetAsEntry?.();
-                if (entry?.isDirectory) {
-                    await collectFiles(entry as FileSystemDirectoryEntry, '', handles);
-                } else if (entry?.isFile) {
+                if (entry) entries.push(entry);
+            }
+            const handles: File[] = [];
+            for (const entry of entries) {
+                if (entry.isDirectory) {
+                    // Keep the dropped folder's name in the path so dropping
+                    // track folders directly (not their parent) still groups
+                    // each one as a track.
+                    await collectFiles(entry as FileSystemDirectoryEntry, entry.name, handles);
+                } else if (entry.isFile) {
                     const f = await new Promise<File>((res, rej) => {
                         (entry as FileSystemFileEntry).file(res, rej);
                     });
@@ -180,7 +188,7 @@ export function Benchmark() {
                 }
             }
             const found = readTracksFromFileList(handles);
-            log(`Drop yielded ${found.length} tracks`);
+            log(`Drop of ${entries.length} item${entries.length === 1 ? '' : 's'} yielded ${found.length} tracks`);
             setTracks(found);
             setResults([]);
             setError(null);
@@ -208,7 +216,7 @@ export function Benchmark() {
                 wasmPaths: ORT_WASM_PATHS,
             });
         } catch (err) {
-            setError(`Model failed to load: ${(err as Error).message}`);
+            setError(`Model failed to load: ${err instanceof Error ? err.message : String(err)}`);
             setPhase('error');
             return;
         }
@@ -243,8 +251,8 @@ export function Benchmark() {
                 for (const stem of MUSDB_STEMS) {
                     // Kim is a vocal-vs-instrumental model. Its `other` output
                     // is mixture - vocals (drums + bass + MUSDB `other`), so
-                    // comparing it with MUSDB's `other.wav` is invalid and
-                    // previously dragged the displayed mean below zero.
+                    // comparing it with MUSDB's `other.wav` is invalid (and
+                    // would drag the displayed mean below zero).
                     if (model === 'melband_roformer_kim' && stem !== 'vocals') {
                         stemSDR[stem] = Number.NaN;
                         continue;
@@ -342,7 +350,7 @@ export function Benchmark() {
                                 <option value="htdemucs">htdemucs (4 stems)</option>
                                 <option value="htdemucs_6s">htdemucs_6s (6 stems, experimental)</option>
                                 <option value="bs_roformer_sw">bs_roformer_sw (6 stems, ~360MB fp16)</option>
-                                <option value="melband_roformer_kim">melband_roformer_kim (vocals, ~477MB fp16)</option>
+                                <option value="melband_roformer_kim">melband_roformer_kim (vocals, ~479MB fp16)</option>
                                 <optgroup label="SCNet — four stems">
                                     <option value="scnet_small">scnet_small (masked)</option>
                                     <option value="scnet_xl_wide_v5">scnet_xl_wide_v5 (XL IHF)</option>

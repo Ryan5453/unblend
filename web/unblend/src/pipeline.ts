@@ -1,13 +1,12 @@
 /**
- * Shared STFT → ONNX → iSTFT pipeline. Pure: takes the worker clients and
- * model config it needs, no module-level state. Family differences are
- * config-driven: HTDemucs normalizes the input and combines a time-domain
- * branch; RoFormer feeds raw audio, has no time branch, and single-mask
- * checkpoints get a ``mixture - stem`` complement computed at the end.
+ * Shared STFT → ONNX → iSTFT pipeline for every model family. Pure: takes the
+ * worker clients and model config it needs, no module-level state. Family
+ * differences are config-driven (see ``ModelConfig`` in constants.ts).
  */
 
 import {
     SAMPLE_RATE,
+    SEGMENT_OVERLAP,
     createSplitWeight,
     specDims,
     type ModelConfig,
@@ -19,7 +18,6 @@ import { StreamingOverlapAccumulator } from './overlap-accumulator.js';
 
 /** Maximum random shift in samples (Python: int(0.5 * model.samplerate)). */
 const MAX_SHIFT = Math.floor(0.5 * SAMPLE_RATE);
-const SEGMENT_OVERLAP = 0.25;
 
 export interface SeparationProgress {
     /** Whether this event marks entry into or completion of the segment. */
@@ -47,7 +45,8 @@ export interface SeparationOptions {
      * Number of random sub-second shifts to average (the Demucs "shift
      * trick"). Each extra shift reruns the whole separation on a randomly
      * shifted copy of the input, so runtime scales linearly. Integer in
-     * [1, 20]; defaults to 1.
+     * [0, 20]; defaults to 1. ``0`` disables shifting: one unshifted pass,
+     * deterministic without a seed (matching Python's ``shifts=0``).
      */
     shifts?: number;
     /**
@@ -102,9 +101,9 @@ export interface Pipeline {
 
 export function validateSeparationOptions(options: SeparationOptions): void {
     const shifts = options.shifts ?? 1;
-    if (!Number.isInteger(shifts) || shifts < 1 || shifts > 20) {
+    if (!Number.isInteger(shifts) || shifts < 0 || shifts > 20) {
         throw new Error(
-            `shifts must be an integer between 1 and 20 (inclusive), got ${shifts}`
+            `shifts must be an integer between 0 and 20 (inclusive), got ${shifts}`
         );
     }
     if (options.seed !== undefined && !Number.isInteger(options.seed)) {
@@ -134,6 +133,9 @@ export async function runPipeline(
     throwIfAborted(options.signal);
     const { onProgress, signal } = options;
     const shifts = options.shifts ?? 1;
+    // shifts=0 runs a single unshifted round (Python apply.py skips the shift
+    // loop and chunks the raw mix directly).
+    const rounds = Math.max(1, shifts);
     const rand = options.seed !== undefined ? mulberry32(options.seed) : Math.random;
     const { onnx, stft, istft } = pipeline;
     const numChannels = 2;
@@ -154,9 +156,9 @@ export async function runPipeline(
     // Track-level normalization (Python unblend/api.py _normalize): mean/std
     // are scalars over the channel-mean reference signal, std is unbiased
     // (divide by N-1). Denormalized after separation with the same
-    // ``1e-5 + std`` factor. RoFormer checkpoints are trained on raw audio,
-    // so the whole normalize/denormalize pair is skipped for them (matching
-    // the Python Separator's external_normalization gate).
+    // ``1e-5 + std`` factor. Models trained on raw audio (RoFormer, SCNet)
+    // skip the whole normalize/denormalize pair (matching the Python
+    // Separator's external_normalization gate).
     let mean = 0;
     let norm = 1;
     let denormStd = 0;
@@ -230,7 +232,7 @@ export async function runPipeline(
     const STEP = Math.floor(SEGMENT_SAMPLES * (1 - SEGMENT_OVERLAP));
     const weight = createSplitWeight(SEGMENT_SAMPLES);
 
-    // Final accumulators across shift rounds; divided by ``shifts`` and
+    // Final accumulators across shift rounds; divided by the round count and
     // denormalized at the end. These are the returned stem buffers.
     const outputs: Record<string, Float32Array> = {};
     for (const source of modelSources) {
@@ -254,30 +256,31 @@ export async function runPipeline(
     );
 
     // Draw all offsets up front so totalSegs is known for progress reporting.
-    // Python: random.randint(0, max_shift) — inclusive on both ends.
+    // Python: random.randint(0, max_shift) — inclusive on both ends. The
+    // unshifted pass (shifts=0) uses offset MAX_SHIFT: the view is then
+    // exactly the original track (trimStart 0, viewLength numSamples), with
+    // the zero padding standing in for the zeros Python reads past its edges.
     const offsets: number[] = [];
     let totalSegs = 0;
-    for (let r = 0; r < shifts; r++) {
-        const offset = Math.floor(rand() * (MAX_SHIFT + 1));
+    for (let r = 0; r < rounds; r++) {
+        const offset = shifts === 0 ? MAX_SHIFT : Math.floor(rand() * (MAX_SHIFT + 1));
         offsets.push(offset);
         totalSegs += Math.ceil((numSamples + MAX_SHIFT - offset) / STEP);
     }
 
-    // Double-buffer so we can prepare the next segment while inference reads
-    // the current one (HTDemucs only — RoFormer graphs take no audio input).
-    const planarBuffers = config.hasTimeBranch
-        ? [
-            new Float32Array(SEGMENT_SAMPLES * numChannels),
-            new Float32Array(SEGMENT_SAMPLES * numChannels),
-        ]
+    // Planar time-domain input (HTDemucs only — the other families take no
+    // audio input). One buffer suffices: runInference structured-clones it
+    // into the worker synchronously when it posts the request, so the next
+    // segment can be written into it while the current one is inferring.
+    const planarBuffer = config.hasTimeBranch
+        ? new Float32Array(SEGMENT_SAMPLES * numChannels)
         : null;
-    let pendingPlanarIndex = 0;
 
     const startTime = performance.now();
     let totalInferenceMs = 0;
     let segsDone = 0;
 
-    for (let r = 0; r < shifts; r++) {
+    for (let r = 0; r < rounds; r++) {
         const viewOffset = offsets[r];
         const viewLength = numSamples + MAX_SHIFT - viewOffset;
         const numSegments = Math.ceil(viewLength / STEP);
@@ -293,8 +296,7 @@ export async function runPipeline(
 
         function accumulate(result: ISTFTResult) {
             const { chunks, segStart, segLength } = result;
-            // Chunks arrive preweighted from the iSTFT worker. The streaming
-            // accumulator preserves the old add-then-divide order exactly.
+            // Chunks arrive preweighted from the iSTFT worker.
             roundAccumulator.add(chunks, segStart, segLength, weight);
         }
 
@@ -336,8 +338,8 @@ export async function runPipeline(
         const seg0 = segmentWindow(0);
         let pendingStft = stft.process(prepareInterleaved(seg0.windowStart));
         pendingStft.catch(() => {});
-        let pendingPlanar = planarBuffers
-            ? preparePlanar(planarBuffers[pendingPlanarIndex], seg0.windowStart)
+        let pendingPlanar = planarBuffer
+            ? preparePlanar(planarBuffer, seg0.windowStart)
             : undefined;
         let prevIstftPromise: Promise<ISTFTResult> | null = null;
 
@@ -380,11 +382,8 @@ export async function runPipeline(
                 const next = segmentWindow(seg + 1);
                 pendingStft = stft.process(prepareInterleaved(next.windowStart));
                 pendingStft.catch(() => {});
-                if (planarBuffers) {
-                    pendingPlanarIndex = 1 - pendingPlanarIndex;
-                    pendingPlanar = preparePlanar(
-                        planarBuffers[pendingPlanarIndex], next.windowStart
-                    );
+                if (planarBuffer) {
+                    pendingPlanar = preparePlanar(planarBuffer, next.windowStart);
                 }
             }
 
@@ -445,8 +444,8 @@ export async function runPipeline(
     // Average the shift rounds and denormalize (Python: out * (1e-5 + std) + mean).
     // Without input normalization this reduces to the plain shift average.
     const denormScale = config.normalizeInput
-        ? (1e-5 + denormStd) / shifts
-        : 1 / shifts;
+        ? (1e-5 + denormStd) / rounds
+        : 1 / rounds;
     for (const source of modelSources) {
         const out = outputs[source];
         const length = numSamples * numChannels;

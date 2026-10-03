@@ -1,15 +1,13 @@
 /**
- * ONNX Runtime worker. Handles both WebGPU and WASM backends — same code, the
- * caller picks via the ``backend`` field on the load message. Model IO is
- * always float32. HTDemucs "fp16" uses fp16 only for weight storage;
- * RoFormer "fp16" uses mixed-precision weights and large activations while
- * preserving fp32 normalization, rotary trig, and softmax. The exporter
- * inserts the required Cast boundaries, so callers always exchange fp32
- * tensors with the worker.
+ * ONNX Runtime worker for both the WebGPU and WASM backends. Model IO is
+ * always float32, including "fp16" artifacts: the exporter inserts the Cast
+ * boundaries, so callers always exchange fp32 tensors with the worker.
  */
 
 import * as onnx from 'onnxruntime-web';
-import { fetchModelBytes } from '../model-fetch.js';
+import { MODEL_CONFIGS, type ModelType } from '../constants.js';
+import { loadModelBytes, type ModelByteSource, type ModelCacheEntry } from '../model-fetch.js';
+import { checkModelMetadata, readOnnxMetadata } from '../model-metadata.js';
 
 let session: onnx.InferenceSession | null = null;
 
@@ -17,6 +15,16 @@ interface LoadMessage {
     type: 'load';
     requestId: number;
     modelUrl: string;
+    /** Check the file's embedded metadata against this model's config. */
+    model?: ModelType;
+    /** Serve/fill this Cache Storage entry instead of always downloading. */
+    cache?: ModelCacheEntry;
+    /** Reject a download of any other length (unset for overridden URLs). */
+    expectedBytes?: number;
+    /** Already-downloaded bytes (a WebGPU-to-WASM retry); skips the fetch. */
+    modelBytes?: Uint8Array<ArrayBuffer>;
+    /** Post the fetched bytes back if session creation fails. */
+    returnBytesOnFailure?: boolean;
     backend: 'webgpu' | 'wasm';
     wasmPaths?: string;
     numThreads?: number;
@@ -48,6 +56,8 @@ interface ProgressResponse {
     phase: 'download' | 'compile';
     loaded: number;
     total: number;
+    /** For 'download': whether the bytes come from the network or the cache. */
+    source?: ModelByteSource;
 }
 
 interface LoadResponse {
@@ -56,6 +66,10 @@ interface LoadResponse {
     success: boolean;
     backend?: 'webgpu' | 'wasm';
     error?: string;
+    /** Whether the failure happened fetching the model or creating the session. */
+    stage?: 'fetch' | 'session';
+    /** On a session failure, the fetched bytes handed back for a retry. */
+    modelBytes?: Uint8Array<ArrayBuffer>;
 }
 
 interface RunResponse {
@@ -76,10 +90,29 @@ interface UnloadResponse {
     success: boolean;
 }
 
-self.onmessage = async (event: MessageEvent<Message>) => {
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A bundler may put onnxruntime-web in the same chunk as this worker, and
+ * ORT's multi-threaded WASM backend spawns its pthread workers from that
+ * chunk's URL (named "em-pthread..."). Those workers evaluate this module too,
+ * so this handler must neither replace ORT's own `self.onmessage` there (its
+ * threads would never start and session creation would hang) nor react to
+ * ORT's internal messages.
+ */
+const isOrtThread = typeof self.name === 'string' && self.name.startsWith('em-pthread');
+
+async function handleMessage(event: MessageEvent<Message>): Promise<void> {
     const msg = event.data;
+    if (msg === null || typeof msg !== 'object' || typeof msg.requestId !== 'number') {
+        return;
+    }
 
     if (msg.type === 'load') {
+        let stage: 'fetch' | 'session' = 'fetch';
+        let modelBytes: Uint8Array<ArrayBuffer> | undefined;
         try {
             // Only override wasmPaths if the caller asked us to. Otherwise let
             // ORT resolve .wasm files via the bundler's default (next to the
@@ -95,16 +128,25 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             }
             onnx.env.logLevel = 'warning';
 
-            const modelBytes = await fetchModelBytes(msg.modelUrl, (loaded, total) => {
+            const fetched = msg.modelBytes === undefined;
+            modelBytes = msg.modelBytes ?? await loadModelBytes(msg.modelUrl, (loaded, total, source) => {
                 const progress: ProgressResponse = {
                     type: 'progress',
                     requestId: msg.requestId,
                     phase: 'download',
                     loaded,
                     total,
+                    source,
                 };
                 self.postMessage(progress);
-            });
+            }, msg.cache, msg.expectedBytes);
+            // A wrong file is a fetch-stage failure, like a wrong size: it
+            // would fail identically on any backend. Handed-back retry bytes
+            // were already checked on the first attempt.
+            if (fetched && msg.model !== undefined) {
+                checkModelMetadata(readOnnxMetadata(modelBytes), msg.model, MODEL_CONFIGS[msg.model]);
+            }
+            stage = 'session';
             const compiling: ProgressResponse = {
                 type: 'progress',
                 requestId: msg.requestId,
@@ -132,9 +174,23 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 type: 'load',
                 requestId: msg.requestId,
                 success: false,
-                error: (error as Error).message,
+                error: errorMessage(error),
+                stage,
             };
-            self.postMessage(response);
+            // Hand intact bytes back so a fallback backend need not download
+            // them again. ORT copies them into its own heap, so they are
+            // normally still attached here.
+            if (
+                msg.returnBytesOnFailure
+                && stage === 'session'
+                && modelBytes
+                && modelBytes.buffer.byteLength > 0
+            ) {
+                response.modelBytes = modelBytes;
+                self.postMessage(response, [modelBytes.buffer]);
+            } else {
+                self.postMessage(response);
+            }
         }
         return;
     }
@@ -167,7 +223,6 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 spec_real: specReal,
                 spec_imag: specImag,
             };
-            // RoFormer graphs have no audio input / time branch.
             if (msg.audio !== undefined) {
                 const audio = new onnx.Tensor('float32', msg.audio, msg.audioShape!);
                 owned.push(audio);
@@ -179,12 +234,8 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 owned.push(tensor);
             }
 
-            // Current exports use the canonical out_spec_* contract. The
-            // first published SCNet artifacts used out_real/out_imag, so keep
-            // those aliases loadable rather than forcing every deployed app
-            // and cached model to update in lockstep.
-            const outSpecReal = results.out_spec_real ?? results.out_real;
-            const outSpecImag = results.out_spec_imag ?? results.out_imag;
+            const outSpecReal = results.out_spec_real;
+            const outSpecImag = results.out_spec_imag;
             const outWave = results.out_wave;
 
             // The model's IO is float32 by design (Cast nodes bracket fp16
@@ -220,11 +271,9 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 );
             }
 
-            // Copy each output's bytes into fresh buffers so nothing posted
-            // depends on the tensors' backing storage; the finally block
-            // then disposes the tensors (WASM heap / GPU) — otherwise they'd
-            // only be reclaimed by GC finalizers and accumulate across every
-            // segment of every track.
+            // Copy the outputs out of the tensors' backing storage so the
+            // finally block can dispose them; left to GC finalizers, WASM-heap
+            // and GPU buffers would accumulate across every segment.
             const outSpecRealData = new Float32Array(outSpecReal.data as Float32Array);
             const outSpecImagData = new Float32Array(outSpecImag.data as Float32Array);
             const outWaveData = outWave
@@ -244,9 +293,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 outWaveShape,
             };
 
-            // Transfer the fresh buffers — they're owned by this scope and no
-            // longer needed here, so handing ownership to the client avoids a
-            // structured-clone copy.
+            // Transfer rather than structured-clone the multi-MB outputs.
             const transfer: Transferable[] = [
                 outSpecRealData.buffer,
                 outSpecImagData.buffer,
@@ -261,7 +308,7 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 type: 'run',
                 requestId: msg.requestId,
                 success: false,
-                error: (error as Error).message,
+                error: errorMessage(error),
             };
             self.postMessage(response);
         } finally {
@@ -296,4 +343,11 @@ self.onmessage = async (event: MessageEvent<Message>) => {
         }
         return;
     }
-};
+}
+
+if (!isOrtThread) {
+    // addEventListener, not onmessage, so nothing else on this global is clobbered.
+    self.addEventListener('message', (event: MessageEvent<Message>) => {
+        void handleMessage(event);
+    });
+}

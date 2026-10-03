@@ -3,14 +3,12 @@
  * the ONNX and iSTFT workers rather than blocking the main thread.
  *
  * The client sends one 'configure' message (model DSP geometry) before the
- * first 'process'; unconfigured workers fall back to the HTDemucs defaults.
+ * first 'process' (Separator.load always does); 'process' on an unconfigured
+ * worker is an error.
  */
 
 import { createDSP, type DSP } from '../audio-processor.js';
-import {
-    NFFT, HOP_LENGTH, SEGMENT_SAMPLES,
-    type DSPConfig,
-} from '../constants.js';
+import type { DSPConfig } from '../constants.js';
 
 let dsp: DSP | null = null;
 
@@ -51,15 +49,6 @@ interface STFTErrorResponse {
     error: string;
 }
 
-function defaultDSP(): DSP {
-    return createDSP({
-        family: 'htdemucs',
-        nfft: NFFT,
-        hopLength: HOP_LENGTH,
-        segmentSamples: SEGMENT_SAMPLES,
-    });
-}
-
 self.onmessage = (event: MessageEvent<STFTMessage>) => {
     const msg = event.data;
 
@@ -78,7 +67,7 @@ self.onmessage = (event: MessageEvent<STFTMessage>) => {
                 type: 'result',
                 requestId: msg.requestId,
                 success: false,
-                error: (error as Error).message,
+                error: error instanceof Error ? error.message : String(error),
             };
             self.postMessage(response);
         }
@@ -87,9 +76,7 @@ self.onmessage = (event: MessageEvent<STFTMessage>) => {
 
     const { requestId, segmentInterleaved } = msg;
     try {
-        if (!dsp) {
-            dsp = defaultDSP();
-        }
+        if (!dsp) throw new Error('STFT worker used before configure');
 
         const stft = dsp.computeSTFT(segmentInterleaved);
 
@@ -115,7 +102,7 @@ self.onmessage = (event: MessageEvent<STFTMessage>) => {
             type: 'result',
             requestId,
             success: false,
-            error: (error as Error).message,
+            error: error instanceof Error ? error.message : String(error),
         };
         self.postMessage(response);
     }

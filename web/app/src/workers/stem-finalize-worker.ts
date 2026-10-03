@@ -47,6 +47,17 @@ workerScope.onmessage = (event: MessageEvent<FinalizeRequest>) => {
         writeAscii(view, 36, 'data');
         view.setUint32(40, dataSize, true);
 
+        // Match the Python default clip="rescale" (unblend/audio.py
+        // prevent_clip): divide the whole stem by max(1, 1.01 * peak) rather
+        // than hard-clipping each over-range sample.
+        let peak = 0;
+        const sampleCount = frames * numChannels;
+        for (let i = 0; i < sampleCount; i++) {
+            const magnitude = Math.abs(audioData[i]);
+            if (magnitude > peak) peak = magnitude;
+        }
+        const gain = 1 / Math.max(1, 1.01 * peak);
+
         const perBin = Math.max(1, Math.floor(frames / WAVE_BINS));
         const peaks = new Array<number>(WAVE_BINS).fill(0);
         let globalMax = 1e-6;
@@ -56,15 +67,14 @@ workerScope.onmessage = (event: MessageEvent<FinalizeRequest>) => {
             const bin = Math.floor(frame / perBin);
             let framePeak = 0;
             for (let channel = 0; channel < numChannels; channel++) {
-                let sample = audioData[frame * numChannels + channel];
-                sample = Math.max(-1, Math.min(1, sample));
+                const sample = audioData[frame * numChannels + channel] * gain;
                 framePeak = Math.max(framePeak, Math.abs(sample));
                 const scaled = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
                 const quantized = Math.max(-32768, Math.min(32767, Math.round(scaled)));
                 view.setInt16(byteOffset, quantized, true);
                 byteOffset += 2;
             }
-            // Match peaksFromInterleaved: any remainder after the final full
+            // Like peaksFromBuffer, any remainder after the final full
             // bin is deliberately ignored.
             if (bin < WAVE_BINS && framePeak > peaks[bin]) {
                 peaks[bin] = framePeak;

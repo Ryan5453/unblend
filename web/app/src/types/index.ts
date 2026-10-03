@@ -2,6 +2,7 @@ export type ProgressPhase =
     | 'idle'
     | 'audio'
     | 'download'
+    | 'cache'
     | 'initialize'
     | 'separate'
     | 'finalize'
@@ -9,11 +10,8 @@ export type ProgressPhase =
 
 export interface UnblendState {
     modelLoaded: boolean;
-    modelLoading: boolean;
-    audioLoaded: boolean;
     audioBuffer: AudioBuffer | null;
     audioFile: File | null;
-    separating: boolean;
     /** Whether `progress` is a measured percentage for the current phase. */
     progressDeterminate: boolean;
     /** Current work phase, used to keep the processing visual semantically honest. */

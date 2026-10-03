@@ -5,16 +5,14 @@
  * blocking the main thread.
  *
  * The client sends one 'configure' message (model DSP geometry) before the
- * first 'process'; unconfigured workers fall back to the HTDemucs defaults.
+ * first 'process' (Separator.load always does); 'process' on an unconfigured
+ * worker is an error.
  * RoFormer and SCNet models have no time branch: 'process' arrives without
  * ``wave`` and the chunk is the weighted iSTFT alone.
  */
 
 import { createDSP, type DSP } from '../audio-processor.js';
-import {
-    NFFT, HOP_LENGTH, SEGMENT_SAMPLES, createSplitWeight,
-    type DSPConfig,
-} from '../constants.js';
+import { createSplitWeight, type DSPConfig } from '../constants.js';
 
 let dsp: DSP | null = null;
 let splitWeight: Float32Array | null = null;
@@ -103,7 +101,7 @@ self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
                 type: 'result',
                 requestId: msg.requestId,
                 success: false,
-                error: (error as Error).message,
+                error: error instanceof Error ? error.message : String(error),
             };
             self.postMessage(response);
         }
@@ -111,14 +109,7 @@ self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
     }
 
     try {
-        if (!dsp) {
-            setup({
-                family: 'htdemucs',
-                nfft: NFFT,
-                hopLength: HOP_LENGTH,
-                segmentSamples: SEGMENT_SAMPLES,
-            });
-        }
+        if (!dsp) throw new Error('iSTFT worker used before configure');
 
         const {
             specReal, specImag, wave,
@@ -181,7 +172,7 @@ self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
             type: 'result',
             requestId: msg.requestId,
             success: false,
-            error: (error as Error).message,
+            error: error instanceof Error ? error.message : String(error),
         };
         self.postMessage(response);
     }

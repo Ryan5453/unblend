@@ -34,8 +34,7 @@ export default defineConfig({
     // unblend ships tsc-transpiled JS whose workers are referenced with
     // `new Worker(new URL('./workers/*.js', import.meta.url))`. Excluding it
     // from esbuild dep pre-bundling lets Vite process those workers on demand
-    // (resolving onnxruntime-web, emitting strippable ort-*.wasm), exactly as
-    // it did when consuming the lib's source.
+    // (resolving onnxruntime-web and emitting strippable ort-*.wasm).
     exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util', 'unblend'],
   },
   worker: {
@@ -43,6 +42,9 @@ export default defineConfig({
   },
   build: {
     target: 'esnext',
+    // Third-party notices for everything bundled (e.g. Mediabunny, MPL-2.0),
+    // linked from the About page. A .txt name so browsers display it inline.
+    license: { fileName: 'third-party-licenses.txt' },
   },
   preview: {
     headers: {

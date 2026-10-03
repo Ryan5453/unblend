@@ -1,7 +1,7 @@
 {
   "name": "unblend",
   "version": "1.0.0",
-  "description": "Browser-side audio source separation using ONNX Demucs and RoFormer models. Designed to be embedded in a web app.",
+  "description": "Browser-side music source separation with ONNX HTDemucs, RoFormer and SCNet models.",
   "license": "MIT",
   "author": "Ryan Fahey <git@ryan.science>",
   "homepage": "https://github.com/Ryan5453/unblend#readme",
@@ -37,9 +37,6 @@
     "./package.json": "./package.json"
   },
   "sideEffects": false,
-  "engines": {
-    "node": ">=18"
-  },
   "files": [
     "dist"
   ],
@@ -50,7 +47,6 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "fft.js": "^4.0.4",
     "onnxruntime-web": "1.26.0"
   },
   "devDependencies": {

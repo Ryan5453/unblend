@@ -1,3 +1,4 @@
+import type { MouseEvent } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useHomeReset } from '../home-reset';
 
@@ -10,14 +11,18 @@ export default function Header() {
     // registered reset; when arriving from another page the Link navigation
     // mounts a fresh Home anyway, so the no-op here is harmless.
     const resetHome = () => reset?.trigger();
+    // Leaving "/" unmounts Home, which cancels its work and drops its stems.
+    const guardLeave = (e: MouseEvent) => {
+        if (reset && !reset.confirmLeave()) e.preventDefault();
+    };
 
     return (
         <header className="site-header">
             <Link to="/" className="wm" onClick={resetHome}>un<i>/</i>blend</Link>
             <nav>
                 <Link to="/" className={pathname === '/' ? 'on' : undefined} onClick={resetHome}>Studio</Link>
-                <Link to="/about" className={pathname === '/about' ? 'on' : undefined}>About</Link>
-                <Link to="/privacy" className={pathname === '/privacy' ? 'on' : undefined}>Privacy</Link>
+                <Link to="/about" className={pathname === '/about' ? 'on' : undefined} onClick={guardLeave}>About</Link>
+                <Link to="/privacy" className={pathname === '/privacy' ? 'on' : undefined} onClick={guardLeave}>Privacy</Link>
                 <a href="https://github.com/Ryan5453/unblend" target="_blank" rel="noopener noreferrer">GitHub</a>
             </nav>
         </header>

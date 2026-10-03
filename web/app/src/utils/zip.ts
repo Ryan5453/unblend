@@ -1,5 +1,8 @@
 // Minimal store-only (no compression) ZIP writer. Enough to bundle a handful
 // of WAV stems into a single downloadable archive without a dependency.
+// There is no ZIP64 support: archives that would exceed the classic format's
+// 32-bit sizes/offsets or 16-bit counts are rejected up front instead of
+// being written with silently truncated fields.
 
 let crcTable: Uint32Array | null = null;
 function getCrcTable(): Uint32Array {
@@ -30,14 +33,61 @@ export interface ZipEntry {
     data: Uint8Array;
 }
 
+/** Largest value a classic (non-ZIP64) 32-bit size/offset field can hold. */
+const MAX_UINT32 = 0xffffffff;
+/** Largest value a 16-bit count/length field can hold. */
+const MAX_UINT16 = 0xffff;
+/**
+ * General purpose bit 11 (EFS): names are UTF-8. Without it readers assume
+ * CP437 and mangle non-ASCII track names such as "Beyoncé".
+ */
+const FLAG_UTF8 = 0x0800;
+
+/** Throws before any bytes are written if the archive needs ZIP64. */
+function assertFitsClassicZip(entries: ZipEntry[], names: Uint8Array[]): void {
+    const tooLarge = (what: string) => new Error(
+        `Cannot create ZIP: ${what} exceeds the 4 GiB / 65,535-entry limits of ` +
+        'the ZIP format without ZIP64, which this writer does not support. ' +
+        'Export fewer or shorter stems.'
+    );
+    if (entries.length > MAX_UINT16) {
+        throw tooLarge(`${entries.length} entries`);
+    }
+    let offset = 0;
+    let centralSize = 0;
+    entries.forEach((entry, i) => {
+        const nameLength = names[i].length;
+        if (nameLength > MAX_UINT16) {
+            throw new Error(`Cannot create ZIP: entry name is too long (${nameLength} bytes)`);
+        }
+        // 0xffffffff is reserved as the ZIP64 marker, so it is not a valid size.
+        if (entry.data.length >= MAX_UINT32) {
+            throw tooLarge(`entry "${entry.name}" (${entry.data.length} bytes)`);
+        }
+        if (offset >= MAX_UINT32) {
+            throw tooLarge(`the offset of entry "${entry.name}"`);
+        }
+        offset += 30 + nameLength + entry.data.length;
+        centralSize += 46 + nameLength;
+    });
+    if (offset >= MAX_UINT32) {
+        throw tooLarge('the central directory offset');
+    }
+    if (centralSize >= MAX_UINT32) {
+        throw tooLarge('the central directory size');
+    }
+}
+
 export function makeZip(entries: ZipEntry[]): Blob {
     const encoder = new TextEncoder();
+    const names = entries.map(entry => encoder.encode(entry.name));
+    assertFitsClassicZip(entries, names);
     const chunks: Uint8Array[] = [];
     const central: Uint8Array[] = [];
     let offset = 0;
 
-    for (const entry of entries) {
-        const nameBytes = encoder.encode(entry.name);
+    for (const [i, entry] of entries.entries()) {
+        const nameBytes = names[i];
         const crc = crc32(entry.data);
         const size = entry.data.length;
 
@@ -46,7 +96,7 @@ export function makeZip(entries: ZipEntry[]): Blob {
         const lv = new DataView(local.buffer);
         lv.setUint32(0, 0x04034b50, true); // signature
         lv.setUint16(4, 20, true); // version needed
-        lv.setUint16(6, 0, true); // flags
+        lv.setUint16(6, FLAG_UTF8, true); // flags
         lv.setUint16(8, 0, true); // method: store
         lv.setUint16(10, 0, true); // mod time
         lv.setUint16(12, 0, true); // mod date
@@ -65,7 +115,7 @@ export function makeZip(entries: ZipEntry[]): Blob {
         cv.setUint32(0, 0x02014b50, true);
         cv.setUint16(4, 20, true); // version made by
         cv.setUint16(6, 20, true); // version needed
-        cv.setUint16(8, 0, true);
+        cv.setUint16(8, FLAG_UTF8, true); // flags
         cv.setUint16(10, 0, true);
         cv.setUint16(12, 0, true);
         cv.setUint16(14, 0, true);

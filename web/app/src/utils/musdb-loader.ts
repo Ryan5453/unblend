@@ -56,7 +56,11 @@ export async function readTracksFromDirectory(
 }
 
 export function readTracksFromFileList(files: File[]): MusdbTrack[] {
-    const byTrack = new Map<string, { mixture?: File; stems: Partial<Record<MusdbStem, File>> }>();
+    const byTrack = new Map<string, {
+        name: string;
+        mixture?: File;
+        stems: Partial<Record<MusdbStem, File>>;
+    }>();
 
     for (const file of files) {
         const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
@@ -67,11 +71,13 @@ export function readTracksFromFileList(files: File[]): MusdbTrack[] {
         const filename = parts[parts.length - 1].toLowerCase();
         if (!filename.endsWith('.wav')) continue;
 
-        const trackName = parts[parts.length - 2];
-        if (!byTrack.has(trackName)) {
-            byTrack.set(trackName, { stems: {} });
+        // Group by the full directory path so equally named track folders
+        // from different dropped roots stay separate.
+        const trackDir = parts.slice(0, -1).join('/');
+        if (!byTrack.has(trackDir)) {
+            byTrack.set(trackDir, { name: parts[parts.length - 2], stems: {} });
         }
-        const entry = byTrack.get(trackName)!;
+        const entry = byTrack.get(trackDir)!;
 
         if (filename === 'mixture.wav') {
             entry.mixture = file;
@@ -84,7 +90,7 @@ export function readTracksFromFileList(files: File[]): MusdbTrack[] {
     }
 
     const tracks: MusdbTrack[] = [];
-    for (const [name, { mixture, stems }] of byTrack) {
+    for (const { name, mixture, stems } of byTrack.values()) {
         if (!mixture) continue;
         tracks.push({ name, mixture, stems });
     }

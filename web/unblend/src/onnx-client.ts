@@ -1,7 +1,15 @@
+import type { ModelType } from './constants.js';
+import type { ModelByteSource, ModelCacheEntry } from './model-fetch.js';
+
 interface LoadModelMessage {
     type: 'load';
     requestId: number;
     modelUrl: string;
+    model?: ModelType;
+    cache?: ModelCacheEntry;
+    expectedBytes?: number;
+    modelBytes?: Uint8Array<ArrayBuffer>;
+    returnBytesOnFailure?: boolean;
     backend: 'webgpu' | 'wasm';
     wasmPaths?: string;
     numThreads?: number;
@@ -13,7 +21,7 @@ interface RunInferenceMessage {
     requestId: number;
     specReal: Float32Array;
     specImag: Float32Array;
-    /** Absent for models without an audio input (RoFormer). */
+    /** Absent for models without an audio input (RoFormer and SCNet). */
     audio?: Float32Array;
     specShape: number[];
     audioShape?: number[];
@@ -30,6 +38,8 @@ interface LoadResponse {
     success: boolean;
     backend?: 'webgpu' | 'wasm';
     error?: string;
+    stage?: 'fetch' | 'session';
+    modelBytes?: Uint8Array<ArrayBuffer>;
 }
 
 interface RunResponse {
@@ -56,6 +66,7 @@ interface ProgressMessage {
     phase: 'download' | 'compile';
     loaded: number;
     total: number;
+    source?: ModelByteSource;
 }
 
 type WorkerResponse = LoadResponse | RunResponse | UnloadResponse;
@@ -67,11 +78,14 @@ type OutgoingMessage =
 
 /** Reported during `load()`: real byte progress while downloading, then a
  *  single 'compile' call once ORT starts parsing/initializing the session
- *  (which has no progress signal of its own). */
+ *  (which has no progress signal of its own). During 'download', ``source``
+ *  is ``'cache'`` when the bytes are read from Cache Storage instead of the
+ *  network; it is undefined for 'compile'. */
 export type LoadProgressCallback = (
     phase: 'download' | 'compile',
     loaded: number,
-    total: number
+    total: number,
+    source?: ModelByteSource,
 ) => void;
 
 export interface InferenceResult {
@@ -81,6 +95,46 @@ export interface InferenceResult {
     outWave?: Float32Array;
     outSpecShape: number[];
     outWaveShape?: number[];
+}
+
+/**
+ * A failed ``OnnxClient.load``. ``stage`` separates download failures
+ * (network, HTTP status, truncation), which another backend cannot fix, from
+ * session-creation failures, which carry the fetched bytes for a retry.
+ */
+export class ModelLoadError extends Error {
+    readonly stage: 'fetch' | 'session';
+    readonly modelBytes?: Uint8Array<ArrayBuffer>;
+
+    constructor(
+        message: string,
+        stage: 'fetch' | 'session',
+        modelBytes?: Uint8Array<ArrayBuffer>,
+    ) {
+        super(message);
+        this.name = 'ModelLoadError';
+        this.stage = stage;
+        this.modelBytes = modelBytes;
+    }
+}
+
+export interface OnnxLoadOptions {
+    wasmPaths?: string;
+    numThreads?: number;
+    graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
+    /**
+     * Reject (at the fetch stage) a file whose embedded metadata contradicts
+     * this model's built-in STFT/chunk geometry.
+     */
+    model?: ModelType;
+    /** Serve/fill this Cache Storage entry (see ``loadModelBytes``). */
+    cache?: ModelCacheEntry;
+    /** Reject a download of any other byte length (see ``loadModelBytes``). */
+    expectedBytes?: number;
+    /** Bytes to load instead of fetching; transferred to the worker. */
+    modelBytes?: Uint8Array<ArrayBuffer>;
+    /** Attach the fetched bytes to a session-stage ``ModelLoadError``. */
+    returnBytesOnFailure?: boolean;
 }
 
 function asError(reason: unknown, fallback: string): Error {
@@ -128,28 +182,33 @@ export class OnnxClient {
     async load(
         modelUrl: string,
         backend: 'webgpu' | 'wasm',
-        options: {
-            wasmPaths?: string;
-            numThreads?: number;
-            graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
-        } = {},
+        options: OnnxLoadOptions = {},
         onProgress?: LoadProgressCallback
     ): Promise<void> {
         const response = (await this.send(
             {
                 type: 'load',
                 modelUrl,
+                model: options.model,
+                cache: options.cache,
+                expectedBytes: options.expectedBytes,
+                modelBytes: options.modelBytes,
+                returnBytesOnFailure: options.returnBytesOnFailure,
                 backend,
                 wasmPaths: options.wasmPaths,
                 numThreads: options.numThreads,
                 graphOptimizationLevel: options.graphOptimizationLevel,
             },
-            [],
-            onProgress && (msg => onProgress(msg.phase, msg.loaded, msg.total))
+            options.modelBytes ? [options.modelBytes.buffer] : [],
+            onProgress && (msg => onProgress(msg.phase, msg.loaded, msg.total, msg.source))
         )) as LoadResponse;
 
         if (!response.success) {
-            throw new Error(response.error || 'Model load failed');
+            throw new ModelLoadError(
+                response.error || 'Model load failed',
+                response.stage ?? 'session',
+                response.modelBytes,
+            );
         }
     }
 
@@ -162,7 +221,8 @@ export class OnnxClient {
     ): Promise<InferenceResult> {
         // The spectrogram buffers are no longer read by the pipeline, so
         // transfer ownership instead of cloning their multi-megabyte payloads.
-        // ``audio`` remains one of the pipeline's reusable double-buffers.
+        // ``audio`` is the pipeline's reusable planar buffer, so it is cloned
+        // (synchronously, by postMessage) rather than transferred.
         const response = (await this.send({
             type: 'run',
             specReal,

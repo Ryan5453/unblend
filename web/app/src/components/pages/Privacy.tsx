@@ -1,3 +1,25 @@
+import { useState } from 'react';
+import { clearModelCache } from 'unblend';
+
+function ClearModelCache() {
+    const [status, setStatus] = useState<'idle' | 'busy' | 'cleared' | 'empty'>('idle');
+    const clear = async () => {
+        setStatus('busy');
+        setStatus((await clearModelCache()) ? 'cleared' : 'empty');
+    };
+    return (
+        <p>
+            <button className="spec" onClick={() => void clear()} disabled={status === 'busy'}>
+                CLEAR CACHED MODELS
+            </button>{' '}
+            <span role="status">
+                {status === 'cleared' && 'Cached models deleted.'}
+                {status === 'empty' && 'No cached models to delete.'}
+            </span>
+        </p>
+    );
+}
+
 export function Privacy() {
     return (
         <div className="content-page">
@@ -5,7 +27,7 @@ export function Privacy() {
 
             <div className="content-body">
                     <p>
-                        <strong>Effective Date:</strong> June 2026
+                        <strong>Effective Date:</strong> September 28, 2026
                     </p>
 
                     <h2>Data Collection</h2>
@@ -17,14 +39,14 @@ export function Privacy() {
                     <h2>Local Processing</h2>
                     <p>
                         All audio separation is performed using WebGPU or WebAssembly directly in your browser.
-                        The model is downloaded from HuggingFace when loaded. No audio data ever leaves your device.
+                        The model is downloaded from Hugging Face when loaded and cached in your browser's storage so later visits can skip the download. No audio data ever leaves your device.
                     </p>
+                    <ClearModelCache />
 
                     <h2>Cookies & Analytics</h2>
                     <p>
-                        We do not use cookies or any in-app tracking technologies. This site is hosted on
-                        Cloudflare Pages, which collects basic, privacy-respecting web analytics (e.g., page views)
-                        at the infrastructure level. No personal data is collected or stored by us.
+                        We do not use cookies, analytics, or any other tracking technologies. This site is
+                        hosted on Cloudflare Pages as static files; no personal data is collected or stored by us.
                     </p>
 
                     <h2>Third-Party Services</h2>
@@ -35,6 +57,7 @@ export function Privacy() {
                     <ul>
                         <li>Hugging Face: ONNX model files</li>
                         <li>jsDelivr: ONNX Web Runtime, ffmpeg.wasm</li>
+                        <li>Google Fonts: web fonts</li>
                     </ul>
 
                     <h2>Open Source</h2>

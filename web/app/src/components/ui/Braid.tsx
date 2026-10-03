@@ -18,7 +18,7 @@ const ENVELOPE_BUCKETS = 160;
  * The mix as a braided line: four strands (one per stem, each with its own
  * waveform character) wound around a common carrier so they read as a single
  * rope of signal. `active` excites it; `progress` unbraids it strand by
- * strand into the SplitDiagram's lanes; with an AudioBuffer the amplitude
+ * strand into separate lanes; with an AudioBuffer the amplitude
  * follows the actual track.
  */
 export function Braid({
@@ -192,9 +192,9 @@ export function Braid({
                     const gx1 = Math.min(x1, xf);
                     if (gx1 - gx0 > 1) {
                         const grad = ctx.createLinearGradient(xf - TW, 0, xf, 0);
-                        grad.addColorStop(0, 'rgba(207,59,23,0)');
-                        grad.addColorStop(0.5, 'rgba(207,59,23,.95)');
-                        grad.addColorStop(1, 'rgba(207,59,23,0)');
+                        grad.addColorStop(0, 'rgba(189,54,19,0)');
+                        grad.addColorStop(0.5, 'rgba(189,54,19,.95)');
+                        grad.addColorStop(1, 'rgba(189,54,19,0)');
                         ctx.beginPath();
                         for (let x = gx0; x <= gx1; x += step) {
                             const y = strandY(stem, phi, x, sepAt(x));
@@ -231,7 +231,7 @@ export function Braid({
                 ctx.beginPath();
                 ctx.moveTo(xf, cy - spread - 6);
                 ctx.lineTo(xf, cy + spread + 6);
-                ctx.strokeStyle = 'rgba(207,59,23,.35)';
+                ctx.strokeStyle = 'rgba(189,54,19,.35)';
                 ctx.lineWidth = 1;
                 ctx.stroke();
             }
