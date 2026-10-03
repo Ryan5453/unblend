@@ -1,19 +1,15 @@
 // RoFormer RMSNorm over the contiguous last dimension.
 //
 // One SIMDGROUP handles one row, so the sum-of-squares reduction is a single
-// ``simd_sum`` with no threadgroup barriers and no threadgroup memory. (The
-// previous shape — one 256-thread threadgroup per row reducing through a
-// shared-memory tree — spent log2(tgs) barriers and 4 KB of threadgroup
-// memory per row to reduce as little as one element per thread, which capped
-// occupancy and left the kernel at ~3% of memory bandwidth.)
+// ``simd_sum`` with no threadgroup barriers and no threadgroup memory; rows
+// are too short to keep a whole threadgroup busy.
 //
 // A threadgroup packs ``tgs / 32`` simdgroups and therefore normalizes that
 // many rows; the host launches ceil(rows / rows_per_tg) threadgroups and the
 // kernel bounds-checks the tail.
 //
 // Inputs and affine weights may be FP32, FP16, or BF16, but the reduction and
-// affine arithmetic stay in FP32 to match ``RMSNorm.forward``. The Python side
-// injects SCALAR_T / SCALAR4_T.
+// affine arithmetic stay in FP32. The Python side injects SCALAR_T / SCALAR4_T.
 
 #ifndef SCALAR_T
 #define SCALAR_T half
@@ -56,9 +52,9 @@ kernel void rms_norm(
             const float4 v = float4(x4[i]);
             local_sqsum += dot(v, v);
         }
-        // F.normalize divides by max(L2 norm, 1e-12), then RoFormer
-        // multiplies by sqrt(dim). Keep that exact convention rather than
-        // introducing the additive epsilon used by other RMSNorm variants.
+        // Reference RoFormer's convention: divide by max(L2 norm, 1e-12), then
+        // multiply by sqrt(dim). The eager path matches it with
+        // F.rms_norm(eps=1e-24 / dim).
         const float multiplier =
             scale / max(sqrt(simd_sum(local_sqsum)), 1.0e-12f);
 

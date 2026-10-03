@@ -2,10 +2,8 @@
 //
 // ``RotaryEmbedding.rotate_queries_or_keys`` applies, per adjacent element
 // pair ``(x1, x2)`` of the last axis, the complex product
-// ``(x1 + i·x2)·e^{iθ}``. In eager PyTorch that is an unflatten/unbind into
-// two STRIDED half-tensors, four muls, a subtract, an add, then a stack and
-// flatten to re-interleave — seven full-tensor passes per query/key, most of
-// them over non-unit-stride views. This does it in one read and one write.
+// ``(x1 + i·x2)·e^{iθ}``. Eager PyTorch spends seven full-tensor passes on
+// it, most over strided views; this kernel does one read and one write.
 //
 // Queries/keys reach this op as ``[B, H, S, Dh]`` transposed views, so the
 // input is read STRIDED via a mixed-radix coordinate walk (the same scheme
@@ -14,11 +12,9 @@
 //
 // Two shapes are provided. ``roformer_rotary`` handles one pair per thread
 // and works for any even last dimension. ``roformer_rotary_v1``/``_v2`` are
-// the templated vector forms, moving 8 and 16 bytes per lane; the 16-byte
-// form is what reaches memory-bandwidth peak on Apple GPUs (measured on an
-// M2 Max: 107 GB/s scalar, 210 GB/s at 8 B/lane, 379 GB/s at 16 B/lane,
-// against a ~380 GB/s ceiling). The host picks the widest form whose
-// alignment preconditions hold and falls back down the list otherwise.
+// the templated vector forms, moving 8 and 16 bytes per lane; only the
+// 16-byte form reaches memory-bandwidth peak on Apple GPUs. The host picks
+// the widest form whose alignment preconditions hold.
 //
 // Arithmetic deliberately rounds every intermediate back to SCALAR_T so the
 // result is bit-identical to the unfused eager path, which computes each
@@ -42,7 +38,7 @@ inline float2 rotary_pair(float a, float b, float c, float sn) {
 }
 
 // Offset of the pair/vector unit ``lead`` selects, walking the leading dims in
-// mixed radix. ``unit_elems`` is how many elements one thread's unit spans.
+// mixed radix. ``elem_in_row`` is the unit's element offset within its row.
 inline ulong rotary_addr(
     device const long* sizes,
     device const long* strides,

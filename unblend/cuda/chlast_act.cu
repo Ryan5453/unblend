@@ -72,9 +72,7 @@ __global__ void group_norm_g1_chlast_gelu_kernel(
     float eps
 ) {
     const bool has_inj = inject != nullptr;
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -85,17 +83,11 @@ __global__ void group_norm_g1_chlast_gelu_kernel(
         has_inj ? inject + (unsigned long long)b * total : nullptr;
     SCALAR_T* __restrict__ out_b = out + (unsigned long long)b * total;
 
-    const unsigned long long jbase =
-        has_inj ? (unsigned long long)b * total : 0ull;
-    float K = static_cast<float>(in_b[0]);
-    if (has_inj) {
-        K += static_cast<float>(inject[jbase]);
-    }
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, j_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, j_b, total, 0u, total, tid, tgs), total, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((C & 3u) == 0u) {
         const Scalar4<SCALAR_T>* __restrict__ in4 =
@@ -240,9 +232,7 @@ __global__ void group_norm_g1_chlast_glu_kernel(
     unsigned int X,                   // spatial size
     float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -254,12 +244,11 @@ __global__ void group_norm_g1_chlast_glu_kernel(
     const SCALAR_T* __restrict__ in_b = in_ + (unsigned long long)b * total_in;
     SCALAR_T* __restrict__ out_b = out + (unsigned long long)b * total_out;
 
-    float K = static_cast<float>(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total_in, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total_in, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total_in, 0u, total_in, tid, tgs), total_in, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((C & 3u) == 0u) {
         const Scalar4<SCALAR_T>* __restrict__ in4 =
@@ -430,9 +419,7 @@ __global__ void norm_glu_ls_resid_chlast_kernel(
     unsigned int X,
     float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -445,12 +432,11 @@ __global__ void norm_glu_ls_resid_chlast_kernel(
     const SCALAR_T* __restrict__ r_b = resid + (unsigned long long)b * total_out;
     SCALAR_T* __restrict__ o_b = out + (unsigned long long)b * total_out;
 
-    float K = static_cast<float>(z_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(z_b, total_in, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total_in, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(z_b, total_in, 0u, total_in, tid, tgs), total_in, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((C & 3u) == 0u) {
         const Scalar4<SCALAR_T>* __restrict__ z4 =

@@ -3,10 +3,9 @@
 // over the input followed by one over the output).
 //
 // ``norm_glu_ls_resid`` (single-stage) and ``apply_norm_glu_ls_resid``
-// (multi-stage third stage) absorb GroupNorm into the same fused op:
+// (multi-stage third stage) compute, once per DConv sub-layer,
 //   output = residual + layer_scale * glu(group_norm(z))
-// which replaces FOUR previously separate kernel launches (group_norm,
-// glu, layerscale mul, residual add) with one. Used per DConv sub-layer.
+// covering the GroupNorm, GLU, LayerScale multiply and residual add.
 // Vector/scalar path selection and the reduction helpers are shared via
 // ``common.metal``, which the Python side prepends before compiling.
 
@@ -26,9 +25,7 @@ kernel void norm_glu_ls_resid(
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
     const uint C = C2 >> 1;
     const uint total_in  = C2 * N;
@@ -38,12 +35,12 @@ kernel void norm_glu_ls_resid(
     device const SCALAR_T* r_b = residual + (ulong)b * total_out;
     device SCALAR_T*       o_b = out + (ulong)b * total_out;
 
-    float K = float(z_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(z_b, total_in, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total_in, eps, lane, sid, tgs, sh_sum, sh_sqsum, bcast);
-    const float mean  = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(z_b, total_in, 0u, total_in, tid, tgs), total_in, eps,
+        lane, sid, tgs, sh
+    );
+    const float mean  = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         device const SCALAR4_T* z4 = (device const SCALAR4_T*)z_b;
@@ -66,16 +63,14 @@ kernel void norm_glu_ls_resid(
         }
     } else {
         // N % 4 != 0: walk the output channel by channel (see common.metal).
-        // In output space the flat index IS idx_a and idx_b sits C*N past it,
-        // so the old per-element ``i / N`` and ``i % N`` divides both go away.
+        // In output space the flat index is idx_a and idx_b sits C*N past it.
         //
-        // Unlike the multi-stage twin below, this fallback deliberately stays
-        // scalar. This kernel is the most register-hungry in the folder (three
-        // data buffers plus layer_scale), and adding the vectorized head/body/
-        // tail here costs the N % 4 == 0 fast path above ~4% -- which is the
-        // path htdemucs actually takes (N=336), while the single-stage
-        // fallback never sees the large odd-N shapes (those have a big enough
-        // per-batch count to be routed to the multi-stage path).
+        // Unlike the multi-stage twin below, this walk stays scalar: the
+        // kernel is the most register-hungry in the folder (three data buffers
+        // plus layer_scale), and a vectorized head/body/tail here slows the
+        // N % 4 == 0 path above, which is the one HTDemucs takes. Routing is
+        // by size only, so any N % 4 != 0 shape within the single-stage limit
+        // lands here: correct for every N, just not vectorized.
         const uint boff = C * N;
         uint c  = 0u;
         uint lo = 0u;
@@ -148,8 +143,7 @@ kernel void apply_norm_glu_ls_resid(
         }
     } else {
         // N % 4 != 0: walk the tile channel by channel (see common.metal). The
-        // flat output index IS idx_a and idx_b sits C*N past it, so the old
-        // per-element ``i / N`` and ``i % N`` divides both disappear.
+        // flat output index is idx_a and idx_b sits C*N past it.
         const uint boff = C * N;
         const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total_out_per_b);
         uint start = (uint)((ulong)t * (ulong)total_out_per_b / (ulong)num_tiles);

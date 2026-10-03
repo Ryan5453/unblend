@@ -1,5 +1,7 @@
 """
-Unit tests for inference-precision resolution and the GPU-residency gate helpers.
+Precision and I/O helper tests: auto-dtype resolution, reduced-precision
+rejection, GPU accumulation sizing, the PCM16 WAV fast path, and how checkpoint
+storage dtypes are read for loading and ONNX export.
 """
 
 import pathlib

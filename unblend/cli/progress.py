@@ -7,16 +7,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from rich.console import RenderableType
 from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
     SpinnerColumn,
+    Task,
     TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
 )
+from rich.text import Text
 
 from .utils import console
 
@@ -52,52 +55,59 @@ def create_progress_callback(
     """
 
     def callback(event_type: str, data: dict[str, Any]) -> None:
-        """
-        Update the progress bar in response to a download event.
-
-        :param event_type: Type of progress event
-        :param data: Event data dictionary
-        """
-        if event_type == "layer_start":
+        # The description column renders markup, and model names come from
+        # the registry (including user-added entries).
+        name = escape(str(data.get("model_name", "")))
+        file_label = f"file {data.get('file_index')}/{data.get('total_files')}"
+        if event_type == "file_start":
+            progress_bar.update(
+                task, description=f"[cyan]Downloading {name}[/cyan] - {file_label}"
+            )
+        elif event_type == "file_progress":
+            file_base = (data["file_index"] - 1) / data["total_files"] * 100
+            file_progress = data["progress_percent"] / data["total_files"]
             progress_bar.update(
                 task,
-                description=f"[cyan]Downloading {data['model_name']}[/cyan] - Layer {data['layer_index']}/{data['total_layers']}",
+                completed=file_base + file_progress,
+                description=f"[cyan]Downloading {name}[/cyan] - {file_label}",
             )
-        elif event_type == "layer_progress":
-            layer_base = (data["layer_index"] - 1) / data["total_layers"] * 100
-            layer_progress = data["progress_percent"] / data["total_layers"]
-            overall_progress = layer_base + layer_progress
-
-            phase_text = ""
-            if "phase" in data:
-                phase_text = f" ({data['phase']})"
-
+        elif event_type == "file_complete":
+            state = "cached" if data.get("cached") else "complete"
             progress_bar.update(
                 task,
-                completed=overall_progress,
-                description=f"[cyan]Downloading {data['model_name']}[/cyan] - Layer {data['layer_index']}/{data['total_layers']}{phase_text}",
+                completed=(data["file_index"] / data["total_files"]) * 100,
+                description=f"[cyan]Downloading {name}[/cyan] - {file_label} ({state})",
             )
-        elif event_type == "layer_complete":
-            if data.get("cached"):
-                progress_bar.update(
-                    task,
-                    completed=(data["layer_index"] / data["total_layers"]) * 100,
-                    description=f"[cyan]Downloading {data['model_name']}[/cyan] - Layer {data['layer_index']}/{data['total_layers']} (cached)",
-                )
-            else:
-                progress_bar.update(
-                    task,
-                    completed=(data["layer_index"] / data["total_layers"]) * 100,
-                    description=f"[cyan]Downloading {data['model_name']}[/cyan] - Layer {data['layer_index']}/{data['total_layers']} (complete)",
-                )
         elif event_type == "download_complete":
             progress_bar.update(
                 task,
                 completed=100,
-                description=f"[green]Downloaded {data['model_name']}[/green] - All {data['total_layers']} layers complete",
+                description=f"[green]Downloaded {name}[/green]"
+                + (
+                    f" - all {data['total_files']} files complete"
+                    if data.get("total_files", 1) > 1
+                    else ""
+                ),
             )
 
     return callback
+
+
+class _StatusColumn(SpinnerColumn):
+    """
+    Spinner that finishes as a green check, or a red cross for a failed file.
+    """
+
+    def render(self, task: Task) -> RenderableType:
+        """
+        Render the status glyph for a task.
+
+        :param task: The task being drawn.
+        :return: The glyph.
+        """
+        if task.finished and task.fields.get("failed"):
+            return Text("✗", style="red")
+        return super().render(task)
 
 
 def create_file_progress_bar() -> Progress:
@@ -107,7 +117,7 @@ def create_file_progress_bar() -> Progress:
     :return: Configured Rich Progress instance
     """
     return Progress(
-        SpinnerColumn(finished_text="[green]✓[/green]"),
+        _StatusColumn(finished_text="[green]✓[/green]"),
         TextColumn("[bold blue]{task.description}"),
         BarColumn(complete_style="green", finished_style="green"),
         TaskProgressColumn(),
@@ -124,15 +134,11 @@ class FileProgressTracker:
     Tracks separation progress across multiple files.
     """
 
-    def __init__(self, total_files: int) -> None:
+    def __init__(self) -> None:
         """
         Initialize the file progress tracker.
-
-        :param total_files: Total number of files to process
         """
-        self.total_files = total_files
         self.progress_bar = None
-        self.current_task = None
         self.file_tasks = {}
 
     def __enter__(self) -> "FileProgressTracker":
@@ -224,7 +230,7 @@ class FileProgressTracker:
         task = next((t for t in self.progress_bar.tasks if t.id == task_id), None)
         total = task.total if task is not None and task.total is not None else 100
         self.progress_bar.update(
-            task_id, completed=total, description=f"[red]✗[/red] {label}"
+            task_id, completed=total, description=f"[red]{label}[/red]", failed=True
         )
 
     def create_audio_callback(
@@ -238,12 +244,6 @@ class FileProgressTracker:
         """
 
         def callback(event_type: str, data: dict[str, Any]) -> None:
-            """
-            Forward an audio processing event to the file progress tracker.
-
-            :param event_type: Type of progress event
-            :param data: Event data dictionary
-            """
             self.update_file_progress(filename, event_type, data)
 
         return callback

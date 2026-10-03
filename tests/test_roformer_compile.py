@@ -85,3 +85,44 @@ def test_cuda_compiled_transformer_core_matches_eager(
     assert set(model.state_dict()) == state_keys
     torch.testing.assert_close(actual, expected, atol=3e-3, rtol=3e-3)
     torch.testing.assert_close(replay, actual, atol=3e-3, rtol=3e-3)
+
+
+@pytest.mark.parametrize("builder", [_tiny_bs, _tiny_mel], ids=["bs", "mel"])
+def test_primed_rotary_tables_are_skipped_at_another_length(
+    builder: Callable[[], _RoformerBase],
+) -> None:
+    """
+    Rotary tables primed for the training segment are used under compile only
+    when the sequence matches; a trace at another length (a direct call, or a
+    copy that kept them) builds its own instead of failing to broadcast.
+    """
+    torch.manual_seed(3)
+    model: _RoformerBase = builder()
+    model.prefill_inference_caches()
+    audio = torch.randn(1, 2, 11025)  # half the 22050-sample training segment
+    with torch.inference_mode():
+        expected = model(audio)
+        actual = torch.compile(model, backend="eager")(audio)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_a_compiled_call_at_an_unprimed_length_does_not_cache_inference_tensors() -> (
+    None
+):
+    """
+    Tables built inside a traced graph aren't cached (there they would be
+    inference tensors, and under CUDAGraphs replay-owned memory), so the cache
+    doesn't grow and a later grad-enabled forward at that length still trains.
+    """
+    from unblend.roformer import RotaryEmbedding
+
+    torch.manual_seed(4)
+    model = _tiny_bs()
+    model.prefill_inference_caches()
+    rotaries = [m for m in model.modules() if isinstance(m, RotaryEmbedding)]
+    before = [dict(r._cos_sin_cache) for r in rotaries]
+    audio = torch.randn(1, 2, 11025)
+    with torch.inference_mode():
+        torch.compile(model, backend="aot_eager")(audio)
+    assert [dict(r._cos_sin_cache) for r in rotaries] == before
+    model(audio).sum().backward()

@@ -10,15 +10,11 @@ class UnblendError(Exception):
     Base exception class for all unblend-specific errors.
     """
 
-    pass
-
 
 class LoadAudioError(UnblendError):
     """
     Exception raised when audio loading fails.
     """
-
-    pass
 
 
 class ModelLoadingError(UnblendError):
@@ -26,12 +22,9 @@ class ModelLoadingError(UnblendError):
     Exception raised when model loading fails.
     """
 
-    pass
 
-
-class ValidationError(UnblendError):
+class ValidationError(UnblendError, ValueError):
     """
-    Exception raised when a parameter value is invalid.
+    Exception raised when a parameter value is invalid. Also a ``ValueError``,
+    so code catching the built-in keeps working.
     """
-
-    pass

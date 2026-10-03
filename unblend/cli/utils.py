@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,11 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 
+from ..audio import AUDIO_SUFFIXES
+
 console = Console()
+# Errors and warnings, so they stay out of piped stdout.
+err_console = Console(stderr=True)
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -31,6 +36,34 @@ def format_file_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
+#: Placeholders :func:`format_output_path` substitutes.
+TEMPLATE_VARIABLES = (
+    "model",
+    "track",
+    "parent",
+    "stem",
+    "ext",
+    "date",
+    "time",
+    "timestamp",
+)
+
+
+def unknown_placeholders(template: str) -> list[str]:
+    """
+    ``{name}`` tokens in an output template that aren't template variables,
+    which would otherwise end up in the path literally.
+
+    :param template: Output path template.
+    :return: The unknown tokens, in order of appearance.
+    """
+    return [
+        token
+        for token in re.findall(r"\{[A-Za-z_]\w*\}", template)
+        if token[1:-1] not in TEMPLATE_VARIABLES
+    ]
+
+
 def format_output_path(
     template: str,
     model: str,
@@ -44,16 +77,19 @@ def format_output_path(
 
     :param template: Path template with {variable} placeholders
     :param model: Model name
-    :param track: Path to the source track
+    :param track: Path to the source track (``{track}`` is its name without
+        the extension, ``{parent}`` its folder's name)
     :param stem: Stem name
     :param ext: Output file extension
     :param now: Timestamp used for {date}/{time}/{timestamp} substitutions. Pass
         a single value shared across an entire run so the collision pre-check and
         the actual writes resolve to identical paths; defaults to ``datetime.now()``.
-    :return: Resolved output path
+    :return: Resolved output path, with ``~`` expanded
     """
     if now is None:
         now = datetime.now()
+    # Expand ~ in the template before substitution, never in a track name.
+    template = os.path.expanduser(template)
     stripped_track = track.name.rsplit(".", 1)[0]
     # Empty/dot components can collapse or escape a template directory after
     # path normalization. Preserve the full legal filename in those cases.
@@ -61,6 +97,8 @@ def format_output_path(
     variables = {
         "model": model,
         "track": safe_track,
+        # Not resolve(): a symlinked track keeps the folder it was given in.
+        "parent": Path(os.path.abspath(track)).parent.name,
         "stem": stem,
         "ext": ext,
         "date": now.strftime("%Y-%m-%d"),
@@ -84,9 +122,8 @@ def validate_model_name(value: str) -> str:
     """
     Accept any model the repository knows about, plus ``auto``.
 
-    Typer callback. The choices used to be a hand-written enum, which could
-    never name a model added through ``UNBLEND_EXTRA_MODELS`` — and had drifted
-    from the shipped registry besides.
+    Typer callback. Checked against the live registry so models added through
+    ``UNBLEND_EXTRA_MODELS`` are accepted too.
 
     :param value: The name the user passed.
     :return: The same name, once known.
@@ -105,7 +142,7 @@ def validate_model_name(value: str) -> str:
 
 def validate_model_names(values: list[str] | None) -> list[str] | None:
     """
-    Validate a repeatable ``--model`` option against the registry.
+    Validate a repeatable ``--model`` option (no ``auto``) against the registry.
 
     :param values: The names the user passed, if any.
     :return: The same names, once known.
@@ -113,7 +150,13 @@ def validate_model_names(values: list[str] | None) -> list[str] | None:
     """
     if not values:
         return values
-    return [validate_model_name(value) for value in values]
+    known = get_models()
+    for value in values:
+        if value not in known:
+            raise typer.BadParameter(
+                f"Unknown model {value!r}. Available: {', '.join(known)}."
+            )
+    return values
 
 
 def complete_model_name(incomplete: str) -> list[str]:
@@ -130,9 +173,6 @@ def complete_model_name(incomplete: str) -> list[str]:
 def _combine_modes() -> list[str]:
     """
     Every ensemble combine mode, sorted.
-
-    Imported lazily: ``unblend.apply`` pulls in torch, and the CLI's small
-    helpers must stay importable without it.
 
     :return: The accepted mode names.
     """
@@ -194,8 +234,6 @@ def get_models() -> dict[str, dict]:
 
     :return: Dictionary mapping model names to their metadata
     """
-    # Imported here: unblend.repo pulls in the model modules, and importing it
-    # at module scope would make the CLI's small helpers depend on torch.
     from ..repo import ModelRepository
 
     return ModelRepository().list_models()
@@ -203,43 +241,26 @@ def get_models() -> dict[str, dict]:
 
 def _looks_like_audio_file(path: Path) -> bool:
     """
-    Heuristic check if a file might be audio based on extension.
-    This is purely for performance in big folders, torchcodec will determine actual support.
+    Check by extension whether a file might be audio.
+
+    Only a cheap filter for directory scans; torchcodec decides actual support.
 
     :param path: Path to check
     :return: True if the file extension matches a known audio format
     """
-    return path.suffix.lower() in {
-        ".mp3",
-        ".wav",
-        ".flac",
-        ".m4a",
-        ".aac",
-        ".ogg",
-        ".opus",
-        ".mp4",
-        ".webm",
-        ".mkv",
-        ".avi",
-        ".mov",
-        ".wma",
-        ".alac",
-        ".aiff",
-        ".aif",
-        ".aifc",
-        ".m4b",
-        ".m4p",
-        ".m4r",
-        ".m4v",
-    }
+    return path.suffix.lower() in AUDIO_SUFFIXES
 
 
-def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
+def expand_paths_to_audio_files(
+    paths: list[Path], exclude: Path | None = None
+) -> tuple[list[Path], bool]:
     """
     Expand directory paths to include all audio files (recursively), keep
     regular files as-is.
 
     :param paths: List of file or directory paths
+    :param exclude: Directory whose contents are skipped while recursing
+        (the output root, so a re-run doesn't separate its own stems)
     :return: ``(audio_files, had_errors)`` — ``had_errors`` is True when any
         input path didn't resolve to audio (nonexistent path, or a directory
         with no audio files), so callers can exit nonzero
@@ -248,20 +269,27 @@ def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
     had_errors = False
 
     for path in paths:
-        if path.is_file():
-            # For individual files, just add them and let torchcodec handle validation
-            # This allows users to try any file they want (including obscure formats FFmpeg can handle)
+        if os.path.isfile(path):
+            # Explicitly named files skip the extension filter; torchcodec
+            # decides whether FFmpeg can read them.
             audio_files.append(path)
-        elif path.is_dir():
-            # Recurse into the directory. Extension heuristic is the cheap
-            # filter; probing every file with torchcodec would be slow on
-            # large libraries. Dotfiles and dot-directories are skipped.
+        elif os.path.isdir(path):
+            # Probing every file with torchcodec would be slow on large
+            # libraries, so filter by extension. Only skip the output root
+            # when it sits inside this directory;
+            # scanning the output root itself is a deliberate choice.
+            skip = (
+                exclude
+                if exclude is not None and not path.resolve().is_relative_to(exclude)
+                else None
+            )
             found_files = [
                 f
                 for f in path.rglob("*")
-                if f.is_file()
+                if os.path.isfile(f)
                 and not any(part.startswith(".") for part in f.relative_to(path).parts)
                 and _looks_like_audio_file(f)
+                and not (skip is not None and f.resolve().is_relative_to(skip))
             ]
 
             if found_files:
@@ -269,13 +297,13 @@ def expand_paths_to_audio_files(paths: list[Path]) -> tuple[list[Path], bool]:
                 audio_files.extend(found_files)
             else:
                 had_errors = True
-                console.print(
+                err_console.print(
                     f"[yellow]Warning:[/yellow] No audio files found in "
                     f"'{escape(str(path))}'"
                 )
         else:
             had_errors = True
-            console.print(
+            err_console.print(
                 f"[red]Error:[/red] Path '{escape(str(path))}' does not exist"
             )
 

@@ -1,8 +1,9 @@
 // Host-side launcher declarations for the Unblend CUDA kernels.
 //
-// Every launcher mirrors the identically-named Metal kernel in
-// ``unblend/metal/*.metal``: same arguments, same semantics, same
-// single-kernel responsibility. The launch configuration (grid of B or
+// Launchers that share a name with a Metal kernel in ``unblend/metal/*.metal``
+// have the same semantics, and the same arguments except for an optional
+// ``inject`` tensor (added before normalizing) on some of them; ``add_gelu``
+// and the ``*_chlast_*`` variants are CUDA-only. The launch configuration (grid of B or
 // B * num_tiles blocks, blockDim.x = tgs threads) is derived here from the
 // tensor shapes and the heuristic parameters the Python side computes —
 // the CUDA analogues of Metal's ``threads=``/``group_size=`` kwargs.
@@ -63,8 +64,7 @@ void partial_reduce(
 
 void finalize_meanvar(
     const at::Tensor& scratch, const at::Tensor& meanvar, int64_t total_per_b,
-    int64_t num_tiles, double eps, const at::Tensor& in_,
-    const at::Tensor& inject, int64_t tgs);
+    int64_t num_tiles, double eps, int64_t tgs);
 
 void apply_norm(
     const at::Tensor& out, const at::Tensor& in_, const at::Tensor& meanvar,
@@ -108,10 +108,6 @@ void apply_norm_glu_ls_resid(
     const at::Tensor& nbias, const at::Tensor& layer_scale,
     int64_t total_in_per_b, int64_t total_out_per_b, int64_t num_tiles,
     int64_t N, int64_t C, int64_t tgs);
-
-void rms_norm(
-    const at::Tensor& out, const at::Tensor& in_, const at::Tensor& gamma,
-    int64_t dim, double scale, int64_t tgs);
 
 void add_gelu(
     const at::Tensor& out, const at::Tensor& a, const at::Tensor& b);

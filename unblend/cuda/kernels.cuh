@@ -5,17 +5,17 @@
 // FP32 conversion helpers, and the two-level warp/block reduction helpers
 // that mirror the Metal simdgroup reductions:
 //
-//   gn_accumulate_sumsq  — K-shifted (sum, sum-of-squares) accumulation,
+//   gn_thread_partial    — per-thread shifted (n, K, sum, sum-of-squares),
 //                          vectorized 4-wide when element count % 4 == 0
-//   block_reduce_sumsq   — warp shuffle reduce + one cross-warp stage
-//                          (two __syncthreads, like the Metal twin's two
-//                          threadgroup barriers)
-//   gn_reduce_finalize   — block_reduce_sumsq + mean/rsqrt(var+eps) math
+//   gn_tile_bounds       — multi-stage tile ranges (32-bit arithmetic)
+//   block_merge_moments  — per-thread partials -> block (mean, M2), via a
+//                          warp stage and one cross-warp stage
+//   gn_reduce_finalize   — block_merge_moments + (mean, rsqrt(var+eps))
 //
 // All reductions accumulate in FP32; the storage type (float/half/bf16)
 // only crosses device memory at load and store. The same kernels serve
-// FP32, FP16, and BF16 via C++ templates — unlike the Metal side there is
-// no per-dtype recompilation; bindings.cpp instantiates and dispatches.
+// FP32, FP16, and BF16 via C++ templates, instantiated once and selected at
+// launch by UNBLEND_DISPATCH (bindings.h) rather than recompiled per dtype.
 
 #pragma once
 
@@ -119,8 +119,9 @@ __device__ __forceinline__ Scalar4<c10::BFloat16> pack4<c10::BFloat16>(const flo
 // Reduction helpers (FP32 throughout)
 // ---------------------------------------------------------------------------
 
-// Butterfly shuffle reduce across a full warp. Full-mask participation is
-// safe: every kernel launches whole blocks, so all 32 lanes are active.
+// Butterfly shuffle reduce across a full warp. Full-mask participation
+// requires blocks of at least 32 threads, which the launcher guarantees
+// (_MIN_TGS in __init__.py).
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -129,33 +130,84 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// Accumulate K-shifted (sum, sqsum) partials for x[0:total] into s/sq,
-// strided by thread. ``inj`` is an optional second input added elementwise
-// before accumulation (the HTDemucs encoder's conv-output + inject pattern);
-// pass nullptr when absent. Uses Scalar4 vector loads when the element count
-// is divisible by 4 (which also keeps every batch's base pointer 8-byte
-// aligned); otherwise scalar loads. The shift by K makes the one-pass
-// E[x^2] - E[x]^2 variance robust to large DC offsets (variance is
-// shift-invariant; the caller adds K back to the mean).
+// Shared-memory floats the reduction helpers need: per-warp (n, mean, M2)
+// partials plus a 2-float broadcast slot at GN_BCAST. Kernels declare
+// ``__shared__ float sh[GN_SHARED_FLOATS];`` and pass ``sh``.
+#define GN_BCAST (3 * MAX_WARPS)
+#define GN_SHARED_FLOATS (3 * MAX_WARPS + 2)
+
+// One thread's share of a reduction: ``n`` elements accumulated as the
+// shifted sums ``s = sum(x - K)`` and ``sq = sum((x - K)^2)``.
+struct GnPartial {
+    float n;
+    float K;
+    float s;
+    float sq;
+};
+
+// x[i] (+ inj[i] when present) in FP32.
 template <typename SCALAR_T>
-__device__ __forceinline__ void gn_accumulate_sumsq(
+__device__ __forceinline__ float gn_load(
+    const SCALAR_T* __restrict__  x,
+    const SCALAR_T* __restrict__ inj,
+    unsigned int i
+) {
+    float v = static_cast<float>(x[i]);
+    if (inj != nullptr) {
+        v += static_cast<float>(inj[i]);
+    }
+    return v;
+}
+
+// Partial for the elements of x[lo:hi) (plus the optional elementwise
+// second input ``inj``, the HTDemucs encoder's conv-output + inject
+// pattern; nullptr when absent) visited by thread ``tid`` of a
+// ``tgs``-thread stride. Uses Scalar4 vector loads when ``total`` (the
+// per-batch element count ``x`` is based on) is divisible by 4, which also
+// keeps every batch's base pointer 8-byte aligned; ``lo``/``hi`` must then
+// be multiples of 4 (see gn_tile_bounds). Otherwise scalar loads.
+//
+// The shift ``K`` is the mean of the thread's first 4 elements (its first
+// Scalar4, or its first 4 strided scalars). Shifting keeps the one-pass
+// sums accurate under large DC offsets. The shift is per thread rather than
+// one shared x[0] because a shared outlier shift puts its offset into every
+// term: an fp16 x[0] = 3000 over N = 750k lost ~5% of the variance to fp32
+// cancellation. Per thread, an outlier only lands in one thread's shift,
+// diluted 4x there. block_merge_moments combines the partials without
+// reintroducing the cancellation. Mirrors gn_thread_partial in
+// common.metal.
+template <typename SCALAR_T>
+__device__ __forceinline__ GnPartial gn_thread_partial(
     const SCALAR_T* __restrict__  x,
     const SCALAR_T* __restrict__ inj,
     unsigned int total,
-    float K,
+    unsigned int lo,
+    unsigned int hi,
     unsigned int tid,
-    unsigned int tgs,
-    float& s,
-    float& sq
+    unsigned int tgs
 ) {
+    GnPartial p = {0.0f, 0.0f, 0.0f, 0.0f};
+    unsigned int cnt = 0u;
     if ((total & 3u) == 0u) {
         const Scalar4<SCALAR_T>* __restrict__ x4 =
             reinterpret_cast<const Scalar4<SCALAR_T>*>(x);
         const Scalar4<SCALAR_T>* __restrict__ j4 =
             inj == nullptr ? nullptr
                            : reinterpret_cast<const Scalar4<SCALAR_T>*>(inj);
-        const unsigned int nv = total >> 2;
-        for (unsigned int i = tid; i < nv; i += tgs) {
+        const unsigned int vhi = hi >> 2;
+        const unsigned int i0 = (lo >> 2) + tid;
+        if (i0 < vhi) {
+            float4 v = unpack4(x4[i0]);
+            if (j4 != nullptr) {
+                const float4 w = unpack4(j4[i0]);
+                v.x += w.x;
+                v.y += w.y;
+                v.z += w.z;
+                v.w += w.w;
+            }
+            p.K = 0.25f * (v.x + v.y + v.z + v.w);
+        }
+        for (unsigned int i = i0; i < vhi; i += tgs) {
             float4 v = unpack4(x4[i]);
             if (j4 != nullptr) {
                 const float4 w = unpack4(j4[i]);
@@ -164,115 +216,147 @@ __device__ __forceinline__ void gn_accumulate_sumsq(
                 v.z += w.z;
                 v.w += w.w;
             }
-            v.x -= K; v.y -= K; v.z -= K; v.w -= K;
-            s += v.x + v.y + v.z + v.w;
-            sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            v.x -= p.K; v.y -= p.K; v.z -= p.K; v.w -= p.K;
+            p.s += v.x + v.y + v.z + v.w;
+            p.sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            cnt += 4u;
         }
     } else {
-        for (unsigned int i = tid; i < total; i += tgs) {
-            float v = static_cast<float>(x[i]) - K;
-            if (inj != nullptr) {
-                v += static_cast<float>(inj[i]);
-            }
-            s += v;
-            sq += v * v;
+        const unsigned int i0 = lo + tid;
+        if (i0 < hi) {
+            // Independent loads (the loop re-reads them from cache); a thread
+            // with fewer than 4 elements pads with its first.
+            const unsigned int i1 = i0 + tgs, i2 = i1 + tgs, i3 = i2 + tgs;
+            const float k0 = gn_load(x, inj, i0);
+            const float k1 = i1 < hi ? gn_load(x, inj, i1) : k0;
+            const float k2 = i2 < hi ? gn_load(x, inj, i2) : k0;
+            const float k3 = i3 < hi ? gn_load(x, inj, i3) : k0;
+            p.K = 0.25f * (k0 + k1 + k2 + k3);
+        }
+        for (unsigned int i = i0; i < hi; i += tgs) {
+            const float v = gn_load(x, inj, i) - p.K;
+            p.s += v;
+            p.sq += v * v;
+            cnt += 1u;
         }
     }
+    p.n = static_cast<float>(cnt);
+    return p;
 }
 
 // Overload for the no-inject call sites. ``nullptr`` cannot be passed
 // directly to the two-pointer form above: template argument deduction cannot
 // infer ``SCALAR_T`` from ``std::nullptr_t``, so the cast lives here.
 template <typename SCALAR_T>
-__device__ __forceinline__ void gn_accumulate_sumsq(
+__device__ __forceinline__ GnPartial gn_thread_partial(
     const SCALAR_T* __restrict__  x,
     unsigned int total,
-    float K,
+    unsigned int lo,
+    unsigned int hi,
     unsigned int tid,
-    unsigned int tgs,
-    float& s,
-    float& sq
+    unsigned int tgs
 ) {
-    gn_accumulate_sumsq(
-        x, static_cast<const SCALAR_T*>(nullptr), total, K, tid, tgs, s, sq
+    return gn_thread_partial(
+        x, static_cast<const SCALAR_T*>(nullptr), total, lo, hi, tid, tgs
     );
 }
 
-// Reduce per-thread (sum, sqsum) partials across the block. On return
-// bcast[0]/bcast[1] hold the block totals, visible to every thread.
-// Two-level scheme mirroring tg_reduce_sumsq in common.metal: warp shuffle
-// within each 32-lane warp, then one shuffle across the per-warp partials.
-__device__ __forceinline__ void block_reduce_sumsq(
-    float s,
-    float sq,
-    float* __restrict__  sh_sum,
-    float* __restrict__  sh_sq,
-    float* __restrict__  bcast
+// floor(t * n / num_tiles) in 32-bit arithmetic (t * n can overflow 32
+// bits; the 64-bit divide that would avoid it is emulated). Exact while
+// num_tiles <= 65536, so that t * r < 2^32; the host caps it at
+// _MULTI_STAGE_MAX_TILES. Mirrors common.metal.
+__device__ __forceinline__ unsigned int gn_split_point(
+    unsigned int t, unsigned int num_tiles, unsigned int n
+) {
+    const unsigned int q = n / num_tiles;
+    const unsigned int r = n - q * num_tiles;
+    return t * q + (t * r) / num_tiles;
+}
+
+// Element range [lo, hi) of tile ``t`` of ``num_tiles`` over a batch of
+// ``total`` elements. When total % 4 == 0 the tiles split the Scalar4
+// vector space, so both bounds are multiples of 4. Shared by partial_reduce
+// (which reduces the tile) and finalize_meanvar (which needs each tile's
+// element count to merge the tile moments).
+__device__ __forceinline__ uint2 gn_tile_bounds(
+    unsigned int t, unsigned int num_tiles, unsigned int total
+) {
+    if ((total & 3u) == 0u) {
+        const unsigned int nv = total >> 2;
+        return make_uint2(
+            gn_split_point(t, num_tiles, nv) << 2,
+            gn_split_point(t + 1u, num_tiles, nv) << 2
+        );
+    }
+    return make_uint2(
+        gn_split_point(t, num_tiles, total),
+        gn_split_point(t + 1u, num_tiles, total)
+    );
+}
+
+// Merge every thread's partial into the block's statistics over ``count``
+// elements (the sum of every thread's ``p.n``). On return sh[GN_BCAST]
+// holds the mean and sh[GN_BCAST + 1] either the M2 (sum of squared
+// deviations from the mean) or, with ``normalize``, the normalization scale
+// rsqrt(M2 / count + eps); both visible to every thread.
+//
+// Each warp first takes its mean ``m`` and then the exact expansion
+// sum (x - m)^2 = sq + (K - m) * (2 s + n (K - m)) per thread, so no
+// per-thread division by ``n`` is needed; warp 0 then merges the per-warp
+// (n, mean, M2) with the parallel-variance identity
+// M2 = sum M2_w + n_w (mean_w - mean)^2. Every term summed is either
+// non-negative or a thread-local expansion, so the merge adds no
+// cancellation. Same barrier count as a plain two-level sum reduce.
+// Mirrors tg_merge_moments in common.metal.
+__device__ __forceinline__ void block_merge_moments(
+    GnPartial p,
+    unsigned int count,
+    bool normalize,
+    float eps,
+    float* sh
 ) {
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int wid = threadIdx.x >> 5;
     const unsigned int tgs = blockDim.x;
+    float* sh_n = sh;
+    float* sh_mean = sh + MAX_WARPS;
+    float* sh_m2 = sh + 2 * MAX_WARPS;
 
-    s = warp_sum(s);
-    sq = warp_sum(sq);
+    const float n_w = warp_sum(p.n);
+    const float m_w = warp_sum(p.n * p.K + p.s) / fmaxf(n_w, 1.0f);
+    const float D = p.K - m_w;
+    const float m2_w = warp_sum(p.sq + D * (2.0f * p.s + p.n * D));
     if (lane == 0) {
-        sh_sum[wid] = s;
-        sh_sq[wid] = sq;
+        sh_n[wid] = n_w;
+        sh_mean[wid] = m_w;
+        sh_m2[wid] = m2_w;
     }
     __syncthreads();
     if (wid == 0) {
         const unsigned int nwarp = (tgs + 31u) >> 5;
-        float ts = lane < nwarp ? sh_sum[lane] : 0.0f;
-        float tq = lane < nwarp ? sh_sq[lane] : 0.0f;
-        ts = warp_sum(ts);
-        tq = warp_sum(tq);
+        const float n = lane < nwarp ? sh_n[lane] : 0.0f;
+        const float m = lane < nwarp ? sh_mean[lane] : 0.0f;
+        const float m2 = lane < nwarp ? sh_m2[lane] : 0.0f;
+        const float inv_count = 1.0f / static_cast<float>(count > 0u ? count : 1u);
+        const float mean = warp_sum(n * m) * inv_count;
+        const float d = m - mean;
+        const float M2 = warp_sum(m2 + n * d * d);
         if (lane == 0) {
-            bcast[0] = ts;
-            bcast[1] = tq;
+            sh[GN_BCAST] = mean;
+            sh[GN_BCAST + 1] = normalize ? rsqrtf(M2 * inv_count + eps) : M2;
         }
     }
     __syncthreads();
 }
 
-// block_reduce_sumsq, then convert the shifted totals into the
-// normalization constants: bcast[0] = mean (K added back),
-// bcast[1] = rsqrt(var + eps).
-__device__ __forceinline__ void gn_reduce_finalize(
-    float s,
-    float sq,
-    float K,
+// block_merge_moments over ``total`` elements, returning the normalization
+// constants (mean, rsqrt(var + eps)) to every thread.
+__device__ __forceinline__ float2 gn_reduce_finalize(
+    GnPartial p,
     unsigned int total,
     float eps,
-    float* __restrict__  sh_sum,
-    float* __restrict__  sh_sq,
-    float* __restrict__  bcast
+    float* sh
 ) {
-    const unsigned int lane = threadIdx.x & 31u;
-    const unsigned int wid = threadIdx.x >> 5;
-    const unsigned int tgs = blockDim.x;
-
-    s = warp_sum(s);
-    sq = warp_sum(sq);
-    if (lane == 0) {
-        sh_sum[wid] = s;
-        sh_sq[wid] = sq;
-    }
-    __syncthreads();
-    if (wid == 0) {
-        const unsigned int nwarp = (tgs + 31u) >> 5;
-        float ts = lane < nwarp ? sh_sum[lane] : 0.0f;
-        float tq = lane < nwarp ? sh_sq[lane] : 0.0f;
-        ts = warp_sum(ts);
-        tq = warp_sum(tq);
-        if (lane == 0) {
-            const float invN = 1.0f / static_cast<float>(total);
-            const float mean_d = ts * invN;
-            const float var = fmaxf(tq * invN - mean_d * mean_d, 0.0f);
-            bcast[0] = K + mean_d;
-            bcast[1] = rsqrtf(var + eps);
-        }
-    }
-    __syncthreads();
+    block_merge_moments(p, total, true, eps, sh);
+    return make_float2(sh[GN_BCAST], sh[GN_BCAST + 1]);
 }
-
-

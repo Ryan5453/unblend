@@ -4,7 +4,7 @@
 // pair ``(x1, x2)`` of the last axis, the complex product
 // ``(x1 + i·x2)·e^{iθ}`` — in eager PyTorch that is four muls, a subtract,
 // an add and an interleave copy: seven full-tensor passes per query/key.
-// This kernel does it in one read and one write, accumulating in FP32,
+// This kernel does it in one read and one write, rounding like eager,
 // and reads STRIDED inputs natively so transposed-head layouts
 // ([B, H, S, Dh] after ``transpose(1, 2)``) need no ``contiguous`` copy.
 //

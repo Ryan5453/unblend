@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import errno
 import json
+import logging
 import math
 import os
 import shutil
@@ -21,7 +23,9 @@ import torch.nn as nn
 if TYPE_CHECKING:
     import onnx
 
+from ._paths import name_encodable, name_fits
 from .blocks import pad1d, spectro
+from .exceptions import ModelLoadingError, ValidationError
 from .htdemucs import HTDemucs
 from .repo import ModelRepository, artifact_storage_dtype
 from .roformer import (
@@ -33,6 +37,7 @@ from .roformer import (
     _RoformerBase,
 )
 from .scnet import FeatureConversion, SCNet
+from .scnet import GroupNorm as SCNetGroupNorm
 
 
 class HTDemucsONNXWrapper(nn.Module):
@@ -107,11 +112,13 @@ class RoformerONNXWrapper(nn.Module):
         feedforward_hidden_chunk_size: int = 384,
     ) -> None:
         """
-            Initialize the ONNX wrapper.
-            :param model: The RoFormer model to wrap.
+        Wrap a RoFormer and set its ONNX chunk sizes.
+
+        :param model: The RoFormer model to wrap.
         :param attention_query_chunk_size: Max query rows per attention chunk.
         :param attention_head_chunk_size: Max heads projected at once.
         :param feedforward_hidden_chunk_size: Max expanded MLP features at once.
+        :raises ValueError: If a chunk size is not positive.
         """
         super().__init__()
         self.model = model
@@ -224,7 +231,7 @@ class SCNetONNXWrapper(nn.Module):
         super().__init__()
         self.model = model
         for module in model.modules():
-            if isinstance(module, FeatureConversion):
+            if isinstance(module, (FeatureConversion, SCNetGroupNorm)):
                 module.onnx_safe = True
 
     def forward(
@@ -249,11 +256,7 @@ class SCNetONNXWrapper(nn.Module):
         n = model.dims[0]
 
         if hasattr(model, "mask_layer"):
-            if freq > model.max_f:
-                repeats = math.ceil(freq / model.max_f)
-                pos_f = model.pos_embed_f.repeat(1, 1, repeats, 1)[:, :, :freq, :]
-            else:
-                pos_f = model.pos_embed_f[:, :, :freq, :]
+            pos_f = model.pos_embed_f[:, :, :freq, :]
 
             mixture = packed.repeat(1, stems, 1, 1)
             mask = model.mask_layer(model.forward_core(packed + pos_f.float()))
@@ -286,11 +289,14 @@ def compute_scnet_stft_for_export(
     """
     Compute STFT for SCNet export.
 
-    :param audio: Input audio ``[B, C, samples]``. :param n_fft: FFT size.
-        :param hop_length: Hop length. :param win_length: Window length.
-        :param normalized: Whether the STFT is normalised. :param window:
-        ``"none"`` or ``"hann"``; from export metadata.
+    :param audio: Input audio ``[B, C, samples]``.
+    :param n_fft: FFT size.
+    :param hop_length: Hop length.
+    :param win_length: Window length.
+    :param normalized: Whether the STFT is normalised.
+    :param window: ``"none"`` or ``"hann"``, from export metadata.
     :return: ``(real, imag)`` spectrograms ``[B, C, F, T]``.
+    :raises ValueError: If ``window`` is not recognised.
     """
     if window not in ("none", "hann"):
         raise ValueError(f"unknown STFT window {window!r}; expected none or hann")
@@ -303,7 +309,8 @@ def compute_scnet_stft_for_export(
         window=(
             torch.hann_window(n_fft, periodic=True, device=audio.device)
             if window == "hann"
-            else None
+            # Explicit ones: what torch uses for None, without its warning.
+            else torch.ones(win_length, device=audio.device)
         ),
         center=True,
         normalized=normalized,
@@ -323,9 +330,11 @@ def compute_roformer_stft_for_export(
     """
     Compute STFT for RoFormer export.
 
-    :param audio: Input audio ``[B, C, samples]``. :param n_fft: FFT size.
-        :param hop_length: Hop length. :param win_length: Window length.
-        :param normalized: Whether the STFT is normalised.
+    :param audio: Input audio ``[B, C, samples]``.
+    :param n_fft: FFT size.
+    :param hop_length: Hop length.
+    :param win_length: Window length.
+    :param normalized: Whether the STFT is normalised.
     :return: ``(real, imag)`` spectrograms ``[B, C, F, T]``.
     """
     B, C, samples = audio.shape
@@ -405,13 +414,73 @@ def _validate_export_precision(precision: str) -> None:
     Reject an unknown ``precision`` before any download happens.
 
     :param precision: Caller's choice.
-    :raises ValueError: If it is not one of ``_EXPORT_PRECISIONS``.
+    :raises ValidationError: If it is not one of ``_EXPORT_PRECISIONS``.
     """
     if precision not in _EXPORT_PRECISIONS:
-        raise ValueError(
+        raise ValidationError(
             f"Invalid precision {precision!r}. Choose one of "
             f"{', '.join(_EXPORT_PRECISIONS)}."
         )
+
+
+#: What ``_atomic_onnx_path``'s staging name adds: "." + name + ".XXXXXXXX.tmp.onnx".
+_STAGING_NAME_EXTRA = 19
+
+
+def _check_output_path(output_path: str, what: str = "Output path") -> None:
+    """
+    Refuse an export path that can't name a file.
+
+    :param output_path: The path to write, as given (``~`` is not expanded).
+    :param what: How to name the path in the error.
+    :raises ValidationError: If it is empty, can't be a file name (NUL,
+        unencodable, too long), ends in a separator or in ``.`` or ``..``, is
+        an existing folder, or lies under something that isn't a folder.
+    """
+    text = str(output_path)
+    if "\0" in text:
+        raise ValidationError(f"{what} {text!r} contains a NUL character.")
+    if not name_encodable(text):
+        raise ValidationError(f"{what} {text!r} can't be encoded as a file name.")
+    if (
+        not text.strip()
+        or text.endswith(("/", os.sep))
+        # "nope/.." isn't a folder while nope is missing, but can't be written.
+        or os.path.basename(text) in {".", ".."}
+        # os.path.isdir, not Path.is_dir(): the latter raises on a name the
+        # OS refuses as too long.
+        or os.path.isdir(text)
+    ):
+        raise ValidationError(f"{what} {text!r} doesn't name a file.")
+    # The staging copy adds 19 to the file name (see _atomic_onnx_path).
+    if not name_fits(os.path.basename(text), reserve=_STAGING_NAME_EXTRA):
+        raise ValidationError(f"{what} {text!r} has a file name too long to write.")
+    if not all(name_fits(part) for part in Path(text).parts):
+        raise ValidationError(f"{what} {text!r} has a folder name too long to write.")
+    # The nearest existing ancestor must be a folder ("afile/x.onnx" fails
+    # otherwise, but only after the model has loaded).
+    parent = Path(text).parent
+    while not os.path.lexists(parent) and parent != parent.parent:
+        parent = parent.parent
+    if os.path.lexists(parent) and not os.path.isdir(parent):
+        raise ValidationError(
+            f"{what} {text!r} is inside {str(parent)!r}, not a folder."
+        )
+
+
+def default_output_path(
+    model_name: str, storage: torch.dtype, static_batch: bool = False
+) -> str:
+    """
+    The file name an export gets when no output path is given.
+
+    :param model_name: Registry model name.
+    :param storage: Resolved weight storage dtype.
+    :param static_batch: Whether the batch axis is fixed.
+    :return: ``{model}_{precision}[_static].onnx``.
+    """
+    static_suffix = "_static" if static_batch else ""
+    return f"{model_name}_{_STORAGE_LABELS[storage]}{static_suffix}.onnx"
 
 
 def _resolve_export_precision(precision: str, model_info: dict) -> torch.dtype:
@@ -438,8 +507,7 @@ def _resolve_export_precision(precision: str, model_info: dict) -> torch.dtype:
 
 
 # Storage dtype -> (numpy dtype factory, ONNX elem type, minimum opset). The
-# fp8 types only exist from opset 19, so exporting to them raises the graph's
-# opset rather than emitting a model no runtime will load.
+# fp8 types only exist from opset 19, so those exports are traced at 19.
 def _onnx_storage_spec(dtype: torch.dtype) -> tuple[object, int, int]:
     """
     Resolve a torch storage dtype to its ONNX representation.
@@ -470,21 +538,71 @@ def _onnx_storage_spec(dtype: torch.dtype) -> tuple[object, int, int]:
     return table[dtype]
 
 
-def _convert_weight_storage(onnx_model: "onnx.ModelProto", dtype: torch.dtype) -> None:
+def _trace_opset(requested: int, family_min: int, storage: torch.dtype) -> int:
+    """
+    The opset to trace at: the request, raised to what the family and the
+    weight storage type need.
+
+    :param requested: Caller's opset.
+    :param family_min: Minimum opset the architecture's export needs.
+    :param storage: Weight storage dtype.
+    :return: Opset to pass to the tracer.
+    """
+    storage_min = 1 if storage is torch.float32 else _onnx_storage_spec(storage)[2]
+    return max(requested, family_min, storage_min)
+
+
+def _parameter_fingerprints(model: nn.Module) -> set[tuple]:
+    """
+    Fingerprints of a model's learned parameters (and their transposes, which
+    the exporters store for MatMul), for telling weights apart from constants
+    the exporter folded into initializers.
+
+    :param model: The exported model.
+    :return: ``(shape, digest)`` pairs.
+    """
+    import hashlib
+
+    fingerprints = set()
+    for param in model.parameters():
+        array = param.detach().float().cpu().numpy()
+        views = [array, array.T] if array.ndim == 2 else [array]
+        for view in views:
+            view = view.copy(order="C")
+            digest = hashlib.sha1(view.tobytes()).hexdigest()
+            fingerprints.add((view.shape, digest))
+    return fingerprints
+
+
+def _convert_weight_storage(
+    onnx_model: "onnx.ModelProto", dtype: torch.dtype, model: nn.Module
+) -> None:
     """
     Rewrite ONNX weight initializers at a narrower storage dtype.
 
     Arithmetic is untouched: each converted initializer is followed by a
-    ``Cast`` back to fp32, so only the stored bytes shrink. This is the
+    ``Cast`` back to fp32 (and, for fp8, a ``Mul`` by its per-tensor scale),
+    so only the stored bytes shrink. Only the model's learned parameters are
+    narrowed: constants the exporter folded into initializers (SCNet's DFT
+    basis, Mel-RoFormer's band-averaging matrix) stay fp32. This is the
     weight-only path used by every family except RoFormer at fp16.
 
     :param onnx_model: Loaded ONNX model; modified in place.
     :param dtype: Storage dtype for the weights.
+    :param model: The exported model, whose parameters identify the weights.
     """
+    import hashlib
+
+    import numpy as np
     from onnx import TensorProto, helper, numpy_helper
 
     np_dtype, elem_type, min_opset = _onnx_storage_spec(dtype)
     suffix = "_" + _STORAGE_LABELS[dtype]
+    fp8_max = (
+        float(torch.finfo(dtype).max)
+        if dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        else None
+    )
 
     weight_op_inputs = {
         "Conv": (1, 2),
@@ -539,6 +657,18 @@ def _convert_weight_storage(onnx_model: "onnx.ModelProto", dtype: torch.dtype) -
     existing_outputs = {n.output[0] for n in onnx_model.graph.node if n.output}
     existing_inputs = {i.name for i in onnx_model.graph.input}
 
+    learned = _parameter_fingerprints(model)
+
+    def is_learned(array: "np.ndarray") -> bool:
+        """
+        Whether an initializer holds one of the model's parameters.
+
+        :param array: The initializer's values.
+        :return: True for a learned weight, False for a folded constant.
+        """
+        array = np.ascontiguousarray(array, dtype=np.float32)
+        return (array.shape, hashlib.sha1(array.tobytes()).hexdigest()) in learned
+
     new_inits = []
     new_cast_nodes = []
     for init in onnx_model.graph.initializer:
@@ -547,21 +677,48 @@ def _convert_weight_storage(onnx_model: "onnx.ModelProto", dtype: torch.dtype) -
             and init.data_type == TensorProto.FLOAT
             and init.name not in existing_outputs
             and init.name not in existing_inputs
+            and is_learned(numpy_helper.to_array(init))
         ):
-            arr = numpy_helper.to_array(init).astype(np_dtype)
+            weights = numpy_helper.to_array(init)
+            scale = None
+            if fp8_max is not None:
+                # fp8 has so few exponent steps that unscaled small weights
+                # lose most of their precision, so each tensor is scaled to
+                # fill the format's range and multiplied back after the Cast
+                # (about 4 dB closer to fp32 output for e4m3 on HTDemucs).
+                peak = float(np.abs(weights).max()) if weights.size else 0.0
+                if peak > 0:
+                    scale = np.float32(peak / fp8_max)
+                    weights = weights / scale
+            arr = weights.astype(np_dtype)
             stored_name = init.name + suffix
             stored = numpy_helper.from_array(arr, name=stored_name)
             stored.data_type = elem_type
             new_inits.append(stored)
+            cast_output = init.name if scale is None else init.name + "_unscaled"
             new_cast_nodes.append(
                 helper.make_node(
                     "Cast",
                     inputs=[stored_name],
-                    outputs=[init.name],
+                    outputs=[cast_output],
                     to=TensorProto.FLOAT,
                     name=init.name + "_cast_to_fp32",
                 )
             )
+            if scale is not None:
+                new_inits.append(
+                    numpy_helper.from_array(
+                        np.array(scale, dtype=np.float32), name=init.name + "_scale"
+                    )
+                )
+                new_cast_nodes.append(
+                    helper.make_node(
+                        "Mul",
+                        inputs=[cast_output, init.name + "_scale"],
+                        outputs=[init.name],
+                        name=init.name + "_rescale",
+                    )
+                )
         else:
             new_inits.append(init)
 
@@ -581,8 +738,13 @@ def _convert_weight_storage(onnx_model: "onnx.ModelProto", dtype: torch.dtype) -
 
     if min_opset > 1:
         for opset in onnx_model.opset_import:
-            if opset.domain in ("", "ai.onnx"):
-                opset.version = max(opset.version, min_opset)
+            if opset.domain in ("", "ai.onnx") and opset.version < min_opset:
+                # Raising the number after tracing would leave ops in their
+                # older signatures; export_to_onnx traces at min_opset instead.
+                raise RuntimeError(
+                    f"{dtype} storage needs a graph traced at opset "
+                    f">= {min_opset}, got {opset.version}."
+                )
         # fp8 tensor types require IR version 9 or newer.
         onnx_model.ir_version = max(onnx_model.ir_version, 9)
 
@@ -601,11 +763,14 @@ def _convert_roformer_to_fp16(onnx_model: "onnx.ModelProto") -> None:
         raise ImportError(
             "onnxconverter-common is required for RoFormer fp16 export. "
             "Install unblend with the 'onnx' extra."
-        )
+        ) from None
 
+    # Pow squares RMSNorm's input: in fp16 anything above 256 overflows to inf
+    # and zeroes that token, and real activations reach ~340.
     blocked_ops = {
         "Clip",
         "Cos",
+        "Pow",
         "Reciprocal",
         "ReduceMean",
         "Sin",
@@ -663,8 +828,8 @@ def _materialize_nonlast_broadcast_muls(onnx_model: "onnx.ModelProto") -> int:
         """
         Decide how to fix one ``Mul``, or return ``None`` to leave it alone.
 
-        :param a: Name of the first ``Mul`` operand. :param b: Name of the
-            second ``Mul`` operand.
+        :param a: Name of the first ``Mul`` operand.
+        :param b: Name of the second ``Mul`` operand.
         :return: ``(small_operand, [(axis, copies), ...])``, or ``None``.
         """
         da, db = dims.get(a), dims.get(b)
@@ -793,10 +958,25 @@ def _atomic_onnx_path(output_path: str) -> Iterator[str]:
     :return: Context manager yielding a temporary sibling filename.
     """
     destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw_path = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp.onnx", dir=destination.parent
-    )
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # mkstemp collapses ".." as text; stage in the folder the kernel will
+        # resolve the destination to (through any symlink), so the final
+        # rename stays within one folder.
+        fd, raw_path = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp.onnx",
+            dir=os.path.realpath(destination.parent),
+        )
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        # APFS refuses some valid UTF-8 (unassigned code points); no static
+        # check matches the OS's Unicode tables, so name the user's path here.
+        raise ValidationError(
+            f"Output path {output_path!r} has a character this filesystem "
+            "can't store in a file name."
+        ) from None
     os.close(fd)
     staging = Path(raw_path)
 
@@ -827,6 +1007,10 @@ def _atomic_onnx_path(output_path: str) -> Iterator[str]:
             file.flush()
             os.fsync(file.fileno())
 
+        # mkstemp creates the file 0600; publish it with normal permissions.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(staging, 0o666 & ~umask)
         os.replace(staging, destination)
     finally:
         staging.unlink(missing_ok=True)
@@ -837,13 +1021,57 @@ def _atomic_onnx_path(output_path: str) -> Iterator[str]:
                 candidate.unlink(missing_ok=True)
 
 
+def _strip_exporter_metadata(onnx_model: "onnx.ModelProto") -> None:
+    """
+    Remove the dynamo exporter's debug metadata: per-node stack traces, FX
+    node names and class hierarchies, the per-tensor bookkeeping on inputs,
+    outputs and value_info, and its ``pkg.torch.*`` model properties.
+
+    They carry the exporting machine's absolute file paths, add megabytes to
+    every browser download, and change the file whenever a source line moves.
+
+    :param onnx_model: Loaded ONNX ``ModelProto``; modified in place.
+    """
+
+    def clean_graph(graph: "onnx.GraphProto") -> None:
+        """
+        Strip one graph and every subgraph its nodes hold.
+
+        :param graph: Graph to clean in place.
+        """
+        del graph.metadata_props[:]
+        for node in graph.node:
+            del node.metadata_props[:]
+            for attribute in node.attribute:
+                if attribute.HasField("g"):
+                    clean_graph(attribute.g)
+                for subgraph in attribute.graphs:
+                    clean_graph(subgraph)
+
+    clean_graph(onnx_model.graph)
+    # Tensor-level entries carry the exporter's own bookkeeping too
+    # (original node names, export signatures, optimizer provenance).
+    graph = onnx_model.graph
+    for value in (*graph.value_info, *graph.input, *graph.output):
+        del value.metadata_props[:]
+    for function in onnx_model.functions:
+        del function.metadata_props[:]
+        for node in function.node:
+            del node.metadata_props[:]
+    kept = [p for p in onnx_model.metadata_props if not p.key.startswith("pkg.torch")]
+    del onnx_model.metadata_props[:]
+    onnx_model.metadata_props.extend(kept)
+
+
 def _add_metadata(onnx_model: "onnx.ModelProto", metadata: dict[str, str]) -> None:
     """
-    Attach key/value pairs to an ONNX model's ``metadata_props``.
+    Attach key/value pairs to an ONNX model's ``metadata_props``, after
+    stripping the exporter's own debug metadata.
 
     :param onnx_model: Loaded ONNX ``ModelProto``; modified in place.
     :param metadata: String key/value pairs to embed.
     """
+    _strip_exporter_metadata(onnx_model)
     for key, value in metadata.items():
         entry = onnx_model.metadata_props.add()
         entry.key = key
@@ -884,7 +1112,6 @@ def _export_metadata(
         "sources": json.dumps(list(model.sources)),
         "sample_rate": str(model.samplerate),
         "audio_channels": str(model.audio_channels),
-        "precision": _STORAGE_LABELS[storage],
         "weight_precision": _STORAGE_LABELS[storage],
         "compute_precision": "fp16"
         if storage is torch.float16 and family in _MIXED_PRECISION_FAMILIES
@@ -907,6 +1134,36 @@ def _export_metadata(
     return metadata
 
 
+@contextmanager
+def _quiet_dynamo_export() -> "Iterator[None]":
+    """
+    Silence the dynamo exporter's warnings that users can't act on.
+
+    nn.LSTM re-assigns its ``_flat_weights`` while being traced, so
+    torch.export warns once per LSTM and lists every weight (pages of output
+    for SCNet XL). Torch's own deprecation notices, the axis-rename note for
+    a batch-1 dummy input, and the registry's "torchvision is not installed"
+    log lines are noise here too.
+
+    :return: Context manager.
+    """
+    registration = logging.getLogger("torch.onnx._internal.exporter._registration")
+    level = registration.level
+    registration.setLevel(logging.ERROR)
+    try:
+        with warnings.catch_warnings():
+            for message, category in (
+                (r"(?s).*_flat_weights.*were assigned during export", UserWarning),
+                (r"(?s).*_check_is_size", FutureWarning),
+                (r"(?s).*isinstance\(treespec, LeafSpec\)", FutureWarning),
+                (r"(?s).*The axis name: .* will not be used", UserWarning),
+            ):
+                warnings.filterwarnings("ignore", message=message, category=category)
+            yield
+    finally:
+        registration.setLevel(level)
+
+
 def _export_roformer_to_onnx(
     model: _RoformerBase,
     output_path: str,
@@ -919,12 +1176,13 @@ def _export_roformer_to_onnx(
     """
     Export RoFormer to ONNX.
 
-    :param model: The model to export. :param output_path: Path to save the
-        ONNX model. :param opset_version: Requested opset; clamped up to 18.
-        :param storage: Weight storage dtype; fp16 selects the browser-oriented
-        mixed-precision path. :param license_label:
-        License to embed in metadata. :param static_batch: Trace with fixed
-        batch=1 instead of dynamic batch.
+    :param model: The model to export.
+    :param output_path: Path to save the ONNX model.
+    :param opset_version: Requested opset; raised to at least 18.
+    :param storage: Weight storage dtype; fp16 selects the browser-oriented
+        mixed-precision path.
+    :param license_label: License to embed in metadata.
+    :param static_batch: Trace with fixed batch=1 instead of dynamic batch.
     :return: Path to the exported ONNX model.
     """
     try:
@@ -933,8 +1191,8 @@ def _export_roformer_to_onnx(
     except ImportError:
         raise ImportError(
             "The 'onnx' and 'onnxscript' packages are required for RoFormer "
-            "ONNX export. Install them with: uv pip install unblend[onnx]"
-        )
+            "ONNX export. Install them with: uv pip install 'unblend[onnx]'"
+        ) from None
 
     model.eval()
     wrapper = RoformerONNXWrapper(model).eval()
@@ -952,21 +1210,30 @@ def _export_roformer_to_onnx(
         normalized=stft["normalized"],
     )
 
+    # One eager pass fills each rotary module's table cache. The export then
+    # reads the cached pair as one shared constant; tables first built inside
+    # the traced graph aren't cached, and would be rebuilt (and stored) once
+    # per attention layer.
+    with torch.no_grad():
+        wrapper(dummy_real[:1], dummy_imag[:1])
+
     with _atomic_onnx_path(output_path) as staging_path:
         dynamic_shapes = None
         if not static_batch:
             batch = torch.export.Dim("batch")
 
             dynamic_shapes = {"spec_real": {0: batch}, "spec_imag": {0: batch}}
-        program = torch.onnx.export(
-            wrapper,
-            (dummy_real, dummy_imag),
-            input_names=["spec_real", "spec_imag"],
-            output_names=["out_spec_real", "out_spec_imag"],
-            dynamic_shapes=dynamic_shapes,
-            opset_version=max(opset_version, 18),
-            dynamo=True,
-        )
+        with _quiet_dynamo_export():
+            program = torch.onnx.export(
+                wrapper,
+                (dummy_real, dummy_imag),
+                input_names=["spec_real", "spec_imag"],
+                output_names=["out_spec_real", "out_spec_imag"],
+                dynamic_shapes=dynamic_shapes,
+                opset_version=_trace_opset(opset_version, 18, storage),
+                dynamo=True,
+                verbose=False,
+            )
         program.save(staging_path)
 
         onnx_model = onnx.load(staging_path)
@@ -976,7 +1243,7 @@ def _export_roformer_to_onnx(
         if storage is torch.float16:
             _convert_roformer_to_fp16(onnx_model)
         elif storage is not torch.float32:
-            _convert_weight_storage(onnx_model, storage)
+            _convert_weight_storage(onnx_model, storage, model)
 
         architecture = (
             "mel_band_roformer" if isinstance(model, MelBandRoformer) else "bs_roformer"
@@ -1043,10 +1310,10 @@ def _export_scnet_to_onnx(
     except ImportError:
         raise ImportError(
             "ONNX export of SCNet needs 'onnx' and 'onnxscript'. "
-            "Install them with: uv pip install unblend[onnx]"
-        )
+            "Install them with: uv pip install 'unblend[onnx]'"
+        ) from None
 
-    opset_version = max(opset_version, 18)
+    opset_version = _trace_opset(opset_version, 18, storage)
     model.eval()
     wrapper = SCNetONNXWrapper(model).eval()
 
@@ -1069,7 +1336,7 @@ def _export_scnet_to_onnx(
         batch = torch.export.Dim("batch")
         dynamic_shapes = ({0: batch}, {0: batch})
 
-    with _atomic_onnx_path(output_path) as staging:
+    with _atomic_onnx_path(output_path) as staging, _quiet_dynamo_export():
         program = torch.onnx.export(
             wrapper,
             (spec_real, spec_imag),
@@ -1083,7 +1350,7 @@ def _export_scnet_to_onnx(
         program.save(staging)
         onnx_model = onnx.load(staging)
         if storage is not torch.float32:
-            _convert_weight_storage(onnx_model, storage)
+            _convert_weight_storage(onnx_model, storage, model)
         window = "hann" if hasattr(model, "window") else "none"
         metadata = _export_metadata(
             model,
@@ -1099,6 +1366,7 @@ def _export_scnet_to_onnx(
         metadata["logical_segment_samples"] = str(segment)
         metadata["stft_pad_samples"] = str(padding)
         _add_metadata(onnx_model, metadata)
+        onnx.checker.check_model(onnx_model)
         onnx.save(onnx_model, staging)
     return output_path
 
@@ -1131,11 +1399,12 @@ def _reject_multi_checkpoint(models: dict[str, dict], model_name: str) -> None:
     :param models: Registry entries, as ``ModelRepository.list_models``
         returns them.
     :param model_name: Name being exported.
-    :raises ValueError: If the name is unknown or holds several checkpoints.
+    :raises ModelLoadingError: If the name is unknown.
+    :raises ValidationError: If the entry holds several checkpoints.
     """
     info = models.get(model_name)
     if info is None:
-        raise ValueError(
+        raise ModelLoadingError(
             f"Could not find a model with name {model_name}. "
             f"Available models: {', '.join(models)}"
         )
@@ -1154,10 +1423,63 @@ def _reject_multi_checkpoint(models: dict[str, dict], model_name: str) -> None:
         if len(referenced) == len(specs)
         else ""
     )
-    raise ValueError(
+    raise ValidationError(
         f"Model {model_name} holds {len(specs)} checkpoints; ONNX export traces "
         f"a single graph and cannot represent a bag or an ensemble.{hint}"
     )
+
+
+def validate_export_request(
+    model_name: str, opset_version: int, precision: str
+) -> tuple[ModelRepository, dict]:
+    """
+    Check an export's arguments against the registry, before any download.
+
+    :param model_name: Model to export.
+    :param opset_version: Requested opset.
+    :param precision: Requested weight precision.
+    :return: ``(repository, registry entry)``.
+    :raises ValidationError: If precision or opset is invalid, or the model
+        holds several checkpoints.
+    :raises ModelLoadingError: If the model is unknown.
+    :raises ImportError: If the ``onnx`` extra isn't installed.
+    """
+    try:
+        import onnx.defs
+    except ImportError:
+        raise ImportError(
+            "The 'onnx' package is required for ONNX export. "
+            "Install it with: uv pip install 'unblend[onnx]'"
+        ) from None
+
+    _validate_export_precision(precision)
+    from torch.onnx import _constants as torch_onnx
+
+    max_opset = min(onnx.defs.onnx_opset_version(), torch_onnx.ONNX_MAX_OPSET)
+    if (
+        isinstance(opset_version, bool)
+        or not isinstance(opset_version, int)
+        or not 17 <= opset_version <= max_opset
+    ):
+        raise ValidationError(
+            f"opset_version must be an integer from 17 to {max_opset} (the "
+            f"newest this torch and onnx support), got {opset_version!r}."
+        )
+
+    repo = ModelRepository()
+    models = repo.list_models()
+    _reject_multi_checkpoint(models, model_name)
+    model_info = models.get(model_name, {})
+    # Before any download: HTDemucs uses the TorchScript exporter.
+    if (
+        model_info.get("architecture") == "htdemucs"
+        and opset_version > torch_onnx.ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET
+    ):
+        raise ValidationError(
+            "HTDemucs exports with torch's TorchScript exporter, which supports "
+            f"opset <= {torch_onnx.ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET}."
+        )
+    return repo, model_info
 
 
 def export_to_onnx(
@@ -1176,37 +1498,59 @@ def export_to_onnx(
     Note that fp16 storage means weight-only fp16 for HTDemucs and SCNet but
     mixed precision for RoFormer; see onnx.md.
 
-    :param model_name: Name of the model to export. :param output_path: Path to
-        save the ONNX model (defaults to ``{model_name}_{precision}.onnx``,
-        with ``_static`` appended under ``static_batch``).
+    :param model_name: Name of the model to export.
+    :param output_path: Path to save the ONNX model (defaults to
+        ``{model_name}_{precision}.onnx``, with ``_static`` appended under
+        ``static_batch``).
     :param opset_version: ONNX opset version (raised to 18 for RoFormer and
-        SCNet). :param precision: ``"native"``, ``"fp16"``, or ``"fp32"``.
-        :param static_batch: Trace with fixed batch=1; browser deployment only.
+        SCNet, and to 19 for fp8 storage).
+    :param precision: ``"native"``, ``"fp32"``, ``"fp16"``, ``"bf16"``,
+        ``"fp8_e4m3"`` or ``"fp8_e5m2"``.
+    :param static_batch: Trace with fixed batch=1; browser deployment only.
     :return: Path to the exported ONNX model.
-    :raises ValueError: If precision is unknown, or the model is unknown, holds
-        several checkpoints, or is not one of the exportable architectures.
+    :raises ValidationError: If precision or opset is invalid, the model
+        holds several checkpoints or isn't an exportable architecture, or the
+        output path can't name a file here (see ``_check_output_path``; a
+        character the filesystem refuses surfaces when the file is created).
+    :raises ModelLoadingError: If the model is unknown or can't be loaded.
     """
     try:
         import onnx
+        import onnx.defs
     except ImportError:
         raise ImportError(
             "The 'onnx' package is required for ONNX export. "
-            "Install it with: uv pip install unblend[onnx]"
-        )
+            "Install it with: uv pip install 'unblend[onnx]'"
+        ) from None
 
-    _validate_export_precision(precision)
-
-    repo = ModelRepository()
-    models = repo.list_models()
-    _reject_multi_checkpoint(models, model_name)
+    repo, model_info = validate_export_request(model_name, opset_version, precision)
+    if output_path is not None:
+        # Before the model is loaded: a bad explicit path fails fast.
+        _check_output_path(output_path)
     model = repo.get_model(model_name)
-    model_info = models.get(model_name, {})
 
     storage = _resolve_export_precision(precision, model_info)
+    if storage is torch.float8_e5m2:
+        warnings.warn(
+            "fp8_e5m2 keeps only two mantissa bits: on HTDemucs stems drift to "
+            "about -7 to 25 dB SNR against fp32, which audibly breaks separation. "
+            "Prefer fp16 or bf16.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if storage is not torch.float32:
+        # Trace at the storage type's minimum opset; bumping the number after
+        # tracing would leave ops in their older signatures.
+        opset_version = max(opset_version, _onnx_storage_spec(storage)[2])
 
     if output_path is None:
-        static_suffix = "_static" if static_batch else ""
-        output_path = f"{model_name}_{_STORAGE_LABELS[storage]}{static_suffix}.onnx"
+        # Named from the checkpoint's real precision, so checked only now
+        # (still before the trace).
+        output_path = default_output_path(model_name, storage, static_batch)
+        try:
+            _check_output_path(output_path, "Default output path")
+        except ValidationError as exc:
+            raise ValidationError(f"{exc} Pass output_path (-o) instead.") from None
 
     for family, exporter in _EXPORTERS.items():
         if isinstance(model, family):
@@ -1220,14 +1564,9 @@ def export_to_onnx(
             )
 
     if not isinstance(model, HTDemucs):
-        raise ValueError(
+        raise ValidationError(
             f"Model {model_name} is not a supported model type. "
             f"Expected HTDemucs, a RoFormer, or SCNet, got {type(model).__name__}"
-        )
-    if not model.cac:
-        raise ValueError(
-            f"Model {model_name} does not use complex-as-channels (cac=False); "
-            "the ONNX wrapper hardcodes CaC spectrogram packing."
         )
     wrapper = HTDemucsONNXWrapper(model)
 
@@ -1235,7 +1574,7 @@ def export_to_onnx(
     wrapper.eval()
 
     sample_rate = model.samplerate
-    segment_samples = int(model.max_allowed_segment * sample_rate)
+    segment_samples = int(round(model.max_allowed_segment * sample_rate))
     nfft = model.nfft
     hop_length = model.hop_length
 
@@ -1248,15 +1587,16 @@ def export_to_onnx(
     )
 
     with _atomic_onnx_path(output_path) as staging_path:
-        # The legacy tracer warns about every Python-level branch it bakes in
-        # as a constant. Here they all read static geometry -- the encoder
-        # stride, ``nfft``, the transformer's ``d_model``, and the segment
-        # length the graph is traced at -- never the batch axis, which is the
-        # only dynamic dimension in this export. Constant-folding them is what
-        # the export is supposed to do, so the warnings are noise. Scoped to
-        # this call so a tracer complaint anywhere else still surfaces.
+        # The TorchScript tracer warns about every Python branch it bakes in.
+        # Here they all read static geometry, never the dynamic batch axis, so
+        # the warnings are noise; they are silenced for this call only.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=torch.jit.TracerWarning)
+            # At opset >= 19 (fp8, or an explicit --opset) the exporter notes
+            # it can't fold strided Slices; the graph is correct regardless.
+            warnings.filterwarnings(
+                "ignore", message=r"(?s).*Constant folding - Only steps=1"
+            )
             torch.onnx.export(
                 wrapper,
                 (dummy_spec_real, dummy_spec_imag, dummy_audio),
@@ -1281,7 +1621,7 @@ def export_to_onnx(
         onnx_model = onnx.load(staging_path)
 
         if storage is not torch.float32:
-            _convert_weight_storage(onnx_model, storage)
+            _convert_weight_storage(onnx_model, storage, model)
 
         metadata = _export_metadata(
             model,

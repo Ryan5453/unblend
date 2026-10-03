@@ -4,10 +4,9 @@
 // CUDA port of ``unblend/metal/dconv_envelope.metal``.
 //
 // ``norm_glu_ls_resid`` (single-stage) and ``apply_norm_glu_ls_resid``
-// (multi-stage third stage) absorb GroupNorm into the same fused op:
+// (multi-stage third stage) compute, once per DConv sub-layer,
 //   output = residual + layer_scale * glu(group_norm(z))
-// which replaces FOUR previously separate kernel launches (group_norm,
-// glu, layerscale mul, residual add) with one. Used per DConv sub-layer.
+// covering the GroupNorm, GLU, LayerScale multiply and residual add.
 // Vector/scalar path selection and the reduction helpers are shared via
 // ``kernels.cuh``.
 
@@ -32,9 +31,7 @@ __global__ void norm_glu_ls_resid_kernel(
     unsigned int N,
     float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -48,12 +45,11 @@ __global__ void norm_glu_ls_resid_kernel(
     const SCALAR_T* __restrict__  r_b = residual + (unsigned long long)b * total_out;
     SCALAR_T* __restrict__  o_b = out + (unsigned long long)b * total_out;
 
-    float K = static_cast<float>(z_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(z_b, total_in, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total_in, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(z_b, total_in, 0u, total_in, tid, tgs), total_in, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         const Scalar4<SCALAR_T>* z4 =

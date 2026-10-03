@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -12,7 +14,7 @@ from unblend import (
     get_version,
 )
 from unblend.api import Separator, select_model
-from unblend.exceptions import LoadAudioError, ValidationError
+from unblend.exceptions import LoadAudioError, ModelLoadingError, ValidationError
 from unblend.roformer import BSRoformer, RotaryEmbedding
 
 
@@ -101,7 +103,7 @@ def test_get_version_matches_dunder() -> None:
     "isolate_stem, expected",
     [
         (None, ("htdemucs", None)),
-        ("drums", ("htdemucs", None)),
+        ("drums", ("htdemucs_6s", None)),
         ("guitar", ("htdemucs_6s", None)),
         ("piano", ("htdemucs_6s", None)),
         ("vocals", ("htdemucs_ft", "vocals")),
@@ -152,6 +154,21 @@ def test_export_stem_unknown_name_raises() -> None:
         _make_sources().export_stem("nope")
 
 
+def test_export_stem_unencodable_format_raises_validation_error(tmp_path) -> None:
+    """
+    An unsupported container surfaces as a ``ValidationError``, not torchcodec's
+    ``RuntimeError``.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    sources = _make_sources()
+    stem = next(iter(sources.sources))
+    with pytest.raises(ValidationError):
+        sources.export_stem(stem, tmp_path / "out", format="notaformat")
+    with pytest.raises(ValidationError):
+        sources.export_stem(stem, format="notaformat")
+
+
 def test_normalize_denormalize_roundtrip() -> None:
     """
     ``_normalize``'s documented inverse (``out * (1e-5 + std) + mean``)
@@ -198,6 +215,29 @@ def test_separate_releases_mps_cache_when_dispatch_fails(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="inference failed"):
         separator.separate(b"audio")
     assert released == [True]
+
+
+def test_seeded_separation_leaves_global_rngs_alone() -> None:
+    """
+    ``seed`` makes shift offsets reproducible through a private RNG, and
+    ``shifts=0`` is deterministic without one.
+    """
+    import random
+
+    separator = _progress_separator()
+    audio = (torch.randn(1, 250), 100)
+    state = random.getstate(), torch.random.get_rng_state()
+    first = separator.separate(audio, shifts=2, seed=5)
+    assert random.getstate() == state[0]
+    assert torch.equal(torch.random.get_rng_state(), state[1])
+    again = separator.separate(audio, shifts=2, seed=5)
+    for stem in first.sources:
+        assert torch.equal(first.sources[stem], again.sources[stem])
+
+    a = separator.separate(audio, shifts=0)
+    b = separator.separate(audio, shifts=0)
+    for stem in a.sources:
+        assert torch.equal(a.sources[stem], b.sources[stem])
 
 
 def test_separate_rejects_chunk_batch_size_too_large() -> None:
@@ -680,11 +720,26 @@ def test_to_tensor_rejects_bad_sample_rate() -> None:
             _stub_separator()._to_tensor((torch.zeros(1, 10), bad))
 
 
+def test_to_tensor_rejects_time_major_tensors() -> None:
+    """
+    A ``[samples, channels]`` tensor raises instead of being truncated.
+    """
+    with pytest.raises(ValidationError, match="transpose"):
+        _stub_separator()._to_tensor((torch.zeros(4410, 2), 44100))
+
+
+def test_to_tensor_rejects_empty_input_at_other_rate() -> None:
+    """
+    Zero samples are rejected before resampling can crash on them.
+    """
+    with pytest.raises(ValidationError, match="zero samples"):
+        _stub_separator()._to_tensor((torch.zeros(2, 0), 48000))
+
+
 def test_to_tensor_accepts_int_like_sample_rates() -> None:
     """
     NumPy integers and whole floats — common outputs of numpy-based audio
-    loaders — are accepted like plain ints (regression: strict
-    ``isinstance(int)`` used to reject them).
+    loaders — are accepted like plain ints.
     """
     sep = _stub_separator()
     sep.sample_rate = 44100
@@ -802,6 +857,29 @@ def test_init_rejects_invalid_chunk_batch_size_before_model_load() -> None:
     for bad in (0, -3, True, 4096):
         with pytest.raises(ValidationError, match="chunk_batch_size"):
             Separator(device="cpu", chunk_batch_size=bad)
+
+
+def test_numpy_chunk_batch_size_runs_end_to_end() -> None:
+    """
+    NumPy integers pass validation and are normalized to ``int``, so they
+    reach the chunk loop both as the init value and as a per-call override.
+    """
+    from unblend.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["drums", "bass", "other", "vocals"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).eval()
+    sep = Separator(model=model, device="cpu", chunk_batch_size=np.int64(2))
+    assert type(sep.chunk_batch_size) is int
+    audio = (torch.zeros(2, 12000), 8000)
+    sep.separate(audio=audio, seed=0)
+    sep.separate(audio=audio, seed=0, chunk_batch_size=np.int32(3))
 
 
 def test_separate_rejects_per_call_cbs_when_compiled() -> None:
@@ -924,15 +1002,12 @@ def test_run_with_oom_backoff_sticky_eager_downgrade() -> None:
     assert sep.chunk_batch_size == 2
 
 
-def test_sizing_reference_accepts_every_registry_architecture() -> None:
+def test_sizing_references_accept_every_registry_architecture() -> None:
     """
     Every shipped architecture is usable as the VRAM-sizing reference.
 
-    This used to be gated on a hand-listed ``(HTDemucs, _RoformerBase)`` tuple,
-    so SCNet — added later — silently failed the check and every SCNet fell
-    back to the hardcoded ``chunk_batch_size = 4`` no matter how much VRAM the
-    card had. Gating on ``ASSModel`` means a newly added architecture is
-    included by construction; this test fails if anyone narrows it again.
+    The reference is gated on ``ASSModel``, so SCNet is sized from measured
+    VRAM rather than falling back to ``chunk_batch_size = 4``.
     """
     import unblend.api as api
     from unblend.backends import ASSModel
@@ -945,12 +1020,12 @@ def test_sizing_reference_accepts_every_registry_architecture() -> None:
     for klass in (SCNet, SCNetMasked):
         model = klass.__new__(klass)
         separator.model = model
-        assert separator._sizing_reference() is model, (
-            f"{klass.__name__} must be usable as the sizing reference"
+        assert separator._sizing_references() == [model], (
+            f"{klass.__name__} must be usable as a sizing reference"
         )
 
 
-def test_prewarm_allocator_is_a_noop_off_cuda() -> None:
+def test_prewarm_allocator_is_a_noop_off_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Allocator pre-warming only applies to the CUDA caching allocator.
 
@@ -959,22 +1034,26 @@ def test_prewarm_allocator_is_a_noop_off_cuda() -> None:
     """
     import unblend.api as api
 
+    def touched(*_args: object, **_kwargs: object) -> None:
+        """
+        Fail if pre-warming reaches CUDA.
+        """
+        pytest.fail("pre-warming touched torch.cuda off CUDA")
+
+    for name in ("synchronize", "empty_cache", "memory_allocated", "mem_get_info"):
+        monkeypatch.setattr(torch.cuda, name, touched)
     separator = api.Separator.__new__(api.Separator)
     separator._compile_enabled = False
+    separator.model = torch.nn.Linear(1, 1)
     for device in ("cpu", "mps"):
         separator.device = device
-        separator._prewarm_allocator()  # must return without touching CUDA
+        separator._prewarm_allocator()
 
 
 def test_mps_batch_size_default_is_one() -> None:
     """
-    MPS defaults to one chunk per forward.
-
-    The previous memory-tier default (>=20 GB -> 8) sized on available memory
-    without ever checking throughput. Measured, no model gains meaningfully
-    from a larger batch on MPS and ``bs_roformer_sw`` loses 2.0x at 8, so the
-    tiers were strictly harmful on that model. This pins the default so a
-    memory-derived heuristic cannot quietly come back.
+    MPS defaults to one chunk per forward regardless of available memory,
+    since larger batches do not help on MPS and slow some models sharply.
     """
     import unblend.api as api
 
@@ -985,7 +1064,7 @@ def test_mps_batch_size_default_is_one() -> None:
 
 def test_cpu_batch_size_default_is_one() -> None:
     """
-    CPU is unchanged at one chunk per forward.
+    CPU defaults to one chunk per forward.
     """
     import unblend.api as api
 
@@ -996,11 +1075,10 @@ def test_cpu_batch_size_default_is_one() -> None:
 
 def test_preferred_batch_multiple_rounds_down_only_for_listed_models() -> None:
     """
-    The mod-8 alignment fix applies to scnet_small and nothing else.
+    Mod-8 batch alignment applies to scnet_small and nothing else.
 
-    `scnet_small` loses up to 39% of its throughput when the chunk batch size
-    is not a multiple of 8, but `htdemucs` is 11% *faster* unaligned, so the
-    rounding must stay keyed on the model rather than the architecture.
+    Other models are unaffected or faster unaligned, so the rounding stays
+    keyed on the model rather than the architecture.
     """
     assert api._PREFERRED_BATCH_MULTIPLE == {"scnet_small": 8}
 
@@ -1029,3 +1107,247 @@ def test_preferred_batch_multiple_application(
     :param expected: Value after alignment.
     """
     assert api._align_batch_size(model_name, estimate) == expected
+
+
+def test_cpu_separator_moves_a_gpu_model_back() -> None:
+    """
+    ``device="cpu"`` moves a model passed in on a GPU to the CPU instead of
+    running a CPU input through GPU weights.
+    """
+    from unblend.htdemucs import HTDemucs
+
+    if torch.cuda.is_available():
+        gpu = "cuda"
+    elif torch.backends.mps.is_available():
+        gpu = "mps"
+    else:
+        pytest.skip("requires a GPU")
+    model = HTDemucs(
+        sources=["drums", "bass", "other", "vocals"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).to(gpu)
+    sep = Separator(model=model, device="cpu")
+    assert next(sep.model.parameters()).device.type == "cpu"
+
+
+def test_mps_zero_is_the_mps_device() -> None:
+    """
+    ``"mps:0"`` (what ``str()`` of an MPS tensor's device gives) is accepted
+    as ``"mps"``.
+    """
+    from unblend.api import default_dtype
+
+    assert default_dtype("mps:0") is torch.float16
+    if not torch.backends.mps.is_available():
+        pytest.skip("requires an MPS device")
+    from unblend.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    assert Separator(model=model, device=torch.device("mps:0")).device == "mps"
+
+
+def test_ffmpeg_load_failure_is_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    When torchcodec can't load FFmpeg, decoding and encoding raise
+    ``LoadAudioError`` (an ``UnblendError``) rather than torchcodec's own
+    error.
+
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    import sys
+
+    from unblend.api import SeparatedSources
+
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.encoders", None)
+    with pytest.raises(LoadAudioError, match="FFmpeg couldn't be loaded"):
+        _stub_separator()._to_tensor(b"not audio")
+    probe = SeparatedSources({"a": torch.zeros(2, 10)}, 44100, torch.zeros(2, 10))
+    with pytest.raises(LoadAudioError, match="FFmpeg couldn't be loaded"):
+        probe.export_stem("a", format="flac")
+
+
+def test_seeded_input_separates_the_same_alone_or_batched() -> None:
+    """
+    A seeded input separates identically alone or alongside others (Cog
+    batches same-seed requests together), because every input in a call
+    gets the same shift offsets.
+    """
+    from unblend.htdemucs import HTDemucs
+
+    torch.manual_seed(0)
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).eval()
+    sep = Separator(model=model, device="cpu")
+    target = (torch.randn(2, 12000), 8000)
+    other = (torch.randn(2, 9000), 8000)
+    alone = sep.separate(audio=target, seed=7, shifts=2)
+    batched = sep.separate(audio=[other, target], seed=7, shifts=2)[1]
+    for stem in alone.sources:
+        assert torch.equal(alone.sources[stem], batched.sources[stem])
+
+
+def test_failed_export_keeps_an_existing_file(tmp_path: object) -> None:
+    """
+    A format that fails to encode leaves an existing file at the target
+    untouched (FFmpeg truncates its output before the codec fails).
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    from unblend.api import SeparatedSources
+
+    target = tmp_path / "keep.amr"  # type: ignore[operator]
+    target.write_bytes(b"precious")
+    sources = SeparatedSources({"a": torch.zeros(2, 4410)}, 44100, torch.zeros(2, 4410))
+    with pytest.raises(ValidationError):
+        sources.export_stem("a", target)
+    assert target.read_bytes() == b"precious"
+    assert [p.name for p in target.parent.iterdir()] == ["keep.amr"]
+
+
+def test_export_stem_handles_long_names_and_interrupts(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A near-limit filename exports (the staging name is short), and an
+    interrupt mid-encode leaves no staging file behind.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from unblend.api import SeparatedSources
+
+    folder = tmp_path  # type: ignore[assignment]
+    sources = SeparatedSources({"a": torch.zeros(2, 4410)}, 44100, torch.zeros(2, 4410))
+    long_name = folder / ("x" * 250 + ".wav")  # type: ignore[operator]
+    assert sources.export_stem("a", long_name) == long_name
+
+    import torchcodec.encoders
+
+    def interrupted(self: object, dest: object, **_kwargs: object) -> None:
+        """
+        Write partial output, then stand in for Ctrl-C.
+        """
+        Path(str(dest)).write_bytes(b"partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(torchcodec.encoders.AudioEncoder, "to_file", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        sources.export_stem("a", folder / "b.wav")  # type: ignore[operator]
+    assert sorted(p.name for p in folder.iterdir()) == [long_name.name]  # type: ignore[attr-defined]
+
+
+def test_export_stem_writes_through_symlinks_and_keeps_modes(tmp_path: object) -> None:
+    """
+    Exporting to a symlink writes the file it points at (keeping the link),
+    an overwritten file keeps its mode, and a read-only file is refused.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores permission bits")
+    import stat
+
+    from unblend.api import SeparatedSources
+
+    folder = tmp_path  # type: ignore[assignment]
+    sources = SeparatedSources({"a": torch.zeros(2, 4410)}, 44100, torch.zeros(2, 4410))
+    real = folder / "real.wav"  # type: ignore[operator]
+    real.write_bytes(b"x")
+    os.chmod(real, 0o600)
+    link = folder / "link.wav"  # type: ignore[operator]
+    link.symlink_to(real)
+    sources.export_stem("a", link)
+    assert link.is_symlink() and real.stat().st_size > 1
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+
+    os.chmod(real, 0o444)
+    try:
+        with pytest.raises(PermissionError):
+            sources.export_stem("a", real)
+    finally:
+        os.chmod(real, 0o600)
+
+
+@pytest.mark.parametrize(
+    "spelling", ["", ".", "..", "./", "out/", "out/.", "out/..", "out/./"]
+)
+def test_export_stem_refuses_paths_that_name_a_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """
+    A path that can only mean a folder is refused instead of growing a
+    ``.wav`` suffix and landing beside it.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    sources = _make_sources()
+    with pytest.raises(ValidationError, match="doesn't name a file"):
+        sources.export_stem("drums", spelling)
+    assert sorted(p.name for p in tmp_path.rglob("*")) == ["out"]
+
+
+def test_torchcodec_loader_sets_the_profile_guard_itself() -> None:
+    """
+    ``_torchcodec`` sets ``LLVM_PROFILE_FILE`` before torchcodec loads (the
+    runtime reads it then), so torchcodec's macOS Python 3.10 wheel can't
+    write ``default.profraw`` into the working folder. Run in a child process,
+    since conftest sets the variable for this one; the child records the
+    variable at the moment torchcodec is first imported.
+    """
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "LLVM_PROFILE_FILE"}
+    code = (
+        "import os, sys\n"
+        "seen = []\n"
+        "class Spy:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'torchcodec' and not seen:\n"
+        "            seen.append(os.environ.get('LLVM_PROFILE_FILE'))\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Spy())\n"
+        "from unblend.api import _torchcodec\n"
+        "try:\n"
+        "    _torchcodec('decoder')\n"
+        "except Exception:\n"
+        "    pass\n"
+        "print(seen[0] if seen else 'torchcodec never imported')\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines()[0] == os.devnull
+
+
+def test_separator_unknown_model_name_is_a_model_loading_error() -> None:
+    """
+    An unknown registry name raises the documented ``ModelLoadingError``
+    (not a ``TypeError`` from the combine-override check).
+    """
+    with pytest.raises(ModelLoadingError, match="nope_model"):
+        Separator(model="nope_model", device="cpu")
+    with pytest.raises(ModelLoadingError, match="nope_model"):
+        Separator(model="nope_model", device="cpu", combine="max_fft")

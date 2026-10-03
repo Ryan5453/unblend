@@ -120,7 +120,7 @@ def test_cog_cuda_not_newer_than_locked_wheels() -> None:
 
 def test_cog_model_url_matches_metadata() -> None:
     """
-    The htdemucs layer URL baked into the Cog image must match metadata.yaml.
+    The htdemucs checkpoint URL baked into the Cog image must match metadata.yaml.
 
     cog.yaml's build.run commands execute before the repo is mounted, so the
     URL is necessarily hardcoded there; this guards it against drifting from

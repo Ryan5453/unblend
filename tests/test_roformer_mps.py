@@ -1,18 +1,16 @@
 """
-MPS behaviour for the RoFormer backend.
+MPS behaviour for the RoFormer backend, plus the reduced-precision auto-default
+it shares with CUDA.
 
-The parity tests need Apple-silicon hardware and skip elsewhere; CI runs them
-on a macOS arm64 runner. RoFormer FP16 is SDR-safe and consistently faster
-with the optimized MPS attention/RMSNorm paths (Kim 1.06x, SW 1.07x on an
-M2 Max), so ``dtype="auto"`` resolves to FP16 on MPS and modern CUDA.
+The device tests need Apple-silicon (or CUDA) hardware and skip elsewhere; CI
+runs the MPS ones on a macOS arm64 runner.
 """
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from unblend.api import Separator, _contains_htdemucs
-from unblend.apply import ModelEnsemble
+from unblend.api import Separator
 from unblend.htdemucs import HTDemucs
 from unblend.roformer import (
     BSRoformer,
@@ -89,23 +87,9 @@ def _tiny_htdemucs() -> HTDemucs:
     )
 
 
-def test_contains_htdemucs_family_detection() -> None:
-    """
-    ``_contains_htdemucs`` distinguishes the HTDemucs family (raw or in an
-    ensemble) from RoFormer models — it gates the reduced-precision
-    auto-default and the MPS Metal-kernel pass.
-    """
-    ht = _tiny_htdemucs()
-    assert _contains_htdemucs(ht)
-    assert _contains_htdemucs(ModelEnsemble([ht]))
-    assert not _contains_htdemucs(_tiny_bs())
-    assert not _contains_htdemucs(_tiny_mel())
-
-
 def test_auto_dtype_is_fp16_for_roformer_on_mps() -> None:
     """
-    ``dtype="auto"`` resolves to FP16 for RoFormer on MPS after 10-track
-    validation found SDR parity and 1.06-1.07x speedups on an M2 Max.
+    ``dtype="auto"`` resolves to FP16 for RoFormer on MPS.
     """
     if not torch.backends.mps.is_available():
         pytest.skip("requires an MPS device")
@@ -116,8 +100,8 @@ def test_auto_dtype_is_fp16_for_roformer_on_mps() -> None:
 
 def test_auto_dtype_is_fp16_for_roformer_on_cuda() -> None:
     """
-    On CUDA with tensor cores, ``dtype="auto"`` resolves to FP16 for RoFormer
-    models (measured SDR-equal to FP32; see the Separator init comment).
+    On CUDA, ``dtype="auto"`` resolves to FP16 for RoFormer on compute
+    capability 7.0+ (tensor cores) and to FP32 below that.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires a CUDA device")
@@ -130,11 +114,12 @@ def test_auto_dtype_is_fp16_for_roformer_on_cuda() -> None:
 @mps_only
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("shape", [(4, 2, 87, 16), (87, 2, 4, 16)])
-def test_mps_manual_attention_matches_native_sdpa(
+def test_mps_attention_wrapper_matches_sdpa(
     dtype: torch.dtype, shape: tuple[int, ...]
 ) -> None:
     """
-    The faster explicit MPS attention path matches native SDPA numerically.
+    ``_scaled_dot_product_attention`` with an explicit ``dim ** -0.5`` scale
+    matches ``F.scaled_dot_product_attention``'s default on MPS.
 
     :param dtype: Attention storage dtype under test.
     :param shape: Query/key/value shape under test.
@@ -159,9 +144,9 @@ def test_mps_manual_attention_matches_native_sdpa(
 
 
 @mps_only
-def test_mps_manual_attention_prescales_before_fp16_matmul() -> None:
+def test_mps_fp16_attention_is_finite_for_large_inputs() -> None:
     """
-    Large finite FP16 Q/K values do not overflow before attention scaling.
+    Large finite FP16 queries/keys do not overflow in MPS attention.
     """
     query = torch.full((1, 1, 4, 16), 100.0, device="mps", dtype=torch.float16)
     key = query.clone()
@@ -217,9 +202,9 @@ def test_metal_rms_norm_preserves_native_mps_forward(builder) -> None:
 @pytest.mark.parametrize("builder", [_tiny_bs, _tiny_mel], ids=["bs", "mel"])
 def test_mps_fp16_forward_is_stable(builder) -> None:
     """
-    Explicit FP16 weights on MPS produce finite output close to FP32 (the
-    STFT/iSTFT, complex mask math, norms, and rotary rotation all run in
-    FP32 internally by design).
+    Explicit FP16 weights on MPS produce finite output close to FP32. The
+    STFT/iSTFT and complex mask math run in FP32; the transformer trunk
+    runs in FP16.
     """
     torch.manual_seed(0)
     model = builder().to("mps")
@@ -244,3 +229,49 @@ def test_separator_end_to_end_on_mps() -> None:
     for stem in result.sources.values():
         assert stem.shape == (2, SR * 2)
         assert torch.isfinite(stem).all()
+
+
+@mps_only
+@pytest.mark.parametrize("source", ["rms_norm.metal", "rotary.metal"])
+def test_a_failing_metal_kernel_falls_back_to_native_ops(
+    source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A shader that fails to compile (``compile_shader`` raises ``SyntaxError``)
+    disables the fused path with a warning instead of crashing the forward,
+    and the failure is remembered rather than recompiled per module.
+
+    :param source: The Metal source file made to fail.
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    import unblend.metal
+
+    torch.manual_seed(0)
+    # FP16: the rotary kernel only runs at reduced precision.
+    model = _tiny_bs().to("mps", torch.float16)
+    audio = torch.randn(1, 2, SR, device="mps", dtype=torch.float16)
+    with torch.no_grad():
+        expected = model(audio).float()
+
+    real_compile = torch.mps.compile_shader
+    attempts: list[str] = []
+
+    def compile_shader(src: str) -> object:
+        """
+        Fail for the chosen source file only.
+        """
+        marker = "rms_norm" if source == "rms_norm.metal" else "roformer_rotary"
+        if f"kernel void {marker}" in src:
+            attempts.append(source)
+            raise SyntaxError("program_source: error: expected ';'")
+        return real_compile(src)
+
+    monkeypatch.setattr(unblend.metal, "_compiled_libraries", {})
+    monkeypatch.setattr(unblend.metal, "_compiled_kernels", {})
+    monkeypatch.setattr(unblend.metal, "_failed_libraries", {})
+    monkeypatch.setattr(torch.mps, "compile_shader", compile_shader)
+    with pytest.warns(RuntimeWarning, match="Fused Metal kernel failed"):
+        with torch.no_grad():
+            actual = model(audio).float()
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+    assert attempts == [source]

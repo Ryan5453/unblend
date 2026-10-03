@@ -9,29 +9,48 @@ import os
 import threading
 import warnings
 from importlib import resources
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..backends import state_without, tensor_record, tensor_record_matches
+
 logger = logging.getLogger(__name__)
 
 
-def _pow2_tgs(max_threads: int, cap: int | None = None) -> int:
+# The reductions shuffle across full warps, so no block may be smaller than
+# one warp; surplus threads are harmless because every kernel loop is strided.
+_MIN_TGS = 32
+
+
+def _pow2_tgs(max_threads: int, cap: int = 256) -> int:
     """
-    Largest power of two ``<= min(cap, max_threads)``.
+    Largest power of two ``<= min(cap, max_threads)``, but at least one warp.
 
     :param max_threads: The device's ``max_threads_per_block``.
-    :param cap: Upper bound on the returned block size; defaults to the.
-    :return: The largest power-of-two block size within the bounds.
+    :param cap: Upper bound on the block size.
+    :return: The power-of-two block size.
     """
-    if cap is None:
-        cap = int(os.environ.get("UNBLEND_CUDA_TGS_CAP", "256"))
     limit = min(cap, max_threads)
-    tgs = 1
+    tgs = _MIN_TGS
     while tgs * 2 <= limit:
         tgs *= 2
+    return tgs
+
+
+def _shrink_tgs(tgs: int, work: int) -> int:
+    """
+    Halve ``tgs`` while it exceeds ``work``, stopping at one warp.
+
+    :param tgs: Starting power-of-two block size.
+    :param work: Elements each block processes.
+    :return: The reduced block size.
+    """
+    while tgs > _MIN_TGS and tgs > work:
+        tgs //= 2
     return tgs
 
 
@@ -40,10 +59,12 @@ _SOURCE_FILES: list[str] = [
     "group_norm_gelu.cu",
     "group_norm_glu.cu",
     "dconv_envelope.cu",
-    "rms_norm.cu",
     "chlast_act.cu",
     "rotary.cu",
 ]
+
+# Included by the sources above; a change to either rebuilds everything.
+_HEADER_FILES: list[str] = ["bindings.h", "kernels.cuh"]
 
 _KERNEL_SOURCES: dict[str, str] = {
     "group_norm_g1": "group_norm.cu",
@@ -59,7 +80,6 @@ _KERNEL_SOURCES: dict[str, str] = {
     "apply_norm_glu": "group_norm_glu.cu",
     "norm_glu_ls_resid": "dconv_envelope.cu",
     "apply_norm_glu_ls_resid": "dconv_envelope.cu",
-    "rms_norm": "rms_norm.cu",
     "roformer_rotary": "rotary.cu",
     "group_norm_g1_chlast_gelu": "chlast_act.cu",
     "apply_norm_chlast_gelu": "chlast_act.cu",
@@ -70,7 +90,6 @@ _KERNEL_SOURCES: dict[str, str] = {
 }
 
 _LP_DTYPES = frozenset((torch.float16, torch.bfloat16))
-_RMS_DTYPES = frozenset((torch.float32, *_LP_DTYPES))
 
 _extension: Any = None
 _extension_error: str | None = None
@@ -81,11 +100,12 @@ _max_threads_cache: dict[int, int] = {}
 _sm_count_cache: dict[int, int] = {}
 _OPS_REGISTERED = False
 
-_SWAPPABLE_BACKENDS = frozenset({"demucs", "scnet"})
+_SWAPPABLE_BACKENDS = frozenset({"demucs", "scnet", "roformer"})
 
 
 def swappable_backends() -> frozenset[str]:
-    """Eligible backend names for fused-kernel swaps.
+    """
+    Return the model backends whose modules the fused-kernel swap covers.
 
     :return: Backend names.
     """
@@ -127,7 +147,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("group_norm_g1", x.dtype)(out, x, weight, bias, C, N, eps, tgs)
+        _get_kernel("group_norm_g1")(out, x, weight, bias, C, N, eps, tgs)
 
     @torch.library.custom_op(
         f"{_OP_NAMESPACE}::group_norm_g1_chlast", mutates_args={"out"}
@@ -154,9 +174,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("group_norm_g1_chlast", x.dtype)(
-            out, x, weight, bias, C, total, eps, tgs
-        )
+        _get_kernel("group_norm_g1_chlast")(out, x, weight, bias, C, total, eps, tgs)
 
     @torch.library.custom_op(
         f"{_OP_NAMESPACE}::partial_reduce", mutates_args={"scratch"}
@@ -173,15 +191,13 @@ def _ensure_custom_ops() -> None:
         Launch the ``partial_reduce`` CUDA kernel (custom-op wrapper).
 
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalizat...
+        :param inject: Optional second input added elementwise before normalization.
         :param scratch: FP32 ``(B, num_tiles, 2)`` scratch buffer, written in place.
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("partial_reduce", x.dtype)(
-            x, inject, scratch, total_per_b, num_tiles, tgs
-        )
+        _get_kernel("partial_reduce")(x, inject, scratch, total_per_b, num_tiles, tgs)
 
     @torch.library.custom_op(
         f"{_OP_NAMESPACE}::finalize_meanvar", mutates_args={"meanvar"}
@@ -192,24 +208,21 @@ def _ensure_custom_ops() -> None:
         total_per_b: int,
         num_tiles: int,
         eps: float,
-        x: torch.Tensor,
-        inject: torch.Tensor,
         tgs: int,
     ) -> None:
         """
         Launch the ``finalize_meanvar`` CUDA kernel (custom-op wrapper).
 
-        :param scratch: FP32 ``(B, num_tiles, 2)`` scratch buffer, written in place.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
+        :param scratch: FP32 ``(B, num_tiles, 2)`` per-tile moments from
+            ``partial_reduce``.
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in place.
         :param total_per_b: Elements reduced per batch element.
         :param num_tiles: Tile count for the multi-stage launches.
         :param eps: Variance epsilon.
-        :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalizat...
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("finalize_meanvar", x.dtype)(
-            scratch, meanvar, total_per_b, num_tiles, eps, x, inject, tgs
+        _get_kernel("finalize_meanvar")(
+            scratch, meanvar, total_per_b, num_tiles, eps, tgs
         )
 
     @torch.library.custom_op(f"{_OP_NAMESPACE}::apply_norm", mutates_args={"out"})
@@ -229,7 +242,7 @@ def _ensure_custom_ops() -> None:
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer from ``finalize_meanvar``.
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_per_b: Elements reduced per batch element.
@@ -237,7 +250,7 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm", x.dtype)(
+        _get_kernel("apply_norm")(
             out, x, meanvar, weight, bias, total_per_b, num_tiles, N, tgs
         )
 
@@ -260,7 +273,7 @@ def _ensure_custom_ops() -> None:
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer from ``finalize_meanvar``.
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_per_b: Elements reduced per batch element.
@@ -268,7 +281,7 @@ def _ensure_custom_ops() -> None:
         :param C: Channel count of the reduction space.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_chlast", x.dtype)(
+        _get_kernel("apply_norm_chlast")(
             out, x, meanvar, weight, bias, total_per_b, num_tiles, C, tgs
         )
 
@@ -291,7 +304,7 @@ def _ensure_custom_ops() -> None:
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalizat...
+        :param inject: Optional second input added elementwise before normalization.
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param C: Channel count of the reduction space.
@@ -299,9 +312,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("group_norm_g1_gelu", x.dtype)(
-            out, x, inject, weight, bias, C, N, eps, tgs
-        )
+        _get_kernel("group_norm_g1_gelu")(out, x, inject, weight, bias, C, N, eps, tgs)
 
     @torch.library.custom_op(f"{_OP_NAMESPACE}::apply_norm_gelu", mutates_args={"out"})
     def apply_norm_gelu(
@@ -321,8 +332,8 @@ def _ensure_custom_ops() -> None:
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param inject: Optional second input added elementwise before normalizat...
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
+        :param inject: Optional second input added elementwise before normalization.
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer from ``finalize_meanvar``.
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_per_b: Elements reduced per batch element.
@@ -330,7 +341,7 @@ def _ensure_custom_ops() -> None:
         :param N: Spatial element count per batch element.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_gelu", x.dtype)(
+        _get_kernel("apply_norm_gelu")(
             out, x, inject, meanvar, weight, bias, total_per_b, num_tiles, N, tgs
         )
 
@@ -359,7 +370,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("group_norm_g1_glu", x.dtype)(out, x, weight, bias, C, N, eps, tgs)
+        _get_kernel("group_norm_g1_glu")(out, x, weight, bias, C, N, eps, tgs)
 
     @torch.library.custom_op(f"{_OP_NAMESPACE}::apply_norm_glu", mutates_args={"out"})
     def apply_norm_glu(
@@ -380,7 +391,7 @@ def _ensure_custom_ops() -> None:
 
         :param out: Output buffer, written in place.
         :param x: Input tensor.
-        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer, written in pl...
+        :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer from ``finalize_meanvar``.
         :param weight: Affine weight.
         :param bias: Affine bias.
         :param total_in_per_b: Input-space elements per batch element.
@@ -390,7 +401,7 @@ def _ensure_custom_ops() -> None:
         :param C_half: Half the GLU input channel count.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_glu", x.dtype)(
+        _get_kernel("apply_norm_glu")(
             out,
             x,
             meanvar,
@@ -433,7 +444,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("norm_glu_ls_resid", z.dtype)(
+        _get_kernel("norm_glu_ls_resid")(
             out, z, residual, nweight, nbias, layer_scale, C2, N, eps, tgs
         )
 
@@ -472,7 +483,7 @@ def _ensure_custom_ops() -> None:
         :param C: Half the GLU input channel count (output channels).
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_glu_ls_resid", z.dtype)(
+        _get_kernel("apply_norm_glu_ls_resid")(
             out,
             z,
             residual,
@@ -515,7 +526,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("group_norm_g1_chlast_gelu", x.dtype)(
+        _get_kernel("group_norm_g1_chlast_gelu")(
             out, x, inject, weight, bias, C, total, eps, tgs
         )
 
@@ -548,7 +559,7 @@ def _ensure_custom_ops() -> None:
         :param C: Channel count.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_chlast_gelu", x.dtype)(
+        _get_kernel("apply_norm_chlast_gelu")(
             out, x, inject, meanvar, weight, bias, total_per_b, num_tiles, C, tgs
         )
 
@@ -569,7 +580,7 @@ def _ensure_custom_ops() -> None:
         Launch the ``group_norm_g1_chlast_glu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param x: Input tensor with ``C2 = 2 * C`` channels in channel-last...
+        :param x: Input tensor with ``C2 = 2 * C`` channels in channel-last storage.
         :param weight: Affine weight over the full ``C2`` input channels.
         :param bias: Affine bias over the full ``C2`` input channels.
         :param C2: Input channel count (even).
@@ -577,9 +588,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("group_norm_g1_chlast_glu", x.dtype)(
-            out, x, weight, bias, C2, X, eps, tgs
-        )
+        _get_kernel("group_norm_g1_chlast_glu")(out, x, weight, bias, C2, X, eps, tgs)
 
     @torch.library.custom_op(
         f"{_OP_NAMESPACE}::apply_norm_chlast_glu", mutates_args={"out"}
@@ -600,7 +609,7 @@ def _ensure_custom_ops() -> None:
         Launch the ``apply_norm_chlast_glu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param x: Input tensor with ``2 * C`` channels in channel-last stor...
+        :param x: Input tensor with ``2 * C`` channels in channel-last storage.
         :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer.
         :param weight: Affine weight over the input channels.
         :param bias: Affine bias over the input channels.
@@ -610,7 +619,7 @@ def _ensure_custom_ops() -> None:
         :param C: Output channel count.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_chlast_glu", x.dtype)(
+        _get_kernel("apply_norm_chlast_glu")(
             out,
             x,
             meanvar,
@@ -642,7 +651,7 @@ def _ensure_custom_ops() -> None:
         Launch the ``norm_glu_ls_resid_chlast`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param z: GroupNorm/GLU input of ``C2`` channels, channel-last stor...
+        :param z: GroupNorm/GLU input of ``C2`` channels in channel-last storage.
         :param resid: Residual tensor added at the end.
         :param nweight: GroupNorm affine weight over the ``C2`` input channels.
         :param nbias: GroupNorm affine bias over the ``C2`` input channels.
@@ -652,7 +661,7 @@ def _ensure_custom_ops() -> None:
         :param eps: Variance epsilon.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("norm_glu_ls_resid_chlast", z.dtype)(
+        _get_kernel("norm_glu_ls_resid_chlast")(
             out, z, resid, nweight, nbias, layer_scale, C2, X, eps, tgs
         )
 
@@ -677,7 +686,7 @@ def _ensure_custom_ops() -> None:
         Launch the ``apply_norm_glu_ls_resid_chlast`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
-        :param z: GroupNorm/GLU input of ``2 * C`` channels, channel-last s...
+        :param z: GroupNorm/GLU input of ``2 * C`` channels in channel-last storage.
         :param resid: Residual tensor added at the end.
         :param meanvar: FP32 ``(B, 2)`` mean/rsqrt(var+eps) buffer.
         :param nweight: GroupNorm affine weight over the input channels.
@@ -689,7 +698,7 @@ def _ensure_custom_ops() -> None:
         :param C: Output channel count.
         :param tgs: Block size (threads per block).
         """
-        _get_kernel("apply_norm_glu_ls_resid_chlast", z.dtype)(
+        _get_kernel("apply_norm_glu_ls_resid_chlast")(
             out,
             z,
             resid,
@@ -710,35 +719,14 @@ def _ensure_custom_ops() -> None:
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> None:
-        """Launch the ``add_gelu`` CUDA kernel (custom-op wrapper).
+        """
+        Launch the ``add_gelu`` CUDA kernel (custom-op wrapper).
 
         :param out: Output buffer, written in place.
         :param a: First addend.
         :param b: Second addend.
-        :return: Nothing; ``out`` is written in place.
         """
-        _get_kernel("add_gelu", a.dtype)(out, a, b)
-
-    @torch.library.custom_op(f"{_OP_NAMESPACE}::rms_norm", mutates_args={"out"})
-    def rms_norm(
-        out: torch.Tensor,
-        x: torch.Tensor,
-        gamma: torch.Tensor,
-        dim: int,
-        scale: float,
-        tgs: int,
-    ) -> None:
-        """
-        Launch the ``rms_norm`` CUDA kernel (custom-op wrapper).
-
-        :param out: Output buffer, written in place.
-        :param x: Input tensor.
-        :param gamma: RMSNorm gain.
-        :param dim: RMSNorm feature dimension.
-        :param scale: RoFormer's ``sqrt(dim)`` scale.
-        :param tgs: Block size (threads per block).
-        """
-        _get_kernel("rms_norm", x.dtype)(out, x, gamma, dim, scale, tgs)
+        _get_kernel("add_gelu")(out, a, b)
 
     _OPS_REGISTERED = True
 
@@ -746,18 +734,20 @@ def _ensure_custom_ops() -> None:
 _ensure_custom_ops()
 
 
-def _launch(name: str, dtype: torch.dtype, *args: Any) -> None:
+def _launch(name: str, *args: Any) -> None:
     """
     Launch a kernel, routing through the custom op under ``torch.compile``.
 
     :param name: Kernel name (a key of ``_KERNEL_SOURCES``).
-    :param dtype: Tensor dtype of the first tensor argument.
     :param args: Full kernel argument list (tensors then scalars).
     """
     if torch.compiler.is_compiling():
         getattr(torch.ops.unblend_cuda, name)(*args)
-    else:
-        _get_kernel(name, dtype)(*args)
+        return
+    # Launch on the tensors' GPU, not whichever device happens to be current.
+    device = next(arg.device for arg in args if isinstance(arg, torch.Tensor))
+    with torch.cuda.device(device):
+        _get_kernel(name)(*args)
 
 
 def _sm_count(device: torch.device) -> int:
@@ -779,16 +769,9 @@ def _build_extension() -> Any:
     """
     Compile the CUDA kernel extension with ``torch.utils.cpp_extension``.
 
-    :return: The compiled extension module exposing one function per k...
+    :return: The compiled extension module exposing one function per kernel.
     """
     from torch.utils import cpp_extension
-
-    sources: list[str] = []
-    with resources.as_file(resources.files(__name__)) as pkg_dir:
-        extra_include_paths = [str(pkg_dir)]
-        for source_name in _SOURCE_FILES:
-            sources.append(str(pkg_dir / source_name))
-        sources.append(str(pkg_dir / "bindings.cpp"))
 
     suffix = ""
     if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
@@ -796,13 +779,51 @@ def _build_extension() -> Any:
             torch.device("cuda", torch.cuda.current_device())
         )
         suffix = f"_sm{major}{minor}"
-    return cpp_extension.load(
-        name="unblend_cuda_kernels" + suffix,
-        sources=sources,
-        extra_include_paths=extra_include_paths,
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
-        verbose=False,
-    )
+    name = "unblend_cuda_kernels" + suffix
+
+    with resources.as_file(resources.files(__name__)) as pkg_dir:
+        sources = [str(pkg_dir / source) for source in _SOURCE_FILES]
+        sources.append(str(pkg_dir / "bindings.cpp"))
+        try:
+            build_dir = Path(cpp_extension._get_build_directory(name, verbose=False))
+            cached = _build_is_fresh(
+                build_dir,
+                name,
+                [Path(s) for s in sources]
+                + [pkg_dir / header for header in _HEADER_FILES],
+            )
+        except Exception:
+            cached = False
+        if not cached:
+            _notify_build_start()
+        return cpp_extension.load(
+            name=name,
+            sources=sources,
+            extra_include_paths=[str(pkg_dir)],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+
+
+def _build_is_fresh(build_dir: Path, name: str, inputs: list[Path]) -> bool:
+    """
+    Whether a cached extension build exists and is newer than every input.
+
+    Ninja rebuilds when any source or header is newer than the library, so an
+    upgrade that ships new kernel sources recompiles for minutes even though a
+    library is already on disk.
+
+    :param build_dir: The extension's build directory.
+    :param name: The extension module name.
+    :param inputs: Source and header files the build depends on.
+    :return: ``True`` if loading will not trigger a rebuild.
+    """
+    for ext in (".so", ".pyd"):
+        lib = build_dir / f"{name}{ext}"
+        if lib.is_file():
+            built = lib.stat().st_mtime
+            return all(path.stat().st_mtime <= built for path in inputs)
+    return False
 
 
 def _notify_build_start() -> None:
@@ -835,7 +856,6 @@ def _get_extension() -> Any:
             return _extension
         if _extension_error is not None:
             raise RuntimeError(_extension_error)
-        _notify_build_start()
         try:
             _extension = _build_extension()
         except Exception as exc:
@@ -844,10 +864,36 @@ def _get_extension() -> Any:
         return _extension
 
 
-def warmup_async() -> None:
+def _build_quietly(device_index: int | None = None) -> None:
     """
-    Start building the kernel extension in a daemon thread, if needed.
+    Background-thread build target. A failure is recorded in
+    ``_extension_error``, and the next foreground use reports it and falls back,
+    so the thread itself stays silent.
 
+    :param device_index: GPU whose architecture to build for; the current
+        device is per thread, so it has to be passed in.
+    """
+    try:
+        if device_index is not None:
+            torch.cuda.set_device(device_index)
+        _get_extension()
+    except RuntimeError:
+        pass
+
+
+def warmup_async(device_index: int | None = None) -> None:
+    """
+    Start building the kernel extension in a background thread, if needed.
+
+    The thread is deliberately not a daemon. ``torch.utils.cpp_extension``
+    holds a lock file in the build directory for the whole nvcc build, and a
+    daemon thread killed at interpreter exit (Ctrl-C, or an error raised after
+    this call) would leave that file behind, so every later process would wait
+    on it forever. A non-daemon thread makes interpreter shutdown wait for the
+    build to finish and release the lock.
+
+    :param device_index: GPU to build for (default: device 0, a new thread's
+        current device).
     """
     global _warmup_thread
     if not torch.cuda.is_available():
@@ -858,19 +904,20 @@ def warmup_async() -> None:
         if _warmup_thread is not None and _warmup_thread.is_alive():
             return
         _warmup_thread = threading.Thread(
-            target=_get_extension,
+            target=_build_quietly,
+            args=(device_index,),
             name="unblend-cuda-kernel-build",
-            daemon=True,
+            daemon=False,
         )
         _warmup_thread.start()
 
 
-def _get_kernel(name: str, dtype: torch.dtype) -> Any:
+def _get_kernel(name: str) -> Any:
     """
-    Look up a CUDA kernel binding by ``(name, dtype)``.
+    Look up a CUDA kernel binding by name; each binding dispatches on dtype
+    itself.
 
     :param name: Kernel function name (a key of ``_KERNEL_SOURCES``).
-    :param dtype: Scalar dtype the caller will run in (unused; see above).
     :return: The callable binding for ``name``.
     """
     ext = _get_extension()
@@ -903,7 +950,7 @@ def _is_cuda_lp(t: torch.Tensor) -> bool:
     Report whether a tensor is on CUDA in a kernel-supported low-precision dtype.
 
     :param t: Tensor whose device and dtype are checked.
-    :return: ``True`` if ``t`` is on CUDA and FP16/BF16 under inferenc...
+    :return: ``True`` if ``t`` is an FP16/BF16 CUDA tensor and autograd is disabled.
     """
     return (
         t.device.type == "cuda"
@@ -917,12 +964,28 @@ def _is_chlast_4d(t: torch.Tensor) -> bool:
     Report whether a rank-4 tensor is stored in channels_last (NHWC) layout.
 
     :param t: Tensor to inspect.
-    :return: True when ``t`` is rank-4 and contiguous in channels_last...
+    :return: ``True`` when ``t`` is rank-4 and contiguous only in channels_last layout.
     """
     return (
         t.dim() == 4
         and not t.is_contiguous()
         and t.is_contiguous(memory_format=torch.channels_last)
+    )
+
+
+def _same_layout(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """
+    Whether two kernel arguments can be indexed identically.
+
+    :param a: First tensor, as prepared by :func:`_kernel_arg`.
+    :param b: Second tensor, as prepared by :func:`_kernel_arg`.
+    :return: True if they share shape, dtype, device and memory format.
+    """
+    return (
+        a.shape == b.shape
+        and a.dtype == b.dtype
+        and a.device == b.device
+        and _is_chlast_4d(a) == _is_chlast_4d(b)
     )
 
 
@@ -938,46 +1001,6 @@ def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
     ):
         return t if t.storage_offset() % 4 == 0 else t.clone()
     return t.contiguous()
-
-
-def cuda_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
-    """
-    Apply RoFormer's last-dimension RMSNorm with one fused CUDA kernel.
-
-    :param x: Input tensor normalized over its final dimension.
-    :param gamma: Learnable gain with length ``x.shape[-1]``.
-    :param scale: RoFormer's ``sqrt(dim)`` normalization scale.
-    :return: Normalized tensor with the same shape and dtype as ``x``.
-    """
-    if (
-        x.device.type != "cuda"
-        or x.dtype not in _RMS_DTYPES
-        or x.numel() == 0
-        or torch.is_grad_enabled()
-    ):
-        normalized = F.normalize(x.float(), dim=-1) * scale * gamma.float()
-        return normalized.type(x.dtype)
-
-    x_contig = x.contiguous()
-    dim = x_contig.shape[-1]
-    gamma_contig = gamma.to(device=x.device, dtype=x.dtype).contiguous()
-    out = torch.empty_like(x_contig)
-
-    try:
-        _get_kernel("rms_norm", x.dtype)
-    except RuntimeError as exc:
-        warnings.warn(
-            f"{exc}; falling back to native PyTorch RMSNorm.",
-            RuntimeWarning,
-        )
-        normalized = F.normalize(x.float(), dim=-1) * scale * gamma.float()
-        return normalized.type(x.dtype)
-
-    tgs = _pow2_tgs(_max_threads(x.device))
-    while tgs > dim:
-        tgs //= 2
-    _launch("rms_norm", x.dtype, out, x_contig, gamma_contig, dim, float(scale), tgs)
-    return out.view_as(x)
 
 
 class CUDAGroupNorm(nn.Module):
@@ -1017,7 +1040,7 @@ class CUDAGroupNorm(nn.Module):
         """
         Size the multi-stage tiling so stages 1/3 saturate the GPU.
 
-        :param tile_space: Element count ``num_tiles`` is sized against — the.
+        :param tile_space: Element count the tiling is sized against: the output space, which GLU halves.
         :param B: Number of batch elements participating in the launch.
         :return: The power-of-two tile count to launch with.
         """
@@ -1055,8 +1078,8 @@ class CUDAGroupNorm(nn.Module):
         :param x_contig: Contiguous kernel-ready input, ``(B, per_batch_in)`` flat.
         :param B: Number of batch elements.
         :param per_batch_in: Elements reduced per batch element.
-        :param tile_space: Element count ``num_tiles`` is sized against — the.
-        :param inject: Optional second input added elementwise before the.
+        :param tile_space: Element count the tiling is sized against: the output space, which GLU halves.
+        :param inject: Optional second input added elementwise before normalization.
         :return: The ``(B, 2)`` FP32 meanvar buffer and ``num_tiles``.
         """
         num_tiles = self._multi_stage_num_tiles(tile_space, B)
@@ -1070,11 +1093,7 @@ class CUDAGroupNorm(nn.Module):
         max_threads = _max_threads(x_contig.device)
         tgs1 = _pow2_tgs(max_threads)
 
-        tgs2 = min(num_tiles, max_threads)
-        pow2 = 1
-        while pow2 * 2 <= tgs2:
-            pow2 *= 2
-        tgs2 = pow2
+        tgs2 = _shrink_tgs(_pow2_tgs(max_threads, cap=max_threads), num_tiles)
 
         inj_arg = (
             torch.empty(0, dtype=dtype, device=x_contig.device)
@@ -1083,7 +1102,6 @@ class CUDAGroupNorm(nn.Module):
         )
         _launch(
             "partial_reduce",
-            dtype,
             x_contig,
             inj_arg,
             scratch,
@@ -1093,14 +1111,11 @@ class CUDAGroupNorm(nn.Module):
         )
         _launch(
             "finalize_meanvar",
-            dtype,
             scratch,
             meanvar,
             per_batch_in,
             num_tiles,
             float(self.eps),
-            x_contig,
-            inj_arg,
             tgs2,
         )
         return meanvar, num_tiles
@@ -1152,15 +1167,13 @@ class CUDAGroupNorm(nn.Module):
             object.__setattr__(self, "_aff_cache", cache)
 
         if not torch.compiler.is_compiling():
-            versions = (
-                id(self.weight),
-                self.weight._version,
-                id(self.bias),
-                self.bias._version,
-            )
-            if getattr(self, "_aff_versions", None) != versions:
+            if not tensor_record_matches(
+                getattr(self, "_aff_versions", None), self.weight, self.bias
+            ):
                 cache.clear()
-                object.__setattr__(self, "_aff_versions", versions)
+                object.__setattr__(
+                    self, "_aff_versions", tensor_record(self.weight, self.bias)
+                )
         key = (dtype, device)
         cached = cache.get(key)
         if cached is None:
@@ -1182,6 +1195,17 @@ class CUDAGroupNorm(nn.Module):
             if hasattr(self, name):
                 object.__delattr__(self, name)
 
+    def __getstate__(self) -> dict:
+        """
+        Pickle and ``deepcopy`` without the derived caches and their records
+        (see ``backends.state_without``).
+
+        :return: The state to pickle.
+        """
+        return state_without(
+            self, "_aff_cache", "_aff_versions", "_ls_cache", "_ls_version"
+        )
+
     def _apply(
         self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
     ) -> "CUDAGroupNorm":
@@ -1200,8 +1224,8 @@ class CUDAGroupNorm(nn.Module):
         """
         Reload parameters and invalidate the lazily-cast affine/LayerScale caches.
 
-        :param args: Positional arguments forwarded to ``nn.Module._load_from_...
-        :param kwargs: Keyword arguments forwarded to ``nn.Module._load_from_sta...
+        :param args: Positional arguments forwarded to ``nn.Module._load_from_state_dict``.
+        :param kwargs: Keyword arguments forwarded to ``nn.Module._load_from_state_dict``.
         """
         super()._load_from_state_dict(*args, **kwargs)
         self._clear_parameter_caches()
@@ -1211,8 +1235,8 @@ class CUDAGroupNorm(nn.Module):
         Apply ``num_groups=1`` group normalization, using a fused CUDA kernel on FP16/BF16.
 
         :param x: Input tensor of shape ``(B, C, ...)``.
-        :param gelu: Also apply GELU to the normalized output in the same.
-        :return: Normalized, affine-transformed tensor with the same shape...
+        :param gelu: Also apply GELU to the normalized output in the same kernel.
+        :return: Normalized, affine-transformed tensor with the same shape as ``x``.
         """
 
         if not _is_cuda_lp(x):
@@ -1235,14 +1259,11 @@ class CUDAGroupNorm(nn.Module):
 
         suffix = "_chlast" if _is_chlast_4d(x_contig) else ""
         if self._use_single_stage(B, per_batch):
-            tgs = _pow2_tgs(max_threads)
-            while tgs > 1 and tgs > per_batch:
-                tgs //= 2
+            tgs = _shrink_tgs(_pow2_tgs(max_threads), per_batch)
             out = torch.empty_like(x_contig)
             if gelu:
                 _launch(
                     f"group_norm_g1{suffix}_gelu",
-                    x.dtype,
                     out,
                     x_contig,
                     torch.empty(0, dtype=x.dtype, device=x.device),
@@ -1258,7 +1279,6 @@ class CUDAGroupNorm(nn.Module):
                 if suffix:
                     _launch(
                         name,
-                        x.dtype,
                         out,
                         x_contig,
                         weight,
@@ -1271,7 +1291,6 @@ class CUDAGroupNorm(nn.Module):
                 else:
                     _launch(
                         name,
-                        x.dtype,
                         out,
                         x_contig,
                         weight,
@@ -1291,7 +1310,6 @@ class CUDAGroupNorm(nn.Module):
         if gelu:
             _launch(
                 f"apply_norm{suffix}_gelu",
-                x.dtype,
                 out,
                 x_contig,
                 torch.empty(0, dtype=x.dtype, device=x.device),
@@ -1308,7 +1326,6 @@ class CUDAGroupNorm(nn.Module):
             if suffix:
                 _launch(
                     name,
-                    x.dtype,
                     out,
                     x_contig,
                     meanvar,
@@ -1322,7 +1339,6 @@ class CUDAGroupNorm(nn.Module):
             else:
                 _launch(
                     name,
-                    x.dtype,
                     out,
                     x_contig,
                     meanvar,
@@ -1348,8 +1364,8 @@ class FusedGroupNormGelu(CUDAGroupNorm):
         Apply ``gelu(group_norm(x + inject))`` fused into one CUDA kernel on FP16/BF16.
 
         :param x: Input tensor of shape ``(B, C, ...)``.
-        :param inject: Optional second input added elementwise before the.
-        :return: GELU-activated normalized tensor with the same shape as `...
+        :param inject: Optional second input added elementwise before normalization.
+        :return: GELU-activated normalized tensor with the same shape as ``x``.
         """
 
         if not _is_cuda_lp(x):
@@ -1365,6 +1381,11 @@ class FusedGroupNormGelu(CUDAGroupNorm):
 
         x_contig = _kernel_arg(x)
         inj_contig = _kernel_arg(inject) if inject is not None else None
+        if inj_contig is not None and not _same_layout(x_contig, inj_contig):
+            # The kernel indexes inject exactly like x; anything else (a
+            # broadcast shape, another memory format) takes the explicit add.
+            x_contig = _kernel_arg(x + inject)
+            inj_contig = None
         B = x_contig.shape[0]
         C = x_contig.shape[1]
         N = 1
@@ -1376,13 +1397,10 @@ class FusedGroupNormGelu(CUDAGroupNorm):
 
         suffix = "_chlast" if _is_chlast_4d(x_contig) else ""
         if self._use_single_stage(B, per_batch):
-            tgs = _pow2_tgs(max_threads)
-            while tgs > 1 and tgs > per_batch:
-                tgs //= 2
+            tgs = _shrink_tgs(_pow2_tgs(max_threads), per_batch)
             out = torch.empty_like(x_contig)
             _launch(
                 f"group_norm_g1{suffix}_gelu",
-                x.dtype,
                 out,
                 x_contig,
                 inj_contig
@@ -1405,7 +1423,6 @@ class FusedGroupNormGelu(CUDAGroupNorm):
         suffix = "_chlast" if _is_chlast_4d(x_contig) else ""
         _launch(
             f"apply_norm{suffix}_gelu",
-            x.dtype,
             out,
             x_contig,
             inj_contig
@@ -1465,9 +1482,7 @@ class FusedGroupNormGlu(CUDAGroupNorm):
 
         suffix = "_chlast" if _is_chlast_4d(x_contig) else ""
         if self._use_single_stage(B, per_batch_in):
-            tgs = _pow2_tgs(max_threads)
-            while tgs > 1 and tgs > per_batch_out:
-                tgs //= 2
+            tgs = _shrink_tgs(_pow2_tgs(max_threads), per_batch_out)
             out_shape = (B, C_half) + tuple(x_contig.shape[2:])
 
             fmt = dict(memory_format=torch.channels_last) if suffix else {}
@@ -1475,7 +1490,6 @@ class FusedGroupNormGlu(CUDAGroupNorm):
             if suffix:
                 _launch(
                     "group_norm_g1_chlast_glu",
-                    x.dtype,
                     out,
                     x_contig,
                     weight,
@@ -1488,7 +1502,6 @@ class FusedGroupNormGlu(CUDAGroupNorm):
             else:
                 _launch(
                     "group_norm_g1_glu",
-                    x.dtype,
                     out,
                     x_contig,
                     weight,
@@ -1512,7 +1525,6 @@ class FusedGroupNormGlu(CUDAGroupNorm):
         if suffix:
             _launch(
                 "apply_norm_chlast_glu",
-                x.dtype,
                 out,
                 x_contig,
                 meanvar,
@@ -1527,7 +1539,6 @@ class FusedGroupNormGlu(CUDAGroupNorm):
         else:
             _launch(
                 "apply_norm_glu",
-                x.dtype,
                 out,
                 x_contig,
                 meanvar,
@@ -1594,10 +1605,11 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
             object.__setattr__(self, "_ls_cache", cache)
 
         if not torch.compiler.is_compiling():
-            version = (id(self.layer_scale), self.layer_scale._version)
-            if getattr(self, "_ls_version", None) != version:
+            if not tensor_record_matches(
+                getattr(self, "_ls_version", None), self.layer_scale
+            ):
                 cache.clear()
-                object.__setattr__(self, "_ls_version", version)
+                object.__setattr__(self, "_ls_version", tensor_record(self.layer_scale))
         key = (dtype, device)
         cached = cache.get(key)
         if cached is None:
@@ -1605,6 +1617,22 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
             cache[key] = t
             return t
         return cached
+
+    def _eager(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the envelope with native PyTorch ops, in FP32 for low precision.
+
+        :param z: GroupNorm/GLU input of shape ``(B, 2C, ...)``
+        :param residual: Residual tensor broadcastable to ``(B, C, ...)``
+        :return: ``residual + layer_scale * glu(group_norm(z), dim=1)`` in ``z``'s dtype
+        """
+        ls = self.layer_scale.view(-1, *([1] * (z.dim() - 2)))
+        if z.dtype == torch.float32:
+            zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
+            return residual + ls * F.glu(zn, dim=1)
+        zn = F.group_norm(z.to(torch.float32), 1, self.weight, self.bias, self.eps)
+        out = residual.to(torch.float32) + ls * F.glu(zn, dim=1)
+        return out.to(z.dtype)
 
     def forward(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         """
@@ -1617,14 +1645,7 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         """
 
         if not _is_cuda_lp(z):
-            if z.dtype == torch.float32:
-                zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
-                return residual + self.layer_scale[:, None] * F.glu(zn, dim=1)
-            zn = F.group_norm(z.to(torch.float32), 1, self.weight, self.bias, self.eps)
-            out = residual.to(torch.float32) + self.layer_scale[:, None] * F.glu(
-                zn, dim=1
-            )
-            return out.to(z.dtype)
+            return self._eager(z, residual)
 
         z_c = _kernel_arg(z)
         r_c = _kernel_arg(residual)
@@ -1633,6 +1654,16 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         if C2 % 2 != 0:
             raise ValueError("GLU input channel dim must be even")
         C = C2 // 2
+        if not (
+            r_c.shape == (B, C) + tuple(z_c.shape[2:])
+            and r_c.dtype == z_c.dtype
+            and r_c.device == z_c.device
+            and _is_chlast_4d(r_c) == _is_chlast_4d(z_c)
+        ):
+            # The kernel indexes the residual exactly like its output; anything
+            # else (a broadcast shape, another dtype or memory format) would
+            # read out of bounds, so take the eager computation.
+            return self._eager(z, residual)
         N = 1
         for d in z_c.shape[2:]:
             N *= d
@@ -1648,13 +1679,9 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         fmt = dict(memory_format=torch.channels_last) if suffix else {}
         out = torch.empty(out_shape, dtype=z.dtype, device=z.device, **fmt)
         if self._use_single_stage(B, per_batch_in):
-            tgs = _pow2_tgs(max_threads)
-
-            while tgs > 1 and tgs > per_batch_out:
-                tgs //= 2
+            tgs = _shrink_tgs(_pow2_tgs(max_threads), per_batch_out)
             _launch(
                 f"norm_glu_ls_resid{suffix}",
-                z.dtype,
                 out,
                 z_c,
                 r_c,
@@ -1676,7 +1703,6 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         if suffix:
             _launch(
                 "apply_norm_glu_ls_resid_chlast",
-                z.dtype,
                 out,
                 z_c,
                 r_c,
@@ -1693,7 +1719,6 @@ class FusedNormGluLayerScaleResid(CUDAGroupNorm):
         else:
             _launch(
                 "apply_norm_glu_ls_resid",
-                z.dtype,
                 out,
                 z_c,
                 r_c,
@@ -1747,13 +1772,10 @@ class CUDAMyGroupNorm(CUDAGroupNorm):
         max_threads = _max_threads(x.device)
 
         if self._use_single_stage(B, per_batch):
-            tgs = _pow2_tgs(max_threads)
-            while tgs > 1 and tgs > per_batch:
-                tgs //= 2
+            tgs = _shrink_tgs(_pow2_tgs(max_threads), per_batch)
             out = torch.empty_like(x_contig)
             _launch(
                 "group_norm_g1_chlast",
-                x.dtype,
                 out,
                 x_contig,
                 weight,
@@ -1772,7 +1794,6 @@ class CUDAMyGroupNorm(CUDAGroupNorm):
         tgs3 = _pow2_tgs(max_threads)
         _launch(
             "apply_norm_chlast",
-            x.dtype,
             out,
             x_contig,
             meanvar,
@@ -1788,7 +1809,8 @@ class CUDAMyGroupNorm(CUDAGroupNorm):
 
 class FusedDConvLayer(nn.Module):
     """
-    One DConv sub-layer (formerly an ``nn.Sequential`` of 7 ops) folded into 4 calls: ``conv1 → fused_norm_gelu → conv2 →...
+    One DConv sub-layer, its 7-op ``nn.Sequential`` folded into four calls:
+    ``conv1 -> fused_norm_gelu -> conv2 -> fused_norm_glu_ls_resid``.
     """
 
     def __init__(
@@ -1860,9 +1882,9 @@ class FusedDConvLayer(nn.Module):
 
 
 class FusedDConv(nn.Module):
-    """Drop-in for ``unblend.blocks.DConv`` whose layers are
-    :class:`FusedDConvLayer`. Each layer already absorbs the residual add,
-    so the outer loop just chains them.
+    """
+    Drop-in for ``unblend.blocks.DConv`` built from :class:`FusedDConvLayer`
+    layers, each of which absorbs its own residual add.
     """
 
     def __init__(self, fused_layers: list[FusedDConvLayer]) -> None:
@@ -1903,13 +1925,12 @@ class FusedDConv(nn.Module):
 
 
 class FusedHEncLayer(nn.Module):
-    """Replacement for ``unblend.blocks.HEncLayer`` that uses fused CUDA
-    kernels for low-precision (FP16/BF16) inference. Same forward contract.
+    """
+    Replacement for ``unblend.blocks.HEncLayer`` using fused CUDA kernels for
+    FP16/BF16 inference, with the same forward contract.
 
-    We keep ``self.conv``, ``self.rewrite``, and the layer's ``empty`` /
-    ``stride`` / ``freq`` / ``pad`` flags as on the original. The
-    GroupNorms and the surrounding ``gelu``/``glu`` are folded into single
-    fused calls; the inner DConv (if present) is replaced with FusedDConv.
+    The GroupNorms and their ``gelu``/``glu`` become single fused calls and the
+    inner DConv becomes a :class:`FusedDConv`; the convs and flags are reused.
     """
 
     def __init__(self, layer: nn.Module) -> None:
@@ -1929,16 +1950,16 @@ class FusedHEncLayer(nn.Module):
         self.norm = layer.norm
         self.pad = layer.pad
 
+        self.conv = layer.conv
+        if layer.empty:
+            return
+
         if isinstance(layer.norm1, nn.GroupNorm) and layer.norm1.num_groups == 1:
             self.norm1 = FusedGroupNormGelu.from_groupnorm(layer.norm1)
             self._fused_gelu = True
         else:
             self.norm1 = layer.norm1
             self._fused_gelu = False
-
-        self.conv = layer.conv
-        if layer.empty:
-            return
 
         self.rewrite = layer.rewrite
         if layer.rewrite is not None:
@@ -1987,11 +2008,15 @@ class FusedHEncLayer(nn.Module):
 
         if self._fused_gelu:
             y = self.norm1(y, inject=inject)
-        elif type(self.norm1) is nn.Identity and inject is not None:
+        elif (
+            type(self.norm1) is nn.Identity
+            and inject is not None
+            and _is_cuda_lp(y)
+            and _same_layout(_kernel_arg(y), _kernel_arg(inject))
+        ):
             out = torch.empty_like(_kernel_arg(y))
             _launch(
                 "add_gelu",
-                y.dtype,
                 out,
                 _kernel_arg(y),
                 _kernel_arg(inject),
@@ -2019,13 +2044,13 @@ class FusedHEncLayer(nn.Module):
 
 
 class FusedHDecLayer(nn.Module):
-    """Replacement for ``unblend.blocks.HDecLayer`` using fused CUDA kernels.
+    """
+    Replacement for ``unblend.blocks.HDecLayer`` using fused CUDA kernels.
 
-    The ``glu(norm1(rewrite(...)))`` pattern is fused. We do NOT fuse the
-    final ``gelu(norm2(conv_tr(...)))`` because the ``last`` flag (mutated
-    by MultiWrap) decides whether GELU runs at all — keeping that switch
-    in Python keeps things simple. ``norm2`` itself is still
-    ``CUDAGroupNorm`` (handled by the outer swap pass).
+    The ``glu(norm1(rewrite(...)))`` path is fused here. ``norm2`` is swapped to
+    :class:`CUDAGroupNorm` by the outer pass, and whether it applies GELU is
+    decided per call from ``last``, which MultiWrap may change after
+    construction.
     """
 
     def __init__(self, layer: nn.Module) -> None:
@@ -2133,19 +2158,35 @@ def fused_roformer_rotary(
     :param sin: Rotation sine table ``[seq, dim // 2]``.
     :return: Rotated tensor of the same shape and dtype.
     """
-    if t.stride(-1) != 1 or t.dim() > 8:
-        x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
-        return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(
-            -2
-        )
-    return torch.ops.unblend_cuda.roformer_rotary(t, cos, sin)
+    if (
+        t.stride(-1) == 1
+        and 2 <= t.dim() <= 8
+        and cos.shape == (t.shape[-2], t.shape[-1] // 2)
+        and sin.shape == cos.shape
+    ):
+        cos, sin = cos.contiguous(), sin.contiguous()
+        try:
+            _get_extension()
+        except RuntimeError as exc:
+            warnings.warn(
+                f"{exc}; falling back to native PyTorch rotary.",
+                RuntimeWarning,
+            )
+        else:
+            # RoFormer never calls this under torch.compile. Launch on the
+            # tensor's GPU, not whichever device happens to be current.
+            with torch.cuda.device(t.device):
+                return torch.ops.unblend_cuda.roformer_rotary(t, cos, sin)
+    x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
+    return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
 
 
 @torch.library.custom_op(f"{_OP_NAMESPACE}::roformer_rotary", mutates_args=())
 def roformer_rotary_op(
     t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """Fused interleaved rotary rotation (custom-op wrapper).
+    """
+    Fused interleaved rotary rotation (custom-op wrapper).
 
     :param t: Queries or keys ``[..., seq, dim]``, last-dim contiguous.
     :param cos: Rotation cosine table ``[seq, dim // 2]``.
@@ -2167,7 +2208,7 @@ def _roformer_rotary_fake(
     :param sin: Unused.
     :return: Fresh tensor with ``t``'s size/dtype (contiguous).
     """
-    return torch.empty_like(t)
+    return torch.empty_like(t, memory_format=torch.contiguous_format)
 
 
 def has_swappable_modules(model: nn.Module) -> bool:
@@ -2192,12 +2233,19 @@ def has_swappable_modules(model: nn.Module) -> bool:
     return False
 
 
+# Exact types: GroupNorm subclasses that change behaviour aren't swapped, but
+# SCNet's (which only adds an export-time path) is.
+from ..scnet import GroupNorm as _SCNetGroupNorm  # noqa: E402
+
+_SWAPPABLE_GROUP_NORMS = (nn.GroupNorm, _SCNetGroupNorm)
+
+
 def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
     """
     Replace memory-bound op chains with fused CUDA-kernel equivalents in-place.
 
     :param model: Model to mutate in place, swapping eligible submodules.
-    :return: A mapping from swap kind to the number of modules replace...
+    :return: A mapping from swap kind to the number of modules replaced.
     """
     from ..blocks import HDecLayer, HEncLayer
     from ..transformer import MyGroupNorm
@@ -2280,7 +2328,7 @@ def apply_cuda_optimizations(model: nn.Module) -> dict[str, int]:
                 if child.num_groups == 1 and child.affine:
                     replacement = CUDAMyGroupNorm(child)
                     counts["my_group_norm"] += 1
-            elif type(child) is nn.GroupNorm:
+            elif type(child) in _SWAPPABLE_GROUP_NORMS:
                 if child.num_groups == 1 and child.affine:
                     replacement = CUDAGroupNorm.from_groupnorm(child)
                     counts["group_norm"] += 1
@@ -2302,7 +2350,6 @@ __all__ = [
     "CUDAGroupNorm",
     "fused_roformer_rotary",
     "has_swappable_modules",
-    "cuda_rms_norm",
     "CUDAMyGroupNorm",
     "FusedGroupNormGelu",
     "FusedGroupNormGlu",

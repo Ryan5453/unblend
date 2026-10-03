@@ -335,7 +335,10 @@ def test_registry_roformer_checkpoints_strict_load() -> None:
             continue
         model = repo.get_model(name)
         assert model.sources == info["sources"], name
-        assert model.samplerate == info["samplerate"], name
+        # An ensemble of RoFormers is labelled "roformer" too, and states its
+        # sample rate through its members rather than at the top level.
+        if "samplerate" in info:
+            assert model.samplerate == info["samplerate"], name
 
 
 def test_build_roformer_loads_state() -> None:
@@ -398,7 +401,7 @@ def test_rotary_rotation_accepts_half_inputs() -> None:
     Rotation must work on fp16 tensors from a model cast to half: the cos/sin
     tables are built in float32 (trig has no half kernel) and cast once to the
     working dtype, so the rotation itself runs in fp16 without a per-call fp32
-    round-trip. Regression test for the fp16 GPU path.
+    round-trip.
     """
     from unblend.roformer import RotaryEmbedding
 

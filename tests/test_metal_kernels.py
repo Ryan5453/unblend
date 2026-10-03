@@ -4,11 +4,11 @@ Numeric-equivalence tests for the MPS Metal kernels in ``unblend.metal``.
 Each fused module has a PyTorch fallback (used on CPU / in FP32) and a
 hand-written Metal kernel (used on MPS in FP16/BF16). RoFormer RMSNorm also
 supports explicitly requested FP32. These tests assert the kernel output
-matches the fallback reference within tolerance, so
-a kernel regression (bad indexing, a broken reduction, wrong activation math)
-can't silently ship. The fallback is treated as ground truth: we run the same
-module on a CPU FP32 copy of the input to get the reference, then on MPS in
-FP16/BF16 to exercise the kernel.
+matches the fallback reference within tolerance, so a kernel bug (bad
+indexing, a broken reduction, wrong activation math) can't silently ship.
+The fallback is treated as ground truth: the same module runs on a CPU FP32
+copy of the input for the reference, then on MPS in FP16/BF16 to exercise
+the kernel.
 
 These only run on Apple Silicon (MPS); elsewhere they skip.
 """
@@ -235,9 +235,8 @@ def test_rms_norm_respects_custom_kernels_flag(monkeypatch) -> None:
     ``RMSNorm`` routes MPS inference through the kernel, and
     ``use_custom_kernels = False`` puts it back on stock ``F.rms_norm``.
 
-    Regression test: this module used to call the Metal kernel unconditionally,
-    so ``custom_kernels=False`` left the RoFormer path partly accelerated and
-    could not be used to rule the kernels out when debugging.
+    Without this, ``custom_kernels=False`` would leave the RoFormer path partly
+    accelerated and could not rule the kernels out when debugging.
     """
     from unblend import metal as metal_mod
     from unblend.roformer import RMSNorm
@@ -492,7 +491,7 @@ def test_metal_group_norm_large_dc_offset(
     dtype: torch.dtype, shape: tuple[int, ...]
 ) -> None:
     """
-    A large DC offset exercises the kernels' K-shift cancellation guard.
+    A large DC offset exercises the kernels' shifted-sum cancellation guard.
 
     Without the shift, the one-pass ``E[x^2] - E[x]^2`` variance loses most of
     its significant digits when ``|mean| >> std``. The input is quantized to
@@ -510,6 +509,142 @@ def test_metal_group_norm_large_dc_offset(
     out = _inference_call(mod.to("mps"), x.to("mps"))
 
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
+
+
+# One 750k-element group: C*N % 4 == 0 takes the vectorized reduction loads,
+# 6 * 125_001 the scalar ones.
+_OUTLIER_SHAPES = [(1, 4, 187_500), (1, 6, 125_001)]
+_OUTLIER = 3000.0
+
+
+def _outlier_input(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """
+    Unit-normal input whose very first element is a large outlier.
+
+    A reduction that shifts every term by ``x[0]`` puts the outlier's offset
+    into all of them, and the fp32 ``E[d^2] - E[d]^2`` cancellation then loses
+    several percent of the variance on a group this size. The input is
+    quantized to ``dtype`` up front so the kernel and the FP32 reference see
+    identical values.
+
+    :param shape: Tensor shape; the outlier goes at ``[:, 0, 0]``
+    :param dtype: Low-precision dtype to quantize to
+    :return: The quantized input, on CPU
+    """
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(*shape, generator=g)
+    x[:, 0, 0] = _OUTLIER
+    return x.to(dtype)
+
+
+def _mean_rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
+    """
+    Mean absolute error relative to the reference's mean magnitude.
+
+    The outlier's own output (hundreds of units, coarsely rounded) is masked so
+    the metric tracks the statistics every other element is normalized with.
+
+    :param out: Kernel output
+    :param ref: FP32 reference of the same shape
+    :return: ``mean|out - ref| / mean|ref|`` over the non-outlier elements
+    """
+    out = out.float().cpu().clone()
+    ref = ref.clone()
+    out[:, 0, 0] = 0.0
+    ref[:, 0, 0] = 0.0
+    return ((out - ref).abs().mean() / ref.abs().mean()).item()
+
+
+@mps_only
+@pytest.mark.parametrize("kind", ["group_norm", "gelu", "glu", "glu_ls_resid"])
+@pytest.mark.parametrize("single_stage", [True, False], ids=["single", "multi"])
+@pytest.mark.parametrize("shape", _OUTLIER_SHAPES)
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+def test_group_norm_outlier_first_element(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    single_stage: bool,
+    kind: str,
+) -> None:
+    """
+    An outlier ``x[0]`` on a large group doesn't skew any fused GroupNorm.
+
+    Covers GroupNorm, GroupNorm+GELU, GroupNorm+GLU and the DConv envelope on
+    both the single-stage and multi-stage (partial / finalize / apply) paths,
+    forced via ``_use_single_stage`` so each path sees the same 750k-element
+    group. With the old shared ``x[0]`` shift the error was 0.5-9% here; the
+    bounds sit at a few times the output-rounding floor.
+
+    :param monkeypatch: pytest fixture used to force the kernel path
+    :param dtype: dtype under test
+    :param shape: tensor shape under test
+    :param single_stage: whether to force the single-stage kernel
+    :param kind: which fused module to exercise
+    """
+    monkeypatch.setattr(
+        MetalGroupNorm,
+        "_use_single_stage",
+        classmethod(lambda cls, batch, per_batch: single_stage),
+    )
+    channels = shape[1]
+    gn = _make_gn(channels)
+    x = _outlier_input(shape, dtype)
+    zn = F.group_norm(x.float(), 1, gn.weight, gn.bias, gn.eps)
+    if kind == "group_norm":
+        mod, args, ref = MetalGroupNorm(gn), (x,), zn
+    elif kind == "gelu":
+        # The kernel uses the tanh approximation; match it so the bound only
+        # measures the normalization.
+        mod, args, ref = FusedGroupNormGelu(gn), (x,), F.gelu(zn, approximate="tanh")
+    elif kind == "glu":
+        mod, args, ref = FusedGroupNormGlu(gn), (x,), F.glu(zn, dim=1)
+    else:
+        ls = _make_ls(channels // 2)
+        # A zero residual keeps the small LayerScale'd term from being lost to
+        # the output rounding of a unit-scale residual.
+        residual = torch.zeros(shape[0], channels // 2, *shape[2:], dtype=dtype)
+        mod = FusedNormGluLayerScaleResid(gn, ls)
+        args = (x, residual)
+        ref = ls[:, None] * F.glu(zn, dim=1)
+
+    out = _inference_call(mod.to("mps"), *(a.to("mps") for a in args))
+
+    assert _mean_rel_err(out, ref) < (2e-3 if dtype == torch.float16 else 8e-3)
+
+
+@mps_only
+@pytest.mark.parametrize("shape", _OUTLIER_SHAPES)
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+def test_multi_stage_meanvar_outlier_first_element(
+    dtype: torch.dtype, shape: tuple[int, ...]
+) -> None:
+    """
+    The multi-stage ``(mean, rsqrt(var + eps))`` matches float64 statistics.
+
+    Checks the partial-reduce / finalize output directly, which isolates the
+    reduction from output rounding: the old shared ``x[0]`` shift was ~5% off
+    in ``rsqrt(var)`` here.
+
+    :param dtype: dtype under test
+    :param shape: tensor shape under test
+    """
+    channels = shape[1]
+    mod = MetalGroupNorm(_make_gn(channels)).to("mps")
+    x = _outlier_input(shape, dtype)
+    per_batch = x[0].numel()
+    xd = x.double().flatten(1)
+    mean = xd.mean(dim=1)
+    scale = torch.rsqrt(xd.var(dim=1, unbiased=False) + mod.eps)
+
+    with torch.inference_mode():
+        meanvar, _ = mod._multi_stage_meanvar(
+            x.to("mps"), shape[0], per_batch, per_batch
+        )
+
+    meanvar = meanvar.cpu().double()
+    torch.testing.assert_close(meanvar[:, 0], mean, atol=1e-5, rtol=0)
+    torch.testing.assert_close(meanvar[:, 1], scale, atol=0, rtol=1e-5)
 
 
 @mps_only
@@ -560,9 +695,9 @@ def test_fused_gelu_fallback_is_exact_erf() -> None:
     """
     The FP32 GELU fallback equals PyTorch's exact-erf ``F.gelu``.
 
-    The kernel's per-element erf-vs-tanh gap (~1e-3) is below FP16 precision so
-    it can't be distinguished by a kernel-vs-fallback comparison; this checks the
-    fallback definition directly, which is what the kernel is verified against.
+    The kernel's tanh-vs-erf gap (at most ~5e-4) sits inside the FP16/BF16
+    tolerance of the kernel-vs-fallback comparison, so this checks the fallback
+    definition directly, which is what the kernel is verified against.
     """
     channels = 64
     gn = _make_gn(channels)
@@ -748,6 +883,82 @@ def test_fused_norm_glu_ls_resid_multi_stage(dtype: torch.dtype) -> None:
 @pytest.mark.parametrize(
     "shape",
     [
+        (128, 16, 4097),  # past the small-batch limit, single-stage via B >= 128
+        (2, 4, 12287),  # just under the small-per-batch limit
+    ],
+)
+def test_fused_norm_glu_ls_resid_large_odd_n_single_stage(
+    dtype: torch.dtype, shape: tuple[int, ...]
+) -> None:
+    """
+    Large odd-N envelopes run the single-stage scalar channel walk correctly.
+
+    Dispatch looks only at sizes, so an odd spatial length never diverts to
+    the multi-stage kernels; the single-stage kernel's scalar branch must
+    handle it.
+
+    :param dtype: dtype under test
+    :param shape: ``(B, 2C, N)`` with odd ``N``
+    """
+    B, in_channels, frames = shape
+    assert frames % 2 == 1
+    assert FusedNormGluLayerScaleResid._use_single_stage(B, in_channels * frames)
+    half = in_channels // 2
+    gn = _make_gn(in_channels)
+    ls = _make_ls(half)
+    mod = FusedNormGluLayerScaleResid(gn, ls)
+    z = torch.randn(*shape)
+    residual = torch.randn(B, half, frames)
+
+    ref = mod(z, residual)
+    out = _inference_call(mod.to("mps"), z.to("mps", dtype), residual.to("mps", dtype))
+
+    assert out.shape == ref.shape
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
+
+
+@mps_only
+@pytest.mark.parametrize(
+    "residual_shape, residual_dtype",
+    [
+        ((1, 24, 200), torch.float16),  # broadcast over batch
+        ((3, 24, 1), torch.float16),  # broadcast over time
+        ((3, 24, 200), torch.float32),  # dtype differs from z
+    ],
+)
+def test_fused_norm_glu_ls_resid_mismatched_residual_falls_back(
+    residual_shape: tuple[int, ...], residual_dtype: torch.dtype
+) -> None:
+    """
+    A residual the kernel cannot index like its output takes the eager path.
+
+    The kernel reads a dense ``(B, C, N)`` residual in ``z``'s dtype; a
+    broadcast residual used to be read out of bounds.
+
+    :param residual_shape: Residual shape, broadcastable to ``(3, 24, 200)``
+    :param residual_dtype: Residual dtype
+    """
+    gn = _make_gn(48)
+    ls = _make_ls(24)
+    mod = FusedNormGluLayerScaleResid(gn, ls)
+    z = torch.randn(3, 48, 200)
+    residual = torch.randn(*residual_shape)
+
+    ref = mod(z, residual)
+    out = _inference_call(
+        mod.to("mps"), z.to("mps", torch.float16), residual.to("mps", residual_dtype)
+    )
+
+    assert out.dtype == torch.float16
+    assert out.shape == ref.shape == (3, 24, 200)
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(torch.float16))
+
+
+@mps_only
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+@pytest.mark.parametrize(
+    "shape",
+    [
         (2, 64, 384),  # single-stage chlast, vectorized (C % 4 == 0)
         (2, 200, 384),  # multi-stage chlast (small B, per-batch > small limit)
         (2, 100, 383),  # odd C: scalar chlast path
@@ -920,3 +1131,121 @@ def test_apply_metal_optimizations_idempotent() -> None:
     assert not model.attn.training
     assert not model.gn.training
     assert not model.mygn.training
+
+
+@mps_only
+@pytest.mark.parametrize(
+    "kwargs", [dict(add_bias_kv=True), dict(add_zero_attn=True)], ids=str
+)
+def test_metal_multihead_attention_defers_unsupported_options(kwargs: dict) -> None:
+    """
+    Options the fast path doesn't implement go through native MHA instead of
+    being silently ignored.
+
+    :param kwargs: ``nn.MultiheadAttention`` option under test
+    """
+    import copy
+
+    torch.manual_seed(0)
+    mha = nn.MultiheadAttention(64, 4, batch_first=True, **kwargs).eval()
+    x = torch.randn(2, 50, 64)
+    with torch.no_grad():
+        ref, _ = mha(x, x, x, need_weights=False)
+    wrapped = MetalMultiheadAttention.from_mha(copy.deepcopy(mha))
+    wrapped = wrapped.to(device="mps", dtype=torch.float16).eval()
+    with torch.no_grad():
+        out, _ = wrapped(*(x.to("mps", torch.float16),) * 3, need_weights=False)
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(torch.float16))
+
+
+@mps_only
+def test_metal_rotary_broadcast_table_uses_eager_math() -> None:
+    """
+    A table that doesn't match ``[seq, dim // 2]`` exactly is broadcast by the
+    eager path rather than misread by the kernel.
+    """
+    t = torch.randn(2, 4, 9, 16, device="mps", dtype=torch.float16)
+    cos = torch.randn(1, 8, device="mps", dtype=torch.float16)
+    sin = torch.randn(1, 8, device="mps", dtype=torch.float16)
+    with torch.inference_mode():
+        out = metal_rotary(t, cos, sin)
+    assert torch.equal(out, _eager_rotary(t, cos, sin))
+
+
+@mps_only
+def test_module_built_under_inference_mode_runs() -> None:
+    """
+    Parameters created inside ``torch.inference_mode`` have no version
+    counter; the cached low-precision copies must still work.
+    """
+    with torch.inference_mode():
+        gn = nn.GroupNorm(1, 8).to("mps", torch.float16)
+        mod = MetalGroupNorm(gn)
+        out = mod(torch.randn(2, 8, 64, device="mps", dtype=torch.float16))
+    assert torch.isfinite(out).all()
+
+
+@mps_only
+def test_scnet_group_norms_are_swapped() -> None:
+    """
+    SCNet's GroupNorm subclass (it only adds an export path) still gets the
+    fused kernel; an exact-type check once silently skipped all of them.
+    """
+    from unblend.scnet import SCNet
+
+    # The tiny config inline: importing it from tests.test_scnet needs the
+    # repo root on sys.path, which only an editable install provides.
+    tiny = dict(
+        audio_channels=2,
+        dims=[4, 8, 16, 32],
+        nfft=512,
+        hop_size=128,
+        win_size=512,
+        band_stride=[1, 2, 4],
+        band_kernel=[3, 4, 4],
+        conv_depths=[1, 1, 1],
+        num_dplayer=2,
+    )
+    model = SCNet(sources=["a", "b", "c", "d"], **tiny).to("mps", torch.float16)
+    assert apply_metal_optimizations(model.eval())["group_norm"] > 0
+
+
+@mps_only
+def test_shader_parameter_cache_sees_a_replaced_weight() -> None:
+    """
+    Replacing a weight twice between forwards can give the second Parameter
+    the first one's freed id at the same version; the cache still refreshes.
+    """
+    x = torch.randn(2, 16, 32, device="mps", dtype=torch.float16)
+    mod = MetalGroupNorm(_make_gn(16)).to("mps").eval()
+    for _ in range(20):
+        _inference_call(mod, x)
+        for _ in range(2):
+            mod.weight = torch.nn.Parameter(torch.randn(16, device="mps"))
+        actual = _inference_call(mod, x)
+        expected = F.group_norm(x.float(), 1, mod.weight, mod.bias, mod.eps).half()
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), **_tol(torch.float16))
+
+
+@mps_only
+def test_a_copied_metal_norm_is_not_served_the_originals_cache() -> None:
+    """
+    Deepcopy drops the cast-weight cache and its record, so in-place edits on
+    the copy (whose versions restart) are never matched to the old cache.
+    """
+    import copy
+
+    x = torch.randn(2, 16, 32, device="mps", dtype=torch.float16)
+    mod = MetalGroupNorm(_make_gn(16)).to("mps").eval()
+    with torch.no_grad():
+        mod.weight.mul_(1.0)
+    _inference_call(mod, x)
+    clone = copy.deepcopy(mod)
+    for _ in range(3):
+        with torch.no_grad():
+            clone.weight.mul_(2.0)
+        actual = _inference_call(clone, x)
+        expected = F.group_norm(
+            x.float(), 1, clone.weight, clone.bias, clone.eps
+        ).half()
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), **_tol(torch.float16))

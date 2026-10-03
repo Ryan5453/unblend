@@ -9,19 +9,8 @@ import sys
 import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import IO
 
-
-class _BaseModel:
-    """
-    Small Cog ``BaseModel`` stand-in used only during module import.
-    """
-
-    def __init__(self, **values: object) -> None:
-        """
-        Store arbitrary output fields like Cog/Pydantic would.
-        """
-        self.__dict__.update(values)
+import pytest
 
 
 class _BasePredictor:
@@ -38,13 +27,9 @@ def _input(**kwargs: object) -> object:
 
 
 _COG = ModuleType("cog")
-_COG.BaseModel = _BaseModel
 _COG.BasePredictor = _BasePredictor
 _COG.Input = _input
 _COG.Path = Path
-# predictor.Output declares its stems as ``File``; only the annotation is
-# needed at import time, so any type object stands in.
-_COG.File = IO[bytes]
 sys.modules.setdefault("cog", _COG)
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -64,10 +49,8 @@ class _FakeSeparator:
 
     chunk_batch_size = 4
     # Mirrors the real Separator's attribute surface, which setup()'s
-    # diagnostic log line reads. Keep this in sync with unblend.api.Separator:
-    # stems live on ``model.sources``, NOT on the separator itself. An earlier
-    # version of this fake invented ``sources`` here, which let a real
-    # AttributeError reach a deployed image because the tests passed.
+    # diagnostic log line reads. Stems live on ``model.sources``, not on the
+    # separator; a fake ``sources`` here would hide a real AttributeError.
     device = "cpu"
     dtype = None
     sample_rate = 44100
@@ -115,13 +98,7 @@ def _request(name: str):
     """
     Create a request while an asyncio loop is running.
     """
-    return _PREDICTOR_MODULE._Request(
-        audio_path=Path(f"/{name}"),
-        model_name="htdemucs",
-        isolate_stem="none",
-        format="wav",
-        clip_mode="rescale",
-    )
+    return _PREDICTOR_MODULE._Request(audio_path=Path(f"/{name}"))
 
 
 def test_same_key_requests_batch_and_worker_retires() -> None:
@@ -132,7 +109,7 @@ def test_same_key_requests_batch_and_worker_retires() -> None:
     async def scenario() -> None:
         separator = _FakeSeparator()
         predictor = _predictor(separator, window=0.01)
-        key = ("htdemucs", 1, 0.25, "none")
+        key = ("htdemucs", 1, 0.25, "none", None)
         requests = [_request(f"track-{index}.wav") for index in range(3)]
         for request in requests:
             predictor._enqueue_request(key, request)
@@ -161,7 +138,7 @@ def test_many_distinct_keys_do_not_accumulate_workers() -> None:
         separator = _FakeSeparator()
         predictor = _predictor(separator)
         for index in range(200):
-            key = ("htdemucs", 1, round(index / 1000, 3), "none")
+            key = ("htdemucs", 1, round(index / 1000, 3), "none", None)
             request = _request(f"track-{index}.wav")
             predictor._enqueue_request(key, request)
             assert await request.future == f"result:track-{index}.wav"
@@ -181,7 +158,7 @@ def test_worker_initialization_failure_resolves_request_and_retires() -> None:
     async def scenario() -> None:
         predictor = _predictor(_FakeSeparator())
         predictor.separators = {}
-        key = ("missing", 1, 0.25, "none")
+        key = ("missing", 1, 0.25, "none", None)
         request = _request("track.wav")
         predictor._enqueue_request(key, request)
 
@@ -241,7 +218,7 @@ def test_completed_batch_is_released_before_next_inference() -> None:
     async def scenario() -> None:
         separator = LifetimeSeparator()
         predictor = _predictor(separator)
-        key = ("htdemucs", 1, 0.25, "none")
+        key = ("htdemucs", 1, 0.25, "none", None)
 
         first = _request("first.wav")
         first_future = first.future
@@ -290,7 +267,7 @@ def test_failed_batch_falls_back_per_request_and_retires() -> None:
 
     async def scenario() -> None:
         predictor = _predictor(PartiallyFailingSeparator(), window=0.01)
-        key = ("htdemucs", 1, 0.25, "none")
+        key = ("htdemucs", 1, 0.25, "none", None)
         good = _request("good.wav")
         bad = _request("bad.wav")
         predictor._enqueue_request(key, good)
@@ -316,10 +293,8 @@ def test_setup_rejects_cpu_fallback(monkeypatch) -> None:
     ``setup()`` refuses to boot on CPU because cog.yaml declares ``gpu: true``.
 
     A host driver too old for the installed CUDA wheel makes
-    ``torch.cuda.is_available()`` return False with only a UserWarning, so
-    without this guard the image boots clean and serves correct audio at ~35x
-    the latency, with compile and batching silently disabled. The failure has
-    to be loud to be diagnosable.
+    ``torch.cuda.is_available()`` return False with only a warning, so without
+    this guard the image would silently serve from CPU.
     """
     monkeypatch.delenv("UNBLEND_ALLOW_CPU", raising=False)
     monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: False)
@@ -358,13 +333,9 @@ def test_output_stems_upload_rather_than_inline() -> None:
     """
     Output stems must be ``Path`` (uploaded), never ``File`` (inlined base64).
 
-    Cog serializes a ``File`` into the prediction response as a base64 data
-    URI. That is survivable for a 3s clip and fatal for real audio: a 225s song
-    as wav is ~160MB of stems, so ~212MB of base64 in one JSON body. Measured
-    on an H100 the separation took 0.65s and the prediction then sat in
-    ``processing`` for over 22 minutes without ever returning, while the same
-    song as mp3 (~19MB inlined) completed with predict_time 11.08s. A ``Path``
-    is uploaded to object storage instead, so payload size stops mattering.
+    Cog serializes a ``File`` into the response as a base64 data URI, which
+    stalls the prediction for full-length wav output; a ``Path`` is uploaded
+    to object storage instead.
     """
     hints = _PREDICTOR_MODULE.Output.__annotations__
     assert hints, "Output must declare stems for Cog's static schema generator"
@@ -380,10 +351,7 @@ def test_setup_warms_up_on_cuda(monkeypatch) -> None:
     ``setup()`` forces the compiled path's CUDAGraph capture at boot.
 
     Capture happens on the first forward rather than in ``Separator()``, so
-    without a warmup the first *prediction* pays it -- 16.4s measured on an
-    H200 against 0.29s warm, which is most of the ~20s predict_time seen in
-    production on a 3s clip. Replicate does not bill setup per prediction, so
-    the cost belongs here.
+    without a warmup the first prediction pays it.
     """
     monkeypatch.setenv("UNBLEND_ALLOW_CPU", "1")
     monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: True)
@@ -409,9 +377,8 @@ def test_setup_survives_a_failing_warmup(monkeypatch) -> None:
     """
     A warmup that raises degrades to a slow first prediction, never a dead boot.
 
-    An earlier diagnostics block read an attribute the real Separator lacked and
-    Replicate permanently disabled that version, so anything setup() runs purely
-    for performance has to be non-fatal.
+    Replicate disables a version whose setup fails, so anything setup() runs
+    purely for performance has to be non-fatal.
     """
     monkeypatch.setenv("UNBLEND_ALLOW_CPU", "1")
     monkeypatch.setattr(_PREDICTOR_MODULE.torch.cuda, "is_available", lambda: True)
@@ -438,10 +405,8 @@ def test_diagnostic_attributes_exist_on_separator() -> None:
     setup()'s diagnostic line reads private Separator attributes; keep them real.
 
     The line is wrapped in a try/except so a rename cannot break the boot, which
-    means a typo would silently reduce it to "diagnostics unavailable" -- exactly
-    when the numbers are needed to explain a slow GPU. This asserts against the
-    real class rather than the fake above, because a fake that invented
-    ``sources`` is what let an AttributeError reach a deployed image.
+    means a typo would silently reduce it to "diagnostics unavailable". This
+    asserts against the real class, not the fake above.
     """
     import inspect
     import re
@@ -467,3 +432,163 @@ def test_diagnostic_attributes_exist_on_separator() -> None:
 
     # Stems come from sep.model.sources; Separator itself has no .sources.
     assert "sources" not in assigned
+
+
+@pytest.mark.parametrize("bad", ["../../etc/x", "w/av", "", "notaformat"])
+def test_output_format_is_validated_before_separation(bad: str) -> None:
+    """
+    A format that isn't an encodable bare extension is refused up front; it
+    becomes a filename suffix, so a path in it must never reach the disk.
+
+    :param bad: Rejected format string.
+    """
+    from unblend import ValidationError
+
+    with pytest.raises(ValidationError):
+        _PREDICTOR_MODULE._check_output_format(bad)
+    _PREDICTOR_MODULE._check_output_format("wav")
+
+
+def test_batches_are_capped_by_audio_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Requests whose combined length exceeds the budget are split across batches
+    instead of loading every song into one ``separate()`` call.
+
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    monkeypatch.setattr(
+        _PREDICTOR_MODULE,
+        "_duration_seconds",
+        lambda _path: _PREDICTOR_MODULE._MAX_BATCH_AUDIO_SECONDS * 0.6,
+    )
+
+    async def scenario() -> list[int]:
+        """
+        Queue three long requests and record the batch sizes.
+
+        :return: Batch sizes seen by the separator.
+        """
+        separator = _FakeSeparator()
+        predictor = _predictor(separator, window=0.05)
+        requests = [_request(f"r{i}") for i in range(3)]
+        key = ("htdemucs", 1, 0.25, "none", None)
+        for request in requests:
+            predictor._enqueue_request(key, request)
+        await asyncio.gather(*(request.future for request in requests))
+        return [len(call) if isinstance(call, list) else 1 for call in separator.calls]
+
+    assert asyncio.run(scenario()) == [1, 1, 1]
+
+
+def test_overlong_requests_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A request longer than the per-request limit fails fast instead of being
+    decoded into memory alongside every other prediction.
+
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from unblend import ValidationError
+
+    monkeypatch.setattr(
+        _PREDICTOR_MODULE,
+        "_duration_seconds",
+        lambda _path: _PREDICTOR_MODULE._MAX_REQUEST_AUDIO_SECONDS + 1,
+    )
+    predictor = _predictor(_FakeSeparator())
+
+    async def call() -> None:
+        """
+        Run one prediction.
+        """
+        await predictor.predict(
+            audio=Path("/long.wav"),
+            model="htdemucs",
+            format="wav",
+            isolate_stem="none",
+            shifts=1,
+            split_overlap=0.25,
+            clip_mode="rescale",
+        )
+
+    with pytest.raises(ValidationError, match="limit"):
+        asyncio.run(call())
+
+
+def test_duration_without_container_metadata_is_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A container that reports no duration is measured by decoding, stopping
+    once past the request limit, so it can't bypass the limit.
+
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from types import SimpleNamespace
+
+    import torch
+    import torchcodec.decoders
+
+    calls: list[float] = []
+
+    class _Decoder:
+        """
+        Endless stream at 10 Hz with no duration metadata.
+        """
+
+        metadata = SimpleNamespace(duration_seconds=None)
+
+        def __init__(self, _path: str) -> None:
+            """
+            :param _path: Ignored.
+            """
+
+        def get_samples_played_in_range(self, start: float, stop: float) -> object:
+            """
+            :param start: Range start in seconds.
+            :param stop: Range end in seconds.
+            :return: Ten samples per second of range.
+            """
+            calls.append(start)
+            return SimpleNamespace(
+                data=torch.zeros(2, int((stop - start) * 10)), sample_rate=10
+            )
+
+    monkeypatch.setattr(torchcodec.decoders, "AudioDecoder", _Decoder)
+    seconds = _PREDICTOR_MODULE._duration_seconds(Path("/stream.aac"))
+    assert seconds > _PREDICTOR_MODULE._MAX_REQUEST_AUDIO_SECONDS
+    assert len(calls) == int(_PREDICTOR_MODULE._MAX_REQUEST_AUDIO_SECONDS // 60) + 1
+
+
+def test_a_failing_single_request_is_separated_once() -> None:
+    """
+    A batch of one that fails is not retried alone (that would repeat the
+    same separation); its error goes straight to the request.
+    """
+
+    class FailingSeparator(_FakeSeparator):
+        """
+        Count calls and always fail.
+        """
+
+        calls = 0
+
+        def separate(self, audio: object, **kwargs: object) -> object:
+            """
+            Fail every call.
+            """
+            FailingSeparator.calls += 1
+            raise ValueError("bad input")
+
+    async def scenario() -> None:
+        predictor = _predictor(FailingSeparator(), window=0.01)
+        request = _request("bad.wav")
+        predictor._enqueue_request(("htdemucs", 1, 0.25, "none", None), request)
+        try:
+            await request.future
+        except ValueError as exc:
+            assert str(exc) == "bad input"
+        else:
+            raise AssertionError("request unexpectedly succeeded")
+
+    asyncio.run(scenario())
+    assert FailingSeparator.calls == 1

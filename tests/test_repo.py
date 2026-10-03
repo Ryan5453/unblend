@@ -1,8 +1,8 @@
 """
 Offline checks for ``unblend.repo`` integrity and safe-loading gates.
 
-Registered models use explicit architectures plus tensor-only Safetensors;
-legacy pickle compatibility is tested as a separate opt-in boundary.
+Registered models use explicit architectures plus tensor-only Safetensors
+weights, verified by size and SHA-256 before anything reads them.
 """
 
 import json
@@ -11,11 +11,13 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from unblend.exceptions import ModelLoadingError
 from unblend.repo import (
@@ -413,19 +415,6 @@ def test_remove_model_unlinks_cached_layers(
     assert not layer.exists()
 
 
-def test_layer_sha256_lookup(tmp_path: Path) -> None:
-    """
-    Public ``layer_sha256`` returns the full 64-character digest for a known
-    layer and raises ``KeyError`` for an unknown one.
-
-    :param tmp_path: pytest temporary directory fixture
-    """
-    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
-    assert repo.layer_sha256(FIRST_KEY) == FIRST_SHA
-    with pytest.raises(KeyError):
-        repo.layer_sha256("nothere")
-
-
 def test_get_model_redownloads_corrupt_cached_layer(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -465,7 +454,7 @@ def test_get_model_redownloads_corrupt_cached_layer(
     )
 
     # get_model swallows the bad cache hit, removes the file, then hits the
-    # (now mocked-out) download path. After the recovery, the bag-of-models
+    # mocked-out download path. After the recovery, the bag-of-models
     # assembly tries to introspect the placeholder and fails — that's fine;
     # we only need to verify the corrupt cache file is gone and the download
     # was attempted.
@@ -559,7 +548,7 @@ def test_only_load_requires_exclusive_specialist_weight(tmp_path: Path) -> None:
         [1.0, 1.0, 1.0, 1.0],
     ]
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
-    assert repo.required_layers("fakemodel", only_load="drums") == [
+    assert repo.required_files("fakemodel", only_load="drums") == [
         FIRST_KEY,
         SECOND_KEY,
     ]
@@ -581,7 +570,7 @@ def test_get_model_rejects_only_load_before_cache_or_network(
     with pytest.raises(ModelLoadingError, match="not found"):
         repo.get_model("fakemodel", only_load=stem)
     with pytest.raises(ModelLoadingError, match="not found"):
-        repo.required_layers("fakemodel", only_load=stem)
+        repo.required_files("fakemodel", only_load=stem)
 
 
 def test_artifact_lock_wraps_acquisition_filesystem_error(
@@ -638,7 +627,9 @@ def test_roformer_materializes_state_while_cache_lock_is_held(
     }
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "cache"))
     repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
-    cache_path = repo._checkpoint_cache_path(repo.list_models()["tiny"])
+    cache_path = repo_module._artifact_cache_path(
+        repo.list_models()["tiny"]["checkpoint"]
+    )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_bytes(checkpoint.read_bytes())
 
@@ -661,8 +652,6 @@ def test_roformer_materializes_state_while_cache_lock_is_held(
 
     monkeypatch.setattr(repo_module, "_artifact_lock", tracked_lock)
     monkeypatch.setattr(repo_module, "load_file", fake_load_file)
-    # Construction now dispatches through the backend registry rather than
-    # calling build_roformer directly, so patch the registry entry point.
     monkeypatch.setattr(
         repo_module.backends,
         "build",
@@ -686,13 +675,15 @@ def test_get_cache_dir_env_override(
     with tilde expansion (Docker ENV / systemd values are not shell-expanded),
     and without creating the directory (that happens on first download).
     """
+    # Resolved on both sides: the override is resolved, and tmp or HOME may
+    # sit behind a symlink (/tmp on macOS, /home on some clusters).
     target = tmp_path / "custom-cache"
     monkeypatch.setenv("UNBLEND_CACHE_DIR", str(target))
-    assert get_cache_dir() == target
+    assert get_cache_dir() == target.resolve()
     assert not target.exists()
 
     monkeypatch.setenv("UNBLEND_CACHE_DIR", "~/some-demucs-cache")
-    assert get_cache_dir() == Path.home() / "some-demucs-cache"
+    assert get_cache_dir() == (Path.home() / "some-demucs-cache").resolve()
 
 
 def test_get_cache_info_reports_partial_models(
@@ -700,9 +691,8 @@ def test_get_cache_info_reports_partial_models(
 ) -> None:
     """
     A model with some but not all layers cached is reported with
-    ``complete: False`` and the cached subset's size — previously it was
-    omitted entirely, hiding its disk usage from ``models list`` and
-    ``models remove --all``.
+    ``complete: False`` and the cached subset's size, so ``models list`` and
+    ``models remove --all`` account for its disk usage.
     """
     cache = tmp_path / "cache"
     cache.mkdir()
@@ -723,17 +713,23 @@ def test_get_cache_info_reports_partial_models(
 
     assert repo.get_cache_info() == {}
 
-    (cache / f"{FIRST_KEY}.safetensors").write_bytes(b"xxxx")
+    (cache / f"{FIRST_KEY}.safetensors").write_bytes(b"x" * 1024)
     info = repo.get_cache_info()
     assert info["fakemodel"]["complete"] is False
-    assert info["fakemodel"]["total_layers"] == 2
-    assert info["fakemodel"]["size_bytes"] == 4
-    assert list(info["fakemodel"]["layers"]) == [FIRST_KEY]
+    assert info["fakemodel"]["total_files"] == 2
+    assert info["fakemodel"]["size_bytes"] == 1024
+    assert list(info["fakemodel"]["files"]) == [FIRST_KEY]
+
+    # A truncated file is listed (removal must find it) but not complete.
+    (cache / f"{SECOND_KEY}.safetensors").write_bytes(b"y")
+    info = repo.get_cache_info()
+    assert info["fakemodel"]["files"][SECOND_KEY]["complete"] is False
+    assert info["fakemodel"]["complete"] is False
 
     (cache / f"{SECOND_KEY}.safetensors").write_bytes(b"yy")
     info = repo.get_cache_info()
     assert info["fakemodel"]["complete"] is True
-    assert info["fakemodel"]["size_bytes"] == 6
+    assert info["fakemodel"]["size_bytes"] == 1026
 
 
 def test_sweep_stale_downloads_removes_staging_files(
@@ -975,7 +971,7 @@ def _tiny_scnet_checkpoint(tmp_path: Path, sources: list[str]) -> tuple[Path, di
         band_stride=[1, 2, 4],
         band_kernel=[3, 4, 4],
         conv_depths=[1, 1, 1],
-        num_dplayer=1,
+        num_dplayer=2,
     )
     model = SCNet(sources=list(sources), **config)
     path = tmp_path / "scnet.safetensors"
@@ -1003,7 +999,7 @@ def test_demucs_model_loads_from_a_local_file(
 ) -> None:
     """
     A user-supplied Demucs checkpoint loads from disk, with the backend
-    derived from its architecture and its licence label passed through
+    derived from its architecture and its license label passed through
     untouched.
     """
     from unblend.htdemucs import HTDemucs
@@ -1024,7 +1020,7 @@ def test_demucs_model_loads_from_a_local_file(
     repo = ModelRepository(extra_models=extra)
     listed = repo.list_models()["custom"]
     assert listed["backend"] == "demucs", "backend should follow from architecture"
-    assert listed["license"] == "my own terms", "licence is a pass-through label"
+    assert listed["license"] == "my own terms", "license is a pass-through label"
 
     model = repo.get_model("custom")
     assert isinstance(model, HTDemucs)
@@ -1034,7 +1030,7 @@ def test_demucs_model_loads_from_a_local_file(
     # for, and ``models remove`` must never unlink it.
     assert repo.is_fully_local("custom")
     assert repo.local_artifacts("custom") == [weights]
-    assert repo.required_layers("custom") == []
+    assert repo.required_files("custom") == []
     assert repo.get_cache_info() == {}
     assert repo.remove_model("custom") is False
     assert weights.is_file()
@@ -1086,7 +1082,7 @@ def test_demucs_layer_from_a_url_is_fetched_once_then_cached(
     repo = ModelRepository(extra_models=extra)
     # No explicit ``checksum``: the cache filename comes from the digest.
     cached = cache / f"{digest[:16]}.safetensors"
-    assert repo.required_layers("custom") == [digest[:16]]
+    assert repo.required_files("custom") == [digest[:16]]
 
     repo.get_model("custom")
     assert downloads == [url]
@@ -1133,7 +1129,7 @@ def test_mixed_local_and_remote_layers_only_account_for_the_download(
     repo = ModelRepository(extra_models=extra)
     assert repo.is_fully_local("custom") is False
     assert repo.local_artifacts("custom") == [weights]
-    assert repo.required_layers("custom") == ["b" * 16]
+    assert repo.required_files("custom") == ["b" * 16]
 
 
 def test_entry_without_a_known_architecture_is_rejected(tmp_path: Path) -> None:
@@ -1165,7 +1161,7 @@ def test_declared_backend_is_rejected(tmp_path: Path) -> None:
     """
     bad = _good_metadata()
     bad["models"]["fakemodel"]["backend"] = "demucs"
-    with pytest.raises(ModelLoadingError, match="no longer exists"):
+    with pytest.raises(ModelLoadingError, match="declares a .backend."):
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
@@ -1179,7 +1175,7 @@ def test_declared_backend_is_rejected_on_a_member(tmp_path: Path) -> None:
     entry = bad["models"]["fakemodel"]
     artifact = entry.pop("checkpoint")
     entry["members"] = [{"backend": "demucs", **artifact}, dict(artifact)]
-    with pytest.raises(ModelLoadingError, match="no longer exists"):
+    with pytest.raises(ModelLoadingError, match="declares a .backend."):
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
@@ -1192,7 +1188,7 @@ def test_remote_artifact_spelling_is_rejected(tmp_path: Path) -> None:
     bad = _good_metadata()
     layer = bad["models"]["fakemodel"]["checkpoint"]
     layer["remote"] = layer.pop("url")
-    with pytest.raises(ModelLoadingError, match="local path or an https url"):
+    with pytest.raises(ModelLoadingError, match="unknown field.*remote"):
         ModelRepository(metadata_path=_write_metadata(tmp_path, bad))
 
 
@@ -1200,8 +1196,8 @@ def test_single_checkpoint_entries_are_validated_at_construction(
     tmp_path: Path,
 ) -> None:
     """
-    Every backend's artifacts are checked up front. An SCNet entry with an
-    unverifiable download used to construct fine and fail mid-``get_model``.
+    Every backend's artifacts are checked up front, so an SCNet entry with an
+    unverifiable download fails at construction rather than mid-``get_model``.
     """
     bad = {
         "models": {
@@ -1319,7 +1315,7 @@ def test_ensemble_members_build_and_honour_weights(
     # One contributor for stem "b", so isolating it builds that member alone.
     isolated = repo.get_model("custom", only_load="b")
     assert isinstance(isolated, HTDemucs)
-    assert repo.required_layers("custom", only_load="b") == []
+    assert repo.required_files("custom", only_load="b") == []
 
 
 def test_member_can_reference_another_registered_model(
@@ -1379,7 +1375,7 @@ def test_heterogeneous_members_report_the_ensemble_backend(tmp_path: Path) -> No
                     },
                     {
                         "architecture": "mel_band_roformer",
-                        "config": {"dim": 16},
+                        "config": {"dim": 16, "stereo": True},
                         "samplerate": 44100,
                         "segment_samples": 44100,
                         "checkpoint": {
@@ -1588,3 +1584,1189 @@ def test_ensemble_combination_is_validated_offline(
         ModelRepository(
             metadata_path=_write_metadata(tmp_path, {"models": {"custom": entry}})
         )
+
+
+def test_default_models_file_is_loaded_without_env(
+    _isolate_default_models_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``~/.unblend/models.yaml`` (where ``models import`` writes) is read even
+    when ``UNBLEND_EXTRA_MODELS`` is unset, and listing it there too doesn't
+    load it twice.
+
+    :param _isolate_default_models_file: the substituted default file path
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    path = _isolate_default_models_file
+    entry = {
+        "members": [{"model": "htdemucs"}, {"model": "scnet_small"}],
+        "sources": ["drums", "bass", "other", "vocals"],
+    }
+    path.write_text(json.dumps({"models": {"custom": entry}}))
+    monkeypatch.delenv("UNBLEND_EXTRA_MODELS", raising=False)
+    assert "custom" in ModelRepository().list_models()
+
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(path))
+    assert "custom" in ModelRepository().list_models()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"models": []}, {"models": {"broken": {"architecture": "htdemucs"}}}],
+    ids=["not-a-mapping", "invalid-entry"],
+)
+def test_a_broken_default_models_file_is_skipped_with_a_warning(
+    _isolate_default_models_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+) -> None:
+    """
+    The implicitly loaded default file can't take the built-in models down.
+
+    :param _isolate_default_models_file: the substituted default file path
+    :param monkeypatch: pytest monkeypatch fixture
+    :param payload: A models file that fails validation
+    """
+    monkeypatch.delenv("UNBLEND_EXTRA_MODELS", raising=False)
+    _isolate_default_models_file.write_text(json.dumps(payload))
+    with pytest.warns(UserWarning, match="Ignoring"):
+        models = ModelRepository().list_models()
+    assert "htdemucs" in models
+
+
+def test_default_file_clashing_with_an_env_file_is_skipped(
+    _isolate_default_models_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A name defined both in an env-listed file and the default file doesn't
+    break the registry; the explicit file wins.
+
+    :param _isolate_default_models_file: the substituted default file path
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    entry = {
+        "members": [{"model": "htdemucs"}, {"model": "scnet_small"}],
+        "sources": ["drums", "bass", "other", "vocals"],
+    }
+    env_file = tmp_path / "env.json"
+    env_file.write_text(json.dumps({"models": {"dup": entry}}))
+    _isolate_default_models_file.write_text(json.dumps({"models": {"dup": entry}}))
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(env_file))
+    with pytest.warns(UserWarning, match="already registered"):
+        assert "dup" in ModelRepository().list_models()
+
+
+def test_remove_model_keeps_files_other_models_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Removing an ensemble doesn't delete its members' weights unless asked to,
+    or unless every model using them is being removed too.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from unblend.repo import _artifact_cache_path
+
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: tmp_path)
+    repo = ModelRepository(extra_models=[])
+    paths = [
+        _artifact_cache_path(s) for s in repo._artifacts("roformer_vocals_ensemble")
+    ]
+
+    def populate() -> None:
+        """
+        Put a placeholder file at every member's cache path.
+        """
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+
+    populate()
+    assert set(repo.shared_artifacts("roformer_vocals_ensemble")) == set(paths)
+    assert repo.remove_model("roformer_vocals_ensemble") is False
+    assert all(path.exists() for path in paths)
+
+    members = ["melband_roformer_kim", "bs_roformer_anvuew"]
+    assert repo.remove_model("roformer_vocals_ensemble", also_removing=members)
+    assert not any(path.exists() for path in paths)
+
+    populate()
+    assert repo.remove_model("roformer_vocals_ensemble", include_shared=True)
+    assert not any(path.exists() for path in paths)
+
+
+@pytest.mark.parametrize("segment", ["abc", -1, float("nan"), True, 1e-5])
+def test_invalid_segment_is_rejected_at_construction(
+    tmp_path: Path, segment: object
+) -> None:
+    """
+    ``segment`` is validated with everything else, not at load or apply time.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param segment: An invalid segment value
+    """
+    entry = {
+        "members": [{"model": "htdemucs"}, {"model": "scnet_small"}],
+        "sources": ["drums", "bass", "other", "vocals"],
+        "segment": segment,
+    }
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {"bad": entry}}))
+    with pytest.raises(
+        ModelLoadingError, match="invalid segment|shorter than one sample"
+    ):
+        ModelRepository(extra_models=path)
+
+
+def test_a_huge_ensemble_segment_loads_as_no_cap(tmp_path: Path) -> None:
+    """
+    ``segment: 1e307`` overflows when multiplied by a sample rate; it must
+    load (a cap above every member's own), not crash every command.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    entry = {
+        "members": [{"model": "htdemucs"}, {"model": "scnet_small"}],
+        "sources": ["drums", "bass", "other", "vocals"],
+        "segment": 1e307,
+    }
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {"huge": entry}}))
+    assert "huge" in ModelRepository(extra_models=path).list_models()
+
+
+def test_ensemble_members_with_different_sample_rates_fail_before_download(
+    tmp_path: Path,
+) -> None:
+    """
+    Declared geometry mismatches are caught at construction, not after every
+    member has downloaded.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    member_keys = {"architecture", "checkpoint", "config", "segment_samples"}
+    other = {k: v for k, v in base.items() if k in member_keys}
+    other["samplerate"] = 48000
+    entry = {
+        "members": [{"model": "scnet_small"}, other],
+        "sources": base["sources"],
+    }
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {"mixed": entry}}))
+    with pytest.raises(ModelLoadingError, match="disagree on sample rate"):
+        ModelRepository(extra_models=path)
+
+
+def test_relative_artifact_paths_resolve_against_the_models_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``path: weights.safetensors`` means the file next to the models file, not
+    one in whatever directory unblend happens to run from.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    path = models_dir / "m.json"
+    entry = {
+        "architecture": "scnet",
+        "sources": ["a"],
+        "samplerate": 44100,
+        "segment_samples": 44100,
+        "config": {"dims": [4]},
+        "checkpoint": {"format": "safetensors", "path": "w.safetensors"},
+    }
+    path.write_text(json.dumps({"models": {"rel": entry}}))
+    monkeypatch.chdir(tmp_path)
+    repo = ModelRepository(extra_models=path)
+    assert repo.local_artifacts("rel") == [(models_dir / "w.safetensors").resolve()]
+
+
+def test_missing_local_checkpoint_says_so(tmp_path: Path) -> None:
+    """
+    An entry that relies on its checkpoint's header, whose file is missing,
+    reports the missing file rather than an unknown architecture.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    path = tmp_path / "m.json"
+    entry = {
+        "sources": ["a"],
+        "checkpoint": {
+            "format": "safetensors",
+            "path": str(tmp_path / "gone.safetensors"),
+        },
+    }
+    path.write_text(json.dumps({"models": {"gone": entry}}))
+    with pytest.raises(ModelLoadingError, match="checkpoint file not found"):
+        ModelRepository(extra_models=path)
+
+
+def test_remove_model_ignores_ensembles_that_were_never_downloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``htdemucs``'s file is also an ensemble member, but if that ensemble's other
+    member isn't cached nobody else is using it, so removal deletes it.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from unblend.repo import _artifact_cache_path
+
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: tmp_path)
+    repo = ModelRepository(extra_models=[])
+    (path,) = [_artifact_cache_path(s) for s in repo._artifacts("htdemucs")]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x")
+    assert repo.shared_artifacts("htdemucs") == {}
+    assert repo.remove_model("htdemucs") is True
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("names", [["foo", "FOO"], ["auto"]])
+def test_models_file_rejects_case_duplicates_and_auto(
+    tmp_path: Path, names: list[str]
+) -> None:
+    """
+    Names that collide case-insensitively, or the reserved ``auto``, fail.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param names: Entry names to write
+    """
+    entry = {
+        "members": [{"model": "htdemucs"}, {"model": "scnet_small"}],
+        "sources": ["drums", "bass", "other", "vocals"],
+    }
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {n: entry for n in names}}))
+    with pytest.raises(ModelLoadingError):
+        ModelRepository(extra_models=path)
+
+
+def test_models_file_rejects_unknown_fields_and_versions(tmp_path: Path) -> None:
+    """
+    A misspelled field (``wieghts``) or an unknown ``version`` fails instead
+    of silently falling back to defaults.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    entry = {
+        "members": [{"model": "htdemucs"}, {"model": "scnet_small"}],
+        "sources": ["drums", "bass", "other", "vocals"],
+    }
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {"x": {**entry, "wieghts": [[1], [1]]}}}))
+    with pytest.raises(ModelLoadingError, match="unknown field"):
+        ModelRepository(extra_models=path)
+    path.write_text(json.dumps({"version": 2, "models": {"x": entry}}))
+    with pytest.raises(ModelLoadingError, match="version"):
+        ModelRepository(extra_models=path)
+
+
+def test_models_file_accepts_msst_style_configs(tmp_path: Path) -> None:
+    """
+    An MSST ``model:`` section pastes verbatim: ``!!python/tuple`` parses, and
+    training-only keys are dropped with a warning.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    weights, config = _tiny_scnet_checkpoint(tmp_path, ["a", "b", "c", "d"])
+    lines = "".join(
+        f"      {k}: !!python/tuple {list(v)}\n"
+        if isinstance(v, list)
+        else f"      {k}: {v}\n"
+        for k, v in config.items()
+    )
+    path = tmp_path / "m.yaml"
+    path.write_text(
+        "models:\n  mine:\n    architecture: scnet\n    sources: [a, b, c, d]\n"
+        "    samplerate: 44100\n    segment_samples: 44100\n    config:\n"
+        f"{lines}      flash_attn: true\n"
+        f"    checkpoint: {{format: safetensors, path: {weights}}}\n"
+    )
+    with pytest.warns(UserWarning, match="flash_attn"):
+        repo = ModelRepository(extra_models=path)
+    assert repo.get_model("mine").sources == ["a", "b", "c", "d"]
+
+
+def test_verified_cache_files_load_from_a_read_only_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An already-downloaded artifact loads without creating a lock file, so a
+    read-only or shared cache directory works.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores permission bits")
+    import hashlib
+
+    from unblend.repo import _artifact_cache_path
+
+    weights, config = _tiny_demucs_layer(tmp_path)
+    data = weights.read_bytes()
+    spec = {
+        "format": "safetensors",
+        "url": "https://example.invalid/w.safetensors",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+    }
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr("unblend.repo.get_cache_dir", lambda: cache)
+    _artifact_cache_path(spec).write_bytes(data)
+    extra = _extra_models_file(
+        tmp_path,
+        {
+            "architecture": "htdemucs",
+            "sources": config["sources"],
+            "config": config,
+            "checkpoint": spec,
+        },
+    )
+    os.chmod(cache, 0o555)
+    try:
+        model = ModelRepository(extra_models=extra).get_model("custom")
+    finally:
+        os.chmod(cache, 0o755)
+    assert model.sources == config["sources"]
+    assert not list(cache.glob(".*.lock"))
+
+
+def test_download_resumes_after_a_dropped_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A connection that drops mid-download resumes with an HTTP Range request
+    instead of starting over.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    import httpx
+
+    payload = b"abcdefgh"
+    calls: list[dict] = []
+
+    class Response:
+        """
+        First attempt drops after four bytes; the resumed one sends the rest.
+        """
+
+        def __init__(self, headers: dict) -> None:
+            self.range = headers.get("Range")
+            self.status_code = 206 if self.range else 200
+            body = payload[4:] if self.range else payload
+            self.headers = {"content-length": str(len(body))}
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def iter_bytes(self, chunk_size: int):
+            del chunk_size
+            if self.range:
+                yield self.body
+            else:
+                yield self.body[:4]
+                raise httpx.ReadError("connection reset")
+
+    def fake_stream(_method: str, _url: str, headers: dict, **_kwargs: object):
+        calls.append(dict(headers))
+        return Response(headers)
+
+    monkeypatch.setattr("unblend.repo.httpx.stream", fake_stream)
+    monkeypatch.setattr("unblend.repo.time.sleep", lambda _s: None)
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
+    target = tmp_path / "cache" / "model.safetensors"
+    repo._download_verified_file(
+        "https://example.invalid/model",
+        target,
+        sha256(payload).hexdigest(),
+        len(payload),
+    )
+    assert target.read_bytes() == payload
+    assert calls == [{}, {"Range": "bytes=4-"}]
+
+
+def test_models_file_structure_typos_are_refused(tmp_path: Path) -> None:
+    """
+    A misspelled top-level key, a non-integer version, and unknown or
+    ignored member fields are errors rather than silently dropped.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    path = tmp_path / "m.yaml"
+    for text, match in (
+        ("version: 1\nmodels: {}\nmodles: {}\n", "unknown top-level"),
+        ("version: true\nmodels: {}\n", "version"),
+        (
+            "models:\n  ens:\n    sources: [drums, bass, other, vocals]\n"
+            "    members: [{model: htdemucs, weight: 2}, {model: scnet_small}]\n",
+            "unknown field",
+        ),
+    ):
+        path.write_text(text)
+        with pytest.raises(ModelLoadingError, match=match):
+            ModelRepository(extra_models=path)
+
+
+def test_uppercase_sha256_and_duplicate_listing_are_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An upper-case digest is normalized, and a file listed twice in
+    ``UNBLEND_EXTRA_MODELS`` loads once instead of clashing with itself.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    entry = {k: v for k, v in base.items() if k != "backend"}
+    entry["checkpoint"] = {
+        **entry["checkpoint"],
+        "sha256": entry["checkpoint"]["sha256"].upper(),
+    }
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {"mine": entry}}))
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", os.pathsep.join([str(path)] * 2))
+    repo = ModelRepository()
+    assert repo.list_models()["mine"]["checkpoint"]["sha256"].islower()
+
+
+def test_a_missing_listed_models_file_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A file ``UNBLEND_EXTRA_MODELS`` lists before it exists (the usual order
+    before a first import) is skipped with a warning, not fatal.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(tmp_path / "later.yaml"))
+    with pytest.warns(UserWarning, match="doesn't exist"):
+        assert "htdemucs" in ModelRepository().list_models()
+
+
+def test_a_broken_listed_file_is_blamed_not_the_default_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_default_models_file: Path,
+) -> None:
+    """
+    With a valid default file present, an error in a listed file names the
+    listed file instead of warning that the default one is being ignored.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param _isolate_default_models_file: the substituted default file path
+    """
+    _isolate_default_models_file.write_text("version: 1\nmodels: {}\n")
+    listed = tmp_path / "listed.yaml"
+    listed.write_text(
+        "models:\n  ens:\n    sources: [drums, bass, other, vocals]\n"
+        "    members: [{model: htdemucs}, {model: nope}]\n"
+    )
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(listed))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ModelLoadingError, match="listed.yaml"):
+            ModelRepository()
+
+
+def test_entry_errors_name_their_models_file(tmp_path: Path) -> None:
+    """
+    An entry-level error (here an unknown field) names the models file the
+    entry came from.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    path = tmp_path / "m.yaml"
+    path.write_text("models:\n  mine:\n    sources: [a]\n    wieghts: []\n")
+    with pytest.raises(ModelLoadingError, match=r"m\.yaml"):
+        ModelRepository(extra_models=path)
+
+
+@pytest.mark.parametrize("failure", ["after_last_byte", "server_error"])
+def test_download_retries_transient_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """
+    A connection dropped after the last byte completes without a Range
+    request (which would get a 416), and a 5xx response is retried.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param failure: Which transient failure the first attempt hits.
+    """
+    import httpx
+
+    payload = b"abcdefgh"
+    calls: list[dict] = []
+
+    class Response:
+        """
+        First attempt fails as ``failure`` says; later ones succeed.
+        """
+
+        def __init__(self, first: bool) -> None:
+            self.first = first
+            self.status_code = 503 if first and failure == "server_error" else 200
+            self.headers = {"content-length": str(len(payload))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("GET", "https://example.invalid/model")
+                raise httpx.HTTPStatusError(
+                    "unavailable",
+                    request=request,
+                    response=httpx.Response(self.status_code, request=request),
+                )
+
+        def iter_bytes(self, chunk_size: int):
+            del chunk_size
+            yield payload
+            if self.first and failure == "after_last_byte":
+                raise httpx.ReadError("connection reset")
+
+    def fake_stream(_method: str, _url: str, headers: dict, **_kwargs: object):
+        calls.append(dict(headers))
+        return Response(first=len(calls) == 1)
+
+    monkeypatch.setattr("unblend.repo.httpx.stream", fake_stream)
+    monkeypatch.setattr("unblend.repo.time.sleep", lambda _s: None)
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
+    target = tmp_path / "cache" / "model.safetensors"
+    repo._download_verified_file(
+        "https://example.invalid/model",
+        target,
+        sha256(payload).hexdigest(),
+        len(payload),
+    )
+    assert target.read_bytes() == payload
+    assert calls == ([{}] if failure == "after_last_byte" else [{}, {}])
+
+
+def test_checkpoint_field_typos_are_refused(tmp_path: Path) -> None:
+    """
+    A misspelled ``checkpoint`` field (``sha265``) is an error rather than
+    silently skipping verification of a local file.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    weights = tmp_path / "w.safetensors"
+    weights.write_bytes(b"x")
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "mine": {
+                        "architecture": "htdemucs",
+                        "sources": ["a", "b"],
+                        "config": {"sources": ["a", "b"]},
+                        "checkpoint": {
+                            "format": "safetensors",
+                            "path": str(weights),
+                            "sha265": "0" * 64,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ModelLoadingError, match="sha265"):
+        ModelRepository(extra_models=path)
+
+
+def test_member_artifact_fields_beside_checkpoint_are_refused(tmp_path: Path) -> None:
+    """
+    A member with a ``checkpoint:`` mapping and a sibling ``sha256`` is an
+    error; the sibling would otherwise be dropped and never verified.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    base = ModelRepository(extra_models=[]).list_models()["htdemucs"]
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "bag": {
+                        "sources": base["sources"],
+                        "architecture": "htdemucs",
+                        "config": base["config"],
+                        "members": [
+                            {
+                                "checkpoint": {
+                                    "format": "safetensors",
+                                    "path": str(tmp_path / "a.safetensors"),
+                                },
+                                "sha256": "0" * 64,
+                            },
+                            {"model": "htdemucs"},
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ModelLoadingError, match="unknown field.*sha256"):
+        ModelRepository(extra_models=path)
+
+
+def test_every_family_is_built_in_eval_mode(tmp_path: Path) -> None:
+    """
+    ``get_model`` returns HTDemucs, and an ensemble with every submodule, in
+    eval mode like the other families, so a direct forward has dropout off
+    (and doesn't fail on MPS attention).
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    from safetensors.torch import save_file
+
+    from unblend.htdemucs import HTDemucs
+
+    config = dict(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    weights = tmp_path / "w.safetensors"
+    save_file(HTDemucs(**config).state_dict(), str(weights))
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "tiny": {
+                        "architecture": "htdemucs",
+                        "sources": ["a", "b"],
+                        "config": config,
+                        "checkpoint": {"format": "safetensors", "path": str(weights)},
+                    },
+                    "pair": {
+                        "sources": ["a", "b"],
+                        "members": [{"model": "tiny"}, {"model": "tiny"}],
+                    },
+                }
+            }
+        )
+    )
+    repo = ModelRepository(extra_models=path)
+    for name in ("tiny", "pair"):
+        model = repo.get_model(name)
+        assert not any(module.training for module in model.modules()), name
+
+
+@pytest.mark.parametrize(
+    "architecture, config_patch, match",
+    [
+        ("htdemucs", {"cac": False}, "cac"),
+        ("scnet", {"num_dplayer": 3}, "num_dplayer"),
+    ],
+)
+def test_unbuildable_configs_fail_before_download(
+    tmp_path: Path, architecture: str, config_patch: dict, match: str
+) -> None:
+    """
+    Configs the constructors refuse are refused when the registry loads, so a
+    remote entry never downloads weights it can't build.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param architecture: Architecture of the entry.
+    :param config_patch: Keys making the config unbuildable.
+    :param match: Expected error fragment.
+    """
+    base = ModelRepository(extra_models=[]).list_models()[
+        "htdemucs" if architecture == "htdemucs" else "scnet_small"
+    ]
+    entry = {k: v for k, v in base.items() if k != "backend"}
+    entry["architecture"] = architecture
+    entry["config"] = {**entry["config"], **config_patch}
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps({"models": {"bad": entry}}))
+    with pytest.raises(ModelLoadingError, match=match):
+        ModelRepository(extra_models=path)
+
+
+def test_a_broken_default_file_is_named_when_a_listed_file_needs_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_default_models_file: Path,
+) -> None:
+    """
+    When a listed ensemble uses a model from a default file that is broken by
+    an unrelated entry, the error names the real fault in the default file
+    rather than blaming the listed file for an "unknown" model.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param _isolate_default_models_file: the substituted default file path
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    good = {k: v for k, v in base.items() if k != "backend"}
+    _isolate_default_models_file.write_text(
+        json.dumps({"models": {"d1": good, "d2": {**good, "architecture": "nonsense"}}})
+    )
+    listed = tmp_path / "b.json"
+    listed.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "eb": {
+                        "sources": base["sources"],
+                        "members": [{"model": "d1"}, {"model": "scnet_small"}],
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(listed))
+    with pytest.raises(ModelLoadingError, match=r"d2(?s:.*)models\.yaml"):
+        ModelRepository()
+
+
+def test_a_listed_files_real_error_is_reported_not_a_missing_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_default_models_file: Path,
+) -> None:
+    """
+    A listed ensemble that uses a default-file model and also has a real
+    mistake (a weights row missing) reports that mistake, not a false
+    "unknown model" from the default file being dropped.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param _isolate_default_models_file: the substituted default file path
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    good = {k: v for k, v in base.items() if k != "backend"}
+    _isolate_default_models_file.write_text(json.dumps({"models": {"mine": good}}))
+    listed = tmp_path / "l.json"
+    listed.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "ens": {
+                        "sources": base["sources"],
+                        "members": [{"model": "mine"}, {"model": "scnet_small"}],
+                        "weights": [[1, 1, 1, 1]],
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(listed))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ModelLoadingError, match="weight row"):
+            ModelRepository()
+
+
+def test_a_sound_default_file_is_not_blamed_for_a_listed_files_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_default_models_file: Path,
+) -> None:
+    """
+    A default file whose ensemble uses a listed model is not warned about
+    when the listed file is broken by an unrelated entry; the error names
+    the listed file's fault.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param _isolate_default_models_file: the substituted default file path
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    good = {k: v for k, v in base.items() if k != "backend"}
+    listed = tmp_path / "l.json"
+    listed.write_text(
+        json.dumps(
+            {"models": {"l_good": good, "l_bad": {**good, "architecture": "nope"}}}
+        )
+    )
+    monkeypatch.setenv("UNBLEND_EXTRA_MODELS", str(listed))
+    _isolate_default_models_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "dens": {
+                        "sources": base["sources"],
+                        "members": [{"model": "l_good"}, {"model": "scnet_small"}],
+                    }
+                }
+            }
+        )
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ModelLoadingError, match=r"l_bad(?s:.*)l\.json"):
+            ModelRepository()
+
+
+def test_cancelling_registry_weights_fail_before_download(tmp_path: Path) -> None:
+    """
+    An extra-models ensemble whose weights cancel is refused when the
+    registry loads, not after its members are downloaded.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "cancel": {
+                        "sources": base["sources"],
+                        "members": [{"model": "scnet_small"}, {"model": "scnet_small"}],
+                        "weights": [[1, 1, 1, 1], [-1, 1, 1, 1]],
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ModelLoadingError, match="non-zero total"):
+        ModelRepository(extra_models=path)
+
+
+def test_a_header_only_entry_with_an_unreadable_file_says_so(tmp_path: Path) -> None:
+    """
+    An entry that relies on its file's header, when the file is truncated,
+    gets an error saying the header is unreadable rather than "unknown
+    architecture None".
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    weights = tmp_path / "w.safetensors"
+    weights.write_bytes(b"\x00" * 1000)
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "hdr": {
+                        "sources": ["a", "b"],
+                        "checkpoint": {"format": "safetensors", "path": str(weights)},
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(
+        ModelLoadingError, match=r"Model hdr doesn't state an architecture"
+    ):
+        ModelRepository(extra_models=path)
+
+
+def test_a_number_too_large_for_a_float_is_a_clean_error(tmp_path: Path) -> None:
+    """
+    A 400-digit integer in a models file is reported as invalid, not raised
+    as a raw OverflowError.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    base = ModelRepository(extra_models=[]).list_models()["scnet_small"]
+    entry = {k: v for k, v in base.items() if k != "backend"}
+    path = tmp_path / "m.yaml"
+    for field in ("segment", "weights"):
+        bad = dict(entry)
+        if field == "segment":
+            bad["segment"] = 10**400
+        else:
+            bad = {
+                "sources": base["sources"],
+                "members": [{"model": "scnet_small"}, {"model": "scnet_small"}],
+                "weights": [[10**400, 1, 1, 1], [1, 1, 1, 1]],
+            }
+        path.write_text(yaml.safe_dump({"models": {"big": bad}}))
+        with pytest.raises(ModelLoadingError):
+            ModelRepository(extra_models=path)
+    demucs = ModelRepository(extra_models=[]).list_models()["htdemucs"]
+    demucs = {k: v for k, v in demucs.items() if k != "backend"}
+    for key, value in (("samplerate", 10**400), ("segment", 1e305), ("segment", 1e-9)):
+        bad = {**demucs, "config": {**demucs["config"], key: value}}
+        bad.pop("samplerate", None)
+        bad.pop("segment_samples", None)
+        path.write_text(yaml.safe_dump({"models": {"big": bad}}))
+        with pytest.raises(ModelLoadingError):
+            ModelRepository(extra_models=path)
+
+
+@pytest.mark.parametrize("case", ["members-int", "channels-list", "huge-rate"])
+def test_nonsense_field_types_are_clean_errors(tmp_path: Path, case: str) -> None:
+    """
+    Values of the wrong type or size give a ``ModelLoadingError`` (so a broken
+    default models file is skipped) rather than a raw TypeError/OverflowError.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param case: Which field to break.
+    """
+    models = ModelRepository(extra_models=[]).list_models()
+    if case == "members-int":
+        entry = {k: v for k, v in models["htdemucs_ft"].items() if k != "backend"}
+        entry["members"] = 5
+    elif case == "channels-list":
+        entry = {
+            "sources": models["htdemucs"]["sources"],
+            "members": [
+                {"model": "htdemucs"},
+                {
+                    **{
+                        k: v
+                        for k, v in models["htdemucs"].items()
+                        if k in ("architecture", "checkpoint")
+                    },
+                    "config": {**models["htdemucs"]["config"], "audio_channels": [2]},
+                },
+            ],
+        }
+    else:
+        entry = {k: v for k, v in models["scnet_small"].items() if k != "backend"}
+        entry["samplerate"] = 10**401
+        entry["segment"] = 1.0
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"odd": entry}}))
+    expected = {
+        "members-int": "members",
+        "channels-list": "invalid channel count",
+        "huge-rate": "invalid samplerate",
+    }[case]
+    with pytest.raises(ModelLoadingError, match=expected):
+        ModelRepository(extra_models=path)
+
+
+def test_an_implicitly_mono_roformer_member_is_caught_before_download(
+    tmp_path: Path,
+) -> None:
+    """
+    RoFormer is mono unless its config sets ``stereo``; an ensemble pairing
+    that with a stereo member is refused at construction, not after both
+    checkpoints download.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    base = ModelRepository(extra_models=[]).list_models()["bs_roformer_anvuew"]
+    member = {
+        k: v
+        for k, v in base.items()
+        if k in ("architecture", "checkpoint", "samplerate", "segment_samples")
+    }
+    mono = {
+        **member,
+        "config": {k: v for k, v in base["config"].items() if k != "stereo"},
+    }
+    entry = {
+        "sources": base["sources"],
+        "members": [{"model": "bs_roformer_anvuew"}, mono],
+    }
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"mixed": entry}}))
+    with pytest.raises(ModelLoadingError, match="channel count"):
+        ModelRepository(extra_models=path)
+
+
+@pytest.mark.parametrize(
+    "case", ["combine-params-int", "bool-key", "nul-path", "nul-absolute-path"]
+)
+def test_unanticipated_shapes_are_model_loading_errors(
+    tmp_path: Path, case: str
+) -> None:
+    """
+    A shape no specific check covers (a non-mapping ``combine_params``, a
+    YAML ``on:`` key read as a bool, a NUL in a path) still fails as a
+    ``ModelLoadingError`` naming the file, so a broken default models file
+    is skipped rather than crashing every command.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param case: Which shape to write.
+    """
+    models = ModelRepository(extra_models=[]).list_models()
+    if case == "combine-params-int":
+        entry = {k: v for k, v in models["htdemucs_ft"].items() if k != "backend"}
+        entry["combine_params"] = 1024
+    elif case == "bool-key":
+        entry = {k: v for k, v in models["scnet_small"].items() if k != "backend"}
+        entry[True] = 1
+    else:
+        weights = "w\0.safetensors" if case == "nul-path" else str(tmp_path / "w\0.st")
+        entry = {
+            "sources": ["a", "b"],
+            "architecture": "scnet",
+            "samplerate": 44100,
+            "segment_samples": 44100,
+            "config": {"dims": [4, 8]},
+            "checkpoint": {"format": "safetensors", "path": weights},
+        }
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"odd": entry}}))
+    with pytest.raises(ModelLoadingError, match=str(path).replace("\\", "\\\\")):
+        ModelRepository(extra_models=path)
+
+
+def test_an_unreadable_local_weights_folder_is_missing_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Path.is_file()`` raises on EACCES; a local path in a locked folder
+    must load the registry and report the file as missing.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads any folder")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "w.safetensors").write_bytes(b"x")
+    entry = {
+        "sources": ["a", "b"],
+        "architecture": "scnet",
+        "samplerate": 44100,
+        "segment_samples": 44100,
+        "config": {"dims": [4, 8]},
+        "checkpoint": {
+            "format": "safetensors",
+            "path": str(locked / "w.safetensors"),
+        },
+    }
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"locked": entry}}))
+    os.chmod(locked, 0)
+    try:
+        repo = ModelRepository(extra_models=path)
+        assert repo.loaded_bytes("locked") == 0
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_a_path_under_an_unknown_tilde_user_is_taken_literally(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Path.expanduser()`` raises ``RuntimeError`` for ``~nosuchuser``; the
+    registry keeps such a path as written (the file is then just missing).
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    entry = {
+        "sources": ["a", "b"],
+        "architecture": "scnet",
+        "samplerate": 44100,
+        "segment_samples": 44100,
+        "config": {"dims": [4, 8]},
+        "checkpoint": {"format": "safetensors", "path": "~nosuchuserzz/w.st"},
+    }
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"tilde": entry}}))
+    repo = ModelRepository(extra_models=path)
+    assert "tilde" in repo.list_models()
+    assert repo.loaded_bytes("tilde") == 0
+
+
+def test_an_htdemucs_config_its_constructor_asserts_on_is_a_load_error(
+    tmp_path: Path,
+) -> None:
+    """
+    ``t_heads: 5`` fails an ``assert`` in the constructor; that surfaces as a
+    ``ModelLoadingError``, as for the other backends, not an AssertionError.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    weights = tmp_path / "w.safetensors"
+    save_file({"x": torch.zeros(1)}, str(weights))
+    entry = {
+        "architecture": "htdemucs",
+        "sources": ["a", "b"],
+        "config": {"sources": ["a", "b"], "t_heads": 5},
+        "checkpoint": {"format": "safetensors", "path": str(weights)},
+    }
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"uu": entry}}))
+    repo = ModelRepository(extra_models=path)
+    with pytest.raises(ModelLoadingError, match="Failed to build"):
+        repo.get_model("uu")
+
+
+def test_an_unknown_tilde_user_path_means_one_file_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``~nosuchuser/w`` stays relative, so it is anchored at the models file's
+    folder like any relative path — the file the registry loads is the file
+    ``unregister --delete-weights`` would consider.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from unblend.repo import entry_weight_paths
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    entry = {
+        "sources": ["a", "b"],
+        "architecture": "scnet",
+        "samplerate": 44100,
+        "segment_samples": 44100,
+        "config": {"dims": [4, 8]},
+        "checkpoint": {"format": "safetensors", "path": "~nosuchuserzz/w.st"},
+    }
+    path = models_dir / "m.yaml"
+    path.write_text(yaml.safe_dump({"models": {"rel": entry}}))
+    monkeypatch.chdir(run_dir)
+    (loaded,) = ModelRepository(extra_models=path).local_artifacts("rel")
+    (named,) = entry_weight_paths(entry, models_dir.resolve())
+    assert os.path.realpath(loaded) == os.path.realpath(named)
+
+
+def test_a_symlink_loop_as_the_cache_dir_is_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``Path.resolve()`` raises on a loop (Python 3.10–3.12); the cache
+    directory is resolved without it, so listing the cache just finds nothing.
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    from unblend.repo import get_cache_dir
+
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    monkeypatch.setenv("UNBLEND_CACHE_DIR", str(tmp_path / "a"))
+    get_cache_dir()
+    assert ModelRepository(extra_models=[]).get_cache_info() == {}

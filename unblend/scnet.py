@@ -1,3 +1,5 @@
+# Copyright (c) 2024 starrytong (starrytong/SCNet)
+# Copyright (c) 2024 Roman Solovyev (ZFTurbo/Music-Source-Separation-Training)
 # Copyright (c) 2025-present Ryan Fahey
 
 # This source code is licensed under the license found in the
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +22,51 @@ from torch import Tensor, nn
 from . import backends
 from .backends import ASSModel
 from .exceptions import ValidationError
+
+
+class GroupNorm(nn.GroupNorm):
+    """
+    ``nn.GroupNorm`` with an export formulation that survives onnxruntime.
+
+    Eager inference is the stock kernel. With ``onnx_safe`` set, the
+    statistics are reduced per channel first and then across channels.
+    The stock op exports as InstanceNormalization, and onnxruntime reduces
+    that (and an equivalent flat ReduceMean) in a single fp32 pass. Over
+    the trunk's ~3.5M-element groups that pass costs ~1e-3 relative error
+    per norm. After a dozen norms the output is off by ~0.5% (~46 dB SNR).
+    The two-level reduction brings the error back to fp32 rounding.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        """
+        Build the norm; arguments are those of ``nn.GroupNorm``.
+
+        :param args: Positional arguments for ``nn.GroupNorm``.
+        :param kwargs: Keyword arguments for ``nn.GroupNorm``.
+        """
+        super().__init__(*args, **kwargs)
+        self.onnx_safe = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Normalize ``x`` over each group of channels and all trailing axes.
+
+        :param x: Input of shape ``[batch, channels, ...]``.
+        :return: Normalized tensor of the same shape.
+        """
+        if not self.onnx_safe:
+            return super().forward(x)
+
+        batch, channels = x.shape[0], x.shape[1]
+        y = x.reshape(batch, self.num_groups, channels // self.num_groups, -1)
+        mean = y.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True)
+        centered = y - mean
+        var = (centered * centered).mean(dim=3, keepdim=True).mean(dim=2, keepdim=True)
+        y = (centered * torch.rsqrt(var + self.eps)).reshape(x.shape)
+        if self.affine:
+            shape = [1, channels] + [1] * (x.dim() - 2)
+            y = y * self.weight.view(shape) + self.bias.view(shape)
+        return y
 
 
 class Swish(nn.Module):
@@ -45,7 +93,7 @@ class ConvolutionModule(nn.Module):
         self, channels: int, depth: int = 2, compress: float = 4, kernel: int = 3
     ) -> None:
         """
-        Residual 1-D convolution stack applied within an SD block.
+        Build ``depth`` pre-norm GLU/depthwise-conv residual layers.
 
         :param channels: Input/output channels.
         :param depth: Number of residual layers.
@@ -62,7 +110,7 @@ class ConvolutionModule(nn.Module):
         for _ in range(self.depth):
             self.layers.append(
                 nn.Sequential(
-                    nn.GroupNorm(1, channels),
+                    GroupNorm(1, channels),
                     nn.Conv1d(channels, hidden_size * 2, kernel, padding=padding),
                     nn.GLU(1),
                     nn.Conv1d(
@@ -72,7 +120,7 @@ class ConvolutionModule(nn.Module):
                         padding=padding,
                         groups=hidden_size,
                     ),
-                    nn.GroupNorm(1, hidden_size),
+                    GroupNorm(1, hidden_size),
                     Swish(),
                     nn.Conv1d(hidden_size, channels, 1),
                 )
@@ -99,7 +147,7 @@ class FusionLayer(nn.Module):
         self, channels: int, kernel_size: int = 3, stride: int = 1, padding: int = 1
     ) -> None:
         """
-        Decoder fusion of a decoded tensor with its encoder skip.
+        Build the fusing convolution.
 
         :param channels: Channel count of the decoded tensor.
         :param kernel_size: Convolution kernel size.
@@ -107,7 +155,6 @@ class FusionLayer(nn.Module):
         :param padding: Convolution padding.
         """
         super().__init__()
-        self.channels = channels
         self.conv = nn.Conv2d(
             channels * 2, channels * 2, kernel_size, stride=stride, padding=padding
         )
@@ -135,7 +182,7 @@ class SDlayer(nn.Module):
 
     def __init__(self, channels_in: int, channels_out: int, band_configs: dict) -> None:
         """
-        Sparse down-sample layer: split into bands and compress each differently.
+        Build one strided convolution per band.
 
         :param channels_in: Input channels.
         :param channels_out: Output channels.
@@ -208,7 +255,7 @@ class SUlayer(nn.Module):
 
     def __init__(self, channels_in: int, channels_out: int, band_configs: dict) -> None:
         """
-        Sparse up-sample layer: the decoder counterpart of :class:`SDlayer`.
+        Build one transposed convolution per band.
 
         :param channels_in: Input channels.
         :param channels_out: Output channels.
@@ -267,9 +314,14 @@ class SDblock(nn.Module):
         kernel_size: int = 3,
     ) -> None:
         """
-        One encoder stage: sparse down-sample, per-band convolution, global mix.
+        Build the down-sample layer, per-band convolutions and global convolution.
 
-        :param channels_in: Input channels. :param channels_out: Output channels. :param band_configs: Per-band ``SR``/``stride``/``kernel`` settings. :param conv_config: ``compress``/``kernel`` for the convolution modules. :param depths: Residual depth per band. :param kernel_size: Global convolution kernel size; must be odd.
+        :param channels_in: Input channels.
+        :param channels_out: Output channels.
+        :param band_configs: Per-band ``SR``/``stride``/``kernel`` settings.
+        :param conv_config: ``compress``/``kernel`` for the convolution modules.
+        :param depths: Residual depth per band.
+        :param kernel_size: Global convolution kernel size; must be odd.
         """
         super().__init__()
         band_configs = band_configs or {}
@@ -313,7 +365,7 @@ class FeatureConversion(nn.Module):
 
     def __init__(self, channels: int, inverse: bool) -> None:
         """
-        Move between time and frequency representations inside the trunk.
+        Configure the transform direction.
 
         :param channels: Channel count of the packed real/imaginary tensor.
         :param inverse: Whether to apply the inverse transform.
@@ -343,26 +395,52 @@ class FeatureConversion(nn.Module):
 
         bins = frames // 2 + 1
 
-        k = torch.arange(bins, device=device).unsqueeze(1)
-        t = torch.arange(frames, device=device).unsqueeze(0)
-        phase = torch.remainder(k * t, frames).to(torch.float32)
-        angle = (2.0 * math.pi / frames) * phase
-        scale = 1.0 / math.sqrt(frames)
+        # Inside a traced graph, inference_mode(False) doesn't apply (the
+        # matrices would be inference tensors), so build them for this call
+        # without caching, as RoFormer's rotary tables do.
+        caching = not torch.compiler.is_compiling()
 
-        if self.inverse:
-            weights = torch.full((bins, 1), 2.0, device=device, dtype=torch.float32)
-            weights[0] = 1.0
-            if frames % 2 == 0:
-                weights[-1] = 1.0
+        # Normal tensors even when first built under inference_mode, so a later
+        # forward with autograd on can still save them for backward.
+        with torch.inference_mode(False):
+            k = torch.arange(bins, device=device).unsqueeze(1)
+            t = torch.arange(frames, device=device).unsqueeze(0)
+            phase = torch.remainder(k * t, frames).to(torch.float32)
+            angle = (2.0 * math.pi / frames) * phase
+            scale = 1.0 / math.sqrt(frames)
 
-            cos_basis = weights * angle.cos() * scale
-            sin_basis = -weights * angle.sin() * scale
-        else:
-            cos_basis = (angle.cos() * scale).transpose(0, 1)
-            sin_basis = (-angle.sin() * scale).transpose(0, 1)
+            if self.inverse:
+                weights = torch.full((bins, 1), 2.0, device=device, dtype=torch.float32)
+                weights[0] = 1.0
+                if frames % 2 == 0:
+                    weights[-1] = 1.0
 
-        result = (cos_basis.to(dtype), sin_basis.to(dtype))
-        self._dft_cache[key] = result
+                cos_basis = weights * angle.cos() * scale
+                sin_basis = -weights * angle.sin() * scale
+            else:
+                cos_basis = (angle.cos() * scale).transpose(0, 1)
+                sin_basis = (-angle.sin() * scale).transpose(0, 1)
+
+            result = (cos_basis.to(dtype), sin_basis.to(dtype))
+        if caching:
+            if len(self._dft_cache) >= 16:
+                # Direct callers with many lengths would otherwise grow it forever.
+                self._dft_cache.clear()
+            self._dft_cache[key] = result
+        return result
+
+    def _apply(
+        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
+    ) -> FeatureConversion:
+        """
+        Drop cached DFT matrices when the module is moved or cast.
+
+        :param fn: Forwarded to ``nn.Module._apply``.
+        :param recurse: Forwarded to ``nn.Module._apply``.
+        :return: This module after the successful transformation.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        self._dft_cache.clear()
         return result
 
     def forward(self, x: Tensor) -> Tensor:
@@ -402,16 +480,14 @@ class DualPathRNN(nn.Module):
 
     def __init__(self, d_model: int, expand: int, bidirectional: bool = True) -> None:
         """
-        Bidirectional LSTM applied along the frequency axis, then the time axis.
+        Build the frequency-axis and time-axis LSTM paths.
 
         :param d_model: Feature width.
         :param expand: Hidden-size expansion factor.
         :param bidirectional: Whether each LSTM is bidirectional.
         """
         super().__init__()
-        self.d_model = d_model
         self.hidden_size = d_model * expand
-        self.bidirectional = bidirectional
 
         self.lstm_layers = nn.ModuleList(
             [
@@ -426,9 +502,12 @@ class DualPathRNN(nn.Module):
             ]
         )
         self.linear_layers = nn.ModuleList(
-            [nn.Linear(self.hidden_size * 2, d_model) for _ in range(2)]
+            [
+                nn.Linear(self.hidden_size * (2 if bidirectional else 1), d_model)
+                for _ in range(2)
+            ]
         )
-        self.norm_layers = nn.ModuleList([nn.GroupNorm(1, d_model) for _ in range(2)])
+        self.norm_layers = nn.ModuleList([GroupNorm(1, d_model) for _ in range(2)])
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -463,7 +542,7 @@ class SeparationNet(nn.Module):
 
     def __init__(self, channels: int, expand: int = 1, num_layers: int = 6) -> None:
         """
-        The dual-path trunk: alternating RNN blocks with FFT domain swaps.
+        Build ``num_layers`` dual-path blocks and their domain swaps.
 
         :param channels: Trunk width.
         :param expand: LSTM hidden expansion.
@@ -501,7 +580,9 @@ def stft_padding(samples: int, hop_length: int) -> int:
     """
     Trailing zeros needed before SCNet's STFT.
 
-    :param samples: Length of the input audio in samples. :param hop_length: STFT hop length. :return: Number of samples to append.
+    :param samples: Length of the input audio in samples.
+    :param hop_length: STFT hop length.
+    :return: Number of samples to append.
     """
     padding = hop_length - samples % hop_length
     if (samples + padding) // hop_length % 2 == 0:
@@ -536,12 +617,33 @@ class SCNet(ASSModel):
         external_normalization: bool = False,
     ) -> None:
         """
-        Sparse Compression Network.
+        Build the encoder, dual-path trunk and decoder.
 
-        :param sources: Output stem names. :param audio_channels: Input/output audio channels. :param dims: Channel width per encoder stage. :param nfft: STFT size. :param hop_size: STFT hop length. :param win_size: STFT window length. :param normalized: Whether the STFT is normalised. :param band_SR: Proportion of the spectrum in each band.
-        :param band_stride: Down-sample ratio per band. :param band_kernel: Down-sample kernel per band. :param conv_depths: Residual depth per band. :param compress: Channel compression inside convolution modules. :param conv_kernel: Convolution module kernel size. :param num_dplayer: Number of dual-path layers. :param expand: LSTM hidden expansion factor. :param external_normalization: Whether the caller applies track-level normalisation.
+        :param sources: Output stem names.
+        :param audio_channels: Input/output audio channels.
+        :param dims: Channel width per encoder stage.
+        :param nfft: STFT size.
+        :param hop_size: STFT hop length.
+        :param win_size: STFT window length.
+        :param normalized: Whether the STFT is normalised.
+        :param band_SR: Proportion of the spectrum in each band.
+        :param band_stride: Down-sample ratio per band.
+        :param band_kernel: Down-sample kernel per band.
+        :param conv_depths: Residual depth per band.
+        :param compress: Channel compression inside convolution modules.
+        :param conv_kernel: Convolution module kernel size.
+        :param num_dplayer: Number of dual-path layers (even).
+        :param expand: LSTM hidden expansion factor.
+        :param external_normalization: Whether the caller applies track-level
+            normalisation.
         """
         super().__init__()
+        if num_dplayer < 1 or num_dplayer % 2:
+            # Each layer swaps between the time and FFT domains, so an odd
+            # count ends in the wrong one and the decoder can't take it.
+            raise ValidationError(
+                f"SCNet num_dplayer must be a positive even number, got {num_dplayer}."
+            )
         sources = list(sources) if sources else ["drums", "bass", "other", "vocals"]
         dims = list(dims) if dims else [4, 32, 64, 128]
         band_SR = list(band_SR) if band_SR else [0.175, 0.392, 0.433]
@@ -629,15 +731,23 @@ class SCNet(ASSModel):
         """
         Arguments for the boundary transforms.
 
-        :param device: Device the transform runs on. :return: Keyword arguments for ``torch.stft``/``torch.istft``.
+        :param device: Device the transform runs on.
+        :return: Keyword arguments for ``torch.stft``/``torch.istft``.
         """
-        return dict(self.stft_config)
+        kwargs = dict(self.stft_config)
+        # Explicit all-ones window: identical to torch's default, minus its
+        # "rectangular window" warning.
+        kwargs["window"] = torch.ones(
+            int(kwargs["win_length"]), device=device, dtype=torch.float32
+        )
+        return kwargs
 
     def forward_core(self, x: Tensor) -> Tensor:
         """
-        Encoder, dual-path trunk, and decoder — everything between the transforms.
+        Run the encoder, dual-path trunk and decoder between the STFT and iSTFT.
 
-        :param x: Packed spectrogram ``[batch, channels, freq, time]``. :return: Decoded tensor before the inverse transform.
+        :param x: Packed spectrogram ``[batch, channels, freq, time]``.
+        :return: Decoded tensor before the inverse transform.
         """
         save_skip: deque[Tensor] = deque()
         save_lengths: deque[list[int]] = deque()
@@ -656,6 +766,19 @@ class SCNet(ASSModel):
             x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
         return x
 
+    def _check_channels(self, mix: Tensor) -> None:
+        """
+        Reject input whose channel count doesn't match the model.
+
+        :param mix: ``(batch, channels, samples)`` audio.
+        :raises ValidationError: On a channel mismatch.
+        """
+        if mix.dim() != 3 or mix.shape[1] != self.audio_channels:
+            raise ValidationError(
+                f"Model expects (batch, {self.audio_channels}, samples) audio, "
+                f"got shape {tuple(mix.shape)}."
+            )
+
     def forward(self, mix: Tensor) -> Tensor:
         """
         Separate a batch of mixtures.
@@ -663,6 +786,7 @@ class SCNet(ASSModel):
         :param mix: ``(batch, channels, samples)`` audio.
         :return: ``(batch, stems, channels, samples)`` estimates.
         """
+        self._check_channels(mix)
         batch = mix.shape[0]
         model_dtype = next(self.parameters()).dtype
         padding = stft_padding(mix.shape[-1], self.hop_length)
@@ -717,11 +841,28 @@ class SCNetMasked(SCNet):
         )
         stems = len(self.sources)
         self.mask_layer = nn.Sequential(
-            nn.Conv2d(4 * stems, 64, kernel_size=3, padding="same"),
+            nn.Conv2d(self.embed_dim * stems, 64, kernel_size=3, padding="same"),
             nn.GELU(),
-            nn.Conv2d(64, 4 * stems, kernel_size=1, padding="same"),
+            nn.Conv2d(64, self.embed_dim * stems, kernel_size=1, padding="same"),
             nn.Tanh(),
         )
+
+    def _apply(
+        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
+    ) -> SCNetMasked:
+        """
+        Keep the Hann window in FP32 when the model is cast, as the
+        transforms run in FP32 and a rounded window would perturb them.
+
+        :param fn: Forwarded to ``nn.Module._apply``.
+        :param recurse: Forwarded to ``nn.Module._apply``.
+        :return: This module after the successful transformation.
+        """
+        window = self.window
+        result = super()._apply(fn, recurse=recurse)
+        if self.window.dtype != torch.float32:
+            self.window = window.to(device=self.window.device, dtype=torch.float32)
+        return result
 
     def _stft_kwargs(self, device: torch.device) -> dict:
         """
@@ -731,7 +872,9 @@ class SCNetMasked(SCNet):
         :return: Keyword arguments for ``torch.stft``/``torch.istft``.
         """
         kwargs = dict(self.stft_config)
-        kwargs["window"] = self.window.to(device)
+        # A no-op unless the window was cast some other way (``_apply`` keeps
+        # it FP32).
+        kwargs["window"] = self.window.to(device=device, dtype=torch.float32)
         return kwargs
 
     def forward(self, mix: Tensor) -> Tensor:
@@ -741,6 +884,7 @@ class SCNetMasked(SCNet):
         :param mix: ``(batch, channels, samples)`` audio.
         :return: ``(batch, stems, channels, samples)`` estimates.
         """
+        self._check_channels(mix)
         batch = mix.shape[0]
         model_dtype = next(self.parameters()).dtype
         padding = stft_padding(mix.shape[-1], self.hop_length)
@@ -767,12 +911,7 @@ class SCNetMasked(SCNet):
         stems = len(self.sources)
         mixture = x.repeat(1, stems, 1, 1)
 
-        if freq > self.max_f:
-            repeats = math.ceil(freq / self.max_f)
-            pos_f = self.pos_embed_f.repeat(1, 1, repeats, 1)[:, :, :freq, :]
-        else:
-            pos_f = self.pos_embed_f[:, :, :freq, :]
-        x = x + pos_f.float()
+        x = x + self.pos_embed_f[:, :, :freq, :].float()
 
         mask = self.mask_layer(self.forward_core(x.to(model_dtype))).float()
 
@@ -808,7 +947,13 @@ def build_scnet(
     """
     Construct an SCNet variant from registry metadata and load a checkpoint.
 
-    :param architecture: Registered SCNet architecture name. :param config: Constructor kwargs from checkpoint metadata. :param sources: Output stem names. :param samplerate: Sample rate the checkpoint operates at. :param segment_samples: Training chunk length in samples. :param state: Checkpoint state dict to load strictly, or ``None``. :return: The constructed model in eval mode.
+    :param architecture: Registered SCNet architecture name.
+    :param config: Constructor kwargs from checkpoint metadata.
+    :param sources: Output stem names.
+    :param samplerate: Sample rate the checkpoint operates at.
+    :param segment_samples: Training chunk length in samples.
+    :param state: Checkpoint state dict to load strictly, or ``None``.
+    :return: The constructed model in eval mode.
     """
     klass = _ARCHITECTURES.get(architecture)
     if klass is None:

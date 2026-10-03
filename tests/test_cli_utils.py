@@ -142,3 +142,74 @@ def test_format_output_path_dotfile_track_keeps_name() -> None:
         "{track}/{stem}.{ext}", "m", Path(".hidden"), "vocals", "wav"
     )
     assert out == Path(".hidden/vocals.wav")
+
+
+def test_expand_paths_skips_the_output_root_inside_an_input_dir(tmp_path) -> None:
+    """
+    Re-running on a directory doesn't pick up the previous run's stems, but
+    pointing at the output directory itself still works.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    from unblend.cli.utils import expand_paths_to_audio_files
+
+    (tmp_path / "song.wav").write_bytes(b"")
+    out = tmp_path / "separated" / "htdemucs" / "song"
+    out.mkdir(parents=True)
+    (out / "vocals.wav").write_bytes(b"")
+    root = (tmp_path / "separated").resolve()
+
+    files, _ = expand_paths_to_audio_files([tmp_path], exclude=root)
+    assert [f.name for f in files] == ["song.wav"]
+
+    files, _ = expand_paths_to_audio_files([tmp_path / "separated"], exclude=root)
+    assert [f.name for f in files] == ["vocals.wav"]
+
+
+def test_parent_variable_distinguishes_same_named_tracks(tmp_path) -> None:
+    """
+    ``{parent}`` is the track's folder name, for layouts like MUSDB's
+    ``*/mixture.wav``.
+
+    :param tmp_path: pytest temporary directory fixture
+    """
+    from pathlib import Path
+
+    from unblend.cli.utils import format_output_path
+
+    a = format_output_path(
+        "{parent}/{stem}.wav", "m", tmp_path / "song a" / "mixture.wav", "v"
+    )
+    b = format_output_path(
+        "{parent}/{stem}.wav", "m", tmp_path / "song b" / "mixture.wav", "v"
+    )
+    assert (a, b) == (Path("song a/v.wav"), Path("song b/v.wav"))
+
+
+def test_tilde_in_a_track_name_is_not_expanded() -> None:
+    """
+    Only the template's own ``~`` means home; a track called ``~.wav`` stays a
+    literal folder name.
+    """
+    from pathlib import Path
+
+    from unblend.cli.utils import format_output_path
+
+    assert format_output_path("{track}/{stem}.wav", "m", Path("~.wav"), "v") == Path(
+        "~/v.wav"
+    )
+    assert (
+        format_output_path("~/o/{stem}.wav", "m", Path("t.wav"), "v")
+        == Path.home() / "o" / "v.wav"
+    )
+
+
+def test_unknown_template_placeholders_are_reported() -> None:
+    """
+    A misspelled placeholder is reported instead of becoming a literal
+    folder name.
+    """
+    from unblend.cli.utils import unknown_placeholders
+
+    assert unknown_placeholders("out/{model}/{trak}/{stem}.{ext}") == ["{trak}"]
+    assert unknown_placeholders("separated/{model}/{track}/{stem}.{ext}") == []

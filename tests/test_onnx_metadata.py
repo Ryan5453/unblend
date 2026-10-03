@@ -66,10 +66,9 @@ def test_external_normalization_is_embedded_for_every_family(
     family: str, external: bool
 ) -> None:
     """
-    Every family carries the key, not just the one whose value varies.
-
-    It used to be written only in the SCNet branch, which left HTDemucs —
-    the sole family that needs the caller to normalize — without it.
+    Every family carries the key, not just the one whose value varies;
+    HTDemucs in particular needs it, since only it requires the caller to
+    normalize.
     """
     metadata = _metadata(_Stub(external), family)
     assert metadata["external_normalization"] == ("true" if external else "false")

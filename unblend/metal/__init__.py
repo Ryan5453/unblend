@@ -13,14 +13,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..backends import state_without, tensor_record, tensor_record_matches
+
 logger = logging.getLogger(__name__)
 
 
 def _pow2_tgs(max_threads: int, cap: int = 256) -> int:
-    """Largest power of two ``<= min(cap, max_threads)``.
-    :param max_threads: max_threads parameter.
-    :param cap: cap parameter.
-    :return: Return value.
+    """
+    Largest power of two ``<= min(cap, max_threads)``.
+
+    :param max_threads: The kernel's ``max_threads_per_threadgroup``.
+    :param cap: Upper bound on the threadgroup size.
+    :return: The power-of-two threadgroup size.
     """
     limit = min(cap, max_threads)
     tgs = 1
@@ -65,6 +69,13 @@ _HTDEMUCS_KERNELS = tuple(
 )
 
 _compiled_libraries: dict[tuple[str, torch.dtype], Any] = {}
+_failed_libraries: dict[tuple[str, torch.dtype], str] = {}
+
+
+class MetalKernelError(RuntimeError):
+    """A fused Metal shader failed to compile on this system."""
+
+
 _compiled_kernels: dict[tuple[str, torch.dtype], Any] = {}
 
 _DTYPE_TO_METAL: dict[torch.dtype, str] = {
@@ -74,7 +85,7 @@ _DTYPE_TO_METAL: dict[torch.dtype, str] = {
 }
 
 _LP_DTYPES = frozenset((torch.float16, torch.bfloat16))
-# Mirrors MAX_DIMS in the rotary kernel's mixed-radix walk.
+# Same cap as MAX_DIMS in the CUDA rotary kernel (unblend/cuda/rotary.cu).
 _ROTARY_MAX_DIMS = 8
 _ROTARY_MAX_THREADS = 1 << 22
 _rotary_layout_cache: dict[tuple, torch.Tensor] = {}
@@ -82,9 +93,11 @@ _RMS_DTYPES = frozenset(_DTYPE_TO_METAL)
 
 
 def _is_metal_lp(t: torch.Tensor) -> bool:
-    """Report whether a tensor is on MPS in a kernel-supported low-precision dtype.
-    :param t: t parameter.
-    :return: Return value.
+    """
+    Report whether a tensor is on MPS in a kernel-supported low-precision dtype.
+
+    :param t: Tensor whose device and dtype are checked.
+    :return: ``True`` if ``t`` is an FP16/BF16 MPS tensor and autograd is disabled.
     """
     return (
         t.device.type == "mps" and t.dtype in _LP_DTYPES and not torch.is_grad_enabled()
@@ -92,9 +105,12 @@ def _is_metal_lp(t: torch.Tensor) -> bool:
 
 
 def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
-    """Prepare a tensor for kernel dispatch: contiguous with a 4-element-aligned.
-    :param t: t parameter.
-    :return: Return value.
+    """
+    Prepare a tensor for kernel dispatch: contiguous with a 4-element-aligned
+    storage offset.
+
+    :param t: Tensor to prepare.
+    :return: ``t`` itself if already safe, else an aligned contiguous copy.
     """
     t = t.contiguous()
     # storage_offset must be 4-aligned for half4 vector loads
@@ -104,20 +120,20 @@ def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
 
 
 def _get_kernel(name: str, dtype: torch.dtype) -> Any:
-    """Look up a Metal kernel by ``(name, dtype)``; compile its source file.
-    :param name: name parameter.
-    :param dtype: dtype parameter.
-    :return: Return value.
+    """
+    Look up a Metal kernel by ``(name, dtype)``, compiling its source on first use.
+
+    :param name: Kernel function name (a key of ``_KERNEL_SOURCES``).
+    :param dtype: Scalar dtype the kernel is specialised for.
+    :return: The compiled kernel callable.
+    :raises MetalKernelError: If the shader doesn't compile (now or earlier).
+    :raises KeyError: If ``name`` is not a known kernel.
+    :raises ValueError: If no kernel is built for ``dtype``.
     """
     cache_key = (name, dtype)
     cached = _compiled_kernels.get(cache_key)
     if cached is not None:
         return cached
-    if not hasattr(torch.mps, "compile_shader"):
-        raise RuntimeError(
-            "torch.mps.compile_shader unavailable; need PyTorch >= 2.6 for "
-            "Metal kernel-backed inference."
-        )
     source_file = _KERNEL_SOURCES.get(name)
     if source_file is None:
         raise KeyError(
@@ -129,12 +145,19 @@ def _get_kernel(name: str, dtype: torch.dtype) -> Any:
             f"Metal kernels are only built for {_RMS_DTYPES}; got {dtype!r}"
         )
     lib_key = (source_file, dtype)
+    if lib_key in _failed_libraries:
+        raise MetalKernelError(_failed_libraries[lib_key])
     lib = _compiled_libraries.get(lib_key)
     if lib is None:
         src = _load_metal_source("common.metal") + _load_metal_source(source_file)
-        lib = torch.mps.compile_shader(
-            f"#define SCALAR_T {metal_type}\n#define SCALAR4_T {metal_type}4\n{src}"
-        )
+        try:
+            lib = torch.mps.compile_shader(
+                f"#define SCALAR_T {metal_type}\n#define SCALAR4_T {metal_type}4\n{src}"
+            )
+        except Exception as exc:  # SyntaxError for a shader that won't compile
+            # Remembered, so other modules don't each retry the compile.
+            _failed_libraries[lib_key] = f"{source_file} failed to compile: {exc}"
+            raise MetalKernelError(_failed_libraries[lib_key]) from exc
         _compiled_libraries[lib_key] = lib
     fn = getattr(lib, name)
     _compiled_kernels[cache_key] = fn
@@ -142,11 +165,13 @@ def _get_kernel(name: str, dtype: torch.dtype) -> Any:
 
 
 def metal_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
-    """Apply RoFormer's last-dimension RMSNorm with one fused MPS kernel.
-    :param x: x parameter.
-    :param gamma: gamma parameter.
-    :param scale: scale parameter.
-    :return: Return value.
+    """
+    Apply RoFormer's last-dimension RMSNorm with one fused MPS kernel.
+
+    :param x: Input tensor normalized over its final dimension.
+    :param gamma: Learnable gain with length ``x.shape[-1]``.
+    :param scale: RoFormer's ``sqrt(dim)`` normalization scale.
+    :return: Normalized tensor with the same shape and dtype as ``x``.
     """
     if (
         x.device.type != "mps"
@@ -157,10 +182,12 @@ def metal_rms_norm(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.
         normalized = F.normalize(x.float(), dim=-1) * scale * gamma.float()
         return normalized.type(x.dtype)
 
-    x_contig = x.contiguous()
+    # Aligned like every other kernel's input: the vector path casts to
+    # 4-element vectors from the buffer start.
+    x_contig = _kernel_arg(x)
     dim = x_contig.shape[-1]
     rows = x_contig.numel() // dim
-    gamma_contig = gamma.to(device=x.device, dtype=x.dtype).contiguous()
+    gamma_contig = _kernel_arg(gamma.to(device=x.device, dtype=x.dtype))
     out = torch.empty_like(x_contig)
 
     kernel = _get_kernel("rms_norm", x.dtype)
@@ -202,6 +229,10 @@ def _rotary_layout(t: torch.Tensor) -> torch.Tensor:
         cached = torch.tensor(
             list(t.shape) + list(t.stride()), dtype=torch.int64, device=t.device
         )
+        if len(_rotary_layout_cache) >= 16:
+            # Bounded like RotaryEmbedding's own cache: callers feeding many
+            # shapes directly shouldn't grow it without limit.
+            _rotary_layout_cache.clear()
         _rotary_layout_cache[key] = cached
     return cached
 
@@ -257,6 +288,8 @@ def metal_rotary(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
         or t.stride(-1) != 1
         or cos.dtype != t.dtype
         or sin.dtype != t.dtype
+        or cos.shape != (t.shape[-2], dim // 2)
+        or sin.shape != cos.shape
     ):
         x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
         return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(
@@ -327,12 +360,15 @@ class MetalGroupNorm(nn.Module):
         per_batch_in: int,
         tile_space: int,
     ) -> tuple[torch.Tensor, int]:
-        """Run multi-stage stages 1+2: per-tile partial reduce, then finalize.
-        :param x_contig: x_contig parameter.
-        :param B: B parameter.
-        :param per_batch_in: per_batch_in parameter.
-        :param tile_space: tile_space parameter.
-        :return: Return value.
+        """
+        Run multi-stage stages 1+2: per-tile partial reduce, then finalize
+        per-batch ``(mean, rsqrt(var+eps))``.
+
+        :param x_contig: Contiguous kernel-ready input, ``(B, per_batch_in)`` flat.
+        :param B: Number of batch elements.
+        :param per_batch_in: Elements reduced per batch element.
+        :param tile_space: Element count the tiling is sized against: the output space, which GLU halves.
+        :return: The ``(B, 2)`` FP32 meanvar buffer and ``num_tiles``.
         """
         num_tiles = min(
             self._MULTI_STAGE_MAX_TILES,
@@ -376,7 +412,6 @@ class MetalGroupNorm(nn.Module):
             per_batch_in,
             num_tiles,
             float(self.eps),
-            x_contig,
             threads=B * tgs2,
             group_size=tgs2,
         )
@@ -426,15 +461,13 @@ class MetalGroupNorm(nn.Module):
         if cache is None:
             cache = {}
             object.__setattr__(self, "_aff_cache", cache)
-        versions = (
-            id(self.weight),
-            self.weight._version,
-            id(self.bias),
-            self.bias._version,
-        )
-        if getattr(self, "_aff_versions", None) != versions:
+        if not tensor_record_matches(
+            getattr(self, "_aff_versions", None), self.weight, self.bias
+        ):
             cache.clear()
-            object.__setattr__(self, "_aff_versions", versions)
+            object.__setattr__(
+                self, "_aff_versions", tensor_record(self.weight, self.bias)
+            )
         key = (dtype, device)
         cached = cache.get(key)
         if cached is None:
@@ -456,6 +489,17 @@ class MetalGroupNorm(nn.Module):
             if hasattr(self, name):
                 object.__delattr__(self, name)
 
+    def __getstate__(self) -> dict:
+        """
+        Pickle and ``deepcopy`` without the derived caches and their records
+        (see ``backends.state_without``).
+
+        :return: The state to pickle.
+        """
+        return state_without(
+            self, "_aff_cache", "_aff_versions", "_ls_cache", "_ls_version"
+        )
+
     def _apply(
         self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
     ) -> "MetalGroupNorm":
@@ -471,9 +515,11 @@ class MetalGroupNorm(nn.Module):
         return result
 
     def _load_from_state_dict(self, *args: object, **kwargs: object) -> None:
-        """Reload parameters and invalidate the lazily-cast affine/LayerScale caches.
-        :param *args: args parameter.
-        :param **kwargs: kwargs parameter.
+        """
+        Reload parameters and invalidate the lazily-cast affine/LayerScale caches.
+
+        :param args: Positional arguments forwarded to ``nn.Module._load_from_state_dict``.
+        :param kwargs: Keyword arguments forwarded to ``nn.Module._load_from_state_dict``.
         """
         super()._load_from_state_dict(*args, **kwargs)
         self._clear_parameter_caches()
@@ -698,6 +744,7 @@ class FusedGroupNormGlu(MetalGroupNorm):
 class FusedNormGluLayerScaleResid(MetalGroupNorm):
     """
     Single fused op for the DConv envelope after the second conv:
+    ``residual + layer_scale * glu(group_norm(z), dim=1)``.
     """
 
     def __init__(self, gn: nn.GroupNorm, layer_scale_param: torch.Tensor) -> None:
@@ -738,10 +785,11 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         if cache is None:
             cache = {}
             object.__setattr__(self, "_ls_cache", cache)
-        version = (id(self.layer_scale), self.layer_scale._version)
-        if getattr(self, "_ls_version", None) != version:
+        if not tensor_record_matches(
+            getattr(self, "_ls_version", None), self.layer_scale
+        ):
             cache.clear()
-            object.__setattr__(self, "_ls_version", version)
+            object.__setattr__(self, "_ls_version", tensor_record(self.layer_scale))
         key = (dtype, device)
         cached = cache.get(key)
         if cached is None:
@@ -749,6 +797,22 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
             cache[key] = t
             return t
         return cached
+
+    def _eager(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the envelope with native PyTorch ops, in FP32 for low precision.
+
+        :param z: GroupNorm/GLU input of shape ``(B, 2C, ...)``
+        :param residual: Residual tensor broadcastable to ``(B, C, ...)``
+        :return: ``residual + layer_scale * glu(group_norm(z), dim=1)`` in ``z``'s dtype
+        """
+        ls = self.layer_scale.view(-1, *([1] * (z.dim() - 2)))
+        if z.dtype == torch.float32:
+            zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
+            return residual + ls * F.glu(zn, dim=1)
+        zn = F.group_norm(z.to(torch.float32), 1, self.weight, self.bias, self.eps)
+        out = residual.to(torch.float32) + ls * F.glu(zn, dim=1)
+        return out.to(z.dtype)
 
     def forward(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         """
@@ -760,22 +824,24 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         :raises ValueError: If the GLU input channel dimension is not even
         """
         if not _is_metal_lp(z):
-            if z.dtype == torch.float32:
-                zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
-                return residual + self.layer_scale[:, None] * F.glu(zn, dim=1)
-            zn = F.group_norm(z.to(torch.float32), 1, self.weight, self.bias, self.eps)
-            out = residual.to(torch.float32) + self.layer_scale[:, None] * F.glu(
-                zn, dim=1
-            )
-            return out.to(z.dtype)
+            return self._eager(z, residual)
 
         z_c = _kernel_arg(z)
-        r_c = _kernel_arg(residual)
         B = z_c.shape[0]
         C2 = z_c.shape[1]
         if C2 % 2 != 0:
             raise ValueError("GLU input channel dim must be even")
         C = C2 // 2
+        if not (
+            residual.shape == (B, C) + tuple(z_c.shape[2:])
+            and residual.dtype == z_c.dtype
+            and residual.device == z_c.device
+        ):
+            # The kernel indexes the residual exactly like its output; anything
+            # else (a broadcast shape, another dtype) would read out of bounds,
+            # so take the eager computation.
+            return self._eager(z, residual)
+        r_c = _kernel_arg(residual)
         N = 1
         for d in z_c.shape[2:]:
             N *= d
@@ -905,7 +971,8 @@ class MetalMyGroupNorm(MetalGroupNorm):
 
 class FusedDConvLayer(nn.Module):
     """
-    One DConv sub-layer (formerly an ``nn.Sequential`` of 7 ops) folded.
+    One DConv sub-layer, its 7-op ``nn.Sequential`` folded into four calls:
+    ``conv1 -> fused_norm_gelu -> conv2 -> fused_norm_glu_ls_resid``.
     """
 
     def __init__(
@@ -916,12 +983,14 @@ class FusedDConvLayer(nn.Module):
         norm2: nn.GroupNorm,
         layer_scale_param: torch.Tensor,
     ) -> None:
-        """Build a fused DConv sub-layer from its constituent convs/norms/scale.
-        :param conv1: conv1 parameter.
-        :param norm1: norm1 parameter.
-        :param conv2: conv2 parameter.
-        :param norm2: norm2 parameter.
-        :param layer_scale_param: layer_scale_param parameter.
+        """
+        Build a fused DConv sub-layer from its constituent convs/norms/scale.
+
+        :param conv1: First pointwise convolution (``C -> hidden``).
+        :param norm1: GroupNorm following ``conv1``; fused with the GELU.
+        :param conv2: Second pointwise convolution (``hidden -> 2C``).
+        :param norm2: GroupNorm following ``conv2``; fused into the envelope op.
+        :param layer_scale_param: Per-channel LayerScale tensor of shape ``(C,)``.
         """
         super().__init__()
         self.conv1 = conv1
@@ -933,9 +1002,13 @@ class FusedDConvLayer(nn.Module):
 
     @classmethod
     def from_sequential(cls, seq: nn.Sequential) -> "FusedDConvLayer":
-        """Build from the standard 7-op DConv ``nn.Sequential``.
-        :param seq: seq parameter.
-        :return: Return value.
+        """
+        Build from the standard 7-op DConv ``nn.Sequential``.
+
+        :param seq: The 7-op DConv ``nn.Sequential`` to fold.
+        :return: A new :class:`FusedDConvLayer` mirroring ``seq``.
+        :raises ValueError: If ``seq`` does not have exactly 7 ops.
+        :raises TypeError: If any op is not of the expected type.
         """
         from ..transformer import LayerScale
 
@@ -972,9 +1045,9 @@ class FusedDConvLayer(nn.Module):
 
 
 class FusedDConv(nn.Module):
-    """Drop-in for ``unblend.blocks.DConv`` whose layers are
-    :class:`FusedDConvLayer`. Each layer already absorbs the residual add,
-    so the outer loop just chains them.
+    """
+    Drop-in for ``unblend.blocks.DConv`` built from :class:`FusedDConvLayer`
+    layers, each of which absorbs its own residual add.
     """
 
     def __init__(self, fused_layers: list[FusedDConvLayer]) -> None:
@@ -1257,16 +1330,21 @@ class MetalMultiheadAttention(nn.Module):
         average_attn_weights: bool = True,
         is_causal: bool = False,
     ) -> tuple[torch.Tensor, None]:
-        """Run multihead attention, keeping projections in the input dtype on MPS FP16/BF16.
-        :param query: query parameter.
-        :param key: key parameter.
-        :param value: value parameter.
-        :param key_padding_mask: key_padding_mask parameter.
-        :param need_weights: need_weights parameter.
-        :param attn_mask: attn_mask parameter.
-        :param average_attn_weights: average_attn_weights parameter.
-        :param is_causal: is_causal parameter.
-        :return: Return value.
+        """
+        Run multihead attention, keeping projections in the input dtype on MPS FP16/BF16.
+
+        Anything other than unmasked, batch-first, packed-QKV inference without
+        attention weights goes to the wrapped ``nn.MultiheadAttention``.
+
+        :param query: Query tensor of shape ``(B, Lq, E)``.
+        :param key: Key tensor of shape ``(B, Lk, E)``.
+        :param value: Value tensor of shape ``(B, Lk, E)``.
+        :param key_padding_mask: Optional key padding mask; forces the fallback.
+        :param need_weights: Whether to return attention weights; forces the fallback.
+        :param attn_mask: Optional attention mask; forces the fallback.
+        :param average_attn_weights: Passed to the fallback when it runs.
+        :param is_causal: Causal-mask hint; forces the fallback.
+        :return: The ``(output, weights)`` pair; ``weights`` is ``None`` on the fused path.
         """
         if (
             self.training
@@ -1276,6 +1354,9 @@ class MetalMultiheadAttention(nn.Module):
             or is_causal
             or not self.batch_first
             or not self._packed_qkv
+            or self._fallback.bias_k is not None
+            or self._fallback.add_zero_attn
+            or query.dim() != 3
             or query.device.type != "mps"
             or query.dtype not in _LP_DTYPES
         ):
@@ -1331,9 +1412,11 @@ class MetalMultiheadAttention(nn.Module):
 
 
 def has_swappable_modules(model: nn.Module) -> bool:
-    """Whether :func:`apply_metal_optimizations` would replace anything.
-    :param model: model parameter.
-    :return: Return value.
+    """
+    Whether :func:`apply_metal_optimizations` would replace anything.
+
+    :param model: Model to inspect.
+    :return: ``True`` if at least one module would be swapped.
     """
     from ..blocks import HDecLayer, HEncLayer
     from ..transformer import MyGroupNorm
@@ -1352,10 +1435,20 @@ def has_swappable_modules(model: nn.Module) -> bool:
     return False
 
 
+# Exact types: GroupNorm subclasses that change behaviour aren't swapped, but
+# SCNet's (which only adds an export-time path) is.
+from ..scnet import GroupNorm as _SCNetGroupNorm  # noqa: E402
+
+_SWAPPABLE_GROUP_NORMS = (nn.GroupNorm, _SCNetGroupNorm)
+
+
 def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
-    """Replace low-precision-slow ops with Metal-backed equivalents in-place.
-    :param model: model parameter.
-    :return: Return value.
+    """
+    Replace ops that are slow in low precision on MPS with Metal-backed
+    equivalents in place.
+
+    :param model: Model to mutate in place, swapping eligible submodules.
+    :return: A mapping from swap kind to the number of modules replaced.
     """
     from ..blocks import HDecLayer, HEncLayer
     from ..transformer import MyGroupNorm
@@ -1443,7 +1536,7 @@ def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
                 if child.num_groups == 1 and child.affine:
                     replacement = MetalMyGroupNorm(child)
                     counts["my_group_norm"] += 1
-            elif type(child) is nn.GroupNorm:
+            elif type(child) in _SWAPPABLE_GROUP_NORMS:
                 if child.num_groups == 1 and child.affine:
                     replacement = MetalGroupNorm.from_groupnorm(child)
                     counts["group_norm"] += 1

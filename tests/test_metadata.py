@@ -1,8 +1,8 @@
 """
 Integrity checks for the bundled model registry (``unblend/metadata.yaml``).
 
-These run fully offline: ``ModelRepository`` only reads the local metadata file
-and builds download URLs as strings, so no network access is required.
+These run fully offline: constructing ``ModelRepository`` parses and validates
+the registry without downloading any weights.
 """
 
 from unblend.repo import ModelRepository
@@ -81,13 +81,13 @@ def test_shipped_ensembles_reference_registered_members() -> None:
 
 def test_ensemble_weights_are_consistent() -> None:
     """
-    Where present, ``weights`` has one row per layer and uniform width.
+    Where present, ``weights`` has one row per member and uniform width.
     """
     for name, info in ModelRepository().list_models().items():
         weights = info.get("weights")
         if weights is None:
             continue
-        member_count = len(info.get("members") or info.get("models") or [1])
+        member_count = len(info.get("members") or [1])
         assert len(weights) == member_count, (
             f"{name}: weight rows must match member count"
         )
@@ -159,3 +159,20 @@ def test_scnet_entries_are_well_formed() -> None:
         assert checkpoint["url"].endswith(".safetensors")
         assert len(checkpoint["sha256"]) == 64
         assert checkpoint["size_bytes"] > 0
+
+
+def test_every_registered_model_reports_its_backend() -> None:
+    """
+    ``list_models`` gives every entry a derived ``backend``; a mis-indented
+    loop once left all but the last one without it, and tests that filter on
+    ``backend`` then silently checked nothing.
+    """
+    from unblend.repo import ModelRepository
+
+    models = ModelRepository(extra_models=[]).list_models()
+    backends = {name: info.get("backend") for name, info in models.items()}
+    assert backends["htdemucs"] == "demucs"
+    assert backends["melband_roformer_kim"] == "roformer"
+    assert backends["scnet_small"] == "scnet"
+    assert backends["htdemucs_scnet_ensemble"] == "ensemble"
+    assert all(backends.values()), backends

@@ -1,5 +1,6 @@
 """
-Regression tests for the SCNet backend.
+Tests for the SCNet backend: construction, forward shapes, the masked variant,
+local checkpoints loaded through an extra-models file, and ONNX export.
 """
 
 import os
@@ -193,6 +194,36 @@ def test_masked_variant_forward_shape() -> None:
     assert out.shape == (1, len(sources), 2, 4096)
 
 
+def test_masked_variant_supports_mono() -> None:
+    """
+    The mask head is sized from the trunk width, so a mono config works.
+    """
+    from unblend.scnet import SCNetMasked
+
+    sources = ["a", "b"]
+    model = SCNetMasked(sources=sources, **_tiny(audio_channels=1, dims=[2, 8, 16, 32]))
+    model.configure_inference(sources=sources, samplerate=44100, segment_samples=4096)
+    model.eval()
+    with torch.inference_mode():
+        out = model(torch.randn(1, 1, 4096))
+    assert out.shape == (1, 2, 1, 4096)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_forward_rejects_wrong_channel_count(masked: bool) -> None:
+    """
+    A mono batch fed to a stereo model raises instead of being regrouped.
+
+    :param masked: Whether to build the masked variant.
+    """
+    from unblend.scnet import SCNetMasked
+
+    cls = SCNetMasked if masked else SCNet
+    model = cls(sources=["a", "b", "c", "d"], **_tiny()).eval()
+    with torch.inference_mode(), pytest.raises(ValidationError, match="expects"):
+        model(torch.randn(2, 1, 4096))
+
+
 def _write_local_model(tmp_path, name: str = "my_scnet") -> tuple:
     """
     Serialise a tiny SCNet and describe it in an extra-models file.
@@ -318,12 +349,11 @@ def test_missing_local_checkpoint_is_reported_clearly(tmp_path) -> None:
 
 def test_onnx_wrapper_reproduces_the_masked_forward() -> None:
     """
-    The export wrapper must apply the masking head, not just the trunk.
+    The export wrapper applies the masking head, not just the trunk.
 
-    ``SCNetONNXWrapper`` originally traced ``forward_core`` alone, which is
-    correct for plain SCNet but silently dropped ``pos_embed_f``, ``mask_layer``
-    and the mask/mixture product for the masked variants -- producing a graph
-    that exported and ran but returned the raw trunk output.
+    Tracing ``forward_core`` alone is correct for plain SCNet but would drop
+    ``pos_embed_f``, ``mask_layer`` and the mask/mixture product for the masked
+    variants, giving a graph that runs but returns the raw trunk output.
     """
     import torch.nn.functional as F
 
@@ -462,3 +492,88 @@ def test_scnet_export_stores_weights_at_any_registered_precision(tmp_path) -> No
         sizes[label] = os.path.getsize(path)
 
     assert sizes["fp8_e4m3"] < sizes["fp16"] < sizes["fp32"]
+
+
+def test_scnet_refuses_an_odd_dual_path_layer_count() -> None:
+    """
+    Each dual-path layer swaps domains, so an odd ``num_dplayer`` would end
+    in the wrong one; it is refused at construction rather than at forward.
+    """
+    from unblend.exceptions import ValidationError
+
+    with pytest.raises(ValidationError, match="even"):
+        SCNet(sources=["a"], **_tiny(num_dplayer=3))
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_onnx_safe_dft_cache_built_in_inference_mode_still_trains(
+    inverse: bool,
+) -> None:
+    """
+    The export path's cached DFT matrices are normal tensors even when first
+    built under ``inference_mode``, so a later forward with autograd can save
+    them for backward.
+    """
+    conversion = FeatureConversion(4, inverse=inverse)
+    conversion.onnx_safe = True
+    with torch.inference_mode():
+        conversion(torch.randn(1, 4, 3, 8))
+    x = torch.randn(1, 4, 3, 8, requires_grad=True)
+    conversion(x).sum().backward()
+    assert x.grad is not None
+
+
+def test_dft_matrices_built_inside_a_traced_graph_are_not_cached() -> None:
+    """
+    Built inside a compiled graph the matrices would be inference tensors;
+    they aren't cached there, so a later grad-enabled forward still trains.
+    """
+    conversion = FeatureConversion(4, inverse=False)
+    conversion.onnx_safe = True
+    x = torch.randn(1, 4, 3, 8)
+    with torch.inference_mode():
+        torch.compile(conversion, backend="aot_eager")(x)
+    assert conversion._dft_cache == {}
+    y = torch.randn(1, 4, 3, 8, requires_grad=True)
+    conversion(y).sum().backward()
+    assert y.grad is not None
+
+
+def test_dft_cache_is_dropped_when_the_module_is_moved_or_cast() -> None:
+    """
+    Matrices cached for one device or dtype aren't carried (or pickled) along
+    after ``.to()``.
+    """
+    conversion = FeatureConversion(4, inverse=False)
+    conversion.onnx_safe = True
+    with torch.inference_mode():
+        conversion(torch.randn(1, 4, 3, 8))
+    assert conversion._dft_cache
+    conversion.to(torch.float64)
+    assert conversion._dft_cache == {}
+
+
+def test_dft_cache_stays_bounded() -> None:
+    """
+    Direct callers with many frame counts don't grow the cache without limit.
+    """
+    conversion = FeatureConversion(4, inverse=False)
+    conversion.onnx_safe = True
+    with torch.inference_mode():
+        for frames in range(4, 44):
+            conversion(torch.randn(1, 4, 3, frames))
+    assert len(conversion._dft_cache) <= 16
+
+
+def test_masked_window_stays_fp32_when_the_model_is_cast() -> None:
+    """
+    Casting the model to FP16 keeps the exact FP32 Hann window the transforms
+    use, rather than one rounded to FP16 and cast back.
+    """
+    from unblend.scnet import SCNetMasked
+
+    model = SCNetMasked(sources=["a", "b"], **_tiny())
+    exact = model.window.clone()
+    model.to(torch.float16)
+    assert model.window.dtype == torch.float32
+    assert torch.equal(model.window, exact)

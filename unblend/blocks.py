@@ -53,7 +53,10 @@ def _hann_window(size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     key = (size, device, dtype)
     win = _HANN_CACHE.get(key)
     if win is None:
-        win = torch.hann_window(size, device=device, dtype=dtype)
+        # A normal tensor even under inference_mode, so a later grad-enabled
+        # forward can use the cached window.
+        with torch.inference_mode(False):
+            win = torch.hann_window(size, device=device, dtype=dtype)
         _HANN_CACHE[key] = win
     return win
 
@@ -98,7 +101,8 @@ def _istft_fold(
     length: int | None,
 ) -> Tensor:
     """
-    Custom iSTFT bypassing torch.istft NOLA check.
+    Overlap-add iSTFT from ``irfft`` and ``fold``, used on MPS in place of
+    ``torch.istft``. It skips the NOLA check and zeroes samples no window covers.
 
     :param z: Complex spectrogram ``[B, freqs, frames]``.
     :param n_fft: FFT size.
@@ -205,7 +209,8 @@ def rescale_conv(
     reference: float,
 ) -> None:
     """
-    Rescale initial weight scale. It is unclear why it helps but it certainly does.
+    Rescale a convolution's initial weights and bias so their standard deviation
+    becomes ``sqrt(std * reference)``, matching upstream Demucs initialisation.
 
     :param conv: Convolution module whose weights will be rescaled
     :param reference: Reference standard deviation for rescaling
@@ -233,7 +238,7 @@ def rescale_module(module: nn.Module, reference: float) -> None:
 
 class DConv(nn.Module):
     """
-    New residual branches in each encoder layer.
+    Dilated residual convolution branches inside an encoder/decoder layer.
     """
 
     def __init__(
@@ -247,12 +252,12 @@ class DConv(nn.Module):
         kernel: int = 3,
     ) -> None:
         """
-        Initialize DConv residual branch.
+        Build ``depth`` residual layers, dilated ``2**d`` when ``depth > 0``.
 
         :param channels: Input/output channels for residual branch.
         :param compress: Channel compression inside the branch.
         :param depth: Number of layers in the branch.
-        :param init: Initial scale for LayerNorm.
+        :param init: Initial LayerScale value.
         :param norm: Use GroupNorm.
         :param gelu: Use GELU activation.
         :param kernel: Kernel size for the dilated convolutions.
@@ -260,8 +265,6 @@ class DConv(nn.Module):
 
         super().__init__()
         assert kernel % 2 == 1
-        self.channels = channels
-        self.compress = compress
         self.depth = abs(depth)
 
         dilate = depth > 0
@@ -352,7 +355,7 @@ class ScaledEmbedding(nn.Module):
         smooth: bool = False,
     ) -> None:
         """
-        Initialize ScaledEmbedding.
+        Build the embedding table, optionally smoothed over positions.
 
         :param num_embeddings: Number of embeddings
         :param embedding_dim: Dimension of each embedding
@@ -508,7 +511,7 @@ class MultiWrap(nn.Module):
         self, layer: "HEncLayer | HDecLayer", split_ratios: list[float]
     ) -> None:
         """
-        Initialize MultiWrap.
+        Clone ``layer`` once per band and reinitialise each copy.
 
         :param layer: Module to clone, must be either HEncLayer or HDecLayer
         :param split_ratios: Ratios indicating which fraction to keep for each band

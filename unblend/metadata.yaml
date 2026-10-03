@@ -270,7 +270,8 @@ models:
     license_note: >-
       GPL-3.0, declared by anvuew in the model card at https://huggingface.co/anvuew/BS-RoFormer
       (cardData license: gpl-3.0, confirmed 2026-08-21). Copyleft applied to model weights
-      is legally untested; unblend downloads them rather than bundling them.
+      is legally untested. The unblend package doesn't bundle them; they are downloaded on first
+      use from Unblend's mirror at https://huggingface.co/Ryan5453/unblend.
     provenance: >-
       BS-RoFormer vocals trained by anvuew; upstream checkpoint bs_roformer_anvuew_sdr_12.45.ckpt
       at https://huggingface.co/anvuew/BS-RoFormer
@@ -407,7 +408,7 @@ models:
       No grant for the weights. The SCNet architecture (https://github.com/starrytong/SCNet)
       and ZFTurbo's Music-Source-Separation-Training, which published this checkpoint as a
       GitHub release asset, are both MIT, but that covers their source code -- neither declares
-      terms for the checkpoint files themselves. Trained only on MUSDB18, whose own licence
+      terms for the checkpoint files themselves. Trained only on MUSDB18, whose own license
       restricts it to non-commercial research.
     provenance: >-
       SCNet-small, masked variant. Published by ZFTurbo as 'SCNet Masked Small Weights', Music-Source-Separation-Training
@@ -444,7 +445,7 @@ models:
       No grant for the weights. The SCNet architecture (https://github.com/starrytong/SCNet)
       and ZFTurbo's Music-Source-Separation-Training, which published this checkpoint as a
       GitHub release asset, are both MIT, but that covers their source code -- neither declares
-      terms for the checkpoint files themselves. Trained only on MUSDB18, whose own licence
+      terms for the checkpoint files themselves. Trained only on MUSDB18, whose own license
       restricts it to non-commercial research.
     provenance: >-
       SCNet-XL, wide v5. Published by ZFTurbo as 'SCNet XL IHF Weights', Music-Source-Separation-Training
@@ -482,10 +483,11 @@ models:
       Using the two together means satisfying both, and the GPL-3.0 grant is the stricter
       of them -- see those entries for the detail.
     provenance: >-
-      Two independently-trained vocal models blended with the default weighted mean, the pairing
-      UVR and audio-separator users reach for most often. Unblend has not measured its SDR
-      against either member; it costs both models' inference time, and single-stem isolation
-      cannot skip a member because both contribute to both stems.
+      Two independently-trained vocal models blended with the default weighted mean. On the
+      MUSDB18-HQ test split (50 tracks) its mean SDR is 12.59 dB, a little above either member
+      alone (bs_roformer_anvuew 12.43 dB, melband_roformer_kim 12.01 dB). It costs both models'
+      inference time, and single-stem isolation cannot skip a member because both contribute to
+      both stems.
     sources: [vocals, other]
     combine: weighted_mean
     members:
@@ -500,8 +502,8 @@ models:
     provenance: >-
       HTDemucs and SCNet xl-wide over the same four stems, blended with the default weighted
       mean. The two architectures disagree about input normalisation, which Unblend applies
-      per member. Unblend has not measured the pair's SDR against either member; it costs
-      both models' inference time.
+      per member. On the MUSDB18-HQ test split (50 tracks) its mean SDR is 9.76 dB, slightly
+      below scnet_xl_wide_v5 alone (9.87 dB), at the cost of both models' inference time.
     sources: [drums, bass, other, vocals]
     combine: weighted_mean
     members:

@@ -1,7 +1,8 @@
 // GroupNorm with num_groups=1: single-stage kernels and the reduction
 // primitives shared with every other ``apply_*`` kernel in this folder.
-// CUDA port of ``unblend/metal/group_norm.metal`` — kernel names, argument
-// order, and semantics match the Metal originals one-to-one.
+// CUDA port of ``unblend/metal/group_norm.metal``: kernel names and semantics
+// match the Metal originals, except that ``partial_reduce`` also takes an
+// optional ``inject`` input.
 //
 // ``group_norm_g1`` runs one block per batch element — best for shapes with
 // many batch elements (DConv internals). ``group_norm_g1_chlast`` is its
@@ -18,7 +19,7 @@
 // Loads/stores use Scalar4 vectors when alignment permits (see kernels.cuh);
 // the apply loops additionally need the affine index to be constant within
 // each vector, i.e. N % 4 == 0 for channel-first and C % 4 == 0 for
-// channel-last, and fall back to scalar loops otherwise.
+// channel-last, and use scalar loops otherwise.
 
 #include "bindings.h"
 
@@ -39,9 +40,7 @@ __global__ void group_norm_g1_kernel(
     unsigned int N,
     float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -53,12 +52,11 @@ __global__ void group_norm_g1_kernel(
     const SCALAR_T* __restrict__  in_b = in_ + (unsigned long long)b * total;
     SCALAR_T* __restrict__  out_b = out + (unsigned long long)b * total;
 
-    float K = static_cast<float>(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total, 0u, total, tid, tgs), total, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         const Scalar4<SCALAR_T>* in4 =
@@ -100,9 +98,7 @@ __global__ void group_norm_g1_chlast_kernel(
     unsigned int total,  // T * C per batch
     float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -111,12 +107,11 @@ __global__ void group_norm_g1_chlast_kernel(
     const SCALAR_T* __restrict__  in_b = in_ + (unsigned long long)b * total;
     SCALAR_T* __restrict__  out_b = out + (unsigned long long)b * total;
 
-    float K = static_cast<float>(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total, 0u, total, tid, tgs), total, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((C & 3u) == 0u) {
         // C % 4 == 0 implies total % 4 == 0 (total = T*C), so vector loads
@@ -163,9 +158,7 @@ __global__ void partial_reduce_kernel(
     unsigned int num_tiles
 ) {
     const bool has_inj = inject != nullptr;
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -177,101 +170,57 @@ __global__ void partial_reduce_kernel(
     const SCALAR_T* __restrict__  j_b =
         has_inj ? inject + (unsigned long long)b * total_per_b : nullptr;
 
-    // Shift by the batch's first element (shared across all tiles of this
-    // batch) so the partial sums feeding the variance don't lose precision
-    // to cancellation on large-DC inputs. finalize_meanvar adds K back for
-    // the mean; the variance it derives from these shifted sums is
-    // unaffected.
-    float K = static_cast<float>(x_b[0]);
-    if (has_inj) {
-        K += static_cast<float>(j_b[0]);
-    }
-    float local_sum = 0.0f;
-    float local_sqsum = 0.0f;
-    if ((total_per_b & 3u) == 0u) {
-        // Tile the vector space. The partial sums are position-agnostic, so
-        // tiling (total/4) vectors instead of total scalars changes nothing
-        // downstream — finalize just sums every tile's partials.
-        const Scalar4<SCALAR_T>* __restrict__ x4 =
-            reinterpret_cast<const Scalar4<SCALAR_T>*>(x_b);
-        const Scalar4<SCALAR_T>* __restrict__ j4 =
-            has_inj ? reinterpret_cast<const Scalar4<SCALAR_T>*>(j_b) : nullptr;
-        const unsigned int nv = total_per_b >> 2;
-        const unsigned int start =
-            (unsigned int)((unsigned long long)t * nv / num_tiles);
-        const unsigned int end =
-            (unsigned int)((unsigned long long)(t + 1) * nv / num_tiles);
-        for (unsigned int i = start + tid; i < end; i += tgs) {
-            float4 v = unpack4(x4[i]);
-            if (has_inj) {
-                const float4 wj = unpack4(j4[i]);
-                v.x += wj.x; v.y += wj.y; v.z += wj.z; v.w += wj.w;
-            }
-            v.x -= K; v.y -= K; v.z -= K; v.w -= K;
-            local_sum += v.x + v.y + v.z + v.w;
-            local_sqsum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
-        }
-    } else {
-        // Even tile boundaries — the last tile picks up any remainder.
-        const unsigned int start =
-            (unsigned int)((unsigned long long)t * total_per_b / num_tiles);
-        const unsigned int end =
-            (unsigned int)((unsigned long long)(t + 1) * total_per_b / num_tiles);
-        for (unsigned int i = start + tid; i < end; i += tgs) {
-            float v = static_cast<float>(x_b[i]) - K;
-            if (has_inj) {
-                v += static_cast<float>(j_b[i]);
-            }
-            local_sum += v;
-            local_sqsum += v * v;
-        }
-    }
-    block_reduce_sumsq(local_sum, local_sqsum, sh_sum, sh_sq, bcast);
+    // Each tile writes its own (mean, M2), not K-shifted sums:
+    // finalize_meanvar merges the tiles with the same identities
+    // block_merge_moments uses across threads, so the multi-stage statistics
+    // match the single-stage ones.
+    const uint2 r = gn_tile_bounds(t, num_tiles, total_per_b);
+    block_merge_moments(
+        gn_thread_partial(x_b, j_b, total_per_b, r.x, r.y, tid, tgs), r.y - r.x,
+        false, 0.0f, sh
+    );
     if (tid == 0) {
-        scratch[((unsigned long long)b * num_tiles + t) * 2 + 0] = bcast[0];
-        scratch[((unsigned long long)b * num_tiles + t) * 2 + 1] = bcast[1];
+        scratch[((unsigned long long)b * num_tiles + t) * 2 + 0] = sh[GN_BCAST];
+        scratch[((unsigned long long)b * num_tiles + t) * 2 + 1] = sh[GN_BCAST + 1];
     }
 }
 
-template <typename SCALAR_T>
+// Reads only the per-tile moments, so unlike the other stages it doesn't
+// depend on the input dtype.
 __global__ void finalize_meanvar_kernel(
-    const float* __restrict__  scratch,  // (B, num_tiles, 2) — shifted (sum_d, sqsum_d)
+    const float* __restrict__  scratch,  // (B, num_tiles, 2) — per-tile (mean, M2)
     float* __restrict__  meanvar,        // (B, 2) — (mean, rsqrt(var+eps))
     unsigned int total_per_b,
     unsigned int num_tiles,
-    float eps,
-    const SCALAR_T* __restrict__  in_,     // input, for the shift reference K
-    const SCALAR_T* __restrict__ inject    // optional second input, same role
+    float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
     const unsigned int b = blockIdx.x;
 
-    float local_sum = 0.0f;
-    float local_sqsum = 0.0f;
+    // Fold this thread's tiles into one partial shifted by its first tile's
+    // mean: a tile of n elements with (mean, M2) contributes
+    // s += n (mean - K) and sq += M2 + n (mean - K)^2.
+    GnPartial p = {0.0f, 0.0f, 0.0f, 0.0f};
     for (unsigned int t = tid; t < num_tiles; t += tgs) {
-        local_sum += scratch[((unsigned long long)b * num_tiles + t) * 2 + 0];
-        local_sqsum += scratch[((unsigned long long)b * num_tiles + t) * 2 + 1];
+        const uint2 r = gn_tile_bounds(t, num_tiles, total_per_b);
+        const float n = static_cast<float>(r.y - r.x);
+        const float mean = scratch[((unsigned long long)b * num_tiles + t) * 2 + 0];
+        const float m2 = scratch[((unsigned long long)b * num_tiles + t) * 2 + 1];
+        if (t == tid) {
+            p.K = mean;
+        }
+        const float d = mean - p.K;
+        p.n += n;
+        p.s += n * d;
+        p.sq += m2 + n * d * d;
     }
-    // sh_sum / sh_sq are sums of (x - K); recover the true mean by adding K
-    // back. The variance is computed from the shifted sums, where
-    // cancellation is negligible. K is the same reference partial_reduce
-    // used: the batch's first element.
-    const unsigned long long kbase = (unsigned long long)b * total_per_b;
-    float K = static_cast<float>(in_[kbase]);
-    if (inject != nullptr) {
-        K += static_cast<float>(inject[kbase]);
-    }
-    gn_reduce_finalize(
-        local_sum, local_sqsum, K, total_per_b, eps, sh_sum, sh_sq, bcast
-    );
+    const float2 ms = gn_reduce_finalize(p, total_per_b, eps, sh);
     if (tid == 0) {
-        meanvar[(unsigned long long)b * 2 + 0] = bcast[0];
-        meanvar[(unsigned long long)b * 2 + 1] = bcast[1];
+        meanvar[(unsigned long long)b * 2 + 0] = ms.x;
+        meanvar[(unsigned long long)b * 2 + 1] = ms.y;
     }
 }
 
@@ -450,22 +399,6 @@ void partial_reduce_impl(
 }
 
 template <typename SCALAR_T>
-void finalize_meanvar_impl(
-    const at::Tensor& scratch, const at::Tensor& meanvar, int64_t total_per_b,
-    int64_t num_tiles, double eps, const at::Tensor& in_,
-    const at::Tensor& inject, int64_t tgs
-) {
-    const dim3 grid((unsigned int)meanvar.size(0));
-    const dim3 block((unsigned int)tgs);
-    finalize_meanvar_kernel<SCALAR_T><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        scratch.const_data_ptr<float>(), meanvar.data_ptr<float>(),
-        (unsigned int)total_per_b, (unsigned int)num_tiles, (float)eps,
-        in_.const_data_ptr<SCALAR_T>(),
-        inject.numel() > 0 ? inject.const_data_ptr<SCALAR_T>() : nullptr);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-template <typename SCALAR_T>
 void apply_norm_impl(
     const at::Tensor& out, const at::Tensor& in_, const at::Tensor& meanvar,
     const at::Tensor& weight, const at::Tensor& bias, int64_t total_per_b,
@@ -526,14 +459,18 @@ void partial_reduce(
 
 void finalize_meanvar(
     const at::Tensor& scratch, const at::Tensor& meanvar, int64_t total_per_b,
-    int64_t num_tiles, double eps, const at::Tensor& in_,
-    const at::Tensor& inject, int64_t tgs
+    int64_t num_tiles, double eps, int64_t tgs
 ) {
-    TORCH_CHECK(in_.is_cuda() && scratch.is_cuda() && meanvar.is_cuda(),
+    TORCH_CHECK(scratch.is_cuda() && meanvar.is_cuda(),
                 "finalize_meanvar: tensors must be CUDA");
     TORCH_CHECK(scratch.scalar_type() == at::kFloat && meanvar.scalar_type() == at::kFloat,
                 "finalize_meanvar: FP32 buffers required");
-    UNBLEND_DISPATCH(finalize_meanvar_impl, in_, scratch, meanvar, total_per_b, num_tiles, eps, in_, inject, tgs)
+    const dim3 grid((unsigned int)meanvar.size(0));
+    const dim3 block((unsigned int)tgs);
+    finalize_meanvar_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scratch.const_data_ptr<float>(), meanvar.data_ptr<float>(),
+        (unsigned int)total_per_b, (unsigned int)num_tiles, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void apply_norm(

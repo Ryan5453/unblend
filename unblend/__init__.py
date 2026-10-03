@@ -27,6 +27,7 @@ from .api import (
     default_device,
     default_dtype,
     get_version,
+    select_model,
 )
 from .apply import Model, ModelEnsemble
 from .exceptions import (
@@ -47,6 +48,7 @@ __all__ = [
     "default_device",
     "default_dtype",
     "get_version",
+    "select_model",
     "UnblendError",
     "LoadAudioError",
     "ModelLoadingError",

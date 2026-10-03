@@ -1,14 +1,11 @@
 // GroupNorm fused with GELU activation.
 // CUDA port of ``unblend/metal/group_norm_gelu.metal``.
 //
-// Saves the round-trip that PyTorch would otherwise spend on the explicit
-// ``functional.gelu(...)`` op after every ``norm1`` call inside HEncLayer /
-// HDecLayer / DConv. We use the tanh approximation (the same form as
-// ``F.gelu(approximate='tanh')``) to match the Metal kernels bit-for-bit in
-// spirit; the per-element gap from PyTorch's default exact-erf GELU peaks at
-// ~1e-3 (near |x|≈2), which is below FP16/BF16 output precision, so this
-// path is numerically equivalent to the reference at the dtypes it runs in.
-// (The FP32 fallback in ``unblend/cuda/__init__.py`` uses exact erf.)
+// GELU uses the tanh approximation (``F.gelu(approximate='tanh')``), the same
+// form as the Metal kernels. It differs from PyTorch's exact-erf GELU by at
+// most ~5e-4 (a few FP16 steps near the GELU minimum), within the kernel
+// tests' tolerance; the FP32 fallback in ``unblend/cuda/__init__.py`` uses
+// exact erf.
 //
 // ``apply_norm_gelu`` is the third stage of the multi-stage path; its
 // mean/scale come from ``finalize_meanvar`` in ``group_norm.cu``.
@@ -57,9 +54,7 @@ __global__ void group_norm_g1_gelu_kernel(
     float eps
 ) {
     const bool has_inj = inject != nullptr;
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -76,15 +71,11 @@ __global__ void group_norm_g1_gelu_kernel(
         has_inj ? inject + jbase : nullptr;
     const Scalar4<SCALAR_T>* __restrict__ j4 =
         has_inj ? reinterpret_cast<const Scalar4<SCALAR_T>*>(j_b) : nullptr;
-    float K = static_cast<float>(in_b[0]);
-    if (has_inj) {
-        K += static_cast<float>(inject[jbase]);
-    }
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, j_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, j_b, total, 0u, total, tid, tgs), total, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         const Scalar4<SCALAR_T>* __restrict__ in4 =
@@ -117,7 +108,7 @@ __global__ void group_norm_g1_gelu_kernel(
             const float bv = static_cast<float>(bias[c]);
             float v = static_cast<float>(in_b[i]);
             if (has_inj) {
-                v += static_cast<float>(inject[i]);
+                v += static_cast<float>(j_b[i]);
             }
             const float y = (v - mean) * scale * w + bv;
             out_b[i] = static_cast<SCALAR_T>(gelu_tanh(y));

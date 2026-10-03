@@ -9,7 +9,7 @@ authors = [
 ]
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Operating System :: OS Independent",
@@ -17,14 +17,18 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "numpy>=2.0.0",
     "torch>=2.13.0",
-    "torchaudio>=2.9.0",
-    "torchcodec>=0.15.0",
+    # 2.9 and 2.10 pin an older torch; 2.11 is the first that fits torch 2.13.
+    "torchaudio>=2.11.0",
+    # <0.16: 0.16's macOS build no longer finds Homebrew's FFmpeg, so every
+    # decode and encode fails on a fresh install.
+    "torchcodec>=0.15.0,<0.16",
     "safetensors>=0.8.0",
     # <0.26: the CLI uses click.get_current_context(), which typer 0.26+
     # breaks by vendoring click (its context stack diverges from real
@@ -37,7 +41,7 @@ dependencies = [
     "filelock>=3.20.0",
     # Model configs (registry files, and the training configs `models import`
     # translates) are YAML.
-    "pyyaml>=6.0"
+    "pyyaml>=6.0.1"
 ]
 
 [project.urls]
@@ -54,7 +58,7 @@ onnx = [
   "onnx>=1.22.0",
   "onnxconverter-common>=1.16.0",
   # Required by the dynamo ONNX exporter (RoFormer export path).
-  "onnxscript>=0.2.0",
+  "onnxscript>=0.7.0",
 ]
 
 [dependency-groups]
@@ -63,7 +67,7 @@ onnx-test = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.7.21,<0.8.0"]
+requires = ["uv_build>=0.12.19,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]

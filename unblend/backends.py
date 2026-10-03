@@ -31,6 +31,11 @@ class ASSModel(nn.Module):
     #: are trained on raw audio and opt out.
     external_normalization = True
 
+    #: Whether FP16 can't be trusted with a chunk that is mostly silence
+    #: around a brief sound, so separation redoes such chunks in FP32. True
+    #: for models that normalize each chunk by its own spread.
+    sparse_chunks_need_fp32 = False
+
     def __init__(self) -> None:
         """
         Initialize the inference-interface defaults.
@@ -41,6 +46,21 @@ class ASSModel(nn.Module):
         self.audio_channels: int = 2
         self.max_allowed_segment: float = 10.0
         self._fixed_batch_shape: bool = False
+
+    def __getstate__(self) -> dict:
+        """
+        Pickle and ``deepcopy`` with the hot path eager: a compiled core is
+        bound to this instance, so a copy keeping it would run this model's
+        weights (and pickling it fails outright). The copy can compile again.
+
+        :return: The state to pickle.
+        """
+        state = super().__getstate__()
+        if "_eager_core" in state:
+            state.pop(self.core_name, None)
+            state.pop("_eager_core")
+            state["_fixed_batch_shape"] = False
+        return state
 
     def prefill_inference_caches(self) -> None:
         """
@@ -183,4 +203,69 @@ def build(
         samplerate=samplerate,
         segment_samples=segment_samples,
         state=state,
+    )
+
+
+def tensor_version(t: torch.Tensor) -> int:
+    """
+    A tensor's in-place version counter, for invalidating derived copies.
+
+    Inference tensors (created under ``torch.inference_mode``) have no counter;
+    they report ``-1``, so only replacing the tensor, which callers track by
+    identity (see :func:`tensor_record`), invalidates their copies.
+
+    :param t: Tensor to inspect.
+    :return: The version counter, or ``-1`` for an inference tensor.
+    """
+    return -1 if t.is_inference() else t._version
+
+
+def state_without(module: torch.nn.Module, *names: str) -> dict:
+    """
+    A module's pickle state minus derived caches and their tensor records.
+
+    ``copy.deepcopy`` and pickling both go through ``__getstate__``. A record
+    copied along would name the copy's own parameters, but with the original's
+    version counts, which the copy's counters restart below: after enough
+    in-place edits the stale cache would match again. Dropping both makes the
+    copy rebuild them.
+
+    :param module: The module being pickled or copied.
+    :param names: Attribute names to leave out.
+    :return: The state to pickle.
+    """
+    state = torch.nn.Module.__getstate__(module)
+    for name in names:
+        state.pop(name, None)
+    return state
+
+
+def tensor_record(*tensors: torch.Tensor) -> tuple[tuple[torch.Tensor, int], ...]:
+    """
+    Record tensors and their versions, to tell later whether derived copies
+    are stale.
+
+    Holds the tensors themselves, not their ids: CPython reuses a freed
+    object's id, so a replacement could otherwise pass for the original.
+
+    :param tensors: The source tensors (e.g. a layer's weight and bias).
+    :return: A record for :func:`tensor_record_matches`.
+    """
+    return tuple((t, tensor_version(t)) for t in tensors)
+
+
+def tensor_record_matches(
+    record: tuple[tuple[torch.Tensor, int], ...] | None, *tensors: torch.Tensor
+) -> bool:
+    """
+    Whether ``tensors`` are the same objects, unchanged, as when recorded.
+
+    :param record: A record from :func:`tensor_record`, or ``None``.
+    :param tensors: The current source tensors.
+    :return: True if every tensor is the recorded one at the recorded version.
+    """
+    return (
+        record is not None
+        and len(record) == len(tensors)
+        and all(r is t and v == tensor_version(t) for (r, v), t in zip(record, tensors))
     )

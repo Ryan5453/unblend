@@ -2,13 +2,13 @@
 Numeric-equivalence tests for the native CUDA kernels in ``unblend.cuda``.
 
 Each fused module has a PyTorch fallback (used on CPU / in FP32) and a
-hand-written CUDA kernel (used on CUDA in FP16/BF16). RoFormer RMSNorm also
-supports explicitly requested FP32. These tests assert the kernel output
-matches the fallback reference within tolerance, so
-a kernel regression (bad indexing, a broken reduction, wrong activation math)
-can't silently ship. The fallback is treated as ground truth: we run the same
-module on a CPU FP32 copy of the input to get the reference, then on CUDA in
-FP16/BF16 to exercise the kernel.
+hand-written CUDA kernel (used on CUDA in FP16/BF16). These tests assert
+the kernel output
+matches the fallback reference within tolerance, so a kernel bug (bad
+indexing, a broken reduction, wrong activation math) can't silently ship.
+The fallback is treated as ground truth: the same module runs on a CPU FP32
+copy of the input for the reference, then on CUDA in FP16/BF16 to exercise
+the kernel.
 
 These only run on machines with an NVIDIA GPU; elsewhere they skip.
 """
@@ -25,7 +25,6 @@ from unblend.cuda import (
     FusedGroupNormGlu,
     FusedNormGluLayerScaleResid,
     apply_cuda_optimizations,
-    cuda_rms_norm,
 )
 
 cuda_only = pytest.mark.skipif(
@@ -66,37 +65,6 @@ def _device() -> torch.device:
     :return: The default CUDA device
     """
     return torch.device("cuda")
-
-
-@cuda_only
-@pytest.mark.parametrize("dtype", [torch.float32, *LP_DTYPES])
-@pytest.mark.parametrize("shape", [(7, 31, 256), (5, 62, 384), (3, 11, 516)])
-def test_cuda_rms_norm_matches_fp32_reference(
-    dtype: torch.dtype, shape: tuple[int, ...]
-) -> None:
-    """
-    Fused last-dimension RMSNorm preserves RoFormer's FP32 arithmetic.
-
-    :param dtype: Storage dtype under test.
-    :param shape: Input shape ending in the affine dimension.
-    """
-    dim = shape[-1]
-    scale = dim**0.5
-    x = torch.randn(*shape)
-    gamma = torch.randn(dim) * 0.1 + 1.0
-    dev_x = x.to(_device(), dtype)
-    dev_gamma = gamma.to(_device(), dtype)
-
-    # Build the reference from dtype-quantized values so the comparison
-    # isolates reduction/affine arithmetic rather than input conversion.
-    ref_x = dev_x.cpu().float()
-    ref_gamma = dev_gamma.cpu().float()
-    ref = F.normalize(ref_x, dim=-1) * scale * ref_gamma
-    with torch.inference_mode():
-        out = cuda_rms_norm(dev_x, dev_gamma, scale).cpu().float()
-
-    tolerance = dict(atol=2e-5, rtol=2e-5) if dtype == torch.float32 else _tol(dtype)
-    torch.testing.assert_close(out, ref, **tolerance)
 
 
 def _make_gn(channels: int) -> nn.GroupNorm:
@@ -179,12 +147,6 @@ def test_kernel_modules_fall_back_when_autograd_is_enabled() -> None:
     assert x.grad is not None
     assert mod.weight.grad is not None
 
-    rms_x = torch.randn(2, 8, device=_device(), dtype=torch.float16, requires_grad=True)
-    gamma = torch.ones(8, device=_device(), requires_grad=True)
-    cuda_rms_norm(rms_x, gamma, 8**0.5).float().sum().backward()
-    assert rms_x.grad is not None
-    assert gamma.grad is not None
-
 
 @cuda_only
 def test_kernel_modules_still_dispatch_during_inference(monkeypatch) -> None:
@@ -196,9 +158,9 @@ def test_kernel_modules_still_dispatch_during_inference(monkeypatch) -> None:
     calls: list[str] = []
     original_get_kernel = cuda_module._get_kernel
 
-    def recording_get_kernel(name: str, dtype: torch.dtype):
+    def recording_get_kernel(name: str):
         calls.append(name)
-        return original_get_kernel(name, dtype)
+        return original_get_kernel(name)
 
     monkeypatch.setattr(cuda_module, "_get_kernel", recording_get_kernel)
     mod = CUDAGroupNorm(_make_gn(16)).to(_device()).eval()
@@ -292,7 +254,7 @@ def test_cuda_group_norm_large_dc_offset(
     dtype: torch.dtype, shape: tuple[int, ...]
 ) -> None:
     """
-    A large DC offset exercises the kernels' K-shift cancellation guard.
+    A large DC offset exercises the kernels' shifted-sum cancellation guard.
 
     Without the shift, the one-pass ``E[x^2] - E[x]^2`` variance loses most of
     its significant digits when ``|mean| >> std``. The input is quantized to
@@ -310,6 +272,154 @@ def test_cuda_group_norm_large_dc_offset(
     out = _inference_call(mod.to(_device()), x.to(_device()))
 
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
+
+
+# One 750k-element group: C*N % 4 == 0 takes the vectorized reduction loads,
+# 6 * 125_001 the scalar ones.
+_OUTLIER_SHAPES = [(1, 4, 187_500), (1, 6, 125_001)]
+_OUTLIER = 3000.0
+
+
+def _outlier_input(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """
+    Unit-normal input whose very first element is a large outlier.
+
+    A reduction that shifts every term by ``x[0]`` puts the outlier's offset
+    into all of them, and the fp32 ``E[d^2] - E[d]^2`` cancellation then loses
+    several percent of the variance on a group this size. The input is
+    quantized to ``dtype`` up front so the kernel and the FP32 reference see
+    identical values.
+
+    :param shape: Tensor shape; the outlier goes at ``[:, 0, 0]``
+    :param dtype: Low-precision dtype to quantize to
+    :return: The quantized input, on CPU
+    """
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(*shape, generator=g)
+    x[:, 0, 0] = _OUTLIER
+    return x.to(dtype)
+
+
+def _mean_rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
+    """
+    Mean absolute error relative to the reference's mean magnitude.
+
+    The outlier's own output (hundreds of units, coarsely rounded) is masked so
+    the metric tracks the statistics every other element is normalized with.
+
+    :param out: Kernel output
+    :param ref: FP32 reference of the same shape
+    :return: ``mean|out - ref| / mean|ref|`` over the non-outlier elements
+    """
+    out = out.float().cpu().reshape(ref.shape).clone()
+    ref = ref.clone()
+    out[:, 0, 0] = 0.0
+    ref[:, 0, 0] = 0.0
+    return ((out - ref).abs().mean() / ref.abs().mean()).item()
+
+
+@cuda_only
+@pytest.mark.parametrize(
+    "kind",
+    ["group_norm", "group_norm_chlast", "gelu", "gelu_inject", "glu", "glu_ls_resid"],
+)
+@pytest.mark.parametrize("single_stage", [True, False], ids=["single", "multi"])
+@pytest.mark.parametrize("shape", _OUTLIER_SHAPES)
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+def test_group_norm_outlier_first_element(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    single_stage: bool,
+    kind: str,
+) -> None:
+    """
+    An outlier ``x[0]`` on a large group doesn't skew any fused GroupNorm.
+
+    CUDA twin of the Metal test: GroupNorm (channel-first and channels_last),
+    GroupNorm+GELU (with and without the fused inject add), GroupNorm+GLU and
+    the DConv envelope, on both the single-stage and multi-stage paths, forced
+    via ``_use_single_stage`` so each path sees the same 750k-element group.
+    The bounds sit at a few times the output-rounding floor; the old shared
+    ``x[0]`` shift was 0.5-9% off on Metal.
+
+    :param monkeypatch: pytest fixture used to force the kernel path
+    :param dtype: dtype under test
+    :param shape: tensor shape under test
+    :param single_stage: whether to force the single-stage kernel
+    :param kind: which fused module to exercise
+    """
+    monkeypatch.setattr(
+        CUDAGroupNorm,
+        "_use_single_stage",
+        classmethod(lambda cls, batch, per_batch: single_stage),
+    )
+    channels = shape[1]
+    gn = _make_gn(channels)
+    x = _outlier_input(shape, dtype)
+    zn = F.group_norm(x.float(), 1, gn.weight, gn.bias, gn.eps)
+    if kind == "group_norm":
+        mod, args, ref = CUDAGroupNorm(gn), (x,), zn
+    elif kind == "group_norm_chlast":
+        # (B, C, 1, N) in channels_last: the outlier stays first in memory.
+        mod, args, ref = CUDAGroupNorm(gn), (_nhwc(x.unsqueeze(2)),), zn
+    elif kind == "gelu":
+        # The kernel uses the tanh approximation; match it so the bound only
+        # measures the normalization.
+        mod, args, ref = FusedGroupNormGelu(gn), (x,), F.gelu(zn, approximate="tanh")
+    elif kind == "gelu_inject":
+        g = torch.Generator().manual_seed(1)
+        inj = torch.randn(*shape, generator=g).to(dtype)
+        zi = F.group_norm(x.float() + inj.float(), 1, gn.weight, gn.bias, gn.eps)
+        mod, args = FusedGroupNormGelu(gn), (x, inj)
+        ref = F.gelu(zi, approximate="tanh")
+    elif kind == "glu":
+        mod, args, ref = FusedGroupNormGlu(gn), (x,), F.glu(zn, dim=1)
+    else:
+        ls = _make_ls(channels // 2)
+        # A zero residual keeps the small LayerScale'd term from being lost to
+        # the output rounding of a unit-scale residual.
+        residual = torch.zeros(shape[0], channels // 2, *shape[2:], dtype=dtype)
+        mod = FusedNormGluLayerScaleResid(gn, ls)
+        args = (x, residual)
+        ref = ls[:, None] * F.glu(zn, dim=1)
+
+    out = _inference_call(mod.to(_device()), *(a.to(_device()) for a in args))
+
+    assert _mean_rel_err(out, ref) < (2e-3 if dtype == torch.float16 else 8e-3)
+
+
+@cuda_only
+@pytest.mark.parametrize("shape", _OUTLIER_SHAPES)
+@pytest.mark.parametrize("dtype", LP_DTYPES)
+def test_multi_stage_meanvar_outlier_first_element(
+    dtype: torch.dtype, shape: tuple[int, ...]
+) -> None:
+    """
+    The multi-stage ``(mean, rsqrt(var + eps))`` matches float64 statistics.
+
+    Checks the partial-reduce / finalize output directly, which isolates the
+    reduction from output rounding.
+
+    :param dtype: dtype under test
+    :param shape: tensor shape under test
+    """
+    channels = shape[1]
+    mod = CUDAGroupNorm(_make_gn(channels)).to(_device())
+    x = _outlier_input(shape, dtype)
+    per_batch = x[0].numel()
+    xd = x.double().flatten(1)
+    mean = xd.mean(dim=1)
+    scale = torch.rsqrt(xd.var(dim=1, unbiased=False) + mod.eps)
+
+    with torch.inference_mode():
+        meanvar, _ = mod._multi_stage_meanvar(
+            x.to(_device()), shape[0], per_batch, per_batch
+        )
+
+    meanvar = meanvar.cpu().double()
+    torch.testing.assert_close(meanvar[:, 0], mean, atol=1e-5, rtol=0)
+    torch.testing.assert_close(meanvar[:, 1], scale, atol=0, rtol=1e-5)
 
 
 @cuda_only
@@ -359,12 +469,13 @@ def test_fused_group_norm_gelu_inject_matches_reference(dtype: torch.dtype) -> N
     ``FusedGroupNormGelu``'s fused inject-add matches the explicit ops.
 
     The HTDemucs encoder computes ``gelu(group_norm(conv(x) + inject))``; the
-    module folds the add into the normalization launch. Exercises both the
-    single-stage and multi-stage dispatch paths.
+    module folds the add into the normalization launch. Exercises the
+    single-stage vector and scalar paths (frames % 4 != 0, which must offset
+    inject per batch), a block smaller than one warp, and multi-stage.
 
     :param dtype: dtype under test
     """
-    for channels, frames in ((48, 100), (512, 4096)):
+    for channels, frames in ((48, 100), (48, 101), (4, 3), (512, 4096)):
         gn = _make_gn(channels)
         mod = FusedGroupNormGelu(gn)
         x = torch.randn(4, channels, frames)
@@ -406,7 +517,7 @@ def test_add_gelu_matches_reference(dtype: torch.dtype, shape: tuple) -> None:
     dev_b = b.to(_device(), dtype).contiguous()
     out = torch.empty_like(dev_a)
     with torch.inference_mode():
-        _get_kernel("add_gelu", dtype)(out, dev_a, dev_b)
+        _get_kernel("add_gelu")(out, dev_a, dev_b)
 
     torch.testing.assert_close(out.float().cpu(), ref, **_tol(dtype))
 
@@ -488,8 +599,8 @@ def test_envelope_channels_last(dtype: torch.dtype, shape: tuple) -> None:
     ``FusedNormGluLayerScaleResid`` supports channels_last storage.
 
     Each vector lane is a different channel in this layout, so the
-    per-channel LayerScale must be applied per lane — the exact regression
-    the chlast envelope kernels exist to handle.
+    per-channel LayerScale must be applied per lane, which is what the chlast
+    envelope kernels handle.
 
     :param dtype: dtype under test
     :param shape: ``(B, 2C, Fr, T)`` shape under test
@@ -584,9 +695,9 @@ def test_fused_gelu_fallback_is_exact_erf() -> None:
     """
     The FP32 GELU fallback equals PyTorch's exact-erf ``F.gelu``.
 
-    The kernel's per-element erf-vs-tanh gap (~1e-3) is below FP16 precision so
-    it can't be distinguished by a kernel-vs-fallback comparison; this checks the
-    fallback definition directly, which is what the kernel is verified against.
+    The kernel's tanh-vs-erf gap (at most ~5e-4) sits inside the FP16/BF16
+    tolerance of the kernel-vs-fallback comparison, so this checks the fallback
+    definition directly, which is what the kernel is verified against.
     """
     channels = 64
     gn = _make_gn(channels)
@@ -866,3 +977,219 @@ def test_fused_roformer_rotary_matches_reference(
         else dict(atol=1e-5, rtol=1e-5)
     )
     torch.testing.assert_close(out.float().cpu(), ref.float(), **tol)
+
+
+def test_fused_roformer_rotary_falls_back_when_build_fails(monkeypatch) -> None:
+    """
+    A failed kernel build degrades rotary to native PyTorch instead of raising.
+
+    :param monkeypatch: pytest fixture used to force the build failure
+    """
+    import unblend.cuda as cuda_mod
+
+    def _fail() -> None:
+        raise RuntimeError("CUDA kernel compilation failed: no nvcc")
+
+    monkeypatch.setattr(cuda_mod, "_get_extension", _fail)
+    t = torch.randn(2, 4, 6, 8)
+    cos, sin = torch.randn(6, 4), torch.randn(6, 4)
+    with pytest.warns(RuntimeWarning, match="falling back"):
+        out = cuda_mod.fused_roformer_rotary(t, cos, sin)
+    x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
+    ref = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
+    torch.testing.assert_close(out, ref)
+
+
+@cuda_only
+def test_fused_group_norm_gelu_broadcast_inject_takes_the_explicit_add() -> None:
+    """
+    An inject the kernel can't index like ``x`` (here a frequency-broadcast
+    ``(B, C, 1, T)``) still gives the right answer instead of reading out of
+    bounds.
+    """
+    gn = _make_gn(16)
+    mod = FusedGroupNormGelu(gn).to(_device())
+    x = torch.randn(2, 16, 8, 64)
+    inj = torch.randn(2, 16, 1, 64)
+    ref = F.gelu(F.group_norm(x + inj, 1, gn.weight, gn.bias, gn.eps))
+    out = _inference_call(
+        mod, x.to(_device(), torch.float16), inj.to(_device(), torch.float16)
+    )
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(torch.float16))
+
+
+@cuda_only
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="needs two GPUs",
+)
+def test_kernels_launch_on_the_tensors_gpu() -> None:
+    """
+    A module on ``cuda:1`` runs correctly while ``cuda:0`` is current.
+    """
+    gn = _make_gn(16)
+    x = torch.randn(2, 16, 64)
+    ref = F.gelu(F.group_norm(x, 1, gn.weight, gn.bias, gn.eps))
+    mod = FusedGroupNormGelu(gn).to("cuda:1")
+    with torch.cuda.device(0):
+        out = _inference_call(mod, x.to("cuda:1", torch.float16))
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(torch.float16))
+
+
+def test_warmup_build_thread_is_not_a_daemon(monkeypatch) -> None:
+    """
+    The background build thread must outlive interpreter shutdown.
+
+    ``cpp_extension`` holds a lock file for the whole nvcc build; a daemon
+    thread killed mid-build would leave it behind and hang later processes.
+
+    :param monkeypatch: pytest fixture used to fake CUDA and the build
+    """
+    import unblend.cuda as cuda_mod
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cuda_mod, "_get_extension", lambda: calls.append(1))
+    monkeypatch.setattr(cuda_mod, "_extension", None)
+    monkeypatch.setattr(cuda_mod, "_extension_error", None)
+    monkeypatch.setattr(cuda_mod, "_warmup_thread", None)
+
+    cuda_mod.warmup_async()
+    thread = cuda_mod._warmup_thread
+    assert thread is not None
+    thread.join(timeout=10)
+    assert not thread.daemon
+    assert calls == [1]
+
+
+def test_build_cache_is_stale_when_a_source_is_newer(tmp_path) -> None:
+    """
+    The build notice fires when ninja will rebuild, not only on a first build.
+
+    :param tmp_path: pytest fixture for a scratch build directory
+    """
+    import os
+
+    from unblend.cuda import _build_is_fresh
+
+    source = tmp_path / "rotary.cu"
+    header = tmp_path / "kernels.cuh"
+    for path in (source, header):
+        path.write_text("")
+        os.utime(path, (1_000, 1_000))
+    assert not _build_is_fresh(tmp_path, "ext", [source, header])
+
+    lib = tmp_path / "ext.so"
+    lib.write_text("")
+    os.utime(lib, (2_000, 2_000))
+    assert _build_is_fresh(tmp_path, "ext", [source, header])
+
+    os.utime(header, (3_000, 3_000))
+    assert not _build_is_fresh(tmp_path, "ext", [source, header])
+
+
+@cuda_only
+@pytest.mark.parametrize(
+    "residual_shape, residual_dtype",
+    [
+        ((1, 24, 200), torch.float16),  # broadcast over batch
+        ((3, 24, 1), torch.float16),  # broadcast over time
+        ((3, 24, 200), torch.float32),  # dtype differs from z
+    ],
+)
+def test_envelope_mismatched_residual_falls_back(
+    residual_shape: tuple[int, ...], residual_dtype: torch.dtype
+) -> None:
+    """
+    A residual the kernel cannot index like its output takes the eager path.
+
+    :param residual_shape: Residual shape, broadcastable to ``(3, 24, 200)``
+    :param residual_dtype: Residual dtype
+    """
+    gn = _make_gn(48)
+    ls = _make_ls(24)
+    mod = FusedNormGluLayerScaleResid(gn, ls)
+    z = torch.randn(3, 48, 200)
+    residual = torch.randn(*residual_shape)
+
+    ref = mod(z, residual)
+    out = _inference_call(
+        mod.to(_device()),
+        z.to(_device(), torch.float16),
+        residual.to(_device(), residual_dtype),
+    )
+
+    assert out.dtype == torch.float16
+    assert out.shape == ref.shape == (3, 24, 200)
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(torch.float16))
+
+
+@cuda_only
+def test_envelope_residual_in_another_memory_format_falls_back() -> None:
+    """
+    A contiguous residual beside a channels_last ``z`` is not indexed as NHWC.
+    """
+    gn = _make_gn(96)
+    ls = _make_ls(48)
+    mod = FusedNormGluLayerScaleResid(gn, ls)
+    z = torch.randn(2, 96, 6, 100)
+    residual = torch.randn(2, 48, 6, 100)
+
+    ref = mod(z, residual)
+    out = _inference_call(
+        mod.to(_device()),
+        _nhwc(z.to(_device(), torch.float16)),
+        residual.to(_device(), torch.float16),
+    )
+
+    torch.testing.assert_close(out.float().cpu(), ref, **_tol(torch.float16))
+
+
+@cuda_only
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="needs two GPUs",
+)
+def test_rotary_launches_on_the_tensors_gpu() -> None:
+    """
+    RoFormer rotary on ``cuda:1`` runs correctly while ``cuda:0`` is current.
+    """
+    from unblend.cuda import fused_roformer_rotary
+
+    t = torch.randn(2, 4, 48, 64)
+    angles = torch.randn(48, 32)
+    cos, sin = angles.cos(), angles.sin()
+    x1, x2 = t.unflatten(-1, (-1, 2)).unbind(dim=-1)
+    ref = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
+
+    dev = torch.device("cuda:1")
+    with torch.cuda.device(0), torch.inference_mode():
+        out = fused_roformer_rotary(
+            t.to(dev, torch.float16),
+            cos.to(dev, torch.float16),
+            sin.to(dev, torch.float16),
+        )
+    torch.testing.assert_close(out.float().cpu(), ref, atol=2e-2, rtol=2e-2)
+
+
+@cuda_only
+def test_scnet_group_norms_are_swapped() -> None:
+    """
+    SCNet's GroupNorm subclass still gets the fused CUDA kernel.
+    """
+    from unblend.scnet import SCNet
+
+    # Inline (not from tests.test_scnet, which needs an editable install).
+    tiny = dict(
+        audio_channels=2,
+        dims=[4, 8, 16, 32],
+        nfft=512,
+        hop_size=128,
+        win_size=512,
+        band_stride=[1, 2, 4],
+        band_kernel=[3, 4, 4],
+        conv_depths=[1, 1, 1],
+        num_dplayer=2,
+    )
+    model = SCNet(sources=["a", "b", "c", "d"], **tiny).to(_device(), torch.float16)
+    assert apply_cuda_optimizations(model.eval())["group_norm"] > 0

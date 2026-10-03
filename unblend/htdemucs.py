@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .backends import ASSModel
+from .backends import ASSModel, tensor_record, tensor_record_matches
 from .blocks import (
     HDecLayer,
     HEncLayer,
@@ -31,6 +31,9 @@ class HTDemucs(ASSModel):
     """
     Hybrid spectrogram/waveform Demucs.
     """
+
+    # It normalizes each chunk by the chunk's own spread.
+    sparse_chunks_need_fp32 = True
 
     def __init__(
         self,
@@ -82,10 +85,11 @@ class HTDemucs(ASSModel):
         t_cross_first: bool = False,
         rescale: float = 0.1,
         samplerate: int = 44100,
-        segment: int = 10,
+        segment: float = 10,
     ) -> None:
         """
-        Initialize the model.
+        Build the frequency and time encoder/decoder stacks and the
+        cross-domain transformer between them.
 
         :param sources: Output stem names.
         :param audio_channels: Input/output audio channels.
@@ -93,7 +97,7 @@ class HTDemucs(ASSModel):
         :param channels_time: Separate channel count for the time branch.
         :param growth: Channel growth per layer.
         :param nfft: STFT size.
-        :param cac: Complex-as-channels output decoding.
+        :param cac: Complex-as-channels output decoding; must be True.
         :param depth: Encoder/decoder depth.
         :param rewrite: Add a 1x1 conv rewrite to each layer.
         :param multi_freqs: Frequency band ratios for MultiWrap.
@@ -130,23 +134,23 @@ class HTDemucs(ASSModel):
         :param t_weight_pos_embed: Positional embedding weight.
         :param t_sin_random_shift: Random shift of the sinusoidal embedding.
         :param t_cape_mean_normalize: CAPE position normalization.
-        :param t_cape_augment: CAPE augmentation (always False at inference).
-        :param t_cape_glob_loc_scale: CAPE scale parameters.
+        :param t_cape_augment: CAPE training augmentation; unused at inference.
+        :param t_cape_glob_loc_scale: CAPE augmentation scales; unused at inference.
         :param t_cross_first: Cross-attention first in each layer pair.
         :param rescale: Conv weight rescale factor (0 disables).
         :param samplerate: Audio sample rate in Hz.
         :param segment: Training segment length in seconds.
         """
         super().__init__()
+        if not cac:
+            # Upstream's magnitude-mask path needs Wiener filtering, which
+            # isn't implemented; no released checkpoint uses it.
+            raise ValidationError("HTDemucs only supports cac=True.")
         self.cac = cac
         self.audio_channels = audio_channels
         self.sources = sources
-        self.kernel_size = kernel_size
-        self.context = context
-        self.stride = stride
         self.depth = depth
         self.bottom_channels = bottom_channels
-        self.channels = channels
         self.samplerate = samplerate
         self.max_allowed_segment = segment
         self.nfft = nfft
@@ -160,9 +164,7 @@ class HTDemucs(ASSModel):
         self.tdecoder = nn.ModuleList()
 
         chin = audio_channels
-        chin_z = chin
-        if self.cac:
-            chin_z *= 2
+        chin_z = chin * 2  # complex as channels
         chout = channels_time or channels
         chout_z = channels
         freqs = nfft // 2
@@ -233,9 +235,7 @@ class HTDemucs(ASSModel):
             self.encoder.append(enc)
             if index == 0:
                 chin = self.audio_channels * len(self.sources)
-                chin_z = chin
-                if self.cac:
-                    chin_z *= 2
+                chin_z = chin * 2
             dec = HDecLayer(
                 chout_z,
                 chin_z,
@@ -358,38 +358,31 @@ class HTDemucs(ASSModel):
 
     def _magnitude(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Compute magnitude of the spectrogram, or reshape complex to channels if CaC.
+        Reshape a complex spectrogram to real channels (complex as channels).
 
         :param z: Complex spectrogram tensor
-        :return: Magnitude or CaC-reshaped tensor
+        :return: CaC-reshaped tensor
         """
-
-        if self.cac:
-            B, C, Fr, T = z.shape
-            m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
-            m = m.reshape(B, C * 2, Fr, T)
-        else:
-            m = z.abs()
-        return m
+        B, C, Fr, T = z.shape
+        m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
+        return m.reshape(B, C * 2, Fr, T)
 
     def _mask(self, z: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
         """
         Convert CaC mask output back to complex spectrogram.
 
-        :param z: Original complex spectrogram (ignored in CaC mode)
-        :param m: Mask or full spectrogram in CaC format
+        :param z: Original complex spectrogram (unused: CaC predicts the
+            spectrogram itself)
+        :param m: Full spectrogram in CaC format
         :return: Complex spectrogram tensor
         """
-        if not self.cac:
-            return z[:, None] * m
-
         B, S, _C, Fr, T = m.shape
         out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
         return torch.view_as_complex(out.contiguous())
 
     def valid_length(self, length: int) -> int:
         """
-        Return a length that is appropriate for evaluation.
+        Return the training length, the only input length the model accepts.
 
         :param length: Requested input length in samples
         :return: Training length for consistent segment processing
@@ -409,17 +402,36 @@ class HTDemucs(ASSModel):
     ) -> torch.Tensor:
         """
         Return the frequency-positional embedding pre-shaped for broadcast,
-        memoised by ``(num_freqs, device, dtype)``.
+        memoised by ``(num_freqs, device, dtype)`` when autograd is off, and
+        dropped when the embedding weights change in place or are replaced.
+        A compiled forward reads the cache without that check (dynamo can't
+        trace it): after editing ``freq_emb`` in place, call
+        ``load_state_dict`` or rebuild the compiled model.
 
         :param num_freqs: Number of frequency bins (``Fq``).
         :param device: Device the embedding should live on.
         :param dtype: Dtype the embedding should match.
         :return: Tensor of shape ``(1, C, Fq, 1)`` ready to add to the encoder input.
         """
+        if torch.is_grad_enabled():
+            # Training: the embedding is learned, so it must stay in the graph.
+            frs = torch.arange(num_freqs, device=device)
+            return self.freq_emb(frs).t()[None, :, :, None].to(dtype)
         cache = getattr(self, "_freq_emb_cache", None)
         if cache is None:
             cache = {}
             object.__setattr__(self, "_freq_emb_cache", cache)
+        if not torch.compiler.is_compiling():
+            # An optimizer step or a copy_() into the weights must not be
+            # served a stale embedding. Skipped while tracing, as in the fused
+            # layers: dynamo can't trace a version counter, and a break here
+            # would cost the whole compiled forward its single graph.
+            params = tuple(self.freq_emb.parameters())
+            if not tensor_record_matches(
+                getattr(self, "_freq_emb_versions", None), *params
+            ):
+                cache.clear()
+                object.__setattr__(self, "_freq_emb_versions", tensor_record(*params))
         key = (num_freqs, device, dtype)
         emb = cache.get(key)
         if emb is None:
@@ -430,6 +442,34 @@ class HTDemucs(ASSModel):
             cache[key] = emb
         return emb
 
+    def __getstate__(self) -> dict:
+        """
+        Pickle and ``deepcopy`` without the derived caches and their records
+        (see ``backends.state_without``).
+
+        :return: The state to pickle.
+        """
+        state = super().__getstate__()  # ASSModel's: the hot path eager
+        state.pop("_freq_emb_cache", None)
+        state.pop("_freq_emb_versions", None)
+        return state
+
+    def _apply(self, fn: Any, recurse: bool = True) -> "HTDemucs":
+        """
+        Apply a dtype/device transform, dropping the memoised frequency
+        embedding, which would otherwise keep the old device and dtype.
+
+        :param fn: Tensor transformation from ``nn.Module.to``/``half``.
+        :param recurse: Whether child modules are transformed too.
+        :return: This module.
+        """
+        cache = getattr(self, "_freq_emb_cache", None)
+        if cache:
+            cache.clear()
+        # The record would otherwise keep pre-cast parameters alive.
+        self.__dict__.pop("_freq_emb_versions", None)
+        return super()._apply(fn, recurse=recurse)
+
     def _load_from_state_dict(self, *args: Any, **kwargs: Any) -> None:
         """
         Load weights and invalidate the memoised frequency embedding —
@@ -438,18 +478,19 @@ class HTDemucs(ASSModel):
 
         :param args: Forwarded to ``nn.Module._load_from_state_dict``.
         :param kwargs: Forwarded to ``nn.Module._load_from_state_dict``.
-        :return: None.
         """
         cache = getattr(self, "_freq_emb_cache", None)
         if cache:
             cache.clear()
+        self.__dict__.pop("_freq_emb_versions", None)
         super()._load_from_state_dict(*args, **kwargs)
 
     def prefill_inference_caches(self) -> None:
         """
-        Eagerly populate caches.
+        Run one training-length forward pass to fill the frequency-embedding
+        cache before CUDAGraph capture.
         """
-        training_length = int(self.max_allowed_segment * self.samplerate)
+        training_length = int(round(self.max_allowed_segment * self.samplerate))
         model_dtype = next(self.parameters()).dtype
         model_device = next(self.parameters()).device
 
@@ -486,7 +527,8 @@ class HTDemucs(ASSModel):
 
         :param x: Normalized frequency branch input [B, C*2, Fq, T] (CaC format)
         :param xt: Normalized time branch input [B, C, samples]
-        :return: Tuple of (frequency output [B, S*C*2, Fq, T], time output [B, S*C, samples])
+        :return: Tuple of (frequency output [B, S*C*2, Fq, T],
+            time output [B, S*C, samples])
         """
         saved = []
         saved_t = []
@@ -589,6 +631,6 @@ class HTDemucs(ASSModel):
         xt = xt.view(B, S, -1, training_length)
         xt = xt * stdt[:, None] + meant[:, None]
         x = xt + x
-        if length_pre_pad:
+        if length_pre_pad is not None:
             x = x[..., :length_pre_pad]
         return x

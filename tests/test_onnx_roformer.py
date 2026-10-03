@@ -301,12 +301,11 @@ def test_export_and_onnxruntime_parity(builder, tmp_path) -> None:
     assert meta["model_family"] == "roformer"
     assert meta["stft_n_fft"] == str(N_FFT)
     assert meta["stft_hop_length"] == str(HOP)
-    assert meta["precision"] == "fp32"
+    assert meta["weight_precision"] == "fp32"
     assert meta["external_normalization"] == "false"
 
-    # Band splitting used to become one ~60-output Split, which exceeds the
-    # WebGPU storage-buffer binding floor. The only remaining Split is the
-    # narrow Q/K/V split (three outputs).
+    # A wide Split (one output per band) would exceed the WebGPU
+    # storage-buffer binding floor; only the three-output Q/K/V split remains.
     graph = onnx.load(path).graph
     assert (
         max(
@@ -399,7 +398,7 @@ def test_fp16_export_uses_mixed_precision(tmp_path) -> None:
     assert os.path.getsize(fp16_path) < 0.75 * os.path.getsize(fp32_path)
     fp16_model = onnx.load(fp16_path)
     meta = {p.key: p.value for p in fp16_model.metadata_props}
-    assert meta["precision"] == "fp16"
+    assert meta["weight_precision"] == "fp16"
     assert all(
         value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
         for value in fp16_model.graph.input
@@ -445,3 +444,32 @@ def test_fp16_export_uses_mixed_precision(tmp_path) -> None:
     )
     assert torch.isfinite(torch.from_numpy(silent_real)).all()
     assert torch.isfinite(torch.from_numpy(silent_imag)).all()
+
+
+def test_fp16_export_keeps_rmsnorm_square_in_fp32(tmp_path) -> None:
+    """
+    RMSNorm squares its input (``Pow``). In fp16 values above 256 overflow to
+    inf and zero the token, and real activations get there, so the mixed
+    export must leave every ``Pow`` computing in fp32. onnxruntime on CPU
+    quietly computes these in fp32 anyway, so this checks the graph's types.
+    """
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+    pytest.importorskip("onnxconverter_common")
+
+    import onnx
+
+    from unblend.onnx import _export_roformer_to_onnx
+
+    torch.manual_seed(0)
+    model = _bs()
+    model.configure_inference(sources=["a", "b"], samplerate=SR, segment_samples=SR)
+    path = str(tmp_path / "m16.onnx")
+    _export_roformer_to_onnx(model, path, opset_version=18, storage=torch.float16)
+
+    graph = onnx.shape_inference.infer_shapes(onnx.load(path)).graph
+    types = {v.name: v.type.tensor_type.elem_type for v in graph.value_info}
+    types.update({v.name: v.type.tensor_type.elem_type for v in graph.output})
+    pows = [node for node in graph.node if node.op_type == "Pow"]
+    assert pows, "RMSNorm should export a Pow"
+    assert all(types.get(node.output[0]) == onnx.TensorProto.FLOAT for node in pows)

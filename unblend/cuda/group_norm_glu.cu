@@ -9,7 +9,7 @@
 //
 // ``apply_norm_glu`` is the third stage of the multi-stage path, reading
 // ``meanvar`` produced by ``finalize_meanvar`` in ``group_norm.cu``.
-// Crucially it tiles the OUTPUT space (size C*N), not the input — each
+// It tiles the OUTPUT space (size C*N), not the input — each
 // output element pulls its two input channels by absolute offset so the
 // tile boundaries don't matter. Vector/scalar path selection and the
 // reduction helpers are shared via ``kernels.cuh``.
@@ -42,9 +42,7 @@ __global__ void group_norm_g1_glu_kernel(
     unsigned int N,
     float eps
 ) {
-    __shared__ float sh_sum[MAX_WARPS];
-    __shared__ float sh_sq[MAX_WARPS];
-    __shared__ float bcast[2];
+    __shared__ float sh[GN_SHARED_FLOATS];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int tgs = blockDim.x;
@@ -57,12 +55,11 @@ __global__ void group_norm_g1_glu_kernel(
     const SCALAR_T* __restrict__  in_b = in_ + (unsigned long long)b * total_in;
     SCALAR_T* __restrict__  out_b = out + (unsigned long long)b * total_out;
 
-    float K = static_cast<float>(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total_in, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total_in, eps, sh_sum, sh_sq, bcast);
-    const float mean = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total_in, 0u, total_in, tid, tgs), total_in, eps, sh
+    );
+    const float mean = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         const Scalar4<SCALAR_T>* in4 =

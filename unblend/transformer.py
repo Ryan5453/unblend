@@ -7,7 +7,7 @@
 
 import math
 import random
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -71,8 +71,8 @@ def create_2d_sin_embedding(
     """
     if d_model % 4 != 0:
         raise ValueError(
-            "Cannot use sin/cos positional encoding with "
-            "odd dimension (got dim={:d})".format(d_model)
+            "2D sin/cos positional encoding needs a dimension divisible by 4 "
+            "(got dim={:d})".format(d_model)
         )
 
     with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
@@ -195,8 +195,9 @@ class ScaledEmbedding(nn.Module):
 
 
 class LayerScale(nn.Module):
-    """Layer scale from [Touvron et al 2021] (https://arxiv.org/pdf/2103.17239.pdf).
-    This rescales diagonaly residual outputs close to 0 initially, then learnt.
+    """
+    LayerScale (Touvron et al. 2021, https://arxiv.org/abs/2103.17239): a learnt
+    per-channel scale on residual outputs, initialised close to 0.
     """
 
     def __init__(
@@ -208,11 +209,12 @@ class LayerScale(nn.Module):
         dtype: Any = None,
     ) -> None:
         """
-        Initialize learnable diagonal rescaling for residual outputs.
+        Create the per-channel scale parameter.
 
         :param channels: Number of channels to scale
         :param init: Initial value for scale parameters
-        :param channel_last: If False, expects (B, C, T) tensors; if True, expects (B, T, C)
+        :param channel_last: If False, expects (B, C, T) tensors; if True,
+            expects (B, T, C)
         :param device: Device for the learnable scale.
         :param dtype: Data type for the learnable scale.
         """
@@ -375,13 +377,13 @@ class CrossTransformerEncoderLayer(nn.Module):
         batch_first: bool = False,
     ) -> None:
         """
-        Cross-attention transformer encoder layer with optional group norm and layer scale.
+        Cross-attention encoder layer with optional group norm and layer scale.
 
         :param d_model: Model dimension.
         :param nhead: Number of attention heads.
         :param dim_feedforward: Feedforward hidden dimension.
         :param dropout: Dropout rate.
-        :param activation: Activation function or string name.
+        :param activation: Activation function.
         :param layer_norm_eps: Epsilon for layer normalization.
         :param layer_scale: Use LayerScale on residual outputs.
         :param init_values: Initial values for LayerScale.
@@ -448,11 +450,7 @@ class CrossTransformerEncoderLayer(nn.Module):
 
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-
-        if isinstance(activation, str):
-            self.activation = self._get_activation_fn(activation)
-        else:
-            self.activation = activation
+        self.activation = activation
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, mask: torch.Tensor | None = None
@@ -500,21 +498,6 @@ class CrossTransformerEncoderLayer(nn.Module):
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
 
-    def _get_activation_fn(self, activation: str) -> Callable:
-        """
-        Return the activation function corresponding to the given name.
-
-        :param activation: Name of activation function ("relu" or "gelu")
-        :return: The activation function
-        :raises RuntimeError: If activation name is not recognized
-        """
-        if activation == "relu":
-            return F.relu
-        elif activation == "gelu":
-            return F.gelu
-
-        raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
-
 
 class CrossTransformerEncoder(nn.Module):
     def __init__(
@@ -542,7 +525,8 @@ class CrossTransformerEncoder(nn.Module):
         cape_glob_loc_scale: list[float] = [5000.0, 1.0, 1.4],
     ) -> None:
         """
-        Cross-transformer encoder alternating self-attention and cross-attention layers.
+        Alternate self-attention and cross-attention layers between the
+        spectrogram and waveform branches.
 
         :param dim: Model dimension.
         :param emb: Positional embedding type ("sin", "cape", or "scaled").
@@ -563,8 +547,10 @@ class CrossTransformerEncoder(nn.Module):
         :param sin_random_shift: Max random shift for sinusoidal embeddings.
         :param weight_pos_embed: Weight for positional embedding contribution.
         :param cape_mean_normalize: Mean-normalize CAPE positions.
-        :param cape_augment: Augment CAPE positions.
-        :param cape_glob_loc_scale: CAPE global/local scale parameters.
+        :param cape_augment: CAPE training augmentation; accepted for config
+            compatibility and unused at inference.
+        :param cape_glob_loc_scale: CAPE augmentation scales; accepted for config
+            compatibility and unused at inference.
         """
         super().__init__()
         assert dim % num_heads == 0
@@ -580,8 +566,6 @@ class CrossTransformerEncoder(nn.Module):
         self.sin_random_shift = sin_random_shift
         if emb == "cape":
             self.cape_mean_normalize = cape_mean_normalize
-            self.cape_augment = cape_augment
-            self.cape_glob_loc_scale = cape_glob_loc_scale
         if emb == "scaled":
             self.position_embeddings = ScaledEmbedding(max_positions, dim, scale=0.2)
 

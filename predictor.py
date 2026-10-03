@@ -5,8 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import functools
 import math
 import os
+import re
 import shutil
 import time
 import uuid
@@ -17,38 +19,17 @@ from typing import TypedDict
 import torch
 from cog import BasePredictor, Input, Path
 
-from unblend import Separator
+from unblend import Separator, ValidationError
 
 
 class Output(TypedDict, total=False):
     """
     Stems returned by a prediction, keyed by stem name.
 
-    Every key is optional because which ones appear depends on
-    ``isolate_stem``: the default returns htdemucs's four sources, while
-    isolating returns just ``{stem}`` and ``no_{stem}`` (see
-    SeparatedSources.isolate_stem in unblend/api.py).
-
-    This is a TypedDict rather than a ``cog.BaseModel`` on purpose. Cog 0.17.0
-    replaced pydantic with coglet, whose ``BaseModel`` is an empty marker class
-    -- it has no field handling and no ``__init__``, so the old
-    ``class Config: extra = "allow"`` silently became a no-op and every
-    prediction failed with "Output.__init__() got an unexpected keyword
-    argument 'drums'". Cog's static schema generator accepts BaseModel or
-    TypedDict, and a TypedDict is a plain dict at runtime, so it both declares
-    a real schema and constructs without relying on any SDK machinery.
-    Keys must be declared: the generator reads only declared fields, so a
-    dynamically-keyed output cannot be expressed here.
-
-    The stems are ``Path``, not ``File``. Cog inlines a ``File`` into the
-    prediction response as a base64 data URI, while a ``Path`` is uploaded to
-    object storage and returned as a URL. Both are ``format: uri`` in the
-    schema, but inlining does not survive real audio: a 225s song as wav is
-    ~160MB of stems, so ~212MB of base64 in a single JSON response. Measured on
-    an H100 -- separation 0.65s, encode 0.47s, then the prediction sat in
-    ``processing`` for over 22 minutes and never returned. The same song with
-    mp3 output (~19MB inlined) finished with predict_time 11.08s, which is what
-    identified the payload rather than the GPU as the bottleneck.
+    Keys are optional because ``isolate_stem`` returns only ``{stem}`` and
+    ``no_{stem}``. A TypedDict, because Cog reads declared keys for its schema;
+    ``Path`` rather than ``File`` so stems are uploaded and returned as URLs
+    instead of inlined as base64.
     """
 
     drums: Path
@@ -66,29 +47,120 @@ class _Request:
     """One coalescer-bound request, with its result future."""
 
     audio_path: PathlibPath
-    model_name: str
-    isolate_stem: str
-    format: str
-    clip_mode: str
     future: asyncio.Future = field(default_factory=asyncio.Future)
+    #: Duration measured by ``predict``, reused for batch budgeting.
+    seconds: float | None = None
 
 
-# Window inside which we wait for additional requests before flushing a batch.
-# 50 ms is the default starting point — short enough that single-file
-# latency only sees ~50 ms of added queueing on idle traffic, long enough to
-# collect a real batch under any meaningful concurrency. Tune via the
-# ``COG_DEMUCS_BATCH_WINDOW_MS`` env var if real traffic shows it short.
+# How long to wait for more requests before flushing a batch: short enough to
+# add little latency on idle traffic, long enough to collect a batch under
+# concurrency. Overridable via ``UNBLEND_BATCH_WINDOW_MS``.
 _BATCH_WINDOW_MS_DEFAULT = 50
 
 # Stems are written here for Cog to upload, one directory per prediction. Cog
 # uploads only after ``predict()`` returns, so a prediction cannot delete its
-# own files; instead every prediction first sweeps directories left by earlier
-# ones. The TTL just has to outlast an upload. coglet's own cleanup behaviour
-# is not inspectable (its serializer is a compiled extension), so this bounds
-# disk growth on a long-lived warm container whether or not Cog also removes
-# them.
+# own files; instead each prediction sweeps directories left by earlier ones,
+# bounding disk use on a long-lived container. The TTL must outlast an upload.
 _OUTPUT_ROOT = PathlibPath("/tmp/unblend-outputs")
 _OUTPUT_TTL_S = 900
+
+
+def _max_request_seconds(default: float = 1800.0) -> float:
+    """
+    The per-request audio limit, from ``UNBLEND_MAX_AUDIO_SECONDS``.
+
+    :param default: Limit used when the variable is unset or invalid.
+    :return: Longest single request, in seconds.
+    """
+    raw = os.environ.get("UNBLEND_MAX_AUDIO_SECONDS")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError
+    except ValueError:
+        print(
+            f"[predictor] ignoring invalid UNBLEND_MAX_AUDIO_SECONDS={raw!r}",
+            flush=True,
+        )
+        return default
+    return value
+
+
+# Longest single request, in seconds (override with UNBLEND_MAX_AUDIO_SECONDS).
+_MAX_REQUEST_AUDIO_SECONDS = _max_request_seconds()
+
+# Total audio per batched separate() call. Inputs and stems for ten minutes of
+# 44.1 kHz stereo are ~1 GB of float32; beyond that, batching saves nothing.
+_MAX_BATCH_AUDIO_SECONDS = 600.0
+
+
+def _duration_seconds(path: PathlibPath) -> float:
+    """
+    Duration for the request limit and batch budgeting.
+
+    The container's duration when it reports one; otherwise the audio is
+    decoded a minute at a time, stopping once it passes the request limit, so
+    a file without a duration can't slip past the limit.
+
+    :param path: Input audio path.
+    :return: Duration in seconds, or 0 for an unreadable file (which fails
+        on its own in separation).
+    """
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        decoder = AudioDecoder(str(path))
+        duration = decoder.metadata.duration_seconds
+    except Exception:
+        return 0.0
+    if duration is not None and math.isfinite(duration) and duration > 0:
+        return float(duration)
+    decoded = 0.0
+    while decoded <= _MAX_REQUEST_AUDIO_SECONDS:
+        try:
+            samples = decoder.get_samples_played_in_range(decoded, decoded + 60.0)
+        except Exception:
+            # Raised past the end of the stream.
+            break
+        count = samples.data.shape[-1]
+        if count == 0:
+            break
+        decoded += count / samples.sample_rate
+    return decoded
+
+
+def _request_seconds(request: _Request) -> float:
+    """
+    A request's duration, measuring it only if ``predict`` didn't.
+
+    :param request: Queued request.
+    :return: Duration in seconds.
+    """
+    if request.seconds is not None:
+        return request.seconds
+    return _duration_seconds(request.audio_path)
+
+
+@functools.lru_cache(maxsize=32)
+def _check_output_format(format: str) -> None:
+    """
+    Reject a format that isn't a bare extension FFmpeg can encode, before any
+    GPU work. The format becomes a filename suffix, so it must not carry a path.
+
+    :param format: Requested output format.
+    :raises ValidationError: If the format is unusable.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9]{1,16}", format):
+        raise ValidationError(f"Unsupported output format {format!r}.")
+    from unblend import SeparatedSources
+
+    probe = SeparatedSources({"probe": torch.zeros(2, 441)}, 44100, torch.zeros(2, 441))
+    try:
+        probe.export_stem("probe", format=format, clip=None)
+    except ValidationError as error:
+        raise ValidationError(f"Unsupported output format {format!r}.") from error
 
 
 def _prune_stale_outputs() -> None:
@@ -113,49 +185,28 @@ def _prune_stale_outputs() -> None:
 
 class Predictor(BasePredictor):
     """
-    Cog predictor for Demucs audio source separation, with in-process request
+    Cog predictor for Unblend's HTDemucs separation, with in-process request
     coalescing so concurrent calls share full-batch forward passes on the GPU.
 
-    Architecture:
+    Cog runs every async ``predict()`` on one event loop. Each ``predict()``
+    puts its input and a result future on the queue for its parameter
+    partition, and a finite-lived worker per partition drains that queue:
+    it takes the first request, then fills up to the model's
+    ``chunk_batch_size`` or waits out the batch window, whichever comes
+    first.
 
-    * ``setup()`` loads each served model and initializes the coalescer
-      registry. ``predict()`` lazily starts one finite-lived worker per active
-      parameter partition on the same asyncio event loop. Cog's Rust
-      orchestrator runs every async ``predict()`` on that loop (verified at
-      event loop initialised in ``setup()`` (verified at
-      ``crates/coglet-python/src/worker_bridge.rs:138-176`` in the cog
-      source — ``new_event_loop`` + ``run_forever`` on a dedicated thread),
-      so each partition worker is visible to every concurrent ``predict()``.
+    The worker runs ``separator.separate`` directly on the event loop thread,
+    not via ``asyncio.to_thread``: ``torch.compile`` with
+    ``mode="reduce-overhead"`` binds its CUDAGraph manager to thread-local
+    storage of the thread that first ran the compiled function, and a forward
+    on another thread fails. Blocking the loop is acceptable on one GPU, which
+    serializes the work anyway; Cog keeps accepting requests at the socket
+    and they enqueue as soon as the loop yields.
 
-    * Each ``predict()`` writes its input + result future into the queue for
-      its requested model and awaits the future. The coalescer drains the
-      queue: takes the first request, then either fills up to the model's
-      ``chunk_batch_size`` or hits the window deadline, whichever comes
-      first. It then runs ``separator.separate(list)`` directly on the
-      event loop's thread — not via ``asyncio.to_thread`` — because
-      ``torch.compile`` with ``mode="reduce-overhead"`` binds its CUDAGraph
-      manager to thread-local storage of the thread that first ran the
-      compiled function (``torch/_inductor/cudagraph_trees.py:332``).
-      Running the forward on a different thread asserts on a missing TLS
-      key. This blocks the event loop for the full duration of the GPU
-      work (seconds per batch) — no other coroutine runs until it returns.
-      That's acceptable on a single GPU, which serializes the work anyway:
-      Cog's Rust HTTP layer keeps accepting requests at the socket while we
-      block, and they get enqueued in a burst the moment we yield, so the
-      next batch coalesces normally.
-
-    Concurrency is controlled by ``concurrency.max`` in ``cog.yaml`` (which
-    Replicate's runtime translates to ``COG_MAX_CONCURRENCY`` at start) — it
-    needs to be at least as large as the coalescer's max batch for batching
-    to ever engage. The cog.yaml in this repo ships with ``concurrency.max:
-    32``, comfortably above the auto-detected ``chunk_batch_size`` on the
-    GPUs we target.
-
-    Requests with different ``shifts`` / ``split_overlap`` / ``isolate_stem``
-    can't share a forward pass (each sub-model and each shift count has a
-    different compute footprint), so we partition the in-flight queue by
-    ``(model, shifts, split_overlap, isolate_stem)``. In practice 99% of
-    traffic uses defaults, so the default queue carries everything.
+    ``concurrency.max`` in ``cog.yaml`` must be at least the coalescer's max
+    batch for batching to fill. Requests with different ``shifts``,
+    ``split_overlap``, ``isolate_stem`` or ``seed`` cannot share a forward
+    pass, so the queue is partitioned by those and the model.
     """
 
     async def setup(self) -> None:
@@ -164,18 +215,10 @@ class Predictor(BasePredictor):
         """
         self.separators: dict[str, Separator] = {}
         use_cuda = torch.cuda.is_available()
-        # cog.yaml declares ``gpu: true``, so a CPU fallback here is always a
-        # deployment fault, never a valid configuration.
-        #
-        # A driver too old for the installed wheel is only loud if you touch
-        # the right API: ``torch.cuda.get_device_properties`` raises
-        # "The NVIDIA driver on your system is too old", but
-        # ``is_available()`` swallows that and returns False (verified on a
-        # driver-570 host against cu130 wheels). Since we branch on
-        # ``is_available()``, we get the quiet path -- setup would succeed and
-        # the endpoint would serve correct output at a fraction of the speed
-        # forever, with compile and batching both silently off. Hence the
-        # explicit raise. Set UNBLEND_ALLOW_CPU=1 to run without a GPU.
+        # cog.yaml declares ``gpu: true``, so a CPU fallback is a deployment
+        # fault. ``is_available()`` returns False (rather than raising) when
+        # the driver is too old for the wheel, which would otherwise serve
+        # slowly on CPU forever. UNBLEND_ALLOW_CPU=1 opts out.
         if not use_cuda and os.environ.get("UNBLEND_ALLOW_CPU") != "1":
             raise RuntimeError(
                 "CUDA is unavailable but cog.yaml declares gpu: true. "
@@ -183,16 +226,10 @@ class Predictor(BasePredictor):
                 f"{torch.version.cuda}; check that the host driver is new "
                 "enough for it. Set UNBLEND_ALLOW_CPU=1 to run on CPU anyway."
             )
-        # This Cog serves htdemucs only. A ``compile=True`` Separator reserves
-        # a CUDAGraphs private memory pool sized to its auto-detected
-        # ``chunk_batch_size``; with a single resident model that pool +
-        # weights + activations fit comfortably even on a 16 GB GPU.
-        #
-        # We deliberately do NOT load htdemucs_ft / htdemucs_6s here. auto-cbs
-        # sizes each compiled model's pool against the free VRAM *at the moment
-        # it's constructed* — load a second compiled model afterward and its
-        # weights land on top of the first's already-locked pool, OOMing
-        # smaller GPUs at inference time. One model, one pool, no surprises.
+        # One model only: a compiled Separator sizes its CUDAGraphs memory
+        # pool from the free VRAM when it is constructed, so a second
+        # compiled model would land on top of the first's pool and OOM
+        # smaller GPUs.
         self.separators["htdemucs"] = Separator(
             model="htdemucs",
             device="cuda" if use_cuda else "cpu",
@@ -200,16 +237,10 @@ class Predictor(BasePredictor):
             compile=use_cuda,
         )
 
-        # Report what the accelerated path actually negotiated. Every one of
-        # these can silently degrade without any error: compile can fall back
-        # to eager, auto-calibration can settle on chunk_batch_size=1 after
-        # repeated OOM halving, and a mismatched driver can strand us on CPU.
-        # The symptom in all three cases is only "predictions are slow", which
-        # is indistinguishable from normal cold-start cost without these
-        # numbers in the log.
-        # Wrapped because this reads private Separator attributes: a rename
-        # upstream must degrade the log line, never fail the boot. Diagnostics
-        # that can take down setup are worse than no diagnostics.
+        # Log what the accelerated path negotiated: compile, batch sizing and
+        # device can each degrade silently, and the only symptom is slow
+        # predictions. This reads private Separator attributes, so it must
+        # never fail setup.
         try:
             if use_cuda:
                 props = torch.cuda.get_device_properties(0)
@@ -220,6 +251,16 @@ class Predictor(BasePredictor):
                     f"vram={props.total_memory / 1024**3:.1f}GiB "
                     f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
                     f"driver={driver}",
+                    flush=True,
+                )
+                import unblend.cuda as cuda_kernels
+
+                # Needs nvcc + ninja matching torch's CUDA major; without them
+                # the model runs on plain PyTorch ops.
+                print(
+                    "[predictor] custom_kernels_loaded="
+                    f"{cuda_kernels._extension is not None} "
+                    f"build_error={cuda_kernels._extension_error!r}",
                     flush=True,
                 )
             for name, sep in self.separators.items():
@@ -239,56 +280,17 @@ class Predictor(BasePredictor):
         except Exception as exc:  # noqa: BLE001 - diagnostics must not break setup
             print(f"[predictor] diagnostics unavailable: {exc!r}", flush=True)
 
-        # Sanity check: cog.yaml's ``concurrency.max`` (read by the Rust
-        # orchestrator at startup; surfaced to Python via the
-        # ``COG_MAX_CONCURRENCY`` env var) must be ≥ each separator's
-        # auto-detected ``chunk_batch_size`` for the coalescer to fully fill
-        # batches under concurrent load. If the deployer underprovisioned
-        # cog.yaml relative to the GPU's actual batch capacity, batching
-        # silently undersizes — each forward still completes correctly but
-        # the last ``cbs - max_concurrency`` slots get tail-padded zeros
-        # instead of real requests, costing throughput. We can't *change*
-        # the orchestrator setting from here (the Rust layer locked it in
-        # before we ran), so we just warn.
-        try:
-            max_concurrency = int(os.environ.get("COG_MAX_CONCURRENCY", "1"))
-        except ValueError:
-            max_concurrency = 1
-        for name, sep in self.separators.items():
-            if sep.chunk_batch_size > max_concurrency:
-                print(
-                    f"[predictor] WARNING: {name} auto-detected "
-                    f"chunk_batch_size={sep.chunk_batch_size} but cog.yaml "
-                    f"concurrency.max={max_concurrency}; batching will only "
-                    f"fill {max_concurrency}/{sep.chunk_batch_size} slots per "
-                    f"forward under concurrent load. Bump ``concurrency.max`` "
-                    f"in cog.yaml (or override at runtime with "
-                    f"``-e COG_MAX_CONCURRENCY=N``) to ≥ "
-                    f"{sep.chunk_batch_size}.",
-                    flush=True,
-                )
-
-        # Force the compiled path's CUDAGraph capture now. Capture happens on
-        # the first forward, not in ``Separator()``, so without this the first
-        # real prediction pays it: 16.4s measured on an H200 against 0.29s
-        # warm, which accounts for essentially all of the ~20s predict_time
-        # seen in production on a 3s clip. Replicate does not bill setup per
-        # prediction, so moving the cost here is close to free.
-        #
-        # One warmup covers every audio length: the compiled path pads every
-        # forward to the captured ``chunk_batch_size`` shape (apply.py:1089),
-        # so input duration cannot change it. Verified on an H200 -- after a 3s
-        # warmup, 30s and 120s inputs measured 0.27s and 0.32s cold.
-        #
-        # Wrapped because a warmup that fails must degrade to a slow first
-        # prediction, never a failed boot.
+        # Capture the CUDAGraph now rather than on the first real prediction.
+        # One warmup covers every audio length, because the compiled path pads
+        # every forward to the captured ``chunk_batch_size`` shape (see
+        # ``_apply_model_multi_unshifted`` in unblend/apply.py). A failed
+        # warmup only makes the first prediction slow, so it must not fail
+        # setup.
         if use_cuda:
             for name, sep in self.separators.items():
                 try:
                     started = time.perf_counter()
                     samplerate = int(getattr(sep.model, "samplerate", 44100))
-                    # Noise rather than silence: separation normalizes by the
-                    # mix's standard deviation, which is zero for zeros.
                     warmup_audio = torch.rand(2, samplerate * 3) * 0.2
                     sep.separate((warmup_audio, samplerate))
                     print(
@@ -303,27 +305,25 @@ class Predictor(BasePredictor):
                         flush=True,
                     )
 
-        # Per-queue-key coalescer state. Keys are
-        # (model, shifts, split_overlap, isolate_stem); each gets its own
-        # asyncio.Queue and a background coalescer task drained by the same
-        # event loop.
+        # One queue and one worker task per partition key.
         self._queues: dict[tuple, asyncio.Queue] = {}
         self._coalescers: dict[tuple, asyncio.Task] = {}
 
-        # Window length is overridable via env so deployments can tune
-        # without rebuilding the image.
         try:
             self._batch_window_s = (
                 float(
-                    os.environ.get(
-                        "COG_DEMUCS_BATCH_WINDOW_MS", _BATCH_WINDOW_MS_DEFAULT
-                    )
+                    os.environ.get("UNBLEND_BATCH_WINDOW_MS", _BATCH_WINDOW_MS_DEFAULT)
                 )
                 / 1000.0
             )
             if not math.isfinite(self._batch_window_s) or self._batch_window_s < 0:
                 raise ValueError
         except ValueError:
+            print(
+                "[predictor] ignoring invalid UNBLEND_BATCH_WINDOW_MS="
+                f"{os.environ.get('UNBLEND_BATCH_WINDOW_MS')!r}",
+                flush=True,
+            )
             self._batch_window_s = _BATCH_WINDOW_MS_DEFAULT / 1000.0
 
     def _queue_key(
@@ -332,23 +332,24 @@ class Predictor(BasePredictor):
         shifts: int,
         split_overlap: float,
         isolate_stem: str,
+        seed: int | None = None,
     ) -> tuple:
         """
         Build the partition key for the coalescer queue.
 
-        ``split_overlap`` is a client-supplied float and would otherwise make
-        near-identical requests incompatible for batching. We quantise to 3
-        decimals: requests in one batch are separated at this rounded overlap,
-        the ≤0.0005 deviation is numerically irrelevant to quality, and workers
-        now retire immediately when their queue drains.
+        ``split_overlap`` is quantised to 3 decimals so near-identical
+        client-supplied floats can share a batch; requests are separated at
+        the rounded overlap, and a deviation of at most 0.0005 does not affect
+        quality.
 
         :param model: model name to separate with
         :param shifts: number of random shifts
         :param split_overlap: overlap between segments
         :param isolate_stem: stem to isolate, or "none"
+        :param seed: shift seed; only same-seed requests share a batch
         :return: the quantised partition key tuple
         """
-        return (model, shifts, round(split_overlap, 3), isolate_stem)
+        return (model, shifts, round(split_overlap, 3), isolate_stem, seed)
 
     def _enqueue_request(self, key: tuple, request: _Request) -> None:
         """
@@ -368,7 +369,7 @@ class Predictor(BasePredictor):
             self._queues[key] = queue
             task = asyncio.create_task(
                 self._coalesce(key, queue),
-                name=f"demucs-coalescer-{'|'.join(map(str, key))}",
+                name=f"unblend-coalescer-{'|'.join(map(str, key))}",
             )
             self._coalescers[key] = task
         queue.put_nowait(request)
@@ -381,6 +382,7 @@ class Predictor(BasePredictor):
         shifts: int,
         split_overlap: float,
         isolate_stem: str,
+        seed: int | None = None,
     ) -> None:
         """
         Resolve one batch, falling back per request when the batch fails.
@@ -393,6 +395,7 @@ class Predictor(BasePredictor):
         :param shifts: Number of shift rounds.
         :param split_overlap: Segment overlap.
         :param isolate_stem: Stem specialization name or ``"none"``.
+        :param seed: Shift seed, or None for random offsets.
         """
         audio_paths = [request.audio_path for request in batch]
         stem_kwarg = isolate_stem if isolate_stem and isolate_stem != "none" else None
@@ -402,12 +405,18 @@ class Predictor(BasePredictor):
                 shifts=shifts,
                 split_overlap=split_overlap,
                 use_only_stem=stem_kwarg,
+                seed=seed,
             )
             if not isinstance(results, list) or len(results) != len(batch):
                 raise RuntimeError(
                     "Batched separation returned an unexpected number of results."
                 )
-        except Exception:
+        except Exception as exc:
+            if len(batch) == 1:
+                # Nothing to isolate: retrying alone would repeat the work.
+                if not batch[0].future.done():
+                    batch[0].future.set_exception(exc)
+                return
             for request in batch:
                 if request.future.done():
                     continue
@@ -417,6 +426,7 @@ class Predictor(BasePredictor):
                         shifts=shifts,
                         split_overlap=split_overlap,
                         use_only_stem=stem_kwarg,
+                        seed=seed,
                     )
                 except Exception as single_exc:
                     request.future.set_exception(single_exc)
@@ -440,19 +450,26 @@ class Predictor(BasePredictor):
         :param queue: Queue owned by this worker.
         """
         active_batch: list[_Request] = []
+        carry: _Request | None = None
 
         try:
-            model_name, shifts, split_overlap, isolate_stem = key
+            model_name, shifts, split_overlap, isolate_stem, seed = key
             separator = self.separators[model_name]
             max_batch = separator.chunk_batch_size
             while True:
-                try:
-                    first = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
+                if carry is not None:
+                    first, carry = carry, None
+                else:
+                    try:
+                        first = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
 
                 batch: list[_Request] = [first]
                 active_batch = batch
+                # Cap the batch by audio length too: one separate() call holds
+                # every input and its stems in memory at once.
+                seconds = _request_seconds(first)
                 next_request: _Request | None = None
                 deadline = asyncio.get_running_loop().time() + self._batch_window_s
                 while len(batch) < max_batch:
@@ -463,6 +480,11 @@ class Predictor(BasePredictor):
                         next_request = await asyncio.wait_for(queue.get(), remaining)
                     except asyncio.TimeoutError:
                         break
+                    added = _request_seconds(next_request)
+                    if seconds + added > _MAX_BATCH_AUDIO_SECONDS:
+                        carry = next_request
+                        break
+                    seconds += added
                     batch.append(next_request)
 
                 # Cog unlinks a cancelled request's temporary input path, so
@@ -476,6 +498,7 @@ class Predictor(BasePredictor):
                         shifts=shifts,
                         split_overlap=split_overlap,
                         isolate_stem=isolate_stem,
+                        seed=seed,
                     )
 
                 active_batch = []
@@ -485,9 +508,11 @@ class Predictor(BasePredictor):
                 # Let completed predict() calls encode and release their stem
                 # tensors before starting another memory-heavy batch.
                 await asyncio.sleep(0)
-                if queue.empty():
+                if queue.empty() and carry is None:
                     return
         except asyncio.CancelledError:
+            if carry is not None:
+                active_batch.append(carry)
             for request in active_batch:
                 if not request.future.done():
                     request.future.cancel()
@@ -500,6 +525,8 @@ class Predictor(BasePredictor):
                     request.future.cancel()
             raise
         except Exception as exc:
+            if carry is not None:
+                active_batch.append(carry)
             for request in active_batch:
                 if not request.future.done():
                     request.future.set_exception(exc)
@@ -542,23 +569,25 @@ class Predictor(BasePredictor):
             ],
         ),
         shifts: int = Input(
-            description="Number of random shifts for equivariant stabilization, more increases quality but increases processing time linearly",
+            description="Random time shifts to average; more is slower and slightly better. 0 disables them",
             default=1,
-            ge=1,
+            ge=0,
             le=20,
         ),
         split_overlap: float = Input(
             description="Overlap between segments; higher values improve quality at segment boundaries",
             default=0.25,
             ge=0.0,
-            # cog's Input only supports inclusive bounds (ge/le), not lt. The
-            # true contract is [0.0, 1.0); 0.99 is the practical ceiling
-            # (higher overlaps are pathological) and Separator.separate still
-            # enforces < 1.0 server-side.
+            # Input has no exclusive bound; the real contract is [0.0, 1.0),
+            # which Separator.separate enforces.
             le=0.99,
         ),
+        seed: int = Input(
+            description="Seed for the random shifts, for reproducible output; -1 for random",
+            default=-1,
+        ),
         clip_mode: str = Input(
-            description="Method to prevent audio clipping in output, or None for no clipping prevention",
+            description='How to keep output within [-1, 1]; "none" leaves it unchanged',
             default="rescale",
             choices=["none", "rescale", "clamp", "tanh"],
         ),
@@ -573,32 +602,37 @@ class Predictor(BasePredictor):
         :param isolate_stem: stem to isolate, or "none" for all stems
         :param shifts: number of random shifts for equivariant stabilization
         :param split_overlap: overlap between segments
+        :param seed: shift seed, or -1 for random
         :param clip_mode: method to prevent audio clipping in output
         :return: the separated stems as output files
         """
-        key = self._queue_key(model, shifts, split_overlap, isolate_stem)
-        request = _Request(
-            audio_path=PathlibPath(str(audio)),
-            model_name=model,
-            isolate_stem=isolate_stem,
-            format=format,
-            clip_mode=clip_mode,
+        format = format.lower()
+        _check_output_format(format)
+        # Off the event loop: a file without a duration is decoded to measure it.
+        seconds = await asyncio.to_thread(_duration_seconds, PathlibPath(str(audio)))
+        if seconds > _MAX_REQUEST_AUDIO_SECONDS:
+            # Decoding plus stems cost ~5 GB of RAM per hour of audio, and one
+            # oversized request would take concurrent predictions down with it.
+            raise ValidationError(
+                # Both at the same precision, so the length never reads as
+                # below the limit (at worst equal, when within rounding).
+                f"Audio is {seconds:.1f} s long; the limit is "
+                f"{_MAX_REQUEST_AUDIO_SECONDS:.1f} s."
+            )
+        key = self._queue_key(
+            model, shifts, split_overlap, isolate_stem, None if seed < 0 else seed
         )
+        request = _Request(audio_path=PathlibPath(str(audio)), seconds=seconds)
         self._enqueue_request(key, request)
 
-        # Split the timing at the separation boundary. A compiled model pays
-        # its graph capture on the first forward of each new shape, so a slow
-        # first prediction followed by fast ones is expected warm-up, while
-        # uniformly slow separations mean compile or batching is not engaging.
-        # Reporting one number cannot tell those apart; reporting separate
-        # and encode can.
+        # Separate and encode are timed apart so a slow first capture can be
+        # told from compile or batching not engaging at all.
         started = time.perf_counter()
         try:
             separated = await request.future
         except asyncio.CancelledError:
-            # Caller disconnected. Mark our future done so the coalescer
-            # discards the result when it lands rather than logging a
-            # missing-listener warning.
+            # Caller disconnected: mark the future done so the coalescer
+            # discards the result when it lands.
             if not request.future.done():
                 request.future.cancel()
             raise
@@ -625,11 +659,8 @@ class Predictor(BasePredictor):
         if sep is not None and getattr(separated, "sources", None):
             first = next(iter(separated.sources.values()))
             audio_s = first.shape[-1] / sep.sample_rate
-        # compile_enabled/chunk_batch_size are repeated here, not just in
-        # setup(), because Replicate exposes setup output on a separate log
-        # stream that the prediction API does not return. Without them on this
-        # line there is no way to tell a compile fallback from a cold cache
-        # when all you have is a slow prediction.
+        # Repeated from setup() because Replicate's prediction API does not
+        # return setup logs.
         timing = f"[predictor] separate={separate_s:.2f}s encode={encode_s:.2f}s"
         if audio_s:
             timing += f" audio={audio_s:.1f}s realtime={audio_s / separate_s:.2f}x"

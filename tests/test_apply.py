@@ -155,7 +155,7 @@ def test_model_ensemble_rejects_zero_weight_total() -> None:
     """
     A per-source zero weight total is rejected before inference.
     """
-    with pytest.raises(ValidationError, match="non-zero total"):
+    with pytest.raises(ValidationError, match="non-zero total|no member contributing"):
         ModelEnsemble(
             [_DoublingModel(), _DoublingModel()],
             weights=[[1.0, 1.0], [-1.0, 1.0]],
@@ -168,11 +168,11 @@ def test_model_ensemble_revalidates_mutated_weights() -> None:
     """
     ensemble = ModelEnsemble([_DoublingModel()])
     ensemble.weights[0][0] = 0.0
-    with pytest.raises(ValidationError, match="non-zero total"):
+    with pytest.raises(ValidationError, match="non-zero total|no member contributing"):
         apply_model(ensemble, torch.randn(1, 100))
 
     ensemble.weights[0] = [1.0, 0.0]
-    with pytest.raises(ValidationError, match="non-zero total"):
+    with pytest.raises(ValidationError, match="non-zero total|no member contributing"):
         apply_model(
             ensemble,
             torch.randn(1, 100),
@@ -328,21 +328,15 @@ def test_htdemucs_valid_length_matches_rounded_apply_segment() -> None:
     assert HTDemucs.valid_length(model, 8001) == 8001
 
 
-def test_htdemucs_mask_without_cac_applies_real_mask() -> None:
+def test_htdemucs_refuses_cac_false() -> None:
     """
-    Non-CaC decoding applies a real mask while preserving mixture phase.
+    Upstream's magnitude-mask decoding needs Wiener filtering, which isn't
+    implemented, so ``cac=False`` is refused rather than giving wrong output.
     """
     from unblend.htdemucs import HTDemucs
 
-    model = object.__new__(HTDemucs)
-    model.cac = False
-    mixture = torch.randn(2, 2, 3, 4, dtype=torch.complex64)
-    mask = torch.randn(2, 5, 2, 3, 4)
-
-    actual = model._mask(mixture, mask)
-
-    assert actual.shape == (2, 5, 2, 3, 4)
-    assert torch.equal(actual, mixture[:, None] * mask)
+    with pytest.raises(ValidationError, match="cac=True"):
+        HTDemucs(sources=["a", "b"], cac=False)
 
 
 def test_htdemucs_mask_with_cac_decodes_complex_channels() -> None:
@@ -352,7 +346,6 @@ def test_htdemucs_mask_with_cac_decodes_complex_channels() -> None:
     from unblend.htdemucs import HTDemucs
 
     model = object.__new__(HTDemucs)
-    model.cac = True
     target = torch.randn(2, 3, 2, 4, 5, dtype=torch.complex64)
     encoded = (
         torch.view_as_real(target).permute(0, 1, 2, 5, 3, 4).reshape(2, 3, 4, 4, 5)
@@ -395,7 +388,7 @@ def test_apply_model_shifts_progress_single_monotonic_span() -> None:
     """
     With shifts > 1, progress is one continuous span: a single start
     event whose total covers all rounds, strictly increasing counts, and
-    completed == total at the end (previously it restarted per round).
+    completed == total at the end, rather than restarting per round.
     """
     model = _DoublingModel()
     mix = torch.randn(1, 1, 250)
@@ -500,8 +493,8 @@ def test_apply_model_multi_reports_aggregate_and_per_input_progress() -> None:
 
 def test_apply_model_rejects_out_of_range_overlap() -> None:
     """
-    ``overlap`` outside ``[0, 1)`` is rejected up front — a negative overlap
-    used to leave uncovered sample ranges and silently return NaN audio.
+    ``overlap`` outside ``[0, 1)`` is rejected up front; a negative overlap
+    would leave uncovered sample ranges and return NaN audio.
     """
     model = _DoublingModel()
     mix = torch.randn(1, 250)
@@ -512,10 +505,9 @@ def test_apply_model_rejects_out_of_range_overlap() -> None:
 
 def test_htdemucs_forward_rejects_overlength_input() -> None:
     """
-    ``HTDemucs.forward`` only supports inputs up to the training length —
-    longer ones used to silently return wrong-shaped output because the
-    time-branch ``view`` reinterpreted samples as channels. ``apply_model``
-    is the supported path for full-length audio.
+    ``HTDemucs.forward`` only supports inputs up to the training length and
+    rejects longer ones, whose time-branch ``view`` would reinterpret samples
+    as channels. ``apply_model`` is the supported path for full-length audio.
     """
     from unblend.htdemucs import HTDemucs
 
@@ -562,6 +554,34 @@ def test_htdemucs_freq_emb_cache_invalidated_on_weight_reload() -> None:
         used(x)  # populate the freq-emb cache with `used`'s weights
         used.load_state_dict(fresh.state_dict())
         assert torch.allclose(used(x), fresh(x), atol=1e-6)
+
+    # Replacing the parameter twice without a forward can hand the second
+    # one the first one's freed id at the same version; still not stale.
+    for _ in range(20):
+        with torch.no_grad():
+            used(x)
+        for _ in range(2):
+            used.freq_emb.embedding.weight = torch.nn.Parameter(
+                torch.randn_like(used.freq_emb.embedding.weight)
+            )
+        with torch.no_grad():
+            expected = used.freq_emb(
+                torch.arange(used.freq_emb.embedding.num_embeddings)
+            )
+            got = used._cached_freq_emb(
+                used.freq_emb.embedding.num_embeddings, x.device, x.dtype
+            )
+            assert torch.allclose(got[0, :, :, 0], expected.t().to(got.dtype))
+
+    # An in-place update (an optimizer step, a copy_) must not be served the
+    # old embedding either.
+    torch.manual_seed(2)
+    other = HTDemucs(**kwargs).eval()
+    with torch.no_grad():
+        used(x)
+        for target, source in zip(used.parameters(), other.parameters()):
+            target.copy_(source)
+        assert torch.allclose(used(x), other(x), atol=1e-6)
 
 
 class _FlakyOOMModel(_DoublingModel):
@@ -948,12 +968,85 @@ def test_combine_params_are_validated(params: dict, expected: str) -> None:
         )
 
 
-def test_compile_is_applied_to_every_ensemble_member() -> None:
+def test_separator_combine_override_keeps_ensemble_stft_geometry() -> None:
     """
-    ``torch.compile`` targets each member's own hot path, so an ensemble
-    compiles member by member — including one whose members are different
-    architectures, where each has its own compiled core.
+    Overriding only the mode, or only one STFT key, keeps the rest of the
+    ensemble's own ``combine_params``, without changing the caller's ensemble.
     """
+    from unblend.api import Separator
+
+    ensemble = ModelEnsemble(
+        [_ScalingModel(1.0, 1.0), _ScalingModel(1.0, 1.0)],
+        combine="min_fft",
+        combine_params={"n_fft": 2048, "hop_length": 512},
+    )
+    sep = Separator(model=ensemble, device="cpu", combine="max_fft")
+    assert sep.model.combine_params == {"n_fft": 2048, "hop_length": 512}
+    sep = Separator(model=ensemble, device="cpu", combine_params={"hop_length": 256})
+    assert sep.model.combine_params == {"n_fft": 2048, "hop_length": 256}
+    # Valid against the ensemble's n_fft (2048), not the 1024 default.
+    sep = Separator(model=ensemble, device="cpu", combine_params={"hop_length": 1024})
+    assert sep.model.combine_params == {"n_fft": 2048, "hop_length": 1024}
+    with pytest.raises(ValidationError, match="must be a mapping"):
+        Separator(model=ensemble, device="cpu", combine_params=5)  # type: ignore[arg-type]
+    # With only_load leaving one member, the unused override is still checked
+    # against the ensemble's own geometry, not the default.
+    one_hot = ModelEnsemble(
+        [_ScalingModel(1.0, 1.0), _ScalingModel(1.0, 1.0)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+        combine="min_fft",
+        combine_params={"n_fft": 2048, "hop_length": 512},
+    )
+    sources = one_hot.sources
+    isolated = Separator(
+        model=one_hot,
+        device="cpu",
+        only_load=sources[0],
+        combine_params={"hop_length": 1024},
+    )
+    assert not isinstance(isolated.model, ModelEnsemble)
+    with pytest.raises(ValidationError):
+        Separator(
+            model=one_hot,
+            device="cpu",
+            only_load=sources[0],
+            combine_params={"hop_length": 4096},
+        )
+    # The override is the Separator's; the caller's ensemble is untouched.
+    assert ensemble.combine == "min_fft"
+    assert ensemble.combine_params == {"n_fft": 2048, "hop_length": 512}
+
+
+def test_separator_only_load_reduces_passed_in_ensemble() -> None:
+    """
+    A passed-in ensemble whose weights give the requested stem to one member
+    keeps only that member, as a registry ensemble does; ``combine`` on a
+    single model is still rejected even with ``only_load``.
+    """
+    from unblend.api import Separator
+
+    first, second = _ScalingModel(1.0, 1.0), _ScalingModel(2.0, 2.0)
+    ensemble = ModelEnsemble([first, second], weights=[[1.0, 0.0], [0.0, 1.0]])
+    sep = Separator(model=ensemble, device="cpu", only_load="two")
+    assert sep.model is second
+    sep = Separator(model=ensemble, device="cpu", only_load="two", combine="max_wave")
+    assert sep.model is second
+    with pytest.raises(ValidationError):
+        Separator(model=ensemble, device="cpu", only_load="two", combine="bogus")
+    with pytest.raises(ValidationError, match="single member"):
+        Separator(model=first, device="cpu", only_load="two", combine="max_wave")
+
+
+def test_compile_is_applied_to_every_compilable_ensemble_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``torch.compile`` targets each member's own hot path, member by member,
+    and skips members whose family has no compile target (SCNet).
+
+    :param monkeypatch: pytest monkeypatch fixture
+    """
+    import unblend.api as api
     from unblend.api import Separator
 
     compiled: list[int] = []
@@ -979,11 +1072,723 @@ def test_compile_is_applied_to_every_ensemble_member() -> None:
             """
             compiled.remove(self.tag)
 
-    ensemble = ModelEnsemble([Compilable(0, True), Compilable(1, False)])
+    class Supported(Compilable):
+        """
+        Stands in for a family with a compile target.
+        """
+
+    monkeypatch.setattr(api, "HTDemucs", Supported)
+    ensemble = ModelEnsemble(
+        [Supported(0, True), Supported(1, False), Compilable(2, False)]
+    )
     separator = Separator(model=ensemble, device="cpu")
 
     separator._setup_compile()
-    assert sorted(compiled) == [0, 1], "every member should be compiled"
+    assert sorted(compiled) == [0, 1], "only compilable members are compiled"
 
     separator._teardown_compile_state()
     assert compiled == [], "teardown must restore every member"
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        (dict(chunk_batch_size=0), "chunk_batch_size"),
+        (dict(shifts=-1), "shifts"),
+    ],
+)
+def test_apply_model_rejects_bad_arguments(kwargs: dict, expected: str) -> None:
+    """
+    Out-of-range arguments raise ``ValidationError`` rather than a raw
+    ``ZeroDivisionError``/``RuntimeError`` from deep inside chunking.
+
+    :param kwargs: Bad argument under test
+    :param expected: Text the error must mention
+    """
+    with pytest.raises(ValidationError, match=expected):
+        apply_model(_ScalingModel(1.0, 1.0), torch.zeros(2, 100), **kwargs)
+
+
+def test_non_numeric_selection_weights_raise_validation_error() -> None:
+    """
+    Weight types are checked before the selection-mode mask rule reads them.
+    """
+    with pytest.raises(ValidationError, match="numeric"):
+        ModelEnsemble(
+            [_ScalingModel(1.0, 1.0), _ScalingModel(1.0, 1.0)],
+            weights=[["a", "b"], [1, 1]],
+            combine="min_fft",
+        )
+
+
+@pytest.mark.parametrize("transition_power", [1.0, 12.0])
+@pytest.mark.parametrize("shifts", [0, 2])
+def test_identity_model_returns_its_input(transition_power: float, shifts: int) -> None:
+    """
+    Overlap-add, shifts and a steep transition power reconstruct an identity
+    model's input exactly (a high power used to underflow the edge weights
+    and give NaN).
+
+    :param transition_power: Fade exponent.
+    :param shifts: Shift rounds.
+    """
+    model = _ScalingModel(1.0, 1.0)
+    model.max_allowed_segment = 400.0  # 40000 samples: (1/20000)^12 underflows
+    mix = torch.randn(1, 1, 100_000)
+    out = apply_model(
+        model, mix, shifts=shifts, overlap=0.25, transition_power=transition_power
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[0, 0], mix[0], atol=1e-5, rtol=1e-5)
+
+
+def test_apply_model_rejects_mixes_of_the_wrong_rank() -> None:
+    """
+    1-D and 4-D input raise ``ValidationError`` rather than an indexing or
+    broadcasting error from deep inside the chunk loop.
+    """
+    model = _ScalingModel(1.0, 1.0)
+    for shape in ((250,), (1, 1, 1, 250)):
+        with pytest.raises(ValidationError, match="shape"):
+            apply_model(model, torch.randn(*shape))
+
+
+def test_negligible_ensemble_weights_are_refused() -> None:
+    """
+    A source whose contributing weights are negligible or cancel to about
+    zero is refused up front, instead of a spectral combine crashing or
+    returning NaN, or a weighted mean blowing the stem up.
+    """
+    models = [_ScalingModel(1.0, 1.0) for _ in range(3)]
+    for weights in (
+        [[1e-10, 1.0], [0.0, 1.0], [0.0, 1.0]],  # only a negligible member
+        [[1.0, 1.0], [-1.0, 1.0], [1e-10, 1.0]],  # cancels to ~1e-10
+        [[0.1, 1.0], [0.2, 1.0], [-0.3, 1.0]],  # cancels to ~5e-17
+        [[1.0, 1.0], [-0.99999999, 1.0], [0.0, 1.0]],  # 0 at float32 precision
+        # Contributors sum to ~0 over all members though the used ones don't.
+        [[1.0, 1.0], [-0.999999998, 1.0], [-1e-9, 1.0]],
+        [[1e300, 1.0], [1e300, 1.0], [0.0, 1.0]],  # overflows float32
+        [[1e-9, 1.0], [1e-9, 1.0], [2e-9, 1.0]],  # modes disagree near cutoff
+    ):
+        for combine in ("avg_fft", "weighted_mean"):
+            with pytest.raises(
+                ValidationError,
+                match="non-zero total|no member contributing|at most|tiny",
+            ):
+                ModelEnsemble(models, weights=weights, combine=combine)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_steep_transition_keeps_track_edges_on_mps() -> None:
+    """
+    MPS flushes denormals to zero, so a steep ``transition_power`` must not
+    push edge weights times audio into the denormal range and silence the
+    start and end of the track.
+    """
+    model = _ScalingModel(1.0, 1.0)
+    model.max_allowed_segment = 400.0
+    mix = torch.randn(1, 1, 100_000)
+    out = apply_model(model, mix, device="mps", shifts=0, transition_power=32.0)
+    out = out[0, 0].cpu()
+    assert not ((out == 0) & (mix[0] != 0)).any()
+    torch.testing.assert_close(out, mix[0], atol=1e-5, rtol=1e-5)
+
+
+def test_a_largest_weight_of_exactly_one_millionth_is_accepted() -> None:
+    """
+    The "all tiny" floor is 1e-6 itself, not 1000 * 1e-9 (a hair above it).
+    """
+    from unblend.apply import check_weight_totals
+
+    check_weight_totals([[1e-6], [0.0]], ["a"])
+    with pytest.raises(ValidationError, match="all tiny"):
+        check_weight_totals([[9.99e-7], [0.0]], ["a"])
+
+
+def test_ensemble_segment_bounds_are_clean_errors_and_nesting_is_capped() -> None:
+    """
+    A segment shorter than one sample is a ``ValidationError``, a huge one is
+    no cap (not an ``OverflowError``), and a cap on an ensemble of ensembles reaches the
+    innermost members.
+    """
+    with pytest.raises(ValidationError, match="shorter than one sample"):
+        ModelEnsemble([_DoublingModel(), _DoublingModel()], segment=1e-9)
+    # A huge cap is no cap: accepted, not an OverflowError.
+    huge = ModelEnsemble([_DoublingModel(), _DoublingModel()], segment=1e304)
+    assert huge.max_allowed_segment == _DoublingModel().max_allowed_segment
+
+    inner_a, inner_b, outer_member = (
+        _DoublingModel(),
+        _DoublingModel(),
+        _DoublingModel(),
+    )
+    for model in (inner_a, inner_b, outer_member):
+        model.max_allowed_segment = 3.0
+    nested = ModelEnsemble(
+        [ModelEnsemble([inner_a, inner_b]), outer_member], segment=1.5
+    )
+    assert nested.max_allowed_segment == 1.5
+    assert inner_a.max_allowed_segment == inner_b.max_allowed_segment == 1.5
+
+
+def test_nested_ensemble_progress_counts_every_inner_member() -> None:
+    """
+    Progress over an ensemble of ensembles plans each inner member's chunks,
+    so it rises steadily to the announced total instead of overshooting and
+    jumping back.
+    """
+    short = _DoublingModel()
+    short.max_allowed_segment = 0.5
+    inner = ModelEnsemble([_DoublingModel(), short])
+    outer = ModelEnsemble([inner, _DoublingModel()])
+    events: list[tuple[str, dict]] = []
+    apply_model(
+        outer,
+        torch.randn(1, 1, 1000),
+        shifts=0,
+        overlap=0.25,
+        progress_callback=lambda kind, data: events.append((kind, data)),
+    )
+    total = events[0][1]["total_chunks"]
+    done = [d["completed_chunks"] for k, d in events if k == "chunk_complete"]
+    assert done == sorted(done) and done[-1] == total
+
+
+def test_combine_params_must_be_a_mapping() -> None:
+    """
+    A non-mapping ``combine_params`` is a ``ValidationError``, as documented,
+    not a ``TypeError``.
+    """
+    from unblend.apply import resolve_combine_params
+
+    for bad in (5, 1.5, True, [1], "n_fft"):
+        with pytest.raises(ValidationError, match="must be a mapping"):
+            resolve_combine_params(bad)  # type: ignore[arg-type]
+
+
+def test_separator_combine_overrides_are_checked_the_same_with_only_load() -> None:
+    """
+    ``only_load`` narrowing an ensemble doesn't change which overrides are
+    valid (a selection mode needs 0/1 weights either way), and never moves
+    the override onto a nested inner ensemble.
+    """
+    from unblend.api import Separator
+
+    blended = ModelEnsemble(
+        [_ScalingModel(1.0, 1.0), _ScalingModel(1.0, 1.0)],
+        weights=[[1.0, 0.5], [0.0, 1.0]],
+    )
+    first = blended.sources[0]
+    for only_load in (None, first):
+        with pytest.raises(ValidationError, match="participation mask"):
+            Separator(
+                model=blended, device="cpu", combine="median_wave", only_load=only_load
+            )
+
+    inner = ModelEnsemble(
+        [_ScalingModel(1.0, 1.0), _ScalingModel(1.0, 1.0)], combine="avg_wave"
+    )
+    outer = ModelEnsemble(
+        [inner, _ScalingModel(1.0, 1.0)], weights=[[1.0, 0.0], [0.0, 1.0]]
+    )
+    isolated = Separator(
+        model=outer, device="cpu", combine="max_wave", only_load=outer.sources[0]
+    )
+    assert isolated.model is inner
+    assert inner.combine == "avg_wave"
+
+
+def test_separator_refuses_a_bad_override_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``combine`` override on a single-model registry entry, an unknown mode,
+    or a non-mapping ``combine_params`` fails before ``get_model`` downloads.
+    """
+    from unblend.api import Separator
+    from unblend.repo import ModelRepository
+
+    monkeypatch.setattr(
+        ModelRepository,
+        "get_model",
+        lambda *a, **k: pytest.fail("loaded before checking the override"),
+    )
+    for model, kwargs in (
+        ("htdemucs", {"combine": "max_fft"}),
+        ("htdemucs_ft", {"combine": "typo"}),
+        ("htdemucs_ft", {"combine_params": 5}),
+    ):
+        with pytest.raises(ValidationError):
+            Separator(model=model, device="cpu", **kwargs)
+
+
+def test_htdemucs_forward_traces_as_one_graph() -> None:
+    """
+    ``torch.compile`` captures HTDemucs's forward in a single graph: nothing
+    in it (such as reading a version counter for a cache) breaks the trace.
+    Runs on CPU, so CI covers what the CUDA compile path relies on.
+    """
+    import torch._dynamo as dynamo
+
+    from unblend.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).eval()
+    x = torch.randn(1, 2, 8000)
+    dynamo.reset()
+    with torch.no_grad():
+        model(x)  # the eager call fills the caches, as Separator's warmup does
+        report = dynamo.explain(model)(x)
+    dynamo.reset()
+    assert report.graph_break_count == 0, [b.reason for b in report.break_reasons]
+
+
+def test_isolating_a_specialists_stem_uses_the_mix_minus_the_stem() -> None:
+    """
+    When only one member runs for a stem (``only_load`` narrowing, or
+    ``use_only_stem``), its other outputs are untrained heads: the complement
+    is the mix minus the stem, and isolating any other stem is refused. A full
+    ensemble run still sums the other stems.
+    """
+    from unblend.api import Separator
+
+    specialist = _ScalingModel(0.25, 3.0)  # "one" is its stem; "two" is junk
+    other = _ScalingModel(5.0, 0.75)
+    ensemble = ModelEnsemble([specialist, other], weights=[[1.0, 0.0], [0.0, 1.0]])
+    mix = torch.randn(1, 400)
+
+    isolated = Separator(model=ensemble, device="cpu", only_load="one")
+    result = isolated.separate((mix, 100), shifts=0)
+    pair = result.isolate_stem("one")
+    assert torch.allclose(pair.sources["no_one"], mix - pair.sources["one"], atol=1e-5)
+    with pytest.raises(ValidationError, match="Only 'one' was separated"):
+        result.isolate_stem("two")
+
+    full = Separator(model=ensemble, device="cpu")
+    run = full.separate((mix, 100), shifts=0, use_only_stem="one")
+    assert torch.allclose(
+        run.isolate_stem("one").sources["no_one"], mix - run.sources["one"], atol=1e-5
+    )
+    everything = full.separate((mix, 100), shifts=0)
+    assert everything.reliable is None
+    assert torch.allclose(
+        everything.isolate_stem("one").sources["no_one"],
+        everything.sources["two"],
+        atol=1e-6,
+    )
+
+
+def test_use_only_stem_wins_over_only_load_inside_a_nested_ensemble() -> None:
+    """
+    ``only_load`` can keep a nested inner ensemble; ``use_only_stem`` then
+    runs only that ensemble's member for its stem, so that stem is the
+    reliable one.
+    """
+    from unblend.api import Separator
+
+    inner = ModelEnsemble(
+        [_ScalingModel(0.25, 9.0), _ScalingModel(7.0, 0.5)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    outer = ModelEnsemble(
+        [inner, _ScalingModel(5.0, 0.75)], weights=[[1.0, 1.0], [0.0, 0.0]]
+    )
+    separator = Separator(model=outer, device="cpu", only_load="one")
+    mix = torch.randn(1, 400)
+    # Narrowed to the inner ensemble, a complete model: every output is real.
+    assert separator.separate((mix, 100), shifts=0).reliable is None
+    result = separator.separate((mix, 100), shifts=0, use_only_stem="two")
+    assert result.reliable == ("two",)
+    pair = result.isolate_stem("two")
+    assert torch.allclose(pair.sources["no_two"], mix - pair.sources["two"], atol=1e-5)
+
+
+def test_htdemucs_pickles_after_a_forward() -> None:
+    """
+    ``torch.save`` of the whole module works after inference: the memoised
+    embedding and its version record aren't pickled, and the
+    loaded copy separates identically.
+    """
+    import io
+
+    from unblend.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).eval()
+    x = torch.randn(1, 2, 8000)
+    with torch.no_grad():
+        expected = model(x)
+    buffer = io.BytesIO()
+    torch.save(model, buffer)
+    buffer.seek(0)
+    loaded = torch.load(buffer, weights_only=False)
+    with torch.no_grad():
+        assert torch.equal(loaded(x), expected)
+
+
+def test_use_only_stem_routed_to_an_inner_ensemble_keeps_all_stems_real() -> None:
+    """
+    When ``use_only_stem``'s sole contributor is itself an ensemble, it runs
+    whole, so every output is real: the same as narrowing with ``only_load``.
+    """
+    from unblend.api import Separator
+
+    inner = ModelEnsemble(
+        [_ScalingModel(0.25, 9.0), _ScalingModel(7.0, 0.5)],
+        weights=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    outer = ModelEnsemble(
+        [inner, _ScalingModel(5.0, 0.75)], weights=[[1.0, 1.0], [0.0, 0.0]]
+    )
+    mix = torch.randn(1, 400)
+    via_use = Separator(model=outer, device="cpu").separate(
+        (mix, 100), shifts=0, use_only_stem="one"
+    )
+    via_load = Separator(model=outer, device="cpu", only_load="one").separate(
+        (mix, 100), shifts=0
+    )
+    assert via_use.reliable is None and via_load.reliable is None
+    assert torch.equal(
+        via_use.isolate_stem("one").sources["no_one"],
+        via_load.isolate_stem("one").sources["no_one"],
+    )
+
+
+def test_a_member_that_owns_several_stems_keeps_them_all() -> None:
+    """
+    When the member that ran is the ensemble's sole source of several stems,
+    all of those outputs are real and any of them can be isolated; if it
+    owns every stem, nothing is marked.
+    """
+    from unblend.api import Separator
+
+    three = ModelEnsemble(
+        [_ScalingModel(0.25, 3.0), _ScalingModel(5.0, 0.75)],
+        weights=[[1.0, 1.0], [0.0, 0.0]],
+    )
+    result = Separator(model=three, device="cpu", only_load="one").separate(
+        (torch.randn(1, 400), 100), shifts=0
+    )
+    assert result.reliable is None
+    result.isolate_stem("two")
+
+
+@pytest.mark.parametrize("how", ["deepcopy", "torch.save"])
+def test_a_copied_htdemucs_is_not_served_the_originals_cache(how: str) -> None:
+    """
+    A copy's parameter versions restart, so a record carried along would match
+    again after a few in-place edits and serve the original's stale embedding.
+    Copies drop the cache and record instead.
+    """
+    import copy
+    import io
+
+    from unblend.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).eval()
+    weight = model.freq_emb.embedding.weight
+    with torch.no_grad():
+        for _ in range(3):
+            weight.mul_(1.0)  # push the original's version counter up
+        x = torch.randn(1, 2, 8000)
+        model(x)
+    if how == "deepcopy":
+        clone = copy.deepcopy(model)
+    else:
+        buffer = io.BytesIO()
+        torch.save(model, buffer)
+        buffer.seek(0)
+        clone = torch.load(buffer, weights_only=False)
+    # Edit the copy, with no forward between, until its restarted version
+    # counter reaches the original's: the point where a carried-over record
+    # would match again.
+    target = weight._version
+    clone_weight = clone.freq_emb.embedding.weight
+    with torch.no_grad():
+        while clone_weight._version < target:
+            clone_weight.mul_(1.5)
+        fresh = HTDemucs(
+            sources=["a", "b"],
+            samplerate=8000,
+            segment=1.0,
+            nfft=512,
+            depth=2,
+            channels=16,
+            t_layers=1,
+        ).eval()
+        fresh.load_state_dict(clone.state_dict())
+        assert torch.allclose(clone(x), fresh(x), atol=1e-5)
+
+
+def test_copying_a_compiled_model_gives_an_eager_copy_of_its_own_weights() -> None:
+    """
+    ``torch.compile`` binds the compiled core to the original instance; a
+    deepcopy or pickle comes back eager and runs its own weights (zeroing the
+    copy's parameters changes its output), and pickling no longer fails.
+    """
+    import copy
+    import io
+
+    from unblend.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    ).eval()
+    x = torch.randn(1, 2, 8000)
+    model.enable_compiled_core()  # wraps only; nothing here runs the compiled core
+    buffer = io.BytesIO()
+    torch.save(model, buffer)
+    buffer.seek(0)
+    for clone in (copy.deepcopy(model), torch.load(buffer, weights_only=False)):
+        assert model.core_name not in clone.__dict__
+        assert not hasattr(clone, "_eager_core")
+        assert clone._fixed_batch_shape is False
+        with torch.no_grad():
+            before = clone(x)
+            for parameter in clone.parameters():
+                parameter.zero_()
+            assert not torch.equal(clone(x), before)
+
+
+def test_split_weight_cache_stays_bounded() -> None:
+    """
+    A caller varying the segment length per request doesn't keep every
+    overlap weight alive for the life of the process.
+    """
+    import unblend.apply as apply_mod
+
+    for length in range(100, 140):
+        apply_mod._split_weight(length, 1.0, torch.device("cpu"), torch.float32)
+    assert len(apply_mod._SPLIT_WEIGHT_CACHE) <= 16
+
+
+class _HalfWeightModel(_ScalingModel):
+    """
+    Like HTDemucs: FP16 weights, FP32 output. In FP16 it overflows on any
+    input above 0.5 and adds 1 to everything (finite but wrong); in FP32 it
+    is exact.
+    """
+
+    max_allowed_segment = 10.0  # 1000-sample chunks
+    sparse_chunks_need_fp32 = True
+
+    def __init__(self) -> None:
+        super().__init__(2.0, 1.0)
+        self.anchor = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: Input of shape ``[batch, channels, samples]``.
+        :return: FP32 output of shape ``[batch, 2, channels, samples]``.
+        """
+        out = super().forward(x.float())
+        if self.anchor.dtype is torch.float16:
+            out = out + 1.0
+            out[(x.float() > 0.5).any(dim=-1).any(dim=-1)] = float("inf")
+        return out
+
+
+def test_fp16_chunks_that_overflow_are_recomputed_in_fp32() -> None:
+    """
+    A chunk whose output overflows in FP16 (from a model with FP16 weights
+    and FP32 output, like HTDemucs) is redone in FP32.
+    """
+    mix = torch.rand(1, 1, 1000) * 0.4
+    mix[..., 10] = 1.0
+    out = apply_model(_HalfWeightModel(), mix, shifts=0, overlap=0.0)
+    torch.testing.assert_close(out[0, 0, 0], 2 * mix[0, 0])
+
+
+def test_sparse_fp16_chunks_are_recomputed_but_dense_ones_are_not() -> None:
+    """
+    A chunk that is mostly silence around a brief sound comes back finite but
+    unreliable from FP16 HTDemucs, so it is redone in FP32; ordinary dense
+    audio keeps its FP16 result.
+    """
+    sparse = torch.zeros(1, 1, 1000)
+    sparse[..., 500] = 0.4
+    out = apply_model(_HalfWeightModel(), sparse, shifts=0, overlap=0.25)
+    torch.testing.assert_close(out[0, 0], 2 * sparse[0])
+
+    dense = torch.rand(1, 1, 1000) * 0.4
+    out = apply_model(_HalfWeightModel(), dense, shifts=0, overlap=0.25)
+    torch.testing.assert_close(out[0, 0], 2 * dense[0] + 1.0)
+
+
+def test_sparse_chunks_keep_fp16_for_models_that_dont_need_fp32() -> None:
+    """
+    The sparse-chunk rule is for models that normalize each chunk by its own
+    spread; other FP16 models keep their result (only non-finite output is
+    redone for them).
+    """
+    model = _HalfWeightModel()
+    model.sparse_chunks_need_fp32 = False
+    sparse = torch.zeros(1, 1, 1000)
+    sparse[..., 500] = 0.4
+    out = apply_model(model, sparse, shifts=0, overlap=0.25)
+    torch.testing.assert_close(out[0, 0], 2 * sparse[0] + 1.0)
+
+
+def test_the_fp32_copy_is_made_once_across_shift_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Every shift pass reuses one FP32 copy rather than building its own.
+    """
+    import unblend.apply as apply_mod
+
+    made = []
+    real = apply_mod._fp32_copy
+    monkeypatch.setattr(apply_mod, "_fp32_copy", lambda *a: made.append(1) or real(*a))
+    sparse = torch.zeros(1, 1, 3000)
+    sparse[..., 1500] = 0.4
+    apply_model(_HalfWeightModel(), sparse, shifts=3, overlap=0.25)
+    assert len(made) == 1
+
+
+def test_fp32_copy_leaves_the_model_alone() -> None:
+    """
+    The FP32 copy has FP32 parameters while the model keeps its FP16 ones.
+    """
+    import unblend.apply as apply_mod
+
+    model = _HalfWeightModel()
+    twin = apply_mod._fp32_copy(model, torch.device("cpu"))
+    assert twin.anchor.dtype is torch.float32
+    assert model.anchor.dtype is torch.float16
+    assert twin.anchor is not model.anchor
+
+
+def test_digital_silence_is_not_mistaken_for_a_sparse_chunk() -> None:
+    """
+    A constant chunk (digital silence once the track is normalized) with a
+    rounding-sized residue keeps its FP16 result: the residue isn't a peak.
+    """
+    flat = torch.full((1, 1, 1000), 0.3)
+    flat[..., 500] += 1e-6
+    out = apply_model(_HalfWeightModel(), flat, shifts=0, overlap=0.25)
+    torch.testing.assert_close(out[0, 0], 2 * flat[0] + 1.0)
+
+
+def test_the_fp32_copy_moves_to_the_cpu_when_the_device_runs_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An FP32 copy that runs out of memory on the model's device is rebuilt on
+    the CPU, and the result is still correct (the OOM never reaches the
+    batch backoff).
+    """
+    import unblend.apply as apply_mod
+
+    model = _HalfWeightModel()
+
+    class _OutOfMemory(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            raise RuntimeError("MPS backend out of memory (simulated)")
+
+    # The "device" is meta, which every torch build has (moving a chunk to
+    # mps fails outright where torch lacks MPS, and that isn't an OOM).
+    real_device = apply_mod._param_device
+    real_copy = apply_mod._fp32_copy
+    monkeypatch.setattr(
+        apply_mod,
+        "_param_device",
+        lambda m: (
+            torch.device("meta")
+            if m is model or isinstance(m, _OutOfMemory)
+            else real_device(m)
+        ),
+    )
+    monkeypatch.setattr(
+        apply_mod,
+        "_fp32_copy",
+        lambda m, d: _OutOfMemory() if d.type == "meta" else real_copy(m, d),
+    )
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    twin: dict = {}
+    chunk = torch.rand(1, 1, 1000) * 0.4
+    out = apply_mod._fp32_forward(model, chunk, twin)
+    torch.testing.assert_close(out[0, 0], 2 * chunk[0])
+    assert next(twin["model"].parameters()).device.type == "cpu"
+
+
+def test_the_device_copy_is_freed_before_falling_back_to_the_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the device copy runs out of memory, no reference to it survives
+    into the cache flush, so the flush can return its memory before the CPU
+    copy is built.
+    """
+    import weakref
+
+    import unblend.apply as apply_mod
+
+    model = torch.nn.Linear(4, 4).half()
+    made: list[weakref.ReferenceType] = []
+
+    class _OutOfMemory(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            raise RuntimeError("MPS backend out of memory (simulated)")
+
+    def fake_copy(module: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+        if device.type == "meta":
+            copy = _OutOfMemory()
+            made.append(weakref.ref(copy))
+            return copy
+        return real_copy(module, device)
+
+    # The "device" is meta, which every torch build has (moving a chunk to
+    # mps fails outright where torch lacks MPS, and that isn't an OOM).
+    real_device = apply_mod._param_device
+    real_copy = apply_mod._fp32_copy
+    monkeypatch.setattr(
+        apply_mod,
+        "_param_device",
+        lambda m: (
+            torch.device("meta")
+            if m is model or isinstance(m, _OutOfMemory)
+            else real_device(m)
+        ),
+    )
+    monkeypatch.setattr(apply_mod, "_fp32_copy", fake_copy)
+    alive_at_flush: list[bool] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.mps, "empty_cache", lambda: alive_at_flush.append(made[0]() is not None)
+    )
+    apply_mod._fp32_forward(model, torch.rand(1, 3, 4), {})
+    assert alive_at_flush == [False]

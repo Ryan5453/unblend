@@ -1,17 +1,13 @@
 // GroupNorm fused with GELU activation.
 //
-// Saves the round-trip that PyTorch would otherwise spend on the explicit
-// ``functional.gelu(...)`` op after every ``norm1`` call inside HEncLayer
-// / HDecLayer / DConv. We use the tanh approximation (the same form as
-// ``F.gelu(approximate='tanh')``) because the MPS shader toolchain exposes no
-// ``erf`` builtin. The per-element gap from PyTorch's default exact-erf GELU
-// peaks at ~1e-3 (near |x|≈2), which is below FP16/BF16 output precision, so
-// this path is numerically equivalent to the reference at the dtypes it runs
-// in. (The FP32 fallback in ``unblend/metal/__init__.py`` uses exact erf, since
-// there erf is available and the difference is no longer sub-precision.)
+// GELU uses the tanh approximation (``F.gelu(approximate='tanh')``) because
+// the Metal shading language has no ``erf`` builtin. It differs from PyTorch's
+// exact-erf GELU by at most ~5e-4 (a few FP16 steps near the GELU minimum),
+// within the kernel tests' tolerance; the FP32 fallback in
+// ``unblend/metal/__init__.py`` uses exact erf.
 //
 // ``apply_norm_gelu`` is the third stage of the multi-stage path; its
-// mean/scale come from ``finalize_meanvar`` over in ``group_norm.metal``.
+// mean/scale come from ``finalize_meanvar`` in ``group_norm.metal``.
 // Vector/scalar path selection and the reduction helpers are shared via
 // ``common.metal``, which the Python side prepends before compiling.
 
@@ -40,21 +36,19 @@ kernel void group_norm_g1_gelu(
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
     const uint total = C * N;
     // ulong base offsets: b * total overflows 32 bits on huge inputs.
     device const SCALAR_T* in_b  = in_ + (ulong)b * total;
     device SCALAR_T*       out_b = out + (ulong)b * total;
 
-    float K = float(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, lane, sid, tgs, sh_sum, sh_sqsum, bcast);
-    const float mean  = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total, 0u, total, tid, tgs), total, eps,
+        lane, sid, tgs, sh
+    );
+    const float mean  = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         device const SCALAR4_T* in4  = (device const SCALAR4_T*)in_b;

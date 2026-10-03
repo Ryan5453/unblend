@@ -8,7 +8,7 @@
 //
 // ``apply_norm_glu`` is the third stage of the multi-stage path,
 // reading ``meanvar`` produced by ``finalize_meanvar`` in
-// ``group_norm.metal``. Crucially it tiles the OUTPUT space (size C*N),
+// ``group_norm.metal``. It tiles the OUTPUT space (size C*N),
 // not the input — each output element pulls its two input channels by
 // absolute offset so the tile boundaries don't matter.
 // Vector/scalar path selection and the reduction helpers are shared via
@@ -28,9 +28,7 @@ kernel void group_norm_g1_glu(
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
     const uint C_half = C >> 1;
     const uint total_in  = C * N;
@@ -39,12 +37,12 @@ kernel void group_norm_g1_glu(
     device const SCALAR_T* in_b  = in_ + (ulong)b * total_in;
     device SCALAR_T*       out_b = out + (ulong)b * total_out;
 
-    float K = float(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total_in, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total_in, eps, lane, sid, tgs, sh_sum, sh_sqsum, bcast);
-    const float mean  = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total_in, 0u, total_in, tid, tgs), total_in, eps,
+        lane, sid, tgs, sh
+    );
+    const float mean  = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         device const SCALAR4_T* in4  = (device const SCALAR4_T*)in_b;
@@ -65,8 +63,7 @@ kernel void group_norm_g1_glu(
         }
     } else {
         // N % 4 != 0: walk the output channel by channel (see common.metal).
-        // The flat output index IS idx_a; idx_b sits C_half*N past it, so the
-        // old per-element ``i / N`` and ``i % N`` divides both disappear.
+        // The flat output index is idx_a; idx_b sits C_half*N past it.
         const uint boff = C_half * N;
         const bool vec_ok = GN_CHANNEL_VECTORIZABLE(total_out);
         uint c  = 0u;

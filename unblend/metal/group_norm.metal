@@ -14,11 +14,12 @@
 // (no activation) third stages.
 //
 // Loads/stores use SCALAR4_T vectors when alignment permits (see
-// ``common.metal``); the apply loops additionally need the affine index
-// to be constant within each vector, i.e. N % 4 == 0 for channel-first
-// and C % 4 == 0 for channel-last, and fall back to scalar loops
-// otherwise. The reduction helpers live in ``common.metal``, which the
-// Python side prepends to this file before compiling.
+// ``common.metal``). The apply loops need the affine index to be constant
+// within each vector: channel-first layouts with N % 4 != 0 use the
+// channel walk from ``common.metal``, and channel-last layouts with
+// C % 4 != 0 use a scalar loop. The reduction helpers live in
+// ``common.metal``, which the Python side prepends to this file before
+// compiling.
 
 kernel void group_norm_g1(
     device SCALAR_T*       out      [[buffer(0)]],
@@ -34,9 +35,7 @@ kernel void group_norm_g1(
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
     const uint total = C * N;
     // Batch base offsets in ulong: b * total overflows 32 bits past ~4G
@@ -44,12 +43,12 @@ kernel void group_norm_g1(
     device const SCALAR_T* in_b  = in_ + (ulong)b * total;
     device SCALAR_T*       out_b = out + (ulong)b * total;
 
-    float K = float(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, lane, sid, tgs, sh_sum, sh_sqsum, bcast);
-    const float mean  = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total, 0u, total, tid, tgs), total, eps,
+        lane, sid, tgs, sh
+    );
+    const float mean  = ms.x;
+    const float scale = ms.y;
 
     if ((N & 3u) == 0u) {
         device const SCALAR4_T* in4  = (device const SCALAR4_T*)in_b;
@@ -112,19 +111,17 @@ kernel void group_norm_g1_chlast(
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
     device const SCALAR_T* in_b  = in_ + (ulong)b * total;
     device SCALAR_T*       out_b = out + (ulong)b * total;
 
-    float K = float(in_b[0]);
-    float s = 0.0f, sq = 0.0f;
-    gn_accumulate_sumsq(in_b, total, K, tid, tgs, s, sq);
-    gn_reduce_finalize(s, sq, K, total, eps, lane, sid, tgs, sh_sum, sh_sqsum, bcast);
-    const float mean  = bcast[0];
-    const float scale = bcast[1];
+    const float2 ms = gn_reduce_finalize(
+        gn_thread_partial(in_b, total, 0u, total, tid, tgs), total, eps,
+        lane, sid, tgs, sh
+    );
+    const float mean  = ms.x;
+    const float scale = ms.y;
 
     if ((C & 3u) == 0u) {
         // C % 4 == 0 implies total % 4 == 0 (total = T*C), so vector loads
@@ -164,87 +161,62 @@ kernel void partial_reduce(
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
     uint b = bt / num_tiles;
     uint t = bt % num_tiles;
 
     device const SCALAR_T* x_b = in_ + (ulong)b * total_per_b;
 
-    // Shift by the batch's first element (shared across all tiles of this
-    // batch) so the partial sums feeding the variance don't lose precision to
-    // cancellation on large-DC inputs. finalize_meanvar adds K back for the
-    // mean; the variance it derives from these shifted sums is unaffected.
-    float K = float(x_b[0]);
-    float local_sum = 0.0f;
-    float local_sqsum = 0.0f;
-    if ((total_per_b & 3u) == 0u) {
-        // Tile the vector space. The partial sums are position-agnostic, so
-        // tiling (total/4) vectors instead of total scalars changes nothing
-        // downstream — finalize just sums every tile's partials.
-        device const SCALAR4_T* x4 = (device const SCALAR4_T*)x_b;
-        const uint nv = total_per_b >> 2;
-        uint start = (uint)((ulong)t * (ulong)nv / (ulong)num_tiles);
-        uint end   = (uint)((ulong)(t + 1) * (ulong)nv / (ulong)num_tiles);
-        for (uint i = start + tid; i < end; i += tgs) {
-            float4 v = float4(x4[i]) - K;
-            local_sum   += v.x + v.y + v.z + v.w;
-            local_sqsum += dot(v, v);
-        }
-    } else {
-        // Even tile boundaries — the last tile picks up any remainder.
-        uint start = (uint)((ulong)t * (ulong)total_per_b / (ulong)num_tiles);
-        uint end   = (uint)((ulong)(t + 1) * (ulong)total_per_b / (ulong)num_tiles);
-        for (uint i = start + tid; i < end; i += tgs) {
-            float v = float(x_b[i]) - K;
-            local_sum   += v;
-            local_sqsum += v * v;
-        }
-    }
-    tg_reduce_sumsq(local_sum, local_sqsum, lane, sid, tgs, sh_sum, sh_sqsum, bcast);
+    // Each tile writes its own (mean, M2), not K-shifted sums: finalize_meanvar
+    // merges the tiles with the same identities tg_merge_moments uses across
+    // threads, so the multi-stage statistics match the single-stage ones.
+    const uint2 r = gn_tile_bounds(t, num_tiles, total_per_b);
+    tg_merge_moments(
+        gn_thread_partial(x_b, total_per_b, r.x, r.y, tid, tgs), r.y - r.x,
+        false, 0.0f, lane, sid, tgs, sh
+    );
     if (tid == 0) {
-        scratch[(b * num_tiles + t) * 2 + 0] = bcast[0];
-        scratch[(b * num_tiles + t) * 2 + 1] = bcast[1];
+        scratch[(b * num_tiles + t) * 2 + 0] = sh[GN_BCAST];
+        scratch[(b * num_tiles + t) * 2 + 1] = sh[GN_BCAST + 1];
     }
 }
 
 kernel void finalize_meanvar(
-    device const float* scratch       [[buffer(0)]],   // (B, num_tiles, 2) — shifted (sum_d, sqsum_d)
+    device const float* scratch       [[buffer(0)]],   // (B, num_tiles, 2) — per-tile (mean, M2)
     device float*       meanvar       [[buffer(1)]],   // (B, 2) — (mean, rsqrt(var+eps))
     constant uint&      total_per_b   [[buffer(2)]],
     constant uint&      num_tiles     [[buffer(3)]],
     constant float&     eps           [[buffer(4)]],
-    device const SCALAR_T* in_        [[buffer(5)]],   // input, for the shift reference K
     uint b    [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tgs  [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sid  [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float sh_sum[MAX_SIMDGROUPS];
-    threadgroup float sh_sqsum[MAX_SIMDGROUPS];
-    threadgroup float bcast[2];
+    threadgroup float sh[GN_SHARED_FLOATS];
 
-    float local_sum = 0.0f;
-    float local_sqsum = 0.0f;
+    // Fold this thread's tiles into one partial shifted by its first tile's
+    // mean: a tile of n elements with (mean, M2) contributes
+    // s += n (mean - K) and sq += M2 + n (mean - K)^2.
+    GnPartial p = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint t = tid; t < num_tiles; t += tgs) {
-        local_sum   += scratch[(b * num_tiles + t) * 2 + 0];
-        local_sqsum += scratch[(b * num_tiles + t) * 2 + 1];
+        const uint2 r = gn_tile_bounds(t, num_tiles, total_per_b);
+        const float n    = float(r.y - r.x);
+        const float mean = scratch[(b * num_tiles + t) * 2 + 0];
+        const float m2   = scratch[(b * num_tiles + t) * 2 + 1];
+        if (t == tid) {
+            p.K = mean;
+        }
+        const float d = mean - p.K;
+        p.n  += n;
+        p.s  += n * d;
+        p.sq += m2 + n * d * d;
     }
-    // sh_sum / sh_sqsum are sums of (x - K); recover the true mean by adding
-    // K back. The variance is computed from the shifted sums, where
-    // cancellation is negligible. K is the same reference partial_reduce
-    // used: the batch's first element.
-    float K = float(in_[(ulong)b * total_per_b]);
-    gn_reduce_finalize(
-        local_sum, local_sqsum, K, total_per_b, eps,
-        lane, sid, tgs, sh_sum, sh_sqsum, bcast
-    );
+    const float2 ms = gn_reduce_finalize(p, total_per_b, eps, lane, sid, tgs, sh);
     if (tid == 0) {
-        meanvar[b * 2 + 0] = bcast[0];
-        meanvar[b * 2 + 1] = bcast[1];
+        meanvar[b * 2 + 0] = ms.x;
+        meanvar[b * 2 + 1] = ms.y;
     }
 }
 
