@@ -16,7 +16,8 @@ import { Braid } from '../ui/Braid';
 import { peaksFromBuffer } from '../../utils/peaks';
 import { makeZip } from '../../utils/zip';
 import { createPlayhead, type Playhead } from '../../utils/playhead';
-import { MODEL_ARTIFACTS, MODEL_CONFIGS, type ModelType } from 'unblend';
+import { adapterHasShaderF16, appPrecision } from '../../utils/precision';
+import { MODEL_ARTIFACTS, MODEL_CONFIGS, type ModelPrecision, type ModelType } from 'unblend';
 import type { ProgressPhase } from '../../types';
 
 const INK = '25,25,22';
@@ -45,10 +46,10 @@ interface ModelChoice {
     stems: number;
 }
 
-// useUnblend's loadModel defaults to fp16, so that is what the app downloads.
-// MiB, matching the download progress readout.
-const downloadSize = (model: ModelType) =>
-    `${Math.round(MODEL_ARTIFACTS[model].fp16.sizeBytes / (1024 * 1024))} MiB`;
+// The file useUnblend's loadModel picks (see appPrecision), in MiB, matching
+// the download progress readout.
+const downloadSize = (model: ModelType, precision: ModelPrecision) =>
+    `${Math.round(MODEL_ARTIFACTS[model][precision].sizeBytes / (1024 * 1024))} MiB`;
 
 const MODEL_CHOICES: Record<ModelType, ModelChoice> = {
     htdemucs: {
@@ -330,6 +331,16 @@ export function Home() {
     // the drag state only clears when the pointer truly leaves the page.
     const dragDepth = useRef(0);
     const [selectedModel, setSelectedModel] = useState<ModelType>('htdemucs');
+    const [hasShaderF16, setHasShaderF16] = useState<boolean | null>(null);
+    useEffect(() => {
+        let live = true;
+        void adapterHasShaderF16().then(value => {
+            if (live) setHasShaderF16(value);
+        });
+        return () => {
+            live = false;
+        };
+    }, []);
 
     const [volumes, setVolumes] = useState<Record<string, number>>({});
     const [muted, setMuted] = useState<Record<string, boolean>>({ [ORIGINAL]: true });
@@ -972,7 +983,7 @@ export function Home() {
                                                     </span>
                                                     <span className="model-option-meta">
                                                         <span>{choice.stems} STEMS</span>
-                                                        <span>{downloadSize(value)}</span>
+                                                        <span>{downloadSize(value, appPrecision(value, hasShaderF16))}</span>
                                                         <span title={`Model weights license: ${MODEL_CONFIGS[value].license}`}>
                                                             {MODEL_CONFIGS[value].license.toUpperCase()}
                                                         </span>

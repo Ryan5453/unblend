@@ -3,6 +3,7 @@ import type { UnblendState, ProgressPhase } from '../types';
 import { SAMPLE_RATE, Separator, type ModelType, type ModelPrecision } from 'unblend';
 import { ORT_WASM_PATHS } from '../onnx-config';
 import { finalizeStems } from '../utils/stem-finalizer';
+import { adapterHasShaderF16, appPrecision } from '../utils/precision';
 
 /**
  * Encode the decoded track as a 16-bit WAV blob URL for the ORIGINAL lane,
@@ -148,7 +149,7 @@ export function useUnblend() {
     const loadModel = useCallback(async (
         model: ModelType,
         backend: 'webgpu' | 'wasm' = 'webgpu',
-        precision: ModelPrecision = 'fp16',
+        precision?: ModelPrecision,
     ) => {
         if (modelLoadInFlightRef.current) {
             const message = 'A model load is already in progress';
@@ -191,6 +192,14 @@ export function useUnblend() {
                 progressDeterminate: false,
                 progressPhase: 'initialize',
             }));
+            if (precision === undefined) {
+                const hasShaderF16 = backend === 'webgpu' ? await adapterHasShaderF16() : null;
+                if (!mountedRef.current) return false;
+                precision = appPrecision(model, hasShaderF16);
+                if (precision === 'fp32') {
+                    addLog("This GPU has no WebGPU 'shader-f16'; loading the fp32 file", 'info');
+                }
+            }
             addLog(`Loading ${model} (${precision})...`, 'info');
             setStatus('Connecting...');
             const start = performance.now();
