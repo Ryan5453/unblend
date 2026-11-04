@@ -8,8 +8,11 @@ import * as onnx from 'onnxruntime-web';
 import { MODEL_CONFIGS, type ModelType } from '../constants.js';
 import { loadModelBytes, type ModelByteSource, type ModelCacheEntry } from '../model-fetch.js';
 import { checkModelMetadata, readOnnxMetadata } from '../model-metadata.js';
+import { checkShaderF16, withGpuErrorScopes } from '../webgpu-checks.js';
 
 let session: onnx.InferenceSession | null = null;
+/** The WebGPU session's device, for the error scopes around each run. */
+let gpuDevice: GPUDevice | null = null;
 
 interface LoadMessage {
     type: 'load';
@@ -140,11 +143,12 @@ async function handleMessage(event: MessageEvent<Message>): Promise<void> {
                 };
                 self.postMessage(progress);
             }, msg.cache, msg.expectedBytes);
+            const metadata = readOnnxMetadata(modelBytes);
             // A wrong file is a fetch-stage failure, like a wrong size: it
             // would fail identically on any backend. Handed-back retry bytes
             // were already checked on the first attempt.
             if (fetched && msg.model !== undefined) {
-                checkModelMetadata(readOnnxMetadata(modelBytes), msg.model, MODEL_CONFIGS[msg.model]);
+                checkModelMetadata(metadata, msg.model, MODEL_CONFIGS[msg.model]);
             }
             stage = 'session';
             const compiling: ProgressResponse = {
@@ -160,6 +164,20 @@ async function handleMessage(event: MessageEvent<Message>): Promise<void> {
                 executionProviders: [msg.backend],
                 graphOptimizationLevel: msg.graphOptimizationLevel ?? 'all',
             });
+            if (msg.backend === 'webgpu') {
+                // ORT creates its device while building the first session.
+                gpuDevice = (await onnx.env.webgpu.device) ?? null;
+                if (gpuDevice !== null) {
+                    try {
+                        checkShaderF16(metadata, gpuDevice);
+                    } catch (error) {
+                        await session.release().catch(() => {});
+                        session = null;
+                        gpuDevice = null;
+                        throw error;
+                    }
+                }
+            }
 
             const response: LoadResponse = {
                 type: 'load',
@@ -229,10 +247,15 @@ async function handleMessage(event: MessageEvent<Message>): Promise<void> {
                 feeds.audio = audio;
             }
 
-            const results = await session.run(feeds);
-            for (const tensor of Object.values(results)) {
-                owned.push(tensor);
-            }
+            // ORT only logs WebGPU errors, so a run whose shaders or buffers
+            // failed would resolve with garbage outputs; fail it instead.
+            const active = session;
+            const results = await withGpuErrorScopes(gpuDevice, async () => {
+                const outputs = await active.run(feeds);
+                // Owned before a GPU error is thrown, so finally frees them.
+                owned.push(...Object.values(outputs));
+                return outputs;
+            });
 
             const outSpecReal = results.out_spec_real;
             const outSpecImag = results.out_spec_imag;
@@ -334,6 +357,7 @@ async function handleMessage(event: MessageEvent<Message>): Promise<void> {
             console.error('[onnx-worker] release failed:', error);
         } finally {
             session = null;
+            gpuDevice = null;
             const response: UnloadResponse = {
                 type: 'unload',
                 requestId: msg.requestId,
