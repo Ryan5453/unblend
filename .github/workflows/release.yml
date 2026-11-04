@@ -169,7 +169,7 @@ jobs:
           if [ "$status" -eq 0 ]; then
             echo "unblend@$version already published ($published); skipping."
           elif grep -q "E404" npm-view.err; then
-            npm publish "release-artifacts/unblend-$version.tgz" --provenance --access public
+            npm publish "./release-artifacts/unblend-$version.tgz" --provenance --access public
           else
             cat npm-view.err >&2
             exit "$status"
