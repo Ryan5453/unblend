@@ -12,5 +12,8 @@
     "build": "npm run build:lib && npm run build:app",
     "test": "npm run test -w unblend",
     "dev": "npm run build:lib && npm run dev -w unblend-app"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1"
   }
 }
