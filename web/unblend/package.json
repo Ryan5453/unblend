@@ -1,6 +1,6 @@
 {
   "name": "unblend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Browser-side music source separation with ONNX HTDemucs, RoFormer and SCNet models.",
   "license": "MIT",
   "author": "Ryan Fahey <git@ryan.science>",
