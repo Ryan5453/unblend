@@ -1,0 +1,83 @@
+name: Dependabot lock sync
+
+# Dependabot bumps pins in requirements-cog.txt directly, but that file is
+# generated from uv.lock (see the "Verify locked Cog requirements" step in
+# ci.yml), so its PRs fail CI. This applies each bumped pin to uv.lock,
+# regenerates requirements-cog.txt from it, and pushes the result back to the
+# Dependabot branch.
+#
+# Pushes made with GITHUB_TOKEN don't trigger new workflow runs, so CI would
+# never re-run on the fixed commit. Add a fine-grained PAT (or GitHub App
+# token) with "Contents: read and write" on this repo as the Dependabot secret
+# DEPENDABOT_SYNC_TOKEN (Settings > Secrets and variables > Dependabot).
+
+on:
+  pull_request:
+    paths:
+      - requirements-cog.txt
+      - uv.lock
+      - pyproject.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-sync-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check for push token
+        env:
+          SYNC_TOKEN: ${{ secrets.DEPENDABOT_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::warning::DEPENDABOT_SYNC_TOKEN is not set; pushing with GITHUB_TOKEN, so CI will not re-run on the sync commit."
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.DEPENDABOT_SYNC_TOKEN || github.token }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: "3.12"
+      - name: Apply bumped pins to uv.lock
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          args=()
+          while read -r pin; do
+            args+=(--upgrade-package "$pin")
+          done < <(git diff "origin/$BASE_REF...HEAD" -- requirements-cog.txt \
+            | sed -n 's/^+\([A-Za-z0-9._-]\+==[^[:space:];]\+\)$/\1/p')
+          if [ ${#args[@]} -gt 0 ]; then
+            echo "uv lock ${args[*]}"
+            uv lock "${args[@]}"
+          fi
+      # Same command as the "Verify locked Cog requirements" step in ci.yml.
+      - name: Regenerate requirements-cog.txt
+        run: |
+          uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt \
+            | uv pip compile - --python-platform x86_64-manylinux_2_28 --python-version 3.12 \
+                --no-annotate --no-header --quiet > requirements-cog.txt
+      - name: Commit and push
+        run: |
+          if git diff --quiet -- uv.lock requirements-cog.txt; then
+            echo "uv.lock and requirements-cog.txt are already in sync."
+            exit 0
+          fi
+          git diff --stat -- uv.lock requirements-cog.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock requirements-cog.txt
+          git commit -m "Sync uv.lock and requirements-cog.txt"
+          git push origin "HEAD:$GITHUB_HEAD_REF"

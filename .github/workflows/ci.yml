@@ -36,7 +36,7 @@ jobs:
       # turns uv's marker-split pins into conflicting duplicates and fails the
       # build. Piping through `uv pip compile` resolves them for the image's one
       # environment; versions still come from uv.lock, since every input is
-      # already pinned with ==.
+      # already pinned with ==. Keep in sync with dependabot-sync.yml.
       - name: Verify locked Cog requirements
         run: |
           uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt \
