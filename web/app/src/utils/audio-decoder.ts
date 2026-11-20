@@ -24,6 +24,7 @@ import type { FFmpeg } from '@ffmpeg/ffmpeg';
 
 let ffmpegInstance: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
+let ffmpegJobQueue: Promise<void> = Promise.resolve();
 
 // CDN base URL for ffmpeg-core (using multi-threaded version from official example)
 const FFMPEG_CORE_VERSION = '0.12.10';
@@ -169,6 +170,17 @@ async function extractMetadataWithFFmpeg(
  * Decode audio using ffmpeg.wasm (last resort for exotic codecs)
  */
 async function decodeWithFFmpeg(
+    arrayBuffer: ArrayBuffer,
+    fileName: string,
+    targetSampleRate: number,
+    onStatus?: (status: string) => void
+) {
+    const job = ffmpegJobQueue.then(() => decodeWithFFmpegJob(arrayBuffer, fileName, targetSampleRate, onStatus));
+    ffmpegJobQueue = job.then(() => {}, () => {});
+    return job;
+}
+
+async function decodeWithFFmpegJob(
     arrayBuffer: ArrayBuffer,
     fileName: string,
     targetSampleRate: number,
@@ -455,4 +467,3 @@ export function parseFfmetadataGlobals(text: string): Record<string, string> {
     }
     return tags;
 }
-
