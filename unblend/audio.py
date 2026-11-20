@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import math
 import os
 import sys
 import warnings
@@ -162,11 +163,10 @@ def convert_audio(
         _MAX_RESAMPLE_TERM, _MAX_RESAMPLE_TERM * ratio.denominator // ratio.numerator
     )
     approx = min(
-        Fraction((ratio.numerator * d + ratio.denominator - 1) // ratio.denominator, d)
-        for d in range(1, max_denominator + 1)
+        Fraction(math.ceil(ratio * d), d) for d in range(1, max_denominator + 1)
     )
     out = torchaudio.functional.resample(wav, approx.denominator, approx.numerator)
-    length = (wav.shape[-1] * to_samplerate + from_samplerate - 1) // from_samplerate
+    length = math.ceil(wav.shape[-1] * ratio)
     return out[..., :length]
 
 
