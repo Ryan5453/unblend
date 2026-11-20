@@ -816,7 +816,11 @@ input[type=range]::-moz-range-thumb {
 }
 
 .not-found-path {
-  overflow-wrap: anywhere;
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.5;
+  word-break: break-all;
+  text-wrap: balance;
 }
 
 .content-body h2 {
