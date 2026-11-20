@@ -158,16 +158,18 @@ def convert_audio(
     # torchaudio's filter bank grows with the reduced ratio's terms: 44099 ->
     # 44100 Hz would take ~15 GB. A nearby ratio with both terms small shifts
     # pitch by far less than anyone can hear; the length is then made exact.
-    # Round the ratio up so trimming suffices, without padding output samples.
-    max_denominator = min(
-        _MAX_RESAMPLE_TERM, _MAX_RESAMPLE_TERM * ratio.denominator // ratio.numerator
-    )
-    approx = min(
-        Fraction(math.ceil(ratio * d), d) for d in range(1, max_denominator + 1)
-    )
+    # Bounding the smaller side's term bounds the larger one too.
+    if ratio < 1:
+        approx = ratio.limit_denominator(_MAX_RESAMPLE_TERM)
+    else:
+        approx = 1 / (1 / ratio).limit_denominator(_MAX_RESAMPLE_TERM)
     out = torchaudio.functional.resample(wav, approx.denominator, approx.numerator)
+    # Match the exact path's ceiling length; extend any shortfall from the
+    # approximation by holding the last sample, never by inserting silence.
     length = math.ceil(wav.shape[-1] * ratio)
-    return out[..., :length]
+    if out.shape[-1] >= length:
+        return out[..., :length]
+    return torch.nn.functional.pad(out, (0, length - out.shape[-1]), mode="replicate")
 
 
 def prevent_clip(audio: Tensor, mode: str | None = "rescale") -> Tensor:
