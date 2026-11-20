@@ -1,11 +1,13 @@
 import { useState } from 'react';
-import { clearModelCache } from 'unblend';
+import { clearModelCache, countCachedModels } from 'unblend';
 
 function ClearModelCache() {
     const [status, setStatus] = useState<'idle' | 'busy' | 'cleared' | 'empty'>('idle');
     const clear = async () => {
         setStatus('busy');
-        setStatus((await clearModelCache()) ? 'cleared' : 'empty');
+        const count = await countCachedModels();
+        await clearModelCache();
+        setStatus(count > 0 ? 'cleared' : 'empty');
     };
     return (
         <p>
