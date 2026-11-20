@@ -1038,6 +1038,21 @@ input[type=range]::-moz-range-thumb {
   }
 }
 
+@media (max-width: 400px) {
+  .site-header {
+    gap: 12px;
+    padding-inline: 12px;
+  }
+  .site-header nav {
+    gap: 10px;
+  }
+  .site-header nav a {
+    padding-block: 6px;
+    letter-spacing: .1em;
+    white-space: nowrap;
+  }
+}
+
 /* -------------------------------------------------------------------- */
 /* /benchmark page (dev only)                                            */
 /* -------------------------------------------------------------------- */
