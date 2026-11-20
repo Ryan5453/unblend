@@ -357,6 +357,58 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
 
         return x
 
+    def _sa_block(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        key_padding_mask: torch.Tensor | None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        """
+        Use SDPA for HTDemucs' unmasked, batch-first self-attention on CPU.
+
+        :param x: Input to self-attention.
+        :param attn_mask: Optional attention mask.
+        :param key_padding_mask: Optional key padding mask.
+        :param is_causal: Whether the attention mask is causal.
+        :return: Self-attended tensor with dropout applied.
+        """
+        attn = self.self_attn
+        if (
+            x.device.type != "cpu"
+            or self.training
+            or torch.is_grad_enabled()
+            or torch.onnx.is_in_onnx_export()
+            or x.ndim != 3
+            or type(attn) is not nn.MultiheadAttention
+            or not attn.batch_first
+            or attn_mask is not None
+            or key_padding_mask is not None
+            or is_causal
+        ):
+            return super()._sa_block(x, attn_mask, key_padding_mask, is_causal)
+
+        # The functional API bypasses native MHA and uses SDPA with no weights.
+        x = x.transpose(0, 1)
+        output, _ = F.multi_head_attention_forward(
+            x,
+            x,
+            x,
+            attn.embed_dim,
+            attn.num_heads,
+            attn.in_proj_weight,
+            attn.in_proj_bias,
+            attn.bias_k,
+            attn.bias_v,
+            attn.add_zero_attn,
+            attn.dropout,
+            attn.out_proj.weight,
+            attn.out_proj.bias,
+            training=False,
+            need_weights=False,
+        )
+        return self.dropout1(output.transpose(0, 1))
+
 
 class CrossTransformerEncoderLayer(nn.Module):
     def __init__(
