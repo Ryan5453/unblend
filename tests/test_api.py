@@ -240,6 +240,44 @@ def test_seeded_separation_leaves_global_rngs_alone() -> None:
         assert torch.equal(a.sources[stem], b.sources[stem])
 
 
+@pytest.mark.parametrize("external_normalization", [False, True])
+@pytest.mark.parametrize("samples", [0, 250])
+def test_single_matches_one_item_batch(
+    external_normalization: bool, samples: int
+) -> None:
+    """
+    Single and one-item batch separation preserve tensors and progress events.
+    """
+    separator = _progress_separator()
+    separator.model.external_normalization = external_normalization
+    audio = (torch.randn(1, samples), 100)
+    single_events, batch_events = [], []
+    kwargs = {"shifts": 2, "seed": 5}
+    if not samples:
+        with pytest.raises(ValidationError) as single_error:
+            separator.separate(audio, **kwargs)
+        with pytest.raises(ValidationError) as batch_error:
+            separator.separate([audio], **kwargs)
+        assert str(single_error.value) == str(batch_error.value)
+        return
+    single = separator.separate(
+        audio,
+        **kwargs,
+        progress_callback=lambda event, data: single_events.append((event, dict(data))),
+    )
+    batch = separator.separate(
+        [audio],
+        **kwargs,
+        progress_callback=lambda event, data: batch_events.append((event, dict(data))),
+    )[0]
+    assert single_events == batch_events
+    assert single.sources.keys() == batch.sources.keys()
+    for stem in single.sources:
+        assert torch.equal(single.sources[stem], batch.sources[stem])
+    assert torch.equal(single.original, batch.original)
+    assert single.sample_rate == batch.sample_rate
+
+
 def test_separate_rejects_chunk_batch_size_too_large() -> None:
     """
     ``chunk_batch_size`` over the sanity cap (1024) is rejected before any

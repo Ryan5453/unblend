@@ -1792,37 +1792,16 @@ class Separator:
         :param oom_backoff_state: Shared OOM backoff state, or None.
         :return: The separated sources.
         """
-        wav = self._to_tensor(audio)
-        original = wav.cpu().clone()
-
-        wav = self._stage_for_inference([wav], shifts)[0]
-        external_norm = getattr(self.model, "external_normalization", True)
-        if external_norm:
-            wav, mean, std = self._normalize(wav)
-
-        sources_tensor = apply_model_multi(
-            self.model,
-            [wav[None]],
-            device=self.device,
+        return self._separate_batch(
+            [audio],
             shifts=shifts,
-            overlap=split_overlap,
+            split_overlap=split_overlap,
+            seed=seed,
             progress_callback=progress_callback,
             use_only_stem=use_only_stem,
             chunk_batch_size=chunk_batch_size,
             oom_backoff_state=oom_backoff_state,
-            _shift_offsets=self._shift_offsets(seed, shifts, 1),
-        )[0][0]
-
-        if external_norm:
-            sources = self._unnormalized_cpu_sources(sources_tensor, mean, std)
-        else:
-            sources = self._cpu_sources(sources_tensor)
-        return SeparatedSources(
-            sources,
-            self.sample_rate,
-            original=original,
-            reliable=self._reliable_stem(use_only_stem),
-        )
+        )[0]
 
     def _reliable_stem(self, use_only_stem: str | None) -> tuple[str, ...] | None:
         """
