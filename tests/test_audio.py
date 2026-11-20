@@ -181,6 +181,35 @@ def test_resampling_keeps_both_ratio_terms_small() -> None:
             convert_audio(torch.randn(2, 100), *rates, 2)
 
 
+@pytest.mark.parametrize("length", [1, 2, 3, 5, 17])
+def test_resampling_short_odd_rate_keeps_samples(length: int) -> None:
+    """
+    Approximate ratios use the same ceiling length as exact resampling.
+
+    :param length: Number of input samples.
+    """
+    from unblend.audio import convert_audio
+
+    out = convert_audio(torch.ones(2, length), 88201, 44100, 2)
+    assert out.shape == (2, (length * 44100 + 88200) // 88201)
+    assert torch.isfinite(out).all()
+    assert (out != 0).all()
+
+
+@pytest.mark.parametrize("rate", [44099, 22051, 997])
+def test_resampling_odd_rate_does_not_pad_output(rate: int) -> None:
+    """
+    A constant signal's tail must be sinc samples, not appended zeros.
+
+    :param rate: Input sample rate.
+    """
+    from unblend.audio import convert_audio
+
+    out = convert_audio(torch.ones(2, rate), rate, 44100, 2)
+    assert out.shape == (2, 44100)
+    assert (out[..., -10:] > 0).all()
+
+
 def test_rates_exactly_1000_times_apart_resample_both_ways() -> None:
     """
     The 1000x bound is inclusive in both directions (an exact Fraction, not
