@@ -410,6 +410,42 @@ test('worker-backed separation failure invalidates the instance', async () => {
     );
 });
 
+for (const value of [NaN, Infinity, -Infinity]) {
+    for (const channel of [0, 1, 2]) {
+        test(`non-finite ${value} in channel ${channel} rejects before starting and permits reuse`, async () => {
+            const separator = await loadedSeparator();
+            const workers = [...FakeWorker.instances];
+            const messageCounts = workers.map(worker => worker.messages.length);
+            const channels = Array.from({ length: channel + 1 }, () => new Float32Array([0.25, -0.5]));
+            channels[channel][1] = value;
+            const audio = {
+                sampleRate: 44100,
+                length: 2,
+                numberOfChannels: channels.length,
+                getChannelData: c => channels[c],
+            };
+            FakeWorker.handler = () => { throw new Error('unexpected worker work'); };
+            try {
+                await assert.rejects(separator.separate(audio), {
+                    message: 'Audio input contains NaN or infinite samples.',
+                });
+                assert.deepEqual(workers.map(worker => worker.messages.length), messageCounts);
+                assert.deepEqual(workers.map(worker => worker.terminateCalls), [0, 0, 0]);
+
+                FakeWorker.handler = successfulLoadHandler;
+                const controller = new AbortController();
+                const pending = separator.separate(tinyAudioBuffer(), { signal: controller.signal });
+                await new Promise(resolve => setTimeout(resolve, 0));
+                assert.ok(workers.some((worker, i) => worker.messages.length > messageCounts[i]));
+                controller.abort();
+                await assert.rejects(pending, error => error?.name === 'AbortError');
+            } finally {
+                await separator.unload();
+            }
+        });
+    }
+}
+
 test('invalid options reject before marking the separator active', async () => {
     const separator = await loadedSeparator();
     await assert.rejects(

@@ -288,6 +288,14 @@ export class Separator {
             );
         }
         if (audioBuffer.length === 0) throw new Error('audioBuffer is empty (0 samples).');
+        for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+            const samples = audioBuffer.getChannelData(channel);
+            for (let i = 0; i < samples.length; i++) {
+                if (!Number.isFinite(samples[i])) {
+                    throw new Error('Audio input contains NaN or infinite samples.');
+                }
+            }
+        }
         validateSeparationOptions(options);
         throwIfAborted(options.signal);
 
