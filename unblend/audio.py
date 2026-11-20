@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import math
 import os
 import sys
 import warnings
@@ -163,10 +164,13 @@ def convert_audio(
     else:
         approx = 1 / (1 / ratio).limit_denominator(_MAX_RESAMPLE_TERM)
     out = torchaudio.functional.resample(wav, approx.denominator, approx.numerator)
-    length = round(wav.shape[-1] * to_samplerate / from_samplerate)
+    # Match the exact path's ceiling length; extend any shortfall from the
+    # approximation by holding the last sample, never by inserting silence.
+    length = math.ceil(wav.shape[-1] * ratio)
     if out.shape[-1] >= length:
         return out[..., :length]
-    return torch.nn.functional.pad(out, (0, length - out.shape[-1]))
+    hold = out[..., -1:].expand(*out.shape[:-1], length - out.shape[-1])
+    return torch.cat([out, hold], dim=-1)
 
 
 def prevent_clip(audio: Tensor, mode: str | None = "rescale") -> Tensor:
