@@ -10,7 +10,7 @@
     "build:lib": "npm run build -w unblend",
     "build:app": "npm run build -w unblend-app",
     "build": "npm run build:lib && npm run build:app",
-    "test": "npm run test -w unblend",
+    "test": "npm run test -w unblend && npm run test -w unblend-app",
     "dev": "npm run build:lib && npm run dev -w unblend-app"
   },
   "overrides": {

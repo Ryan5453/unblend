@@ -348,13 +348,16 @@ export function useUnblend() {
             localArtwork = artwork;
             if (stale()) return false;
 
-            // Keep decoded resources local until every asynchronous step completes.
+            // ffmpeg.wasm is only reached when WebCodecs can't decode the
+            // codec, so the <audio> element almost certainly can't either;
+            // play the decoded PCM instead of a silent ORIGINAL lane.
             let usePcm = usedFallback === 'ffmpeg' || !mayPlayNatively(file);
             if (usePcm) {
                 try {
                     localSource = await pcmOriginalUrl(audioBuffer);
                 } catch (error) {
                     if (stale()) return false;
+                    // Not fatal: separation only needs the decoded buffer.
                     console.error('[unblend] Failed to encode the original track:', error);
                     usePcm = false;
                 }
