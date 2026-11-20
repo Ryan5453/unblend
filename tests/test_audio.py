@@ -210,6 +210,19 @@ def test_resampling_odd_rate_does_not_pad_output(rate: int) -> None:
     assert (out[..., -10:] > 0).all()
 
 
+def test_resampling_odd_rate_keeps_timing() -> None:
+    """
+    The approximate ratio must not stretch audio enough to move late events.
+    """
+    from unblend.audio import convert_audio
+
+    wav = torch.zeros(1, 44099 * 3)
+    wav[0, -100] = 1.0
+    out = convert_audio(wav, 44099, 44100, 1)
+    expected = round((wav.shape[-1] - 100) * 44100 / 44099)
+    assert abs(out.argmax().item() - expected) <= 5
+
+
 def test_rates_exactly_1000_times_apart_resample_both_ways() -> None:
     """
     The 1000x bound is inclusive in both directions (an exact Fraction, not
