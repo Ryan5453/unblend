@@ -169,7 +169,8 @@ def convert_audio(
     length = math.ceil(wav.shape[-1] * ratio)
     if out.shape[-1] >= length:
         return out[..., :length]
-    return torch.nn.functional.pad(out, (0, length - out.shape[-1]), mode="replicate")
+    hold = out[..., -1:].expand(*out.shape[:-1], length - out.shape[-1])
+    return torch.cat([out, hold], dim=-1)
 
 
 def prevent_clip(audio: Tensor, mode: str | None = "rescale") -> Tensor:

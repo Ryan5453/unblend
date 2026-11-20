@@ -205,8 +205,8 @@ def test_resampling_odd_rate_does_not_pad_output(rate: int) -> None:
     """
     from unblend.audio import convert_audio
 
-    out = convert_audio(torch.ones(2, rate), rate, 44100, 2)
-    assert out.shape == (2, 44100)
+    out = convert_audio(torch.ones(2, 3, 2, rate), rate, 44100, 2)
+    assert out.shape == (2, 3, 2, 44100)
     assert (out[..., -10:] > 0).all()
 
 
