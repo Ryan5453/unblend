@@ -380,6 +380,7 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
             or torch.is_grad_enabled()
             or torch.onnx.is_in_onnx_export()
             or x.ndim != 3
+            or type(attn) is not nn.MultiheadAttention
             or not attn.batch_first
             or attn_mask is not None
             or key_padding_mask is not None
