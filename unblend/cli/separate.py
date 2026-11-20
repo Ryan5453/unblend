@@ -716,6 +716,12 @@ def separate_command(
             err_console.print(f"  {escape(', '.join(aliases))}")
         raise typer.Exit(1)
 
+    # Like the writer, check permissions on existing files, following symlinks.
+    for path in planned_paths:
+        if os.path.exists(path) and not os.access(path, os.W_OK):
+            err_console.print(f"[red]✗[/red] Can't write {escape(path)}.")
+            raise typer.Exit(1)
+
     # only_load keeps the download to the single specialist file when set.
     if not ensure_model_available(selected_model_name, only_load=only_load_stem):
         raise typer.Exit(1)
