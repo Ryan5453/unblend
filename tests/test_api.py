@@ -736,6 +736,18 @@ def test_to_tensor_rejects_empty_input_at_other_rate() -> None:
         _stub_separator()._to_tensor((torch.zeros(2, 0), 48000))
 
 
+def test_to_tensor_preserves_short_input_at_odd_rate() -> None:
+    """
+    A nonempty input remains nonempty after approximate-ratio resampling.
+    """
+    sep = _stub_separator()
+    sep.sample_rate = 44100
+    sep.audio_channels = 2
+    wav = sep._to_tensor((torch.ones(2, 1), 88201))
+    assert wav.shape == (2, 1)
+    assert (wav != 0).all()
+
+
 def test_to_tensor_accepts_int_like_sample_rates() -> None:
     """
     NumPy integers and whole floats — common outputs of numpy-based audio
