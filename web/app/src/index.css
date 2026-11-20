@@ -815,6 +815,10 @@ input[type=range]::-moz-range-thumb {
   font-weight: 600;
 }
 
+.not-found-path {
+  overflow-wrap: anywhere;
+}
+
 .content-body h2 {
   font-size: 10px;
   font-weight: 600;

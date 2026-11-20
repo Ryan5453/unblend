@@ -8,7 +8,7 @@ export function NotFound() {
 
             <div className="content-body">
                 <p>
-                    There is nothing at <strong>{pathname}</strong>.
+                    There is nothing at <strong className="not-found-path">{pathname}</strong>.
                 </p>
                 <p>
                     <Link to="/">Back to the studio</Link>
