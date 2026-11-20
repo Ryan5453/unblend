@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from unblend.metal import MetalMultiheadAttention
 from unblend.transformer import (
     CrossTransformerEncoder,
     CrossTransformerEncoderLayer,
@@ -88,4 +89,19 @@ def test_cpu_self_attention_uses_sdpa(monkeypatch: pytest.MonkeyPatch) -> None:
         actual = layer._sa_block(x, None, None)
 
     assert calls == [True]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_metal_wrapped_self_attention_can_run_on_cpu() -> None:
+    """
+    A Metal-wrapped encoder can still run in an FP32 CPU fallback.
+    """
+    layer = MyTransformerEncoderLayer(32, 4, batch_first=True).eval()
+    x = torch.randn(2, 17, 32)
+
+    with torch.inference_mode():
+        expected = layer(x)
+        layer.self_attn = MetalMultiheadAttention.from_mha(layer.self_attn)
+        actual = layer(x)
+
     torch.testing.assert_close(actual, expected)
