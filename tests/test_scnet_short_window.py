@@ -50,8 +50,6 @@ def test_short_hann_window(win_size, tmp_path) -> None:
             bool(model.stft_config["normalized"]),
             window="hann",
         )
-    stft_diff = (torch.complex(real, imag) - reference).abs().max().item()
-    print(f"win_size={win_size} eager/export STFT max abs diff={stft_diff:.9g}")
     torch.testing.assert_close(torch.complex(real, imag), reference)
     assert expected.shape == (1, 2, 2, 4096)
     assert torch.isfinite(expected).all()
@@ -79,6 +77,4 @@ def test_short_hann_window(win_size, tmp_path) -> None:
             **model._stft_kwargs(spec.device),
             length=padded.shape[-1],
         ).reshape(1, 2, 2, -1)[..., : audio.shape[-1]]
-    diff = (wave - expected).abs().max().item()
-    print(f"win_size={win_size} eager/ONNX waveform max abs diff={diff:.9g}")
     torch.testing.assert_close(wave, expected, atol=1e-4, rtol=1e-4)
