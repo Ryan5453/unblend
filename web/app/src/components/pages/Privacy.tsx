@@ -2,12 +2,13 @@ import { useState } from 'react';
 import { clearModelCache, countCachedModels } from 'unblend';
 
 function ClearModelCache() {
-    const [status, setStatus] = useState<'idle' | 'busy' | 'cleared' | 'empty'>('idle');
+    const [status, setStatus] = useState<'idle' | 'busy' | 'cleared' | 'empty' | 'failed'>('idle');
     const clear = async () => {
         setStatus('busy');
         const count = await countCachedModels();
-        await clearModelCache();
-        setStatus(count > 0 ? 'cleared' : 'empty');
+        const deleted = await clearModelCache();
+        if (count === 0) setStatus('empty');
+        else setStatus(deleted ? 'cleared' : 'failed');
     };
     return (
         <p>
@@ -17,6 +18,7 @@ function ClearModelCache() {
             <span role="status">
                 {status === 'cleared' && 'Cached models deleted.'}
                 {status === 'empty' && 'No cached models to delete.'}
+                {status === 'failed' && 'Could not delete cached models.'}
             </span>
         </p>
     );
