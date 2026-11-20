@@ -836,7 +836,7 @@ class SCNetMasked(SCNet):
 
         self.register_buffer(
             "window",
-            torch.hann_window(int(self.stft_config["n_fft"]), periodic=True),
+            torch.hann_window(int(self.stft_config["win_length"]), periodic=True),
             persistent=False,
         )
         stems = len(self.sources)
