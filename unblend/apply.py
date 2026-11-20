@@ -1699,8 +1699,9 @@ def _apply_model_multi_unshifted(
             channels,
             length,
             device=accum_device,
+            dtype=torch.float32,
         )
-        sum_weight_mix = torch.zeros(length, device=accum_device)
+        sum_weight_mix = torch.zeros(length, device=accum_device, dtype=torch.float32)
         mix_states.append(
             {
                 "out": out_acc,
