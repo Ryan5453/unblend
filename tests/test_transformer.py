@@ -4,6 +4,7 @@ Regression tests for documented transformer construction options.
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 from unblend.transformer import (
     CrossTransformerEncoder,
@@ -66,3 +67,25 @@ def test_transformer_layer_propagates_dtype(layer_type) -> None:
         output = layer(query)
     assert output.dtype == torch.float64
     assert torch.isfinite(output).all()
+
+
+def test_cpu_self_attention_uses_sdpa(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    CPU inference uses SDPA and matches the original multihead attention.
+    """
+    layer = MyTransformerEncoderLayer(32, 4, batch_first=True).eval()
+    x = torch.randn(2, 17, 32)
+    sdpa = F.scaled_dot_product_attention
+    calls = []
+
+    def record_sdpa(*args, **kwargs):
+        calls.append(True)
+        return sdpa(*args, **kwargs)
+
+    with torch.inference_mode():
+        expected, _ = layer.self_attn(x, x, x, need_weights=False)
+        monkeypatch.setattr(F, "scaled_dot_product_attention", record_sdpa)
+        actual = layer._sa_block(x, None, None)
+
+    assert calls == [True]
+    torch.testing.assert_close(actual, expected)
