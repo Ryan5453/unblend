@@ -310,11 +310,11 @@ def compute_scnet_stft_for_export(
         win_length=win_length,
         window=(
             torch.hann_window(
-                win_length, periodic=True, device=audio.device, dtype=torch.float32
+                win_length, periodic=True, device=audio.device, dtype=audio.dtype
             )
             if window == "hann"
             # Explicit ones: what torch uses for None, without its warning.
-            else torch.ones(win_length, device=audio.device, dtype=torch.float32)
+            else torch.ones(win_length, device=audio.device, dtype=audio.dtype)
         ),
         center=True,
         normalized=normalized,
