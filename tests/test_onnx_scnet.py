@@ -169,6 +169,40 @@ def test_export_and_onnxruntime_parity(cls, tmp_path) -> None:
         assert _relative_error(torch.from_numpy(got), want) < 1e-5
 
 
+@pytest.mark.parametrize("architecture", ["scnet", "scnet_masked"])
+def test_fp32_export_ignores_default_dtype(architecture, tmp_path) -> None:
+    """SCNet traces FLOAT inputs with FP32 weights under a float64 default."""
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+
+    from unblend.scnet import build_scnet
+
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        model = build_scnet(
+            architecture,
+            _tiny_config(),
+            sources=SOURCES,
+            samplerate=44100,
+            segment_samples=4096,
+        )
+        path = str(tmp_path / "scnet_fp32.onnx")
+        _export_scnet_to_onnx(
+            model,
+            path,
+            opset_version=18,
+            storage=torch.float32,
+            license_label="unlicensed",
+            static_batch=True,
+        )
+        assert {i.type.tensor_type.elem_type for i in onnx.load(path).graph.input} == {
+            onnx.TensorProto.FLOAT
+        }
+    finally:
+        torch.set_default_dtype(previous)
+
+
 def test_fp16_storage_narrows_only_learned_weights(tmp_path) -> None:
     """
     Weight-only fp16 storage narrows the model's parameters and leaves the
