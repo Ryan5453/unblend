@@ -13,7 +13,7 @@ export { Separator } from './separator.js';
 export type { LoadModelOptions, ModelPrecision } from './separator.js';
 export { ModelLoadError } from './onnx-client.js';
 export type { LoadProgressCallback } from './onnx-client.js';
-export { MODEL_CACHE_NAME, clearModelCache } from './model-fetch.js';
+export { MODEL_CACHE_NAME, clearModelCache, countCachedModels } from './model-fetch.js';
 export type { ModelByteSource } from './model-fetch.js';
 
 export type {

@@ -72,6 +72,18 @@ export async function clearModelCache(): Promise<boolean> {
     }
 }
 
+/** Count stored model artifacts without creating a cache; unavailable storage returns zero. */
+export async function countCachedModels(): Promise<number> {
+    if (typeof caches === 'undefined') return 0;
+    try {
+        if (!await caches.has(MODEL_CACHE_NAME)) return 0;
+        const cache = await caches.open(MODEL_CACHE_NAME);
+        return (await cache.keys()).length;
+    } catch {
+        return 0;
+    }
+}
+
 async function openModelCache(): Promise<Cache | null> {
     if (typeof caches === 'undefined') return null;
     try {

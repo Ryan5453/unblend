@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     MODEL_CACHE_NAME,
     clearModelCache,
+    countCachedModels,
     fetchModelBytes,
     loadModelBytes,
 } from '../dist/model-fetch.js';
@@ -228,9 +229,50 @@ test('clearModelCache deletes the model bucket and tolerates missing Cache Stora
     assert.equal(await clearModelCache(), false);
 });
 
+test('countCachedModels does not open a missing bucket', async () => {
+    installCaches(new FakeCache());
+    globalThis.caches.has = async name => (assert.equal(name, MODEL_CACHE_NAME), false);
+    globalThis.caches.open = async () => assert.fail('must not create a bucket');
+    assert.equal(await countCachedModels(), 0);
+});
+
+test('countCachedModels counts entries in an existing bucket, including an empty one', async () => {
+    const cache = new FakeCache();
+    installCaches(cache);
+    globalThis.caches.has = async name => (assert.equal(name, MODEL_CACHE_NAME), true);
+    assert.equal(await countCachedModels(), 0);
+    assert.equal(cache.entries.size, 0);
+    cache.entries.set(KEY, new Uint8Array([1]));
+    cache.entries.set(`${KEY}?other`, new Uint8Array([2]));
+    assert.equal(await countCachedModels(), 2);
+});
+
+test('countCachedModels tolerates unavailable or failing Cache Storage', async () => {
+    assert.equal(await countCachedModels(), 0);
+    for (const method of ['has', 'open', 'keys']) {
+        const cache = new FakeCache();
+        installCaches(cache);
+        globalThis.caches.has = async () => true;
+        const target = method === 'keys' ? cache : globalThis.caches;
+        target[method] = async () => { throw new Error('storage unavailable'); };
+        assert.equal(await countCachedModels(), 0);
+    }
+});
+
+test('clearModelCache returns true when an existing empty bucket is removed', async () => {
+    const buckets = new Map([[MODEL_CACHE_NAME, new FakeCache()]]);
+    Object.defineProperty(globalThis, 'caches', {
+        configurable: true,
+        value: { delete: async name => buckets.delete(name) },
+    });
+    assert.equal(await clearModelCache(), true);
+    assert.equal(buckets.size, 0);
+});
+
 test('the package entry point exports the cache and load-error API', async () => {
     const index = await import('../dist/index.js');
     assert.equal(index.clearModelCache, clearModelCache);
+    assert.equal(index.countCachedModels, countCachedModels);
     assert.equal(index.MODEL_CACHE_NAME, MODEL_CACHE_NAME);
     assert.equal(new index.ModelLoadError('x', 'fetch').stage, 'fetch');
 });
