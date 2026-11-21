@@ -307,7 +307,7 @@ def compute_scnet_stft_for_export(
         hop_length=hop_length,
         win_length=win_length,
         window=(
-            torch.hann_window(n_fft, periodic=True, device=audio.device)
+            torch.hann_window(win_length, periodic=True, device=audio.device)
             if window == "hann"
             # Explicit ones: what torch uses for None, without its warning.
             else torch.ones(win_length, device=audio.device)
