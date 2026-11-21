@@ -155,10 +155,12 @@ class RoformerONNXWrapper(nn.Module):
 
         if isinstance(model, MelBandRoformer):
             n_selected = int(model.freq_indices.numel())
-            denom = model.num_bands_per_freq.repeat_interleave(
-                model.audio_channels
-            ).clamp(min=1e-8)
-            averaging = torch.zeros(int(denom.numel()), n_selected)
+            denom = (
+                model.num_bands_per_freq.repeat_interleave(model.audio_channels)
+                .float()
+                .clamp(min=1e-8)
+            )
+            averaging = torch.zeros(int(denom.numel()), n_selected, dtype=denom.dtype)
             averaging[model.freq_indices, torch.arange(n_selected)] = 1.0
             averaging = averaging / denom[:, None]
             self.register_buffer("mel_averaging_matrix", averaging, persistent=False)
@@ -338,7 +340,7 @@ def compute_roformer_stft_for_export(
     :return: ``(real, imag)`` spectrograms ``[B, C, F, T]``.
     """
     B, C, samples = audio.shape
-    window = torch.hann_window(win_length, device=audio.device)
+    window = torch.hann_window(win_length, dtype=audio.dtype, device=audio.device)
     z = torch.stft(
         audio.reshape(B * C, samples),
         n_fft=n_fft,
@@ -1201,7 +1203,9 @@ def _export_roformer_to_onnx(
     stft = model.stft_kwargs
 
     trace_batch = 1 if static_batch else 2
-    dummy_audio = torch.randn(trace_batch, model.audio_channels, segment_samples)
+    dummy_audio = torch.randn(
+        trace_batch, model.audio_channels, segment_samples, dtype=torch.float32
+    )
     dummy_real, dummy_imag = compute_roformer_stft_for_export(
         dummy_audio,
         n_fft=stft["n_fft"],

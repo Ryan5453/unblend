@@ -10,6 +10,9 @@ torch; the export/onnxruntime tests skip unless the ``onnx`` extra (plus
 ``onnxruntime``) is installed, mirroring the CI onnx job.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import pytest
 import torch
 
@@ -321,6 +324,65 @@ def test_export_and_onnxruntime_parity(builder, tmp_path) -> None:
         )
         <= 8
     )
+
+
+@contextmanager
+def _default_dtype(dtype: torch.dtype) -> Iterator[None]:
+    """
+    Make ``dtype`` torch's process default dtype for the block.
+
+    :param dtype: Temporary default dtype.
+    """
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+@pytest.mark.parametrize("builder", [_bs, _mel], ids=["bs", "mel"])
+def test_fp32_export_ignores_process_default_dtype(builder, tmp_path) -> None:
+    """
+    A float32 model exports a float32 graph even when the process default
+    dtype is float64: the exporter's dummy audio, STFT window and Mel-Band
+    averaging matrix must not inherit it.
+    """
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+    ort = pytest.importorskip("onnxruntime")
+
+    from unblend.onnx import _export_roformer_to_onnx
+
+    torch.manual_seed(0)
+    model = builder()
+    model.configure_inference(
+        sources=(["vocals", "other"] if model.num_stems == 1 else ["a", "b"]),
+        samplerate=SR,
+        segment_samples=SR,
+    )
+    stft = model.stft_kwargs
+    spec_real, spec_imag = compute_roformer_stft_for_export(
+        torch.randn(1, 2, SR),
+        n_fft=stft["n_fft"],
+        hop_length=stft["hop_length"],
+        win_length=stft["win_length"],
+        normalized=stft["normalized"],
+    )
+    with torch.no_grad():
+        torch_real, torch_imag = RoformerONNXWrapper(model).eval()(spec_real, spec_imag)
+
+    path = str(tmp_path / "model.onnx")
+    with _default_dtype(torch.float64):
+        _export_roformer_to_onnx(model, path, opset_version=17, storage=torch.float32)
+
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    assert {i.type for i in session.get_inputs()} == {"tensor(float)"}
+    ort_real, ort_imag = session.run(
+        None, {"spec_real": spec_real.numpy(), "spec_imag": spec_imag.numpy()}
+    )
+    assert torch.allclose(torch.from_numpy(ort_real), torch_real, atol=1e-4)
+    assert torch.allclose(torch.from_numpy(ort_imag), torch_imag, atol=1e-4)
 
 
 @pytest.mark.parametrize("builder", [_bs, _mel], ids=["bs", "mel"])
