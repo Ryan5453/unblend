@@ -75,6 +75,7 @@ export function useUnblend() {
     const modelLoadInFlightRef = useRef(false);
     const separateInFlightRef = useRef(false);
     const loadAudioInFlightRef = useRef(false);
+    const audioLoadAbortRef = useRef<AbortController | null>(null);
     const modelLoadAbortRef = useRef<AbortController | null>(null);
     const separationAbortRef = useRef<AbortController | null>(null);
     // Read at separation time (not captured at click time) so a click-time
@@ -293,14 +294,12 @@ export function useUnblend() {
             setAudioError(message);
             return false;
         }
-        // Two racing decodes would interleave their state writes (and leak
-        // the loser's artwork URL).
-        if (loadAudioInFlightRef.current) {
-            const message = 'A track is already loading';
-            addLog(message, 'error');
-            setAudioError(message);
-            return false;
-        }
+        audioLoadAbortRef.current?.abort();
+        const controller = new AbortController();
+        audioLoadAbortRef.current = controller;
+        const stale = () => !mountedRef.current || controller.signal.aborted;
+        let localArtwork: string | null = null;
+        let localSource: string | null = null;
         loadAudioInFlightRef.current = true;
         setLogs([]);
         setProgress(0, false, 'audio');
@@ -340,15 +339,31 @@ export function useUnblend() {
             // Mediabunny is most of the app's JS, so the decoder is split into
             // its own chunk and only fetched once the user picks a file.
             const { decodeAudioFile } = await import('../utils/audio-decoder');
+            if (stale()) return false;
             const { buffer: audioBuffer, artwork, title, artist, usedFallback } = await decodeAudioFile(
                 file,
                 ctx,
-                s => { if (mountedRef.current) setStatus(s); }
+                s => { if (!stale()) setStatus(s); }
             );
-            if (!mountedRef.current) {
-                if (artwork) URL.revokeObjectURL(artwork);
-                return false;
+            localArtwork = artwork;
+            if (stale()) return false;
+
+            // ffmpeg.wasm is only reached when WebCodecs can't decode the
+            // codec, so the <audio> element almost certainly can't either;
+            // play the decoded PCM instead of a silent ORIGINAL lane.
+            let usePcm = usedFallback === 'ffmpeg' || !mayPlayNatively(file);
+            if (usePcm) {
+                try {
+                    localSource = await pcmOriginalUrl(audioBuffer);
+                } catch (error) {
+                    if (stale()) return false;
+                    // Not fatal: separation only needs the decoded buffer.
+                    console.error('[unblend] Failed to encode the original track:', error);
+                    usePcm = false;
+                }
             }
+            if (stale()) return false;
+            localSource ??= URL.createObjectURL(file);
 
             if (usedFallback === 'ffmpeg') {
                 addLog('Audio decoded using fallback decoder (ffmpeg.wasm)', 'info');
@@ -373,43 +388,31 @@ export function useUnblend() {
 
             addLog('Audio loaded successfully.', 'success');
 
-            // ffmpeg.wasm is only reached when WebCodecs can't decode the
-            // codec, so the <audio> element almost certainly can't either;
-            // play the decoded PCM instead of a silent ORIGINAL lane.
-            let usePcm = usedFallback === 'ffmpeg' || !mayPlayNatively(file);
-            let sourceUrl: string | null = null;
-            if (usePcm) {
-                try {
-                    sourceUrl = await pcmOriginalUrl(audioBuffer);
-                } catch (error) {
-                    // Not fatal: separation only needs the decoded buffer.
-                    console.error('[unblend] Failed to encode the original track:', error);
-                    usePcm = false;
-                }
-            }
-            sourceUrl ??= URL.createObjectURL(file);
-            if (!mountedRef.current) {
-                URL.revokeObjectURL(sourceUrl);
-                return false;
-            }
-            originalUrlRef.current = sourceUrl;
+            originalUrlRef.current = localSource;
             originalIsPcmRef.current = usePcm;
-            setOriginalUrl(sourceUrl);
+            setOriginalUrl(localSource);
             audioBufferRef.current = audioBuffer;
             setState(prev => ({
                 ...prev,
                 audioBuffer,
                 audioFile: file,
             }));
+            localArtwork = null;
+            localSource = null;
             return true;
         } catch (error) {
-            if (!mountedRef.current) return false;
+            if (stale()) return false;
             const errorMessage = error instanceof Error ? error.message : String(error);
             addLog(`Failed to load audio: ${errorMessage}`, 'error');
             setAudioError(errorMessage);
             return false;
         } finally {
-            loadAudioInFlightRef.current = false;
+            if (localArtwork) URL.revokeObjectURL(localArtwork);
+            if (localSource) URL.revokeObjectURL(localSource);
+            if (audioLoadAbortRef.current === controller) {
+                audioLoadAbortRef.current = null;
+                loadAudioInFlightRef.current = false;
+            }
         }
     }, [addLog, getAudioContext, setProgress, setStatus]);
 
@@ -626,8 +629,10 @@ export function useUnblend() {
         setStemPeaks({});
     }, []);
 
-    /** Abort an in-flight model load and/or separation (and its finalize). */
+    /** Cancel in-flight audio/model loads and separation (and its finalize). */
     const cancel = useCallback(() => {
+        audioLoadAbortRef.current?.abort();
+        loadAudioInFlightRef.current = false;
         modelLoadAbortRef.current?.abort();
         separationAbortRef.current?.abort();
     }, []);
@@ -646,6 +651,7 @@ export function useUnblend() {
         mountedRef.current = true;
         return () => {
             mountedRef.current = false;
+            audioLoadAbortRef.current?.abort();
             // Abort first so in-flight load/separation promises reject promptly;
             // then unload any fully constructed Separator still owned here.
             modelLoadAbortRef.current?.abort();
