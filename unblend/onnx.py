@@ -309,10 +309,12 @@ def compute_scnet_stft_for_export(
         hop_length=hop_length,
         win_length=win_length,
         window=(
-            torch.hann_window(win_length, periodic=True, device=audio.device)
+            torch.hann_window(
+                win_length, periodic=True, device=audio.device, dtype=audio.dtype
+            )
             if window == "hann"
             # Explicit ones: what torch uses for None, without its warning.
-            else torch.ones(win_length, device=audio.device)
+            else torch.ones(win_length, device=audio.device, dtype=audio.dtype)
         ),
         center=True,
         normalized=normalized,
@@ -1326,7 +1328,9 @@ def _export_scnet_to_onnx(
 
     padding = stft_padding(segment, model.hop_length)
     device = next(model.parameters()).device
-    audio = torch.zeros(1, model.audio_channels, segment + padding, device=device)
+    audio = torch.zeros(
+        1, model.audio_channels, segment + padding, device=device, dtype=torch.float32
+    )
     spec_real, spec_imag = compute_scnet_stft_for_export(
         audio,
         int(model.stft_config["n_fft"]),

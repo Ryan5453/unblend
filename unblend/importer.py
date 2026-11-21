@@ -524,7 +524,9 @@ def _check_runs(model: torch.nn.Module, segment_samples: int) -> None:
     try:
         with torch.inference_mode():
             # Through apply_model, which pads chunks as separation does.
-            out = apply_model(model, torch.zeros(1, channels, segment_samples))
+            out = apply_model(
+                model, torch.zeros(1, channels, segment_samples, dtype=torch.float32)
+            )
     except Exception as exc:
         raise ValidationError(
             f"The checkpoint loads but the model doesn't run with this config: {_brief(exc)}"
