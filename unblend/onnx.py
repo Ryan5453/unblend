@@ -1585,7 +1585,9 @@ def export_to_onnx(
     batch_size = 1
     audio_channels = model.audio_channels
 
-    dummy_audio = torch.randn(batch_size, audio_channels, segment_samples)
+    dummy_audio = torch.randn(
+        batch_size, audio_channels, segment_samples, dtype=torch.float32
+    )
     dummy_spec_real, dummy_spec_imag = compute_stft_for_export(
         dummy_audio, nfft, hop_length
     )

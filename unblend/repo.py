@@ -410,7 +410,7 @@ def _build_demucs_layer(state: dict, member: dict, label: str) -> HTDemucs:
             f"Unsupported Demucs architecture {member.get('architecture')!r}."
         )
     try:
-        model = HTDemucs(**dict(member["config"]))
+        model = HTDemucs(**dict(member["config"])).float()
         model.load_state_dict(state, strict=True)
         return model.eval()
     except Exception as exc:

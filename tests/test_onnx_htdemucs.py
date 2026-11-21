@@ -70,6 +70,27 @@ def tiny_htdemucs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     return MODEL_NAME
 
 
+def test_fp32_export_ignores_default_dtype(tiny_htdemucs: str, tmp_path: Path) -> None:
+    """Registry loading and tracing produce FLOAT inputs under a float64 default."""
+    onnx = pytest.importorskip("onnx")
+
+    from unblend.onnx import export_to_onnx
+
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        path = export_to_onnx(
+            tiny_htdemucs, str(tmp_path / "fp32.onnx"), precision="fp32"
+        )
+        graph = onnx.load(path).graph
+        assert {i.type.tensor_type.elem_type for i in graph.input} == {
+            onnx.TensorProto.FLOAT
+        }
+        assert torch.get_default_dtype() == torch.float64
+    finally:
+        torch.set_default_dtype(previous)
+
+
 @pytest.mark.parametrize("precision", ["fp32", "fp16", "fp8_e4m3"])
 def test_htdemucs_export_to_onnx(
     tiny_htdemucs: str,

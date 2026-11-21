@@ -1529,7 +1529,7 @@ def build_roformer(
             f"Unknown roformer architecture {architecture!r}; expected one "
             f"of {sorted(_ARCHITECTURES)}."
         )
-    model = klass(**config)
+    model = klass(**config).float()
     model.configure_inference(
         sources=sources, samplerate=samplerate, segment_samples=segment_samples
     )

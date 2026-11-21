@@ -922,6 +922,65 @@ def test_registered_layer_loads_safetensors_without_pickle(
     assert loaded.sources == ["a", "b"]
 
 
+@pytest.mark.parametrize("architecture", ["htdemucs", "bs_roformer", "scnet"])
+def test_registry_load_ignores_default_dtype(tmp_path: Path, architecture: str) -> None:
+    """FP32 checkpoints load as FP32 even under a float64 process default."""
+    import torch
+    from safetensors.torch import save_file
+
+    from unblend.roformer import BSRoformer
+
+    sources = ["a", "b"]
+    if architecture == "htdemucs":
+        weights, config = _tiny_demucs_layer(tmp_path, sources)
+        entry = _local_htdemucs_entry(weights, config)
+    else:
+        if architecture == "scnet":
+            weights, config = _tiny_scnet_checkpoint(tmp_path, sources)
+            config["sources"] = sources
+        else:
+            config = dict(
+                dim=16,
+                depth=1,
+                stereo=True,
+                num_stems=2,
+                time_transformer_depth=1,
+                freq_transformer_depth=1,
+                dim_head=8,
+                heads=2,
+            )
+            weights = tmp_path / "roformer.safetensors"
+            save_file(
+                {
+                    k: v.contiguous()
+                    for k, v in BSRoformer(**config).state_dict().items()
+                },
+                weights,
+            )
+        entry = dict(
+            architecture=architecture,
+            sources=sources,
+            samplerate=8000,
+            segment_samples=8192,
+            config=config,
+            checkpoint={"format": "safetensors", "path": str(weights)},
+        )
+    repo = ModelRepository(
+        metadata_path=_write_metadata(tmp_path, {"models": {"tiny": entry}})
+    )
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        loaded = repo.get_model("tiny")
+        assert {p.dtype for p in loaded.parameters()} == {torch.float32}
+        assert all(
+            b.dtype == torch.float32 for b in loaded.buffers() if b.is_floating_point()
+        )
+        assert torch.get_default_dtype() == torch.float64
+    finally:
+        torch.set_default_dtype(previous)
+
+
 def _tiny_demucs_layer(
     tmp_path: Path, sources: list[str] | None = None
 ) -> tuple[Path, dict]:
