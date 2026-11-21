@@ -461,7 +461,7 @@ def build_and_verify(
             # build_entry writes them into the config the same way.
             model = HTDemucs(
                 **_htdemucs_config(config, sources, samplerate, segment_samples)
-            )
+            ).float()
             model.load_state_dict(state, strict=True)
             return model.eval()
         backend = backends.backend_for_architecture(architecture)
