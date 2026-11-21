@@ -568,12 +568,16 @@ def test_names_differing_only_by_case_are_refused(tmp_path: Path) -> None:
         check_registrable(models_file, "HTDemucs")
 
 
-def test_htdemucs_import_takes_stems_from_the_entry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+def test_htdemucs_import_takes_stems_from_the_entry(
+    tmp_path: Path, default_dtype: torch.dtype
+) -> None:
     """
     An HTDemucs config without ``sources`` imports when the stems are given
     separately (``--stem``), instead of failing on a missing argument.
 
     :param tmp_path: pytest temporary directory fixture
+    :param default_dtype: Process default during model construction and validation.
     """
     from unblend.htdemucs import HTDemucs
 
@@ -586,15 +590,20 @@ def test_htdemucs_import_takes_stems_from_the_entry(tmp_path: Path) -> None:
     config_path.write_text(
         "model:\n" + "".join(f"  {k}: {v}\n" for k, v in config.items())
     )
-    entry, summary = import_checkpoint(
-        checkpoint,
-        tmp_path / "out.safetensors",
-        config_path=config_path,
-        architecture="htdemucs",
-        sources=["a", "b"],
-        samplerate=8000,
-        segment_samples=8000,
-    )
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        entry, summary = import_checkpoint(
+            checkpoint,
+            tmp_path / "out.safetensors",
+            config_path=config_path,
+            architecture="htdemucs",
+            sources=["a", "b"],
+            samplerate=8000,
+            segment_samples=8000,
+        )
+    finally:
+        torch.set_default_dtype(previous)
     assert summary["architecture"] == "htdemucs"
     assert entry["config"]["sources"] == ["a", "b"]
 
