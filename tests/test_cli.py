@@ -18,6 +18,7 @@ from click.testing import Result
 from torchcodec.encoders import AudioEncoder
 from typer.testing import CliRunner
 
+from unblend.api import SeparatedSources
 from unblend.cli import build_app
 from unblend.cli.separate import (
     _estimate_compile_chunks,
@@ -1439,6 +1440,68 @@ def test_separate_output_problems_are_found_before_downloading(
     assert result.exit_code == 1
     output = " ".join(result.output.split())
     assert "isn't a writable folder" in output or "is a folder" in output
+
+
+@pytest.mark.parametrize("case", ["writable", "read-only", "symlink-to-read-only"])
+def test_separate_preflights_existing_stem_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """
+    An unwritable complement is refused before model loading or any stem write.
+    """
+    if case != "writable" and os.geteuid() == 0:
+        pytest.skip("root ignores permission bits")
+
+    monkeypatch.chdir(tmp_path)
+    track = tmp_path / "t.wav"
+    track.write_bytes(b"RIFF")
+    out = Path("out")
+    out.mkdir()
+    vocals = out / "vocals.wav"
+    complement = out / "no_vocals.wav"
+    target = tmp_path / "target.wav" if case == "symlink-to-read-only" else complement
+    target.write_bytes(b"existing audio")
+    if target != complement:
+        complement.symlink_to(target)
+    if case != "writable":
+        target.chmod(0o444)
+
+    samples = torch.zeros(2, 4410)
+    separator = Mock(model=SimpleNamespace(sources=["vocals", "other"]))
+    separator.separate.return_value = SeparatedSources(
+        {"vocals": samples, "other": samples}, sample_rate=44100, original=samples
+    )
+    load = Mock(return_value=True)
+    construct = Mock(return_value=separator)
+    monkeypatch.setattr("unblend.cli.separate.ensure_model_available", load)
+    monkeypatch.setattr("unblend.cli.separate.Separator", construct)
+
+    result = _invoke(
+        [
+            "separate",
+            str(track),
+            "-m",
+            "htdemucs",
+            "-d",
+            "cpu",
+            "--isolate-stem",
+            "vocals",
+            "-o",
+            str(out / "{stem}.wav"),
+        ]
+    )
+
+    if case == "writable":
+        assert result.exit_code == 0, result.output
+        assert vocals.read_bytes().startswith(b"RIFF")
+        assert complement.read_bytes().startswith(b"RIFF")
+    else:
+        assert result.exit_code == 1, result.output
+        assert f"Can't write {complement}." in result.output
+        assert not vocals.exists(), result.output
+        assert target.read_bytes() == b"existing audio"
+        load.assert_not_called()
+        construct.assert_not_called()
 
 
 def test_separate_self_looping_output_file_is_refused(
