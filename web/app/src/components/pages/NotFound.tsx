@@ -8,7 +8,10 @@ export function NotFound() {
 
             <div className="content-body">
                 <p>
-                    There is nothing at <strong>{pathname}</strong>.
+                    There is nothing at{' '}
+                    <span className="not-found-path">
+                        <strong>{pathname}</strong>.
+                    </span>
                 </p>
                 <p>
                     <Link to="/">Back to the studio</Link>

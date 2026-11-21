@@ -815,6 +815,14 @@ input[type=range]::-moz-range-thumb {
   font-weight: 600;
 }
 
+.not-found-path {
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.5;
+  word-break: break-all;
+  text-wrap: balance;
+}
+
 .content-body h2 {
   font-size: 10px;
   font-weight: 600;
