@@ -53,6 +53,12 @@ const initialState: UnblendState = {
     status: 'Ready',
 };
 
+const emptyStems: {
+    stemUrls: Record<string, string>;
+    stemPeaks: Record<string, number[]>;
+    stemBlobs: Record<string, Blob>;
+} = { stemUrls: {}, stemPeaks: {}, stemBlobs: {} };
+
 const DEFAULT_SEGMENT_MS: Record<ModelType, number> = {
     htdemucs: 1_500,
     htdemucs_6s: 2_000,
@@ -86,9 +92,8 @@ export function useUnblend() {
     // Terminal-style log lines surfaced to the processing view.
     const [logs, setLogs] = useState<string[]>([]);
     const [originalUrl, setOriginalUrl] = useState<string | null>(null);
-    const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
-    // Precomputed waveform peaks per stem (0..1), for the studio lanes.
-    const [stemPeaks, setStemPeaks] = useState<Record<string, number[]>>({});
+    const [stems, setStems] = useState(emptyStems);
+    const { stemUrls } = stems;
     const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
     // Mirror the latest object URLs into refs so the unmount cleanup can
     // revoke them without reading stale state from its empty-deps closure.
@@ -314,8 +319,7 @@ export function useUnblend() {
             setOriginalUrl(null);
             Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
             stemUrlsRef.current = {};
-            setStemUrls({});
-            setStemPeaks({});
+            setStems(emptyStems);
             if (artworkUrlRef.current) {
                 URL.revokeObjectURL(artworkUrlRef.current);
             }
@@ -464,7 +468,7 @@ export function useUnblend() {
             // Revoke the previous run's object URLs before dropping them.
             Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
             stemUrlsRef.current = {};
-            setStemUrls({});
+            setStems(emptyStems);
             setStatus('Preparing audio...');
             setProgress(0, false, 'audio');
 
@@ -517,6 +521,7 @@ export function useUnblend() {
 
             const urls: Record<string, string> = {};
             const peaks: Record<string, number[]> = {};
+            const blobs: Record<string, Blob> = {};
             const finalized = await finalizeStems(
                 result.stems,
                 SAMPLE_RATE,
@@ -533,13 +538,13 @@ export function useUnblend() {
                 const source = stem.source;
                 localUrls.push(urls[source]);
                 peaks[source] = stem.peaks;
+                blobs[source] = stem.blob;
             }
 
             // Transfer URL ownership to the cleanup ref synchronously before
             // publishing React state; an unmount cannot fall into an effect gap.
             stemUrlsRef.current = urls;
-            setStemUrls(urls);
-            setStemPeaks(peaks);
+            setStems({ stemUrls: urls, stemPeaks: peaks, stemBlobs: blobs });
             localUrls = [];
 
             setStatus('Complete!');
@@ -622,8 +627,7 @@ export function useUnblend() {
     const clearStems = useCallback(() => {
         Object.values(stemUrlsRef.current).forEach(url => URL.revokeObjectURL(url));
         stemUrlsRef.current = {};
-        setStemUrls({});
-        setStemPeaks({});
+        setStems(emptyStems);
     }, []);
 
     /** Abort an in-flight model load and/or separation (and its finalize). */
@@ -668,8 +672,7 @@ export function useUnblend() {
         ...state,
         logs,
         originalUrl,
-        stemUrls,
-        stemPeaks,
+        ...stems,
         artworkUrl,
         trackTitle,
         trackArtist,

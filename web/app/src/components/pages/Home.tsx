@@ -14,7 +14,7 @@ import { useHomeReset } from '../home-reset';
 import { WaveCanvas, RulerCanvas } from '../ui/WaveLane';
 import { Braid } from '../ui/Braid';
 import { peaksFromBuffer } from '../../utils/peaks';
-import { makeZip } from '../../utils/zip';
+import { buildStemZip } from '../../utils/zip-export';
 import { createPlayhead, type Playhead } from '../../utils/playhead';
 import { adapterHasShaderF16, appPrecision } from '../../utils/precision';
 import { MODEL_ARTIFACTS, MODEL_CONFIGS, type ModelPrecision, type ModelType } from 'unblend';
@@ -304,6 +304,7 @@ export function Home() {
         originalUrl,
         stemUrls,
         stemPeaks,
+        stemBlobs,
         trackTitle,
         trackArtist,
         artworkUrl,
@@ -801,21 +802,16 @@ export function Home() {
     };
 
     const handleExport = async () => {
-        const targets = stemKeys.filter(k => stemUrls[k]);
+        const targets = stemKeys.filter(k => stemBlobs[k]);
         // One pack at a time: a double-click would download two ZIPs.
         if (targets.length === 0 || exportingRef.current) return;
         exportingRef.current = true;
         if (exportResetRef.current !== null) clearTimeout(exportResetRef.current);
         setExportLabel(`PACKING ${targets.length} STEMS…`);
         try {
-            const entries = await Promise.all(
-                targets.map(async key => {
-                    const res = await fetch(stemUrls[key]);
-                    const buf = new Uint8Array(await res.arrayBuffer());
-                    return { name: stemFileName(key), data: buf };
-                })
+            const zip = await buildStemZip(
+                targets.map(key => ({ name: stemFileName(key), blob: stemBlobs[key] })),
             );
-            const zip = makeZip(entries);
             const url = URL.createObjectURL(zip);
             downloadUrl(url, `${sanitizeFileName(trackName)} (stems).zip`);
             setTimeout(() => URL.revokeObjectURL(url), 2000);
